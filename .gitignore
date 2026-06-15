@@ -1,0 +1,62 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Runtime data
+data/
+
+# Coverage & testing
+.coverage
+coverage/
+htmlcov/
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Backups
+backups/
+*.bak
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Secrets
+secrets/
+keys/
+
+# Python cache
+*.pyo
+
+# Local envs
+.python-version
+
+# Security scans
+.bandit
+
+# Temporary files
+*.tmp
+*.swp
