@@ -1,21 +1,23 @@
 import logging
 
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram import Update
-from telegram.ext import ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from app.bot.handlers import home_handler, settings_handler, start_handler
+from app.bot.handlers import (
+    ask_handler,
+    findings_handler,
+    home_handler,
+    reports_handler,
+    scan_callback_handler,
+    scan_handler,
+    settings_handler,
+    start_handler,
+    upload_handler,
+)
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 
 logger = logging.getLogger(__name__)
-
-
-async def unavailable_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
-
-    await update.message.reply_text("This workflow is not available yet. Use Home or Settings for now.")
 
 
 def build_application(settings: Settings) -> Application:
@@ -25,13 +27,13 @@ def build_application(settings: Settings) -> Application:
     application = Application.builder().token(settings.telegram_bot_token).build()
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(MessageHandler(filters.Regex("^Home$"), home_handler))
+    application.add_handler(MessageHandler(filters.Regex("^Scan$"), scan_handler))
+    application.add_handler(MessageHandler(filters.Regex("^Upload$"), upload_handler))
+    application.add_handler(MessageHandler(filters.Regex("^Findings$"), findings_handler))
+    application.add_handler(MessageHandler(filters.Regex("^Ask Mongrel$"), ask_handler))
+    application.add_handler(MessageHandler(filters.Regex("^Reports$"), reports_handler))
     application.add_handler(MessageHandler(filters.Regex("^Settings$"), settings_handler))
-    application.add_handler(
-        MessageHandler(
-            filters.Regex("^(Scan|Upload|Findings|Ask Mongrel|Reports)$"),
-            unavailable_handler,
-        )
-    )
+    application.add_handler(CallbackQueryHandler(scan_callback_handler, pattern="^(scan:(nmap|nuclei|bbot)|nav:home)$"))
     return application
 
 
