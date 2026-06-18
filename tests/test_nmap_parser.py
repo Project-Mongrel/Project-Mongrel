@@ -41,7 +41,9 @@ def test_parse_duration() -> None:
 
 
 def test_format_clean_output() -> None:
-    result_text = format_nmap_result(parse_nmap_output(NMAP_OUTPUT))
+    parsed = parse_nmap_output(NMAP_OUTPUT)
+    parsed.update({"risk_level": "high", "risk_notes": ["SSH exposed", "SMB exposed"]})
+    result_text = format_nmap_result(parsed)
 
     assert result_text == (
         "Target: 127.0.0.1\n"
@@ -53,7 +55,10 @@ def test_format_clean_output() -> None:
         "135/tcp msrpc\n"
         "445/tcp microsoft-ds\n"
         "\n"
-        "Duration: 0.32s"
+        "Duration: 0.32s\n"
+        "\n"
+        "Risk: high\n"
+        "Notes: SSH exposed, SMB exposed"
     )
     assert "Starting Nmap" not in result_text
     assert "https://nmap.org" not in result_text

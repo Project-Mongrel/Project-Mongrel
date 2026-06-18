@@ -62,6 +62,8 @@ def format_nmap_result(parsed: dict, fallback_output: str = "") -> str:
         host_status = parsed.get("host_status")
         open_ports = parsed.get("open_ports")
         duration = parsed.get("duration")
+        risk_level = parsed.get("risk_level")
+        risk_notes = parsed.get("risk_notes")
     except AttributeError:
         return _safe_truncated_fallback(fallback_output)
 
@@ -84,6 +86,11 @@ def format_nmap_result(parsed: dict, fallback_output: str = "") -> str:
 
     if duration:
         lines.extend(["", f"Duration: {duration}"])
+
+    if risk_level:
+        lines.extend(["", f"Risk: {risk_level}"])
+        notes = ", ".join(risk_notes or []) if isinstance(risk_notes, list) else str(risk_notes or "")
+        lines.append(f"Notes: {notes or 'None'}")
 
     return "\n".join(lines)
 

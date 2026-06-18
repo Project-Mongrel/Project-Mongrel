@@ -6,6 +6,8 @@ from telegram.ext import ContextTypes
 from app.bot.handlers.home import build_home_text
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
+from app.services.findings_store import add_finding
+from app.services.risk_rules import assess_nmap_ports
 from app.services.scan_manager import (
     complete_scan_request,
     create_scan_request,
@@ -40,11 +42,37 @@ def build_nmap_scan_started_text(target: str) -> str:
 def build_nmap_scan_result_text(result: dict[str, object]) -> str:
     output = str(result.get("output") or "")
     fallback_output = str(result.get("error") or output or "No output returned.")
-    parsed_output = parse_nmap_output(output)
+    parsed_output = parse_nmap_result(result)
+
+    return format_nmap_result(parsed_output, fallback_output=fallback_output)
+
+
+def parse_nmap_result(result: dict[str, object]) -> dict:
+    parsed_output = parse_nmap_output(str(result.get("output") or ""))
     if result.get("target") is not None and parsed_output.get("target") is None:
         parsed_output["target"] = result["target"]
 
-    return format_nmap_result(parsed_output, fallback_output=fallback_output)
+    parsed_output.update(assess_nmap_ports(parsed_output.get("open_ports", [])))
+    return parsed_output
+
+
+def store_successful_nmap_finding(user_id: int, result: dict[str, object]) -> dict | None:
+    if result.get("success") is not True:
+        return None
+
+    parsed_output = parse_nmap_result(result)
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nmap",
+            "target": parsed_output.get("target"),
+            "host_status": parsed_output.get("host_status"),
+            "open_ports": parsed_output.get("open_ports", []),
+            "duration": parsed_output.get("duration"),
+            "risk_level": parsed_output.get("risk_level"),
+            "risk_notes": parsed_output.get("risk_notes", []),
+        },
+    )
 
 
 async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,5 +157,6 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         target=str(result["target"]),
         result=result,
     )
+    store_successful_nmap_finding(user_id=user_id, result=result)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     await update.message.reply_text(build_nmap_scan_result_text(result))
