@@ -1,4 +1,6 @@
 from collections import defaultdict
+from dataclasses import replace
+from datetime import UTC, datetime
 
 from app.models.scan_request import ScanRequest, create_pending_scan_request
 
@@ -15,5 +17,40 @@ def get_user_scan_requests(user_id: int) -> list[ScanRequest]:
     return list(_scan_requests.get(user_id, []))
 
 
+def get_scan_request(user_id: int, scan_request_id: str) -> ScanRequest | None:
+    for scan_request in _scan_requests.get(user_id, []):
+        if scan_request.id == scan_request_id:
+            return scan_request
+
+    return None
+
+
+def mark_scan_request_awaiting_target(user_id: int, scan_request_id: str) -> ScanRequest:
+    return _replace_scan_request(user_id, scan_request_id, status="awaiting_target")
+
+
+def complete_scan_request(user_id: int, scan_request_id: str, target: str, result: dict[str, object]) -> ScanRequest:
+    status = "completed" if result.get("success") is True else "failed"
+    return _replace_scan_request(
+        user_id,
+        scan_request_id,
+        status=status,
+        target=target,
+        result=result,
+        completed_at=datetime.now(UTC),
+    )
+
+
 def clear_user_scan_requests(user_id: int) -> None:
     _scan_requests.pop(user_id, None)
+
+
+def _replace_scan_request(user_id: int, scan_request_id: str, **changes: object) -> ScanRequest:
+    scan_requests = _scan_requests.get(user_id, [])
+    for index, scan_request in enumerate(scan_requests):
+        if scan_request.id == scan_request_id:
+            updated_scan_request = replace(scan_request, **changes)
+            scan_requests[index] = updated_scan_request
+            return updated_scan_request
+
+    raise ValueError(f"Scan request '{scan_request_id}' was not found for user '{user_id}'.")

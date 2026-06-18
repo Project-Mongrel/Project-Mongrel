@@ -1,10 +1,21 @@
+import asyncio
+
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from app.bot.handlers.home import build_home_text
-from app.bot.keyboards import build_main_menu_keyboard, build_scan_type_keyboard
+from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
-from app.services.scan_manager import create_scan_request
+from app.services.scan_manager import (
+    complete_scan_request,
+    create_scan_request,
+    get_scan_request,
+    mark_scan_request_awaiting_target,
+)
+from app.tools.nmap_runner import run_nmap_scan
+
+PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
+MAX_SCAN_OUTPUT_LENGTH = 3000
 
 
 def build_scan_text() -> str:
@@ -15,6 +26,28 @@ def build_scan_created_text(scan_type: str) -> str:
     return (
         f"{scan_type.upper()} scan request created with status: pending.\n\n"
         "Target collection and tool execution will be added in a later mission."
+    )
+
+
+def build_nmap_target_prompt() -> str:
+    return "NMAP scan request created. Send the authorized target hostname or IP address to run the scan."
+
+
+def build_nmap_scan_started_text(target: str) -> str:
+    return f"Running NMAP scan for target: {target}"
+
+
+def build_nmap_scan_result_text(result: dict[str, object]) -> str:
+    status = "completed" if result.get("success") is True else "failed"
+    target = result.get("target", "unknown")
+    returncode = result.get("returncode")
+    output = str(result.get("output") or result.get("error") or "No output returned.")
+    trimmed_output = _trim_scan_output(output)
+
+    return (
+        f"NMAP scan {status} for target: {target}\n"
+        f"Return code: {returncode}\n\n"
+        f"{trimmed_output}"
     )
 
 
@@ -57,5 +90,55 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Unable to identify Telegram user.")
         return
 
-    create_scan_request(user_id=user_id, scan_type=scan_type)
+    scan_request = create_scan_request(user_id=user_id, scan_type=scan_type)
+    if scan_type == "nmap":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_nmap_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
+
+
+async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    if update.message.text in MAIN_MENU_BUTTONS:
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    user_id = update.effective_user.id if update.effective_user is not None else None
+    scan_request_id = context.user_data.get(PENDING_NMAP_REQUEST_KEY)
+    if user_id is None or not isinstance(scan_request_id, str):
+        return
+
+    scan_request = get_scan_request(user_id=user_id, scan_request_id=scan_request_id)
+    if scan_request is None or scan_request.scan_type != "nmap" or scan_request.status != "awaiting_target":
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    target = update.message.text or ""
+    await update.message.reply_text(build_nmap_scan_started_text(target.strip()))
+
+    try:
+        result = await asyncio.to_thread(run_nmap_scan, target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid NMAP target: {exc}")
+        return
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result["target"]),
+        result=result,
+    )
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    await update.message.reply_text(build_nmap_scan_result_text(result))
+
+
+def _trim_scan_output(output: str) -> str:
+    if len(output) <= MAX_SCAN_OUTPUT_LENGTH:
+        return output
+
+    return f"{output[:MAX_SCAN_OUTPUT_LENGTH]}\n\n[output truncated]"

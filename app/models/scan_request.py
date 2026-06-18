@@ -11,7 +11,10 @@ class ScanRequest:
     user_id: int
     scan_type: str
     status: str = "pending"
+    target: str | None = None
+    result: dict[str, object] | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    completed_at: datetime | None = None
 
 
 def create_pending_scan_request(user_id: int, scan_type: str) -> ScanRequest:
