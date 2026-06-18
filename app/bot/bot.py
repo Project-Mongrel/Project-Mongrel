@@ -5,6 +5,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from app.bot.handlers import (
     ask_handler,
+    findings_callback_handler,
     findings_handler,
     home_handler,
     reports_handler,
@@ -35,6 +36,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(MessageHandler(filters.Regex("^Reports$"), reports_handler))
     application.add_handler(MessageHandler(filters.Regex("^Settings$"), settings_handler))
     application.add_handler(CallbackQueryHandler(scan_callback_handler, pattern="^(scan:(nmap|nuclei|bbot)|nav:home)$"))
+    application.add_handler(CallbackQueryHandler(findings_callback_handler, pattern="^finding:(view:.+|list)$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, scan_target_handler))
     return application
 

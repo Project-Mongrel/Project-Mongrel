@@ -20,5 +20,13 @@ def get_user_findings(user_id: int) -> list[dict]:
     return [dict(finding) for finding in _findings.get(user_id, [])]
 
 
+def get_user_finding(user_id: int, finding_id: str) -> dict | None:
+    for finding in _findings.get(user_id, []):
+        if finding.get("id") == finding_id:
+            return dict(finding)
+
+    return None
+
+
 def clear_user_findings(user_id: int) -> None:
     _findings.pop(user_id, None)

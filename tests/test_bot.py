@@ -1,5 +1,16 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 from app.bot.auth import is_admin
-from app.bot.handlers.findings import build_findings_text
+from app.bot.handlers.findings import (
+    build_finding_detail_keyboard,
+    build_finding_detail_text,
+    build_findings_keyboard,
+    build_findings_text,
+    findings_callback_handler,
+    findings_handler,
+)
 from app.bot.handlers.home import build_home_text
 from app.bot.handlers.scan import (
     build_nmap_scan_result_text,
@@ -13,7 +24,7 @@ from app.bot.handlers.start import build_start_text
 from app.bot.handlers.upload import build_upload_text
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard
 from app.core.config import Settings
-from app.services.findings_store import clear_user_findings, get_user_findings
+from app.services.findings_store import add_finding, clear_user_findings, get_user_findings
 
 
 def test_main_menu_keyboard_contains_expected_buttons() -> None:
@@ -84,24 +95,26 @@ def test_nmap_result_text_uses_clean_parser_output() -> None:
 
 
 def test_findings_text_summarizes_latest_findings() -> None:
+    finding = {
+        "id": "abc123",
+        "source": "nmap",
+        "target": "127.0.0.1",
+        "host_status": "Up",
+        "open_ports": [
+            {"port": "22", "protocol": "tcp", "service": "ssh"},
+            {"port": "445", "protocol": "tcp", "service": "microsoft-ds"},
+        ],
+        "created_at": "2026-06-18T12:00:00Z",
+        "risk_level": "high",
+        "risk_notes": ["SMB exposed"],
+    }
     findings_text = build_findings_text(
-        [
-            {
-                "source": "nmap",
-                "target": "127.0.0.1",
-                "host_status": "Up",
-                "open_ports": [
-                    {"port": "22", "protocol": "tcp", "service": "ssh"},
-                    {"port": "445", "protocol": "tcp", "service": "microsoft-ds"},
-                ],
-                "created_at": "2026-06-18T12:00:00Z",
-                "risk_level": "high",
-                "risk_notes": ["SMB exposed"],
-            }
-        ]
+        [finding]
     )
+    keyboard = build_findings_keyboard([finding])
 
     assert "Latest findings:" in findings_text
+    assert "ID: abc123" in findings_text
     assert "Source: nmap" in findings_text
     assert "Target: 127.0.0.1" in findings_text
     assert "Host Status: Up" in findings_text
@@ -109,6 +122,9 @@ def test_findings_text_summarizes_latest_findings() -> None:
     assert "Risk Level: high" in findings_text
     assert "Risk Notes: SMB exposed" in findings_text
     assert "Created At: 2026-06-18T12:00:00Z" in findings_text
+    assert keyboard is not None
+    assert keyboard.inline_keyboard[0][0].text == "View Finding abc123"
+    assert keyboard.inline_keyboard[0][0].callback_data == "finding:view:abc123"
 
 
 def test_successful_nmap_result_creates_finding() -> None:
@@ -145,33 +161,125 @@ def test_successful_nmap_result_creates_finding() -> None:
 
 
 def test_findings_include_service_intelligence() -> None:
-    findings_text = build_findings_text(
-        [
-            {
-                "source": "nmap",
-                "target": "127.0.0.1",
-                "host_status": "Up",
-                "open_ports": [
-                    {
-                        "port": "445",
-                        "protocol": "tcp",
-                        "service": "microsoft-ds",
-                        "intelligence": {
-                            "name": "SMB",
-                            "description": "Windows file sharing and remote administration service.",
-                            "common_risk": "File exposure and lateral movement.",
-                            "recommendation": "Block internet exposure.",
-                        },
-                    }
-                ],
-                "created_at": "2026-06-18T12:00:00Z",
-                "risk_level": "high",
-                "risk_notes": ["SMB exposed"],
-            }
-        ]
+    findings_text = build_finding_detail_text(
+        {
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "host_status": "Up",
+            "open_ports": [
+                {
+                    "port": "445",
+                    "protocol": "tcp",
+                    "service": "microsoft-ds",
+                    "intelligence": {
+                        "name": "SMB",
+                        "description": "Windows file sharing and remote administration service.",
+                        "common_risk": "File exposure and lateral movement.",
+                        "recommendation": "Block internet exposure.",
+                    },
+                }
+            ],
+            "duration": "0.32s",
+            "created_at": "2026-06-18T12:00:00Z",
+            "risk_level": "high",
+            "risk_notes": ["SMB exposed"],
+        }
     )
 
+    assert "Risk Level: high" in findings_text
     assert "Service: SMB" in findings_text
     assert "Description: Windows file sharing and remote administration service." in findings_text
     assert "Common Risk: File exposure and lateral movement." in findings_text
     assert "Recommendation: Block internet exposure." in findings_text
+
+
+def test_unknown_finding_id_handled_safely() -> None:
+    assert build_finding_detail_text(None) == "Finding not found."
+
+
+def test_back_button_routes_to_findings_list() -> None:
+    keyboard = build_finding_detail_keyboard()
+
+    assert keyboard.inline_keyboard[0][0].text == "Back to Findings"
+    assert keyboard.inline_keyboard[0][0].callback_data == "finding:list"
+
+
+def test_pressing_findings_returns_list_view_not_detail_view() -> None:
+    clear_user_findings(4001)
+    finding = add_finding(
+        user_id=4001,
+        finding={
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "host_status": "Up",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+            "risk_level": "medium",
+            "risk_notes": ["SSH exposed"],
+        },
+    )
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=4001))
+
+    asyncio.run(findings_handler(update, SimpleNamespace()))
+
+    reply_text = message.reply_text.call_args.args[0]
+    reply_markup = message.reply_text.call_args.kwargs["reply_markup"]
+    assert "Latest findings:" in reply_text
+    assert "Finding detail:" not in reply_text
+    assert reply_markup.inline_keyboard[0][0].callback_data == f"finding:view:{finding['id']}"
+
+
+def test_detail_view_only_opens_from_finding_view_callback() -> None:
+    clear_user_findings(4002)
+    finding = add_finding(
+        user_id=4002,
+        finding={
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "host_status": "Up",
+            "open_ports": [],
+            "risk_level": "low",
+            "risk_notes": [],
+        },
+    )
+    query = SimpleNamespace(
+        data=f"finding:view:{finding['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=4002))
+
+    asyncio.run(findings_callback_handler(update, SimpleNamespace()))
+
+    detail_text = query.edit_message_text.call_args.args[0]
+    assert "Finding detail:" in detail_text
+    assert "Latest findings:" not in detail_text
+
+
+def test_back_to_findings_callback_returns_list_view() -> None:
+    clear_user_findings(4003)
+    finding = add_finding(
+        user_id=4003,
+        finding={
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "host_status": "Up",
+            "open_ports": [],
+            "risk_level": "low",
+            "risk_notes": [],
+        },
+    )
+    query = SimpleNamespace(
+        data="finding:list",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=4003))
+
+    asyncio.run(findings_callback_handler(update, SimpleNamespace()))
+
+    list_text = query.edit_message_text.call_args.args[0]
+    reply_markup = query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert "Latest findings:" in list_text
+    assert "Finding detail:" not in list_text
+    assert reply_markup.inline_keyboard[0][0].callback_data == f"finding:view:{finding['id']}"
