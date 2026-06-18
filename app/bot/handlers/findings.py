@@ -25,6 +25,7 @@ def build_findings_text(findings: list[dict] | None = None) -> str:
                 f"Created At: {finding.get('created_at', 'unknown')}",
             ]
         )
+        lines.extend(_format_open_port_intelligence(open_ports))
 
     return "\n".join(lines)
 
@@ -34,6 +35,27 @@ def _format_risk_notes(risk_notes: object) -> str:
         return ", ".join(str(note) for note in risk_notes)
 
     return "None"
+
+
+def _format_open_port_intelligence(open_ports: list[dict]) -> list[str]:
+    if not open_ports:
+        return []
+
+    lines = ["", "Services:"]
+    for open_port in open_ports:
+        intelligence = open_port.get("intelligence") or {}
+        service_label = f"{open_port.get('port', '?')}/{open_port.get('protocol', '?')} {open_port.get('service', 'unknown')}"
+        lines.extend(
+            [
+                service_label,
+                f"Service: {intelligence.get('name', open_port.get('service', 'unknown'))}",
+                f"Description: {intelligence.get('description', 'Description unavailable.')}",
+                f"Common Risk: {intelligence.get('common_risk', 'Description unavailable.')}",
+                f"Recommendation: {intelligence.get('recommendation', 'Manual review recommended.')}",
+            ]
+        )
+
+    return lines
 
 
 async def findings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

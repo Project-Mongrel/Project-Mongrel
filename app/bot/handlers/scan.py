@@ -14,6 +14,7 @@ from app.services.scan_manager import (
     get_scan_request,
     mark_scan_request_awaiting_target,
 )
+from app.services.service_intelligence import get_service_intelligence
 from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 
@@ -61,18 +62,35 @@ def store_successful_nmap_finding(user_id: int, result: dict[str, object]) -> di
         return None
 
     parsed_output = parse_nmap_result(result)
+    enriched_open_ports = enrich_open_ports(parsed_output.get("open_ports", []))
     return add_finding(
         user_id=user_id,
         finding={
             "source": "nmap",
             "target": parsed_output.get("target"),
             "host_status": parsed_output.get("host_status"),
-            "open_ports": parsed_output.get("open_ports", []),
+            "open_ports": enriched_open_ports,
             "duration": parsed_output.get("duration"),
             "risk_level": parsed_output.get("risk_level"),
             "risk_notes": parsed_output.get("risk_notes", []),
         },
     )
+
+
+def enrich_open_ports(open_ports: list[dict]) -> list[dict]:
+    enriched_ports = []
+    for open_port in open_ports:
+        enriched_ports.append(
+            {
+                **open_port,
+                "intelligence": get_service_intelligence(
+                    service_name=str(open_port.get("service", "")),
+                    port=str(open_port.get("port", "")),
+                ),
+            }
+        )
+
+    return enriched_ports
 
 
 async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

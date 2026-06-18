@@ -134,7 +134,44 @@ def test_successful_nmap_result_creates_finding() -> None:
     assert finding["source"] == "nmap"
     assert finding["target"] == "127.0.0.1"
     assert finding["host_status"] == "Up"
-    assert finding["open_ports"] == [{"port": "22", "protocol": "tcp", "service": "ssh"}]
+    assert finding["open_ports"][0]["port"] == "22"
+    assert finding["open_ports"][0]["protocol"] == "tcp"
+    assert finding["open_ports"][0]["service"] == "ssh"
     assert finding["duration"] == "0.32s"
     assert finding["risk_level"] == "medium"
     assert finding["risk_notes"] == ["SSH exposed"]
+    assert finding["open_ports"][0]["intelligence"]["name"] == "SSH"
+    assert finding["open_ports"][0]["intelligence"]["recommendation"]
+
+
+def test_findings_include_service_intelligence() -> None:
+    findings_text = build_findings_text(
+        [
+            {
+                "source": "nmap",
+                "target": "127.0.0.1",
+                "host_status": "Up",
+                "open_ports": [
+                    {
+                        "port": "445",
+                        "protocol": "tcp",
+                        "service": "microsoft-ds",
+                        "intelligence": {
+                            "name": "SMB",
+                            "description": "Windows file sharing and remote administration service.",
+                            "common_risk": "File exposure and lateral movement.",
+                            "recommendation": "Block internet exposure.",
+                        },
+                    }
+                ],
+                "created_at": "2026-06-18T12:00:00Z",
+                "risk_level": "high",
+                "risk_notes": ["SMB exposed"],
+            }
+        ]
+    )
+
+    assert "Service: SMB" in findings_text
+    assert "Description: Windows file sharing and remote administration service." in findings_text
+    assert "Common Risk: File exposure and lateral movement." in findings_text
+    assert "Recommendation: Block internet exposure." in findings_text
