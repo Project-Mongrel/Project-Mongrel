@@ -12,10 +12,10 @@ from app.services.scan_manager import (
     get_scan_request,
     mark_scan_request_awaiting_target,
 )
+from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
-MAX_SCAN_OUTPUT_LENGTH = 3000
 
 
 def build_scan_text() -> str:
@@ -38,17 +38,13 @@ def build_nmap_scan_started_text(target: str) -> str:
 
 
 def build_nmap_scan_result_text(result: dict[str, object]) -> str:
-    status = "completed" if result.get("success") is True else "failed"
-    target = result.get("target", "unknown")
-    returncode = result.get("returncode")
-    output = str(result.get("output") or result.get("error") or "No output returned.")
-    trimmed_output = _trim_scan_output(output)
+    output = str(result.get("output") or "")
+    fallback_output = str(result.get("error") or output or "No output returned.")
+    parsed_output = parse_nmap_output(output)
+    if result.get("target") is not None and parsed_output.get("target") is None:
+        parsed_output["target"] = result["target"]
 
-    return (
-        f"NMAP scan {status} for target: {target}\n"
-        f"Return code: {returncode}\n\n"
-        f"{trimmed_output}"
-    )
+    return format_nmap_result(parsed_output, fallback_output=fallback_output)
 
 
 async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -135,10 +131,3 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     await update.message.reply_text(build_nmap_scan_result_text(result))
-
-
-def _trim_scan_output(output: str) -> str:
-    if len(output) <= MAX_SCAN_OUTPUT_LENGTH:
-        return output
-
-    return f"{output[:MAX_SCAN_OUTPUT_LENGTH]}\n\n[output truncated]"

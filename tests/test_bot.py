@@ -1,7 +1,6 @@
 from app.bot.auth import is_admin
 from app.bot.handlers.home import build_home_text
 from app.bot.handlers.scan import (
-    MAX_SCAN_OUTPUT_LENGTH,
     build_nmap_scan_result_text,
     build_nmap_target_prompt,
     build_scan_created_text,
@@ -53,17 +52,26 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "Nmap XML" in build_upload_text()
 
 
-def test_nmap_result_text_reports_status_and_truncates_output() -> None:
+def test_nmap_result_text_uses_clean_parser_output() -> None:
     result_text = build_nmap_scan_result_text(
         {
             "success": True,
-            "target": "example.com",
+            "target": "127.0.0.1",
             "returncode": 0,
-            "output": "x" * (MAX_SCAN_OUTPUT_LENGTH + 1),
+            "output": (
+                "Starting Nmap 7.95 ( https://nmap.org )\n"
+                "Nmap scan report for 127.0.0.1\n"
+                "Host is up (0.00012s latency).\n"
+                "PORT     STATE SERVICE\n"
+                "22/tcp   open  ssh\n"
+                "Nmap done: 1 IP address (1 host up) scanned in 0.32 seconds\n"
+            ),
             "error": "",
         }
     )
 
-    assert "completed" in result_text
-    assert "example.com" in result_text
-    assert "[output truncated]" in result_text
+    assert "Target: 127.0.0.1" in result_text
+    assert "Host Status: Up" in result_text
+    assert "22/tcp ssh" in result_text
+    assert "Duration: 0.32s" in result_text
+    assert "https://nmap.org" not in result_text
