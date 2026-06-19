@@ -170,6 +170,8 @@ def test_successful_nmap_result_creates_finding() -> None:
     assert finding["risk_notes"] == ["SSH exposed"]
     assert finding["comparison"]["has_previous"] is False
     assert finding["comparison"]["summary"] == "No previous scan found for this target."
+    assert finding["impact"]["impact_level"] == "low"
+    assert finding["impact"]["summary"] == "No material exposure changes detected."
     assert finding["open_ports"][0]["intelligence"]["name"] == "SSH"
     assert finding["open_ports"][0]["intelligence"]["recommendation"]
 
@@ -207,6 +209,12 @@ def test_findings_include_service_intelligence() -> None:
                 "current_risk": "high",
                 "summary": "1 new port(s), risk changed from medium to high",
             },
+            "impact": {
+                "impact_level": "high",
+                "summary": "High-impact exposure change detected.",
+                "impacts": ["SMB file sharing became exposed."],
+                "recommendations": ["Restrict or disable SMB if not required."],
+            },
         },
         display_number=1,
     )
@@ -224,6 +232,10 @@ def test_findings_include_service_intelligence() -> None:
     assert "Removed Ports: none" in findings_text
     assert "Risk Change: MEDIUM -> HIGH" in findings_text
     assert "Unchanged Ports: 1" in findings_text
+    assert "Impact Assessment" in findings_text
+    assert "Impact Level: HIGH" in findings_text
+    assert "SMB file sharing became exposed." in findings_text
+    assert "Restrict or disable SMB if not required." in findings_text
     assert "Technical Details" in findings_text
     assert "Risk: HIGH" in findings_text
     assert "445/tcp microsoft-ds" in findings_text
@@ -463,6 +475,7 @@ def test_uploaded_scan_creates_finding() -> None:
     assert findings[0]["risk_level"] == "medium"
     assert findings[0]["risk_notes"] == ["SSH exposed"]
     assert findings[0]["comparison"]["has_previous"] is False
+    assert findings[0]["impact"]["impact_level"] == "low"
     assert get_upload_state(5002) is None
     success_text = message.reply_text.call_args.args[0]
     reply_markup = message.reply_text.call_args.kwargs["reply_markup"]
@@ -472,6 +485,8 @@ def test_uploaded_scan_creates_finding() -> None:
     assert "Analysis stored successfully." in success_text
     assert "Comparison" in success_text
     assert "No previous scan found for this target." in success_text
+    assert "Impact" in success_text
+    assert "No material exposure changes detected." in success_text
     assert reply_markup.inline_keyboard[0][0].text == "Open Findings"
     assert reply_markup.inline_keyboard[0][0].callback_data == "finding:list"
 
@@ -559,6 +574,8 @@ def test_live_scan_finding_stores_comparison() -> None:
     assert second is not None
     assert second["comparison"]["has_previous"] is True
     assert second["comparison"]["new_ports"] == [{"port": "3389", "protocol": "tcp", "service": "rdp", "intelligence": second["open_ports"][1]["intelligence"]}]
+    assert second["impact"]["impact_level"] == "high"
+    assert "Remote Desktop became exposed." in second["impact"]["impacts"]
 
 
 def test_live_scan_comparison_matches_normalized_target_key() -> None:

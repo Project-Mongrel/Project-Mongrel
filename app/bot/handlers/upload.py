@@ -48,7 +48,7 @@ def build_nmap_xml_import_success_text(finding: dict) -> str:
         f"{formatted_key_findings}\n\n"
         "Analysis stored successfully."
     )
-    return append_change_summary(message, finding.get("comparison"))
+    return append_change_summary(message, finding.get("comparison"), finding.get("impact"))
 
 
 def build_upload_success_keyboard() -> InlineKeyboardMarkup:

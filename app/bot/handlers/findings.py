@@ -76,6 +76,11 @@ def build_finding_detail_text(finding: dict | None, display_number: int | None =
         "",
         "--------------------------------",
         "",
+        "Impact Assessment",
+        *_format_impact(finding.get("impact")),
+        "",
+        "--------------------------------",
+        "",
         "Technical Details",
         "",
         title,
@@ -133,6 +138,21 @@ def _format_comparison(comparison: object) -> list[str]:
         ]
     )
 
+    return lines
+
+
+def _format_impact(impact: object) -> list[str]:
+    if not isinstance(impact, dict):
+        return ["No material exposure changes detected."]
+
+    lines = [
+        f"Impact Level: {_format_risk_level(impact.get('impact_level'))}",
+        str(impact.get("summary", "No material exposure changes detected.")),
+        "Impacts:",
+        *_format_bullets(impact.get("impacts") or []),
+        "Recommendations:",
+        *_format_bullets(impact.get("recommendations") or []),
+    ]
     return lines
 
 

@@ -8,6 +8,7 @@ from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
+from app.services.impact_engine import assess_change_impact
 from app.services.risk_rules import assess_nmap_ports
 from app.services.scan_manager import (
     complete_scan_request,
@@ -50,7 +51,7 @@ def build_nmap_scan_result_text(result: dict[str, object]) -> str:
     return format_nmap_result(parsed_output, fallback_output=fallback_output)
 
 
-def append_change_summary(message: str, comparison: dict | None) -> str:
+def append_change_summary(message: str, comparison: dict | None, impact: dict | None = None) -> str:
     if comparison is None:
         return message
 
@@ -65,6 +66,8 @@ def append_change_summary(message: str, comparison: dict | None) -> str:
         f"Risk Change: {_format_risk_change(comparison)}",
         f"Unchanged Ports: {len(comparison.get('unchanged_ports') or [])}",
     ]
+    if impact is not None:
+        lines.extend(["", "Impact", impact.get("summary", "No material exposure changes detected.")])
 
     return "\n".join(lines)
 
@@ -98,6 +101,7 @@ def store_parsed_nmap_finding(user_id: int, parsed_output: dict, source: str) ->
             "open_ports": enriched_open_ports,
         },
     )
+    impact = assess_change_impact(comparison)
     return add_finding(
         user_id=user_id,
         finding={
@@ -110,6 +114,7 @@ def store_parsed_nmap_finding(user_id: int, parsed_output: dict, source: str) ->
             "risk_level": assessed_output.get("risk_level"),
             "risk_notes": assessed_output.get("risk_notes", []),
             "comparison": comparison,
+            "impact": impact,
         },
     )
 
@@ -230,4 +235,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     finding = store_successful_nmap_finding(user_id=user_id, result=result)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
-    await update.message.reply_text(append_change_summary(build_nmap_scan_result_text(result), finding.get("comparison") if finding else None))
+    await update.message.reply_text(
+        append_change_summary(
+            build_nmap_scan_result_text(result),
+            finding.get("comparison") if finding else None,
+            finding.get("impact") if finding else None,
+        )
+    )
