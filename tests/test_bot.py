@@ -1,8 +1,9 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.bot.auth import is_admin
+from app.bot.handlers.ask import ask_handler, build_ask_text
 from app.bot.handlers.findings import (
     MAX_FINDINGS_MESSAGE_LENGTH,
     build_finding_detail_keyboard,
@@ -14,11 +15,13 @@ from app.bot.handlers.findings import (
 )
 from app.bot.handlers.home import build_home_text
 from app.bot.handlers.scan import (
+    PENDING_NMAP_REQUEST_KEY,
     append_change_summary,
     build_nmap_scan_result_text,
     build_nmap_target_prompt,
     build_scan_created_text,
     build_scan_text,
+    scan_target_handler,
     store_successful_nmap_finding,
 )
 from app.bot.handlers.settings import build_settings_text
@@ -36,6 +39,8 @@ from app.bot.handlers.upload import (
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard
 from app.core.config import Settings
 from app.services.findings_store import add_finding, clear_user_findings, get_user_findings
+from app.services.chat_state import clear_ai_waiting, is_ai_waiting
+from app.services.scan_manager import clear_user_scan_requests, create_scan_request, mark_scan_request_awaiting_target
 from app.services.verdict_engine import generate_mongrel_verdict
 
 
@@ -78,6 +83,71 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "authorized target" in build_nmap_target_prompt()
     assert "Nmap XML" in build_upload_text()
     assert "Send an Nmap XML file to begin analysis." in build_upload_text()
+    assert build_ask_text() == "Ask a cybersecurity question."
+
+
+def test_ask_mongrel_sets_ai_waiting_state() -> None:
+    clear_ai_waiting(7001)
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7001))
+
+    asyncio.run(ask_handler(update, SimpleNamespace()))
+
+    assert is_ai_waiting(7001) is True
+    assert message.reply_text.call_args.args[0] == "Ask a cybersecurity question."
+
+
+def test_ai_question_triggers_ask_ai_and_clears_state() -> None:
+    clear_ai_waiting(7002)
+    message = SimpleNamespace(text="How do I harden SSH?", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7002))
+    asyncio.run(ask_handler(SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=7002)), SimpleNamespace()))
+
+    with patch("app.bot.handlers.scan.ask_ai", return_value="AI integration is not configured yet.") as ask_ai:
+        asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
+
+    ask_ai.assert_called_once_with("How do I harden SSH?")
+    assert is_ai_waiting(7002) is False
+    assert message.reply_text.call_args.args[0] == "AI integration is not configured yet."
+
+
+def test_normal_messages_do_not_trigger_ai() -> None:
+    clear_ai_waiting(7003)
+    message = SimpleNamespace(text="hello", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7003))
+
+    with patch("app.bot.handlers.scan.ask_ai") as ask_ai:
+        asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
+
+    ask_ai.assert_not_called()
+    message.reply_text.assert_not_called()
+
+
+def test_scan_workflow_still_runs_when_ai_state_is_not_waiting() -> None:
+    clear_ai_waiting(7004)
+    clear_user_findings(7004)
+    clear_user_scan_requests(7004)
+    scan_request = create_scan_request(user_id=7004, scan_type="nmap")
+    mark_scan_request_awaiting_target(user_id=7004, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="127.0.0.1", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7004))
+
+    with patch(
+        "app.bot.handlers.scan.run_nmap_scan",
+        return_value={
+            "success": True,
+            "target": "127.0.0.1",
+            "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n",
+            "error": "",
+        },
+    ) as run_nmap_scan:
+        asyncio.run(scan_target_handler(update, context))
+
+    run_nmap_scan.assert_called_once_with("127.0.0.1")
+    assert message.reply_text.call_args_list[0].args[0] == "Running NMAP scan for target: 127.0.0.1"
+    assert "Target: 127.0.0.1" in message.reply_text.call_args_list[1].args[0]
+    assert get_user_findings(7004)
 
 
 def test_nmap_result_text_uses_clean_parser_output() -> None:

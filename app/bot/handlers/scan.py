@@ -6,6 +6,8 @@ from telegram.ext import ContextTypes
 from app.bot.handlers.home import build_home_text
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
+from app.services.ai_client import ask_ai
+from app.services.chat_state import clear_ai_waiting, is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.impact_engine import assess_change_impact
@@ -225,11 +227,16 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.message is None:
         return
 
+    user_id = update.effective_user.id if update.effective_user is not None else None
+    if user_id is not None and is_ai_waiting(user_id):
+        clear_ai_waiting(user_id)
+        await update.message.reply_text(ask_ai(update.message.text or ""))
+        return
+
     if update.message.text in MAIN_MENU_BUTTONS:
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
-    user_id = update.effective_user.id if update.effective_user is not None else None
     scan_request_id = context.user_data.get(PENDING_NMAP_REQUEST_KEY)
     if user_id is None or not isinstance(scan_request_id, str):
         return
