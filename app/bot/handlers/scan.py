@@ -62,17 +62,23 @@ def store_successful_nmap_finding(user_id: int, result: dict[str, object]) -> di
         return None
 
     parsed_output = parse_nmap_result(result)
-    enriched_open_ports = enrich_open_ports(parsed_output.get("open_ports", []))
+    return store_parsed_nmap_finding(user_id=user_id, parsed_output=parsed_output, source="nmap")
+
+
+def store_parsed_nmap_finding(user_id: int, parsed_output: dict, source: str) -> dict:
+    assessed_output = dict(parsed_output)
+    assessed_output.update(assess_nmap_ports(assessed_output.get("open_ports", [])))
+    enriched_open_ports = enrich_open_ports(assessed_output.get("open_ports", []))
     return add_finding(
         user_id=user_id,
         finding={
-            "source": "nmap",
-            "target": parsed_output.get("target"),
-            "host_status": parsed_output.get("host_status"),
+            "source": source,
+            "target": assessed_output.get("target"),
+            "host_status": assessed_output.get("host_status"),
             "open_ports": enriched_open_ports,
-            "duration": parsed_output.get("duration"),
-            "risk_level": parsed_output.get("risk_level"),
-            "risk_notes": parsed_output.get("risk_notes", []),
+            "duration": assessed_output.get("duration"),
+            "risk_level": assessed_output.get("risk_level"),
+            "risk_notes": assessed_output.get("risk_notes", []),
         },
     )
 

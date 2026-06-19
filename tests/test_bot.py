@@ -23,9 +23,17 @@ from app.bot.handlers.scan import (
 from app.bot.handlers.settings import build_settings_text
 from app.bot.handlers.start import build_start_text
 from app.bot.handlers.upload import build_upload_text
+from app.bot.handlers.upload import (
+    UPLOAD_STATE_AWAITING_NMAP_XML,
+    clear_upload_state,
+    get_upload_state,
+    set_upload_state,
+    upload_document_handler,
+)
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard
 from app.core.config import Settings
 from app.services.findings_store import add_finding, clear_user_findings, get_user_findings
+from app.services.verdict_engine import generate_mongrel_verdict
 
 
 def test_main_menu_keyboard_contains_expected_buttons() -> None:
@@ -66,6 +74,7 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "pending" in build_scan_created_text("nmap")
     assert "authorized target" in build_nmap_target_prompt()
     assert "Nmap XML" in build_upload_text()
+    assert "Send an Nmap XML file to begin analysis." in build_upload_text()
 
 
 def test_nmap_result_text_uses_clean_parser_output() -> None:
@@ -392,3 +401,61 @@ def test_long_detail_output_safely_truncates() -> None:
 
     assert len(detail_text) <= MAX_FINDINGS_MESSAGE_LENGTH + len("\n\n[output truncated]")
     assert "[output truncated]" in detail_text
+
+
+def test_wrong_file_type_handling() -> None:
+    set_upload_state(5001, UPLOAD_STATE_AWAITING_NMAP_XML)
+    document = SimpleNamespace(file_name="scan.txt", file_size=100)
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5001))
+
+    asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    assert message.reply_text.call_args.args[0] == "Please upload an Nmap XML file."
+
+
+def test_uploaded_scan_creates_finding() -> None:
+    clear_user_findings(5002)
+    set_upload_state(5002, UPLOAD_STATE_AWAITING_NMAP_XML)
+    xml_content = (
+        "<nmaprun>"
+        "<host>"
+        "<status state=\"up\" />"
+        "<address addr=\"192.168.0.24\" />"
+        "<ports>"
+        "<port protocol=\"tcp\" portid=\"22\"><state state=\"open\" /><service name=\"ssh\" /></port>"
+        "</ports>"
+        "</host>"
+        "<runstats><finished elapsed=\"0.25\" /></runstats>"
+        "</nmaprun>"
+    )
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(xml_content, "utf-8")))
+    document = SimpleNamespace(file_name="scan.xml", file_size=len(xml_content), get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5002))
+
+    asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    findings = get_user_findings(5002)
+    assert len(findings) == 1
+    assert findings[0]["source"] == "nmap_xml"
+    assert findings[0]["target"] == "192.168.0.24"
+    assert findings[0]["risk_level"] == "medium"
+    assert findings[0]["risk_notes"] == ["SSH exposed"]
+    assert get_upload_state(5002) is None
+    assert "Nmap XML imported successfully." in message.reply_text.call_args.args[0]
+    assert "Risk: MEDIUM" in message.reply_text.call_args.args[0]
+
+
+def test_verdict_generated_from_uploaded_scan() -> None:
+    finding = {
+        "source": "nmap_xml",
+        "target": "192.168.0.24",
+        "risk_level": "medium",
+        "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+    }
+
+    verdict = generate_mongrel_verdict(finding)
+
+    assert "SSH remote administration service exposed." in verdict["key_findings"]
+    assert "Restrict SSH access to trusted networks." in verdict["recommended_actions"]
