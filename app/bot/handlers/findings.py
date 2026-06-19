@@ -2,61 +2,83 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
-from app.services.findings_store import get_user_finding, get_user_findings
+from app.services.findings_store import clear_user_findings, get_user_finding, get_user_findings
+from app.services.verdict_engine import generate_mongrel_verdict
+
+MAX_FINDINGS_MESSAGE_LENGTH = 3800
+MAX_LATEST_FINDINGS = 5
 
 
 def build_findings_text(findings: list[dict] | None = None) -> str:
     if not findings:
         return "No findings available yet."
 
-    lines = ["Latest findings:"]
-    for finding in reversed(findings[-5:]):
+    lines = ["Latest Findings"]
+    for index, finding in enumerate(_latest_findings(findings), start=1):
         open_ports = finding.get("open_ports") or []
         risk_notes = finding.get("risk_notes") or []
         lines.extend(
             [
                 "",
-                f"ID: {finding.get('id', 'unknown')}",
-                f"Source: {finding.get('source', 'unknown')}",
+                f"#{index} {_format_risk_level(finding.get('risk_level'))} - {finding.get('source', 'unknown')}",
                 f"Target: {finding.get('target', 'unknown')}",
-                f"Host Status: {finding.get('host_status', 'unknown')}",
+                f"Host: {finding.get('host_status', 'unknown')}",
                 f"Open Ports: {len(open_ports)}",
-                f"Risk Level: {finding.get('risk_level', 'unknown')}",
-                f"Risk Notes: {_format_risk_notes(risk_notes)}",
-                f"Created At: {finding.get('created_at', 'unknown')}",
+                f"Notes: {_format_risk_notes(risk_notes)}",
             ]
         )
 
-    return "\n".join(lines)
+    return _truncate_message("\n".join(lines))
 
 
 def build_findings_keyboard(findings: list[dict] | None = None) -> InlineKeyboardMarkup | None:
     if not findings:
         return None
 
-    buttons = [
-        [InlineKeyboardButton(f"View Finding {finding.get('id')}", callback_data=f"finding:view:{finding.get('id')}")]
-        for finding in reversed(findings[-5:])
-        if finding.get("id")
-    ]
+    buttons = []
+    for index, finding in enumerate(_latest_findings(findings), start=1):
+        if finding.get("id"):
+            buttons.append(
+                [InlineKeyboardButton(f"View Details #{index}", callback_data=f"finding:view:{finding.get('id')}")]
+            )
+
+    buttons.append([InlineKeyboardButton("Clear Findings", callback_data="finding:clear")])
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 
-def build_finding_detail_text(finding: dict | None) -> str:
+def build_finding_detail_text(finding: dict | None, display_number: int | None = None) -> str:
     if finding is None:
         return "Finding not found."
 
     open_ports = finding.get("open_ports") or []
-    risk_notes = finding.get("risk_notes") or []
+    verdict = generate_mongrel_verdict(finding)
+    title = f"Finding #{display_number}" if display_number is not None else "Finding"
     lines = [
-        "Finding detail:",
+        "Mongrel Verdict",
         "",
-        f"Source: {finding.get('source', 'unknown')}",
+        f"Target: {finding.get('target', 'unknown')}",
+        "",
+        f"{_format_risk_level(verdict.get('risk_level'))} RISK",
+        "",
+        "Summary:",
+        str(verdict.get("summary", "")),
+        "",
+        "Key Findings:",
+        *_format_bullets(verdict.get("key_findings") or []),
+        "",
+        "Recommended Actions:",
+        *_format_bullets(verdict.get("recommended_actions") or []),
+        "",
+        "--------------------------------",
+        "",
+        "Technical Details",
+        "",
+        title,
+        "",
         f"Target: {finding.get('target', 'unknown')}",
         f"Host Status: {finding.get('host_status', 'unknown')}",
-        f"Risk Level: {finding.get('risk_level', 'unknown')}",
-        f"Risk Notes: {_format_risk_notes(risk_notes)}",
-        f"Scan Duration: {finding.get('duration', 'unknown')}",
+        f"Risk: {_format_risk_level(finding.get('risk_level'))}",
+        f"Duration: {finding.get('duration', 'unknown')}",
         f"Created At: {finding.get('created_at', 'unknown')}",
         "",
         "Open Ports:",
@@ -67,7 +89,7 @@ def build_finding_detail_text(finding: dict | None) -> str:
     else:
         lines.extend(_format_open_port_intelligence(open_ports))
 
-    return "\n".join(lines)
+    return _truncate_message("\n".join(lines))
 
 
 def build_finding_detail_keyboard() -> InlineKeyboardMarkup:
@@ -81,6 +103,17 @@ def _format_risk_notes(risk_notes: object) -> str:
     return "None"
 
 
+def _format_risk_level(risk_level: object) -> str:
+    return str(risk_level or "unknown").upper()
+
+
+def _format_bullets(items: list[str]) -> list[str]:
+    if not items:
+        return ["- None"]
+
+    return [f"- {item}" for item in items]
+
+
 def _format_open_port_intelligence(open_ports: list[dict]) -> list[str]:
     if not open_ports:
         return []
@@ -92,14 +125,33 @@ def _format_open_port_intelligence(open_ports: list[dict]) -> list[str]:
         lines.extend(
             [
                 service_label,
-                f"Service: {intelligence.get('name', open_port.get('service', 'unknown'))}",
-                f"Description: {intelligence.get('description', 'Description unavailable.')}",
-                f"Common Risk: {intelligence.get('common_risk', 'Description unavailable.')}",
+                f"{intelligence.get('description', 'Description unavailable.')}",
+                f"Risk: {intelligence.get('common_risk', 'Description unavailable.')}",
                 f"Recommendation: {intelligence.get('recommendation', 'Manual review recommended.')}",
+                "",
             ]
         )
 
     return lines
+
+
+def _latest_findings(findings: list[dict]) -> list[dict]:
+    return list(reversed(findings[-MAX_LATEST_FINDINGS:]))
+
+
+def _find_display_number(findings: list[dict], finding_id: str) -> int | None:
+    for index, finding in enumerate(_latest_findings(findings), start=1):
+        if finding.get("id") == finding_id:
+            return index
+
+    return None
+
+
+def _truncate_message(message: str) -> str:
+    if len(message) <= MAX_FINDINGS_MESSAGE_LENGTH:
+        return message
+
+    return f"{message[:MAX_FINDINGS_MESSAGE_LENGTH]}\n\n[output truncated]"
 
 
 async def findings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -135,12 +187,17 @@ async def findings_callback_handler(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
+    if query.data == "finding:clear":
+        clear_user_findings(user_id)
+        await query.edit_message_text("No findings available yet.")
+        return
+
     if query.data is None or not query.data.startswith("finding:view:"):
         return
 
     finding_id = query.data.removeprefix("finding:view:")
     finding = get_user_finding(user_id=user_id, finding_id=finding_id)
     await query.edit_message_text(
-        build_finding_detail_text(finding),
+        build_finding_detail_text(finding, display_number=_find_display_number(findings, finding_id)),
         reply_markup=build_finding_detail_keyboard(),
     )

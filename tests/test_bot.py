@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 from app.bot.auth import is_admin
 from app.bot.handlers.findings import (
+    MAX_FINDINGS_MESSAGE_LENGTH,
     build_finding_detail_keyboard,
     build_finding_detail_text,
     build_findings_keyboard,
@@ -113,18 +114,17 @@ def test_findings_text_summarizes_latest_findings() -> None:
     )
     keyboard = build_findings_keyboard([finding])
 
-    assert "Latest findings:" in findings_text
-    assert "ID: abc123" in findings_text
-    assert "Source: nmap" in findings_text
+    assert "Latest Findings" in findings_text
+    assert "#1 HIGH - nmap" in findings_text
     assert "Target: 127.0.0.1" in findings_text
-    assert "Host Status: Up" in findings_text
+    assert "Host: Up" in findings_text
     assert "Open Ports: 2" in findings_text
-    assert "Risk Level: high" in findings_text
-    assert "Risk Notes: SMB exposed" in findings_text
-    assert "Created At: 2026-06-18T12:00:00Z" in findings_text
+    assert "Notes: SMB exposed" in findings_text
     assert keyboard is not None
-    assert keyboard.inline_keyboard[0][0].text == "View Finding abc123"
+    assert keyboard.inline_keyboard[0][0].text == "View Details #1"
     assert keyboard.inline_keyboard[0][0].callback_data == "finding:view:abc123"
+    assert keyboard.inline_keyboard[1][0].text == "Clear Findings"
+    assert keyboard.inline_keyboard[1][0].callback_data == "finding:clear"
 
 
 def test_successful_nmap_result_creates_finding() -> None:
@@ -183,13 +183,23 @@ def test_findings_include_service_intelligence() -> None:
             "created_at": "2026-06-18T12:00:00Z",
             "risk_level": "high",
             "risk_notes": ["SMB exposed"],
-        }
+        },
+        display_number=1,
     )
 
-    assert "Risk Level: high" in findings_text
-    assert "Service: SMB" in findings_text
-    assert "Description: Windows file sharing and remote administration service." in findings_text
-    assert "Common Risk: File exposure and lateral movement." in findings_text
+    assert "Finding #1" in findings_text
+    assert "Mongrel Verdict" in findings_text
+    assert "HIGH RISK" in findings_text
+    assert "Summary:" in findings_text
+    assert "Key Findings:" in findings_text
+    assert "- Windows SMB file sharing service exposed." in findings_text
+    assert "Recommended Actions:" in findings_text
+    assert "- Restrict or disable SMB if not required." in findings_text
+    assert "Technical Details" in findings_text
+    assert "Risk: HIGH" in findings_text
+    assert "445/tcp microsoft-ds" in findings_text
+    assert "Windows file sharing and remote administration service." in findings_text
+    assert "Risk: File exposure and lateral movement." in findings_text
     assert "Recommendation: Block internet exposure." in findings_text
 
 
@@ -202,6 +212,49 @@ def test_back_button_routes_to_findings_list() -> None:
 
     assert keyboard.inline_keyboard[0][0].text == "Back to Findings"
     assert keyboard.inline_keyboard[0][0].callback_data == "finding:list"
+
+
+def test_max_5_findings_shown() -> None:
+    findings = [
+        {
+            "id": f"id-{index}",
+            "source": "nmap",
+            "target": f"192.168.0.{index}",
+            "host_status": "Up",
+            "open_ports": [],
+            "risk_level": "low",
+            "risk_notes": [],
+        }
+        for index in range(1, 7)
+    ]
+
+    findings_text = build_findings_text(findings)
+    keyboard = build_findings_keyboard(findings)
+
+    assert "192.168.0.1" not in findings_text
+    assert "192.168.0.2" in findings_text
+    assert "192.168.0.6" in findings_text
+    assert findings_text.count("LOW - nmap") == 5
+    assert keyboard is not None
+    assert len(keyboard.inline_keyboard) == 6
+
+
+def test_risk_labels_are_uppercase() -> None:
+    findings_text = build_findings_text(
+        [
+            {
+                "id": "risk-id",
+                "source": "nmap",
+                "target": "127.0.0.1",
+                "host_status": "Up",
+                "open_ports": [],
+                "risk_level": "medium",
+                "risk_notes": [],
+            }
+        ]
+    )
+
+    assert "#1 MEDIUM - nmap" in findings_text
 
 
 def test_pressing_findings_returns_list_view_not_detail_view() -> None:
@@ -224,8 +277,8 @@ def test_pressing_findings_returns_list_view_not_detail_view() -> None:
 
     reply_text = message.reply_text.call_args.args[0]
     reply_markup = message.reply_text.call_args.kwargs["reply_markup"]
-    assert "Latest findings:" in reply_text
-    assert "Finding detail:" not in reply_text
+    assert "Latest Findings" in reply_text
+    assert "Finding #1" not in reply_text
     assert reply_markup.inline_keyboard[0][0].callback_data == f"finding:view:{finding['id']}"
 
 
@@ -252,8 +305,9 @@ def test_detail_view_only_opens_from_finding_view_callback() -> None:
     asyncio.run(findings_callback_handler(update, SimpleNamespace()))
 
     detail_text = query.edit_message_text.call_args.args[0]
-    assert "Finding detail:" in detail_text
-    assert "Latest findings:" not in detail_text
+    assert "Finding #1" in detail_text
+    assert "Mongrel Verdict" in detail_text
+    assert "Latest Findings" not in detail_text
 
 
 def test_back_to_findings_callback_returns_list_view() -> None:
@@ -280,6 +334,61 @@ def test_back_to_findings_callback_returns_list_view() -> None:
 
     list_text = query.edit_message_text.call_args.args[0]
     reply_markup = query.edit_message_text.call_args.kwargs["reply_markup"]
-    assert "Latest findings:" in list_text
-    assert "Finding detail:" not in list_text
+    assert "Latest Findings" in list_text
+    assert "Finding #1" not in list_text
     assert reply_markup.inline_keyboard[0][0].callback_data == f"finding:view:{finding['id']}"
+
+
+def test_clear_findings_callback_works() -> None:
+    clear_user_findings(4004)
+    add_finding(
+        user_id=4004,
+        finding={
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "host_status": "Up",
+            "open_ports": [],
+            "risk_level": "low",
+            "risk_notes": [],
+        },
+    )
+    query = SimpleNamespace(
+        data="finding:clear",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=4004))
+
+    asyncio.run(findings_callback_handler(update, SimpleNamespace()))
+
+    assert query.edit_message_text.call_args.args[0] == "No findings available yet."
+    assert get_user_findings(4004) == []
+
+
+def test_long_detail_output_safely_truncates() -> None:
+    finding = {
+        "source": "nmap",
+        "target": "127.0.0.1",
+        "host_status": "Up",
+        "open_ports": [
+            {
+                "port": str(1000 + index),
+                "protocol": "tcp",
+                "service": "test",
+                "intelligence": {
+                    "description": "x" * 200,
+                    "common_risk": "y" * 200,
+                    "recommendation": "z" * 200,
+                },
+            }
+            for index in range(30)
+        ],
+        "duration": "0.25s",
+        "risk_level": "high",
+        "risk_notes": ["Many open ports"],
+    }
+
+    detail_text = build_finding_detail_text(finding, display_number=1)
+
+    assert len(detail_text) <= MAX_FINDINGS_MESSAGE_LENGTH + len("\n\n[output truncated]")
+    assert "[output truncated]" in detail_text
