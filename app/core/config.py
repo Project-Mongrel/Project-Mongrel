@@ -24,8 +24,11 @@ class Settings(BaseSettings):
     admin_user_id: int | None = None
 
     database_path: Path = Path("data/mongrel.db")
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "qwen3"
+    ai_enabled: bool = False
+    ai_provider: str = "ollama"
+    ollama_base_url: str = ""
+    ollama_model: str = "qwen3:4b"
+    ai_timeout_seconds: int = 60
 
 
 @lru_cache
