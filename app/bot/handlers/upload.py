@@ -1,9 +1,10 @@
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
 from app.bot.handlers.scan import store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
+from app.services.verdict_engine import generate_mongrel_verdict
 
 UPLOAD_STATE_AWAITING_NMAP_XML = "awaiting_nmap_xml"
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
@@ -34,12 +35,23 @@ def clear_upload_state(user_id: int) -> None:
 
 
 def build_nmap_xml_import_success_text(finding: dict) -> str:
+    verdict = generate_mongrel_verdict(finding)
+    key_findings = verdict.get("key_findings") or ["No significant findings identified."]
+    formatted_key_findings = "\n".join(f"- {key_finding}" for key_finding in key_findings)
+
     return (
-        "Nmap XML imported successfully.\n\n"
+        "Nmap XML Imported\n\n"
         f"Target: {finding.get('target', 'unknown')}\n\n"
-        f"Open Ports: {len(finding.get('open_ports') or [])}\n\n"
-        f"Risk: {str(finding.get('risk_level', 'unknown')).upper()}"
+        f"{str(verdict.get('risk_level', 'unknown')).upper()} RISK\n\n"
+        f"Ports Detected: {len(finding.get('open_ports') or [])}\n\n"
+        "Top Findings:\n"
+        f"{formatted_key_findings}\n\n"
+        "Analysis stored successfully."
     )
+
+
+def build_upload_success_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Open Findings", callback_data="finding:list")]])
 
 
 async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -84,4 +96,7 @@ async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_
 
     finding = store_parsed_nmap_finding(user_id=user_id, parsed_output=parsed_output, source="nmap_xml")
     clear_upload_state(user_id)
-    await update.message.reply_text(build_nmap_xml_import_success_text(finding))
+    await update.message.reply_text(
+        build_nmap_xml_import_success_text(finding),
+        reply_markup=build_upload_success_keyboard(),
+    )

@@ -25,6 +25,8 @@ from app.bot.handlers.start import build_start_text
 from app.bot.handlers.upload import build_upload_text
 from app.bot.handlers.upload import (
     UPLOAD_STATE_AWAITING_NMAP_XML,
+    build_nmap_xml_import_success_text,
+    build_upload_success_keyboard,
     clear_upload_state,
     get_upload_state,
     set_upload_state,
@@ -443,8 +445,14 @@ def test_uploaded_scan_creates_finding() -> None:
     assert findings[0]["risk_level"] == "medium"
     assert findings[0]["risk_notes"] == ["SSH exposed"]
     assert get_upload_state(5002) is None
-    assert "Nmap XML imported successfully." in message.reply_text.call_args.args[0]
-    assert "Risk: MEDIUM" in message.reply_text.call_args.args[0]
+    success_text = message.reply_text.call_args.args[0]
+    reply_markup = message.reply_text.call_args.kwargs["reply_markup"]
+    assert "Nmap XML Imported" in success_text
+    assert "MEDIUM RISK" in success_text
+    assert "- SSH remote administration service exposed." in success_text
+    assert "Analysis stored successfully." in success_text
+    assert reply_markup.inline_keyboard[0][0].text == "Open Findings"
+    assert reply_markup.inline_keyboard[0][0].callback_data == "finding:list"
 
 
 def test_verdict_generated_from_uploaded_scan() -> None:
@@ -459,3 +467,47 @@ def test_verdict_generated_from_uploaded_scan() -> None:
 
     assert "SSH remote administration service exposed." in verdict["key_findings"]
     assert "Restrict SSH access to trusted networks." in verdict["recommended_actions"]
+
+
+def test_upload_success_includes_risk_level() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "192.168.0.24",
+            "risk_level": "high",
+            "open_ports": [{"port": "445", "protocol": "tcp", "service": "microsoft-ds"}],
+        }
+    )
+
+    assert "HIGH RISK" in success_text
+
+
+def test_upload_success_includes_key_findings() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "192.168.0.24",
+            "risk_level": "high",
+            "open_ports": [{"port": "445", "protocol": "tcp", "service": "microsoft-ds"}],
+        }
+    )
+
+    assert "Top Findings:" in success_text
+    assert "- Windows SMB file sharing service exposed." in success_text
+
+
+def test_upload_success_includes_open_findings_button() -> None:
+    keyboard = build_upload_success_keyboard()
+
+    assert keyboard.inline_keyboard[0][0].text == "Open Findings"
+    assert keyboard.inline_keyboard[0][0].callback_data == "finding:list"
+
+
+def test_upload_success_no_findings_fallback_message() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "192.168.0.24",
+            "risk_level": "low",
+            "open_ports": [],
+        }
+    )
+
+    assert "- No significant findings identified." in success_text
