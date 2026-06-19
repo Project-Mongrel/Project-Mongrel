@@ -77,7 +77,7 @@ def build_finding_detail_text(finding: dict | None, display_number: int | None =
         "--------------------------------",
         "",
         "Impact Assessment",
-        *_format_impact(finding.get("impact")),
+        *_format_impact(finding.get("impact"), finding.get("comparison")),
         "",
         "--------------------------------",
         "",
@@ -128,6 +128,13 @@ def _format_comparison(comparison: object) -> list[str]:
     if not isinstance(comparison, dict):
         return ["No previous scan found for this target."]
 
+    if comparison.get("has_previous") is False:
+        return [
+            str(comparison.get("summary", "No previous scan found for this target.")),
+            "",
+            "This scan has been stored as the baseline for future comparisons.",
+        ]
+
     lines = [str(comparison.get("summary", "No previous scan found for this target."))]
     lines.extend(
         [
@@ -141,7 +148,18 @@ def _format_comparison(comparison: object) -> list[str]:
     return lines
 
 
-def _format_impact(impact: object) -> list[str]:
+def _format_impact(impact: object, comparison: object = None) -> list[str]:
+    if isinstance(comparison, dict) and comparison.get("has_previous") is False:
+        return [
+            "Change Impact: N/A",
+            "",
+            "Summary:",
+            "No historical comparison available.",
+            "",
+            "Reason:",
+            "This is the first recorded scan for this target.",
+        ]
+
     if not isinstance(impact, dict):
         return [
             "Change Impact: LOW",

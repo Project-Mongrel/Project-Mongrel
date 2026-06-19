@@ -55,6 +55,27 @@ def append_change_summary(message: str, comparison: dict | None, impact: dict | 
     if comparison is None:
         return message
 
+    if comparison.get("has_previous") is False:
+        return "\n".join(
+            [
+                message,
+                "",
+                "Comparison",
+                comparison.get("summary", "No previous scan found for this target."),
+                "",
+                "This scan has been stored as the baseline for future comparisons.",
+                "",
+                "Impact Assessment",
+                "Change Impact: N/A",
+                "",
+                "Summary:",
+                "No historical comparison available.",
+                "",
+                "Reason:",
+                "This is the first recorded scan for this target.",
+            ]
+        )
+
     lines = [
         message,
         "",

@@ -14,6 +14,7 @@ from app.bot.handlers.findings import (
 )
 from app.bot.handlers.home import build_home_text
 from app.bot.handlers.scan import (
+    append_change_summary,
     build_nmap_scan_result_text,
     build_nmap_target_prompt,
     build_scan_created_text,
@@ -488,8 +489,10 @@ def test_uploaded_scan_creates_finding() -> None:
     assert "Analysis stored successfully." in success_text
     assert "Comparison" in success_text
     assert "No previous scan found for this target." in success_text
-    assert "Impact" in success_text
-    assert "No material exposure changes detected." in success_text
+    assert "This scan has been stored as the baseline for future comparisons." in success_text
+    assert "Impact Assessment" in success_text
+    assert "Change Impact: N/A" in success_text
+    assert "No historical comparison available." in success_text
     assert reply_markup.inline_keyboard[0][0].text == "Open Findings"
     assert reply_markup.inline_keyboard[0][0].callback_data == "finding:list"
 
@@ -777,3 +780,122 @@ def test_no_change_impact_section_has_reason_without_empty_lists() -> None:
     assert "No new services appeared and no risky services were removed since the previous scan." in detail_text
     assert "Impacts:\n- None" not in detail_text
     assert "Recommendations:\n- None" not in detail_text
+
+
+def test_first_scan_comparison_rendering_uses_baseline_message() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "target": "127.0.0.1",
+            "risk_level": "medium",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+            "comparison": {
+                "has_previous": False,
+                "new_ports": [],
+                "removed_ports": [],
+                "unchanged_ports": [],
+                "risk_changed": False,
+                "previous_risk": None,
+                "current_risk": "medium",
+                "summary": "No previous scan found for this target.",
+            },
+            "impact": {
+                "impact_level": "low",
+                "summary": "No material exposure changes detected.",
+                "impacts": [],
+                "recommendations": [],
+            },
+        }
+    )
+
+    assert "Comparison" in detail_text
+    assert "No previous scan found for this target." in detail_text
+    assert "This scan has been stored as the baseline for future comparisons." in detail_text
+
+
+def test_first_scan_impact_rendering_is_not_applicable() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "target": "127.0.0.1",
+            "risk_level": "low",
+            "open_ports": [],
+            "comparison": {
+                "has_previous": False,
+                "new_ports": [],
+                "removed_ports": [],
+                "unchanged_ports": [],
+                "risk_changed": False,
+                "previous_risk": None,
+                "current_risk": "low",
+                "summary": "No previous scan found for this target.",
+            },
+            "impact": {
+                "impact_level": "low",
+                "summary": "No material exposure changes detected.",
+                "impacts": [],
+                "recommendations": [],
+            },
+        }
+    )
+
+    assert "Impact Assessment" in detail_text
+    assert "Change Impact: N/A" in detail_text
+    assert "Summary:\nNo historical comparison available." in detail_text
+    assert "Reason:\nThis is the first recorded scan for this target." in detail_text
+    assert "Impacts:" not in detail_text
+    assert "Recommendations:" not in detail_text
+
+
+def test_first_scan_response_does_not_show_port_delta_counts() -> None:
+    response_text = append_change_summary(
+        "Target: 127.0.0.1",
+        {
+            "has_previous": False,
+            "new_ports": [],
+            "removed_ports": [],
+            "unchanged_ports": [],
+            "risk_changed": False,
+            "previous_risk": None,
+            "current_risk": "medium",
+            "summary": "No previous scan found for this target.",
+        },
+        {
+            "impact_level": "low",
+            "summary": "No material exposure changes detected.",
+            "impacts": [],
+            "recommendations": [],
+        },
+    )
+
+    assert "This scan has been stored as the baseline for future comparisons." in response_text
+    assert "New Ports:" not in response_text
+    assert "Removed Ports:" not in response_text
+    assert "Risk Change:" not in response_text
+    assert "Unchanged Ports:" not in response_text
+
+
+def test_existing_comparison_response_behavior_is_unchanged() -> None:
+    response_text = append_change_summary(
+        "Target: 127.0.0.1",
+        {
+            "has_previous": True,
+            "new_ports": [{"port": "3389", "protocol": "tcp", "service": "rdp"}],
+            "removed_ports": [],
+            "unchanged_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+            "risk_changed": True,
+            "previous_risk": "medium",
+            "current_risk": "high",
+            "summary": "1 new port(s), risk changed from medium to high",
+        },
+        {
+            "impact_level": "high",
+            "summary": "High-impact exposure change detected.",
+            "impacts": ["Remote Desktop became exposed."],
+            "recommendations": ["Restrict RDP and require strong authentication."],
+        },
+    )
+
+    assert "New Ports: 3389/tcp rdp" in response_text
+    assert "Removed Ports: none" in response_text
+    assert "Risk Change: MEDIUM -> HIGH" in response_text
+    assert "Unchanged Ports: 1" in response_text
+    assert "Impact\nHigh-impact exposure change detected." in response_text
