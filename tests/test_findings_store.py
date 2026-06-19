@@ -1,4 +1,9 @@
-from app.services.findings_store import add_finding, clear_user_findings, get_user_findings
+from app.services.findings_store import (
+    add_finding,
+    clear_user_findings,
+    get_latest_user_finding_for_target,
+    get_user_findings,
+)
 
 
 def test_add_finding() -> None:
@@ -45,3 +50,30 @@ def test_clear_findings() -> None:
     clear_user_findings(2004)
 
     assert get_user_findings(2004) == []
+
+
+def test_previous_lookup_works_with_target_key() -> None:
+    clear_user_findings(2005)
+    finding = add_finding(
+        user_id=2005,
+        finding={
+            "source": "nmap",
+            "target": "localhost (127.0.0.1)",
+            "target_key": "127.0.0.1",
+        },
+    )
+
+    assert get_latest_user_finding_for_target(2005, "127.0.0.1") == finding
+
+
+def test_previous_lookup_fallback_works_without_target_key() -> None:
+    clear_user_findings(2006)
+    finding = add_finding(
+        user_id=2006,
+        finding={
+            "source": "nmap",
+            "target": "DESKTOP-MSP5KSM (192.168.0.24)",
+        },
+    )
+
+    assert get_latest_user_finding_for_target(2006, "192.168.0.24") == finding

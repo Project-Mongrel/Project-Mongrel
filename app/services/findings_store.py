@@ -2,6 +2,8 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from app.services.target_normalizer import normalize_target_key
+
 _findings: dict[int, list[dict]] = defaultdict(list)
 
 
@@ -23,6 +25,19 @@ def get_user_findings(user_id: int) -> list[dict]:
 def get_user_finding(user_id: int, finding_id: str) -> dict | None:
     for finding in _findings.get(user_id, []):
         if finding.get("id") == finding_id:
+            return dict(finding)
+
+    return None
+
+
+def get_latest_user_finding_for_target(user_id: int, target: str | None) -> dict | None:
+    target_key = normalize_target_key(target)
+    if target_key is None:
+        return None
+
+    for finding in reversed(_findings.get(user_id, [])):
+        finding_target_key = finding.get("target_key") or normalize_target_key(finding.get("target"))
+        if finding_target_key == target_key:
             return dict(finding)
 
     return None

@@ -6,7 +6,8 @@ from telegram.ext import ContextTypes
 from app.bot.handlers.home import build_home_text
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
-from app.services.findings_store import add_finding
+from app.services.comparison_engine import compare_findings
+from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.risk_rules import assess_nmap_ports
 from app.services.scan_manager import (
     complete_scan_request,
@@ -15,6 +16,7 @@ from app.services.scan_manager import (
     mark_scan_request_awaiting_target,
 )
 from app.services.service_intelligence import get_service_intelligence
+from app.services.target_normalizer import normalize_target_key
 from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 
@@ -48,6 +50,25 @@ def build_nmap_scan_result_text(result: dict[str, object]) -> str:
     return format_nmap_result(parsed_output, fallback_output=fallback_output)
 
 
+def append_change_summary(message: str, comparison: dict | None) -> str:
+    if comparison is None:
+        return message
+
+    lines = [
+        message,
+        "",
+        "Comparison",
+        comparison.get("summary", "No previous scan found for this target."),
+        "",
+        f"New Ports: {_format_ports(comparison.get('new_ports') or [])}",
+        f"Removed Ports: {_format_ports(comparison.get('removed_ports') or [])}",
+        f"Risk Change: {_format_risk_change(comparison)}",
+        f"Unchanged Ports: {len(comparison.get('unchanged_ports') or [])}",
+    ]
+
+    return "\n".join(lines)
+
+
 def parse_nmap_result(result: dict[str, object]) -> dict:
     parsed_output = parse_nmap_output(str(result.get("output") or ""))
     if result.get("target") is not None and parsed_output.get("target") is None:
@@ -69,16 +90,26 @@ def store_parsed_nmap_finding(user_id: int, parsed_output: dict, source: str) ->
     assessed_output = dict(parsed_output)
     assessed_output.update(assess_nmap_ports(assessed_output.get("open_ports", [])))
     enriched_open_ports = enrich_open_ports(assessed_output.get("open_ports", []))
+    previous_finding = get_latest_user_finding_for_target(user_id, assessed_output.get("target"))
+    comparison = compare_findings(
+        previous=previous_finding,
+        current={
+            **assessed_output,
+            "open_ports": enriched_open_ports,
+        },
+    )
     return add_finding(
         user_id=user_id,
         finding={
             "source": source,
             "target": assessed_output.get("target"),
+            "target_key": normalize_target_key(assessed_output.get("target")),
             "host_status": assessed_output.get("host_status"),
             "open_ports": enriched_open_ports,
             "duration": assessed_output.get("duration"),
             "risk_level": assessed_output.get("risk_level"),
             "risk_notes": assessed_output.get("risk_notes", []),
+            "comparison": comparison,
         },
     )
 
@@ -97,6 +128,22 @@ def enrich_open_ports(open_ports: list[dict]) -> list[dict]:
         )
 
     return enriched_ports
+
+
+def _format_ports(open_ports: list[dict]) -> str:
+    if not open_ports:
+        return "none"
+
+    return ", ".join(
+        f"{open_port.get('port')}/{open_port.get('protocol')} {open_port.get('service')}" for open_port in open_ports
+    )
+
+
+def _format_risk_change(comparison: dict) -> str:
+    if comparison.get("risk_changed"):
+        return f"{str(comparison.get('previous_risk')).upper()} -> {str(comparison.get('current_risk')).upper()}"
+
+    return "none"
 
 
 async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -181,6 +228,6 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         target=str(result["target"]),
         result=result,
     )
-    store_successful_nmap_finding(user_id=user_id, result=result)
+    finding = store_successful_nmap_finding(user_id=user_id, result=result)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
-    await update.message.reply_text(build_nmap_scan_result_text(result))
+    await update.message.reply_text(append_change_summary(build_nmap_scan_result_text(result), finding.get("comparison") if finding else None))

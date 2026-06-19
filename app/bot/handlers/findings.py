@@ -71,6 +71,11 @@ def build_finding_detail_text(finding: dict | None, display_number: int | None =
         "",
         "--------------------------------",
         "",
+        "Comparison",
+        *_format_comparison(finding.get("comparison")),
+        "",
+        "--------------------------------",
+        "",
         "Technical Details",
         "",
         title,
@@ -112,6 +117,39 @@ def _format_bullets(items: list[str]) -> list[str]:
         return ["- None"]
 
     return [f"- {item}" for item in items]
+
+
+def _format_comparison(comparison: object) -> list[str]:
+    if not isinstance(comparison, dict):
+        return ["No previous scan found for this target."]
+
+    lines = [str(comparison.get("summary", "No previous scan found for this target."))]
+    lines.extend(
+        [
+            f"New Ports: {_format_ports(comparison.get('new_ports') or [])}",
+            f"Removed Ports: {_format_ports(comparison.get('removed_ports') or [])}",
+            f"Risk Change: {_format_detail_risk_change(comparison)}",
+            f"Unchanged Ports: {len(comparison.get('unchanged_ports') or [])}",
+        ]
+    )
+
+    return lines
+
+
+def _format_ports(open_ports: list[dict]) -> str:
+    if not open_ports:
+        return "none"
+
+    return ", ".join(
+        f"{open_port.get('port')}/{open_port.get('protocol')} {open_port.get('service')}" for open_port in open_ports
+    )
+
+
+def _format_detail_risk_change(comparison: dict) -> str:
+    if comparison.get("risk_changed"):
+        return f"{str(comparison.get('previous_risk')).upper()} -> {str(comparison.get('current_risk')).upper()}"
+
+    return "none"
 
 
 def _format_open_port_intelligence(open_ports: list[dict]) -> list[str]:

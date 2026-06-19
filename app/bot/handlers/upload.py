@@ -2,7 +2,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
-from app.bot.handlers.scan import store_parsed_nmap_finding
+from app.bot.handlers.scan import append_change_summary, store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.services.verdict_engine import generate_mongrel_verdict
 
@@ -39,7 +39,7 @@ def build_nmap_xml_import_success_text(finding: dict) -> str:
     key_findings = verdict.get("key_findings") or ["No significant findings identified."]
     formatted_key_findings = "\n".join(f"- {key_finding}" for key_finding in key_findings)
 
-    return (
+    message = (
         "Nmap XML Imported\n\n"
         f"Target: {finding.get('target', 'unknown')}\n\n"
         f"{str(verdict.get('risk_level', 'unknown')).upper()} RISK\n\n"
@@ -48,6 +48,7 @@ def build_nmap_xml_import_success_text(finding: dict) -> str:
         f"{formatted_key_findings}\n\n"
         "Analysis stored successfully."
     )
+    return append_change_summary(message, finding.get("comparison"))
 
 
 def build_upload_success_keyboard() -> InlineKeyboardMarkup:

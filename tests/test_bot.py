@@ -160,6 +160,7 @@ def test_successful_nmap_result_creates_finding() -> None:
     assert get_user_findings(3001) == [finding]
     assert finding["source"] == "nmap"
     assert finding["target"] == "127.0.0.1"
+    assert finding["target_key"] == "127.0.0.1"
     assert finding["host_status"] == "Up"
     assert finding["open_ports"][0]["port"] == "22"
     assert finding["open_ports"][0]["protocol"] == "tcp"
@@ -167,6 +168,8 @@ def test_successful_nmap_result_creates_finding() -> None:
     assert finding["duration"] == "0.32s"
     assert finding["risk_level"] == "medium"
     assert finding["risk_notes"] == ["SSH exposed"]
+    assert finding["comparison"]["has_previous"] is False
+    assert finding["comparison"]["summary"] == "No previous scan found for this target."
     assert finding["open_ports"][0]["intelligence"]["name"] == "SSH"
     assert finding["open_ports"][0]["intelligence"]["recommendation"]
 
@@ -194,6 +197,16 @@ def test_findings_include_service_intelligence() -> None:
             "created_at": "2026-06-18T12:00:00Z",
             "risk_level": "high",
             "risk_notes": ["SMB exposed"],
+            "comparison": {
+                "has_previous": True,
+                "new_ports": [{"port": "445", "protocol": "tcp", "service": "microsoft-ds"}],
+                "removed_ports": [],
+                "unchanged_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+                "risk_changed": True,
+                "previous_risk": "medium",
+                "current_risk": "high",
+                "summary": "1 new port(s), risk changed from medium to high",
+            },
         },
         display_number=1,
     )
@@ -206,6 +219,11 @@ def test_findings_include_service_intelligence() -> None:
     assert "- Windows SMB file sharing service exposed." in findings_text
     assert "Recommended Actions:" in findings_text
     assert "- Restrict or disable SMB if not required." in findings_text
+    assert "Comparison" in findings_text
+    assert "New Ports: 445/tcp microsoft-ds" in findings_text
+    assert "Removed Ports: none" in findings_text
+    assert "Risk Change: MEDIUM -> HIGH" in findings_text
+    assert "Unchanged Ports: 1" in findings_text
     assert "Technical Details" in findings_text
     assert "Risk: HIGH" in findings_text
     assert "445/tcp microsoft-ds" in findings_text
@@ -444,6 +462,7 @@ def test_uploaded_scan_creates_finding() -> None:
     assert findings[0]["target"] == "192.168.0.24"
     assert findings[0]["risk_level"] == "medium"
     assert findings[0]["risk_notes"] == ["SSH exposed"]
+    assert findings[0]["comparison"]["has_previous"] is False
     assert get_upload_state(5002) is None
     success_text = message.reply_text.call_args.args[0]
     reply_markup = message.reply_text.call_args.kwargs["reply_markup"]
@@ -451,6 +470,8 @@ def test_uploaded_scan_creates_finding() -> None:
     assert "MEDIUM RISK" in success_text
     assert "- SSH remote administration service exposed." in success_text
     assert "Analysis stored successfully." in success_text
+    assert "Comparison" in success_text
+    assert "No previous scan found for this target." in success_text
     assert reply_markup.inline_keyboard[0][0].text == "Open Findings"
     assert reply_markup.inline_keyboard[0][0].callback_data == "finding:list"
 
@@ -511,3 +532,206 @@ def test_upload_success_no_findings_fallback_message() -> None:
     )
 
     assert "- No significant findings identified." in success_text
+
+
+def test_live_scan_finding_stores_comparison() -> None:
+    clear_user_findings(6001)
+    first = store_successful_nmap_finding(
+        user_id=6001,
+        result={
+            "success": True,
+            "target": "127.0.0.1",
+            "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n",
+            "error": "",
+        },
+    )
+    second = store_successful_nmap_finding(
+        user_id=6001,
+        result={
+            "success": True,
+            "target": "127.0.0.1",
+            "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n3389/tcp open rdp\n",
+            "error": "",
+        },
+    )
+
+    assert first is not None
+    assert second is not None
+    assert second["comparison"]["has_previous"] is True
+    assert second["comparison"]["new_ports"] == [{"port": "3389", "protocol": "tcp", "service": "rdp", "intelligence": second["open_ports"][1]["intelligence"]}]
+
+
+def test_live_scan_comparison_matches_normalized_target_key() -> None:
+    clear_user_findings(6003)
+    first = store_successful_nmap_finding(
+        user_id=6003,
+        result={
+            "success": True,
+            "target": "127.0.0.1",
+            "output": "Nmap scan report for localhost (127.0.0.1)\nHost is up.\n22/tcp open ssh\n",
+            "error": "",
+        },
+    )
+    second = store_successful_nmap_finding(
+        user_id=6003,
+        result={
+            "success": True,
+            "target": "127.0.0.1",
+            "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n",
+            "error": "",
+        },
+    )
+
+    assert first is not None
+    assert second is not None
+    assert second["comparison"]["has_previous"] is True
+
+
+def test_xml_upload_finding_stores_comparison() -> None:
+    clear_user_findings(6002)
+    add_finding(
+        user_id=6002,
+        finding={
+            "source": "nmap",
+            "target": "192.168.0.24",
+            "risk_level": "medium",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        },
+    )
+    set_upload_state(6002, UPLOAD_STATE_AWAITING_NMAP_XML)
+    xml_content = (
+        "<nmaprun><host><status state=\"up\" /><address addr=\"192.168.0.24\" />"
+        "<ports><port protocol=\"tcp\" portid=\"22\"><state state=\"open\" /><service name=\"ssh\" /></port>"
+        "<port protocol=\"tcp\" portid=\"445\"><state state=\"open\" /><service name=\"microsoft-ds\" /></port>"
+        "</ports></host></nmaprun>"
+    )
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(xml_content, "utf-8")))
+    document = SimpleNamespace(file_name="scan.xml", file_size=len(xml_content), get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=6002))
+
+    asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    latest = get_user_findings(6002)[-1]
+    assert latest["source"] == "nmap_xml"
+    assert latest["comparison"]["has_previous"] is True
+    assert latest["comparison"]["new_ports"][0]["port"] == "445"
+    assert "Comparison" in message.reply_text.call_args.args[0]
+
+
+def test_comparison_unchanged_ports_render_as_count() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "target": "127.0.0.1",
+            "risk_level": "medium",
+            "open_ports": [],
+            "comparison": {
+                "has_previous": True,
+                "new_ports": [],
+                "removed_ports": [],
+                "unchanged_ports": [
+                    {"port": "22", "protocol": "tcp", "service": "ssh"},
+                    {"port": "445", "protocol": "tcp", "service": "microsoft-ds"},
+                ],
+                "risk_changed": False,
+                "previous_risk": "medium",
+                "current_risk": "medium",
+                "summary": "No material changes detected.",
+            },
+        }
+    )
+
+    assert "Unchanged Ports: 2" in detail_text
+    assert "Unchanged Ports: 22/tcp ssh" not in detail_text
+
+
+def test_comparison_new_ports_still_list_details() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "target": "127.0.0.1",
+            "risk_level": "high",
+            "open_ports": [],
+            "comparison": {
+                "has_previous": True,
+                "new_ports": [{"port": "3389", "protocol": "tcp", "service": "rdp"}],
+                "removed_ports": [],
+                "unchanged_ports": [],
+                "risk_changed": True,
+                "previous_risk": "medium",
+                "current_risk": "high",
+                "summary": "1 new port(s), risk changed from medium to high",
+            },
+        }
+    )
+
+    assert "New Ports: 3389/tcp rdp" in detail_text
+
+
+def test_comparison_removed_ports_still_list_details() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "target": "127.0.0.1",
+            "risk_level": "medium",
+            "open_ports": [],
+            "comparison": {
+                "has_previous": True,
+                "new_ports": [],
+                "removed_ports": [{"port": "445", "protocol": "tcp", "service": "microsoft-ds"}],
+                "unchanged_ports": [],
+                "risk_changed": True,
+                "previous_risk": "high",
+                "current_risk": "medium",
+                "summary": "1 removed port(s), risk changed from high to medium",
+            },
+        }
+    )
+
+    assert "Removed Ports: 445/tcp microsoft-ds" in detail_text
+
+
+def test_comparison_risk_change_still_renders() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "target": "127.0.0.1",
+            "risk_level": "high",
+            "open_ports": [],
+            "comparison": {
+                "has_previous": True,
+                "new_ports": [],
+                "removed_ports": [],
+                "unchanged_ports": [],
+                "risk_changed": True,
+                "previous_risk": "medium",
+                "current_risk": "high",
+                "summary": "risk changed from medium to high",
+            },
+        }
+    )
+
+    assert "Risk Change: MEDIUM -> HIGH" in detail_text
+
+
+def test_no_material_changes_section_is_clean() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "target": "127.0.0.1",
+            "risk_level": "low",
+            "open_ports": [],
+            "comparison": {
+                "has_previous": True,
+                "new_ports": [],
+                "removed_ports": [],
+                "unchanged_ports": [],
+                "risk_changed": False,
+                "previous_risk": "low",
+                "current_risk": "low",
+                "summary": "No material changes detected.",
+            },
+        }
+    )
+
+    assert "No material changes detected." in detail_text
+    assert "New Ports: none" in detail_text
+    assert "Removed Ports: none" in detail_text
+    assert "Risk Change: none" in detail_text
+    assert "Unchanged Ports: 0" in detail_text
