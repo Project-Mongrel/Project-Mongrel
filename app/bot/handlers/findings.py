@@ -143,17 +143,44 @@ def _format_comparison(comparison: object) -> list[str]:
 
 def _format_impact(impact: object) -> list[str]:
     if not isinstance(impact, dict):
-        return ["No material exposure changes detected."]
+        return [
+            "Change Impact: LOW",
+            "",
+            "Summary:",
+            "No material exposure changes detected.",
+            "",
+            "Reason:",
+            "No new services appeared and no risky services were removed since the previous scan.",
+        ]
 
     lines = [
-        f"Impact Level: {_format_risk_level(impact.get('impact_level'))}",
+        f"Change Impact: {_format_risk_level(impact.get('impact_level'))}",
+        "",
+        "Summary:",
         str(impact.get("summary", "No material exposure changes detected.")),
-        "Impacts:",
-        *_format_bullets(impact.get("impacts") or []),
-        "Recommendations:",
-        *_format_bullets(impact.get("recommendations") or []),
+        "",
+        "Reason:",
+        _format_impact_reason(impact),
     ]
+    if impact.get("impacts"):
+        lines.extend(["", "Impacts:", *_format_bullets(impact.get("impacts") or [])])
+    if impact.get("recommendations"):
+        lines.extend(["", "Recommendations:", *_format_bullets(impact.get("recommendations") or [])])
+
     return lines
+
+
+def _format_impact_reason(impact: dict) -> str:
+    if not impact.get("impacts"):
+        return "No new services appeared and no risky services were removed since the previous scan."
+
+    if _format_risk_level(impact.get("impact_level")) == "HIGH":
+        return "A new high-risk service became exposed."
+
+    if _format_risk_level(impact.get("impact_level")) == "MEDIUM":
+        return "A new medium-risk service became exposed."
+
+    return "Detected changes reduced or did not materially increase exposure."
 
 
 def _format_ports(open_ports: list[dict]) -> str:

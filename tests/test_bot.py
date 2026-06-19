@@ -233,7 +233,10 @@ def test_findings_include_service_intelligence() -> None:
     assert "Risk Change: MEDIUM -> HIGH" in findings_text
     assert "Unchanged Ports: 1" in findings_text
     assert "Impact Assessment" in findings_text
-    assert "Impact Level: HIGH" in findings_text
+    assert "Change Impact: HIGH" in findings_text
+    assert "Summary:" in findings_text
+    assert "Reason:" in findings_text
+    assert "A new high-risk service became exposed." in findings_text
     assert "SMB file sharing became exposed." in findings_text
     assert "Restrict or disable SMB if not required." in findings_text
     assert "Technical Details" in findings_text
@@ -752,3 +755,25 @@ def test_no_material_changes_section_is_clean() -> None:
     assert "Removed Ports: none" in detail_text
     assert "Risk Change: none" in detail_text
     assert "Unchanged Ports: 0" in detail_text
+
+
+def test_no_change_impact_section_has_reason_without_empty_lists() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "target": "127.0.0.1",
+            "risk_level": "low",
+            "open_ports": [],
+            "impact": {
+                "impact_level": "low",
+                "summary": "No material exposure changes detected.",
+                "impacts": [],
+                "recommendations": [],
+            },
+        }
+    )
+
+    assert "Change Impact: LOW" in detail_text
+    assert "Reason:" in detail_text
+    assert "No new services appeared and no risky services were removed since the previous scan." in detail_text
+    assert "Impacts:\n- None" not in detail_text
+    assert "Recommendations:\n- None" not in detail_text
