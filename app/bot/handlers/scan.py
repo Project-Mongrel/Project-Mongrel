@@ -8,7 +8,7 @@ from app.bot.handlers.home import build_home_text
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.services.ai_client import ask_ai
-from app.services.chat_state import clear_ai_waiting, is_ai_waiting
+from app.services.chat_state import is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.impact_engine import assess_change_impact
@@ -231,9 +231,8 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user_id = update.effective_user.id if update.effective_user is not None else None
     if user_id is not None and is_ai_waiting(user_id):
-        clear_ai_waiting(user_id)
         logger.info("Ask Mongrel question received for user_id=%s", user_id)
-        await update.message.reply_text("Mongrel is thinking...")
+        await update.message.reply_text("Analyzing...")
         try:
             logger.info("AI request started for user_id=%s", user_id)
             ai_response = await asyncio.to_thread(ask_ai, update.message.text or "")

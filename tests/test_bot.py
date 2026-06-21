@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.bot.auth import is_admin
-from app.bot.handlers.ask import ask_handler, build_ask_text
+from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
 from app.bot.handlers.findings import (
     MAX_FINDINGS_MESSAGE_LENGTH,
     build_finding_detail_keyboard,
@@ -13,7 +13,7 @@ from app.bot.handlers.findings import (
     findings_callback_handler,
     findings_handler,
 )
-from app.bot.handlers.home import build_home_text
+from app.bot.handlers.home import build_home_text, home_handler
 from app.bot.handlers.scan import (
     PENDING_NMAP_REQUEST_KEY,
     append_change_summary,
@@ -83,7 +83,7 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "authorized target" in build_nmap_target_prompt()
     assert "Nmap XML" in build_upload_text()
     assert "Send an Nmap XML file to begin analysis." in build_upload_text()
-    assert build_ask_text() == "Ask a cybersecurity question."
+    assert build_ask_text() == "Ask Mongrel anything. Cybersecurity is my specialty."
 
 
 def test_ask_mongrel_sets_ai_waiting_state() -> None:
@@ -94,10 +94,10 @@ def test_ask_mongrel_sets_ai_waiting_state() -> None:
     asyncio.run(ask_handler(update, SimpleNamespace()))
 
     assert is_ai_waiting(7001) is True
-    assert message.reply_text.call_args.args[0] == "Ask a cybersecurity question."
+    assert message.reply_text.call_args.args[0] == "Ask Mongrel anything. Cybersecurity is my specialty."
 
 
-def test_ai_question_triggers_ask_ai_and_clears_state() -> None:
+def test_ai_question_triggers_ask_ai_and_keeps_state() -> None:
     clear_ai_waiting(7002)
     message = SimpleNamespace(text="How do I harden SSH?", reply_text=AsyncMock())
     update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7002))
@@ -107,8 +107,8 @@ def test_ai_question_triggers_ask_ai_and_clears_state() -> None:
         asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
 
     ask_ai.assert_called_once_with("How do I harden SSH?")
-    assert is_ai_waiting(7002) is False
-    assert message.reply_text.call_args_list[0].args[0] == "Mongrel is thinking..."
+    assert is_ai_waiting(7002) is True
+    assert message.reply_text.call_args_list[0].args[0] == "Analyzing..."
     assert message.reply_text.call_args_list[1].args[0] == "AI integration is not configured yet."
 
 
@@ -121,9 +121,73 @@ def test_ai_question_failure_returns_safe_message() -> None:
     with patch("app.bot.handlers.scan.ask_ai", side_effect=RuntimeError("boom")):
         asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
 
-    assert is_ai_waiting(7005) is False
-    assert message.reply_text.call_args_list[0].args[0] == "Mongrel is thinking..."
+    assert is_ai_waiting(7005) is True
+    assert message.reply_text.call_args_list[0].args[0] == "Analyzing..."
     assert message.reply_text.call_args_list[1].args[0] == "AI request failed. Check bot logs."
+
+
+def test_multiple_consecutive_ai_questions_stay_in_session() -> None:
+    clear_ai_waiting(7006)
+    asyncio.run(
+        ask_handler(
+            SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=7006)),
+            SimpleNamespace(),
+        )
+    )
+
+    with patch("app.bot.handlers.scan.ask_ai", side_effect=["Linux answer", "Nmap answer"]) as ask_ai:
+        first_message = SimpleNamespace(text="What is Linux?", reply_text=AsyncMock())
+        second_message = SimpleNamespace(text="What is Nmap?", reply_text=AsyncMock())
+        asyncio.run(
+            scan_target_handler(
+                SimpleNamespace(message=first_message, effective_user=SimpleNamespace(id=7006)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+        asyncio.run(
+            scan_target_handler(
+                SimpleNamespace(message=second_message, effective_user=SimpleNamespace(id=7006)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    assert ask_ai.call_args_list[0].args[0] == "What is Linux?"
+    assert ask_ai.call_args_list[1].args[0] == "What is Nmap?"
+    assert first_message.reply_text.call_args_list[1].args[0] == "Linux answer"
+    assert second_message.reply_text.call_args_list[1].args[0] == "Nmap answer"
+    assert is_ai_waiting(7006) is True
+
+
+def test_home_exits_ai_session() -> None:
+    clear_ai_waiting(7007)
+    asyncio.run(
+        ask_handler(
+            SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=7007)),
+            SimpleNamespace(),
+        )
+    )
+    message = SimpleNamespace(text="Home", reply_text=AsyncMock())
+
+    asyncio.run(home_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7007)), SimpleNamespace()))
+
+    assert is_ai_waiting(7007) is False
+    assert "Project Mongrel control panel" in message.reply_text.call_args.args[0]
+
+
+def test_cancel_exits_ai_session() -> None:
+    clear_ai_waiting(7008)
+    asyncio.run(
+        ask_handler(
+            SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=7008)),
+            SimpleNamespace(),
+        )
+    )
+    message = SimpleNamespace(text="Cancel", reply_text=AsyncMock())
+
+    asyncio.run(cancel_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7008)), SimpleNamespace()))
+
+    assert is_ai_waiting(7008) is False
+    assert message.reply_text.call_args.args[0] == "Ask Mongrel session closed."
 
 
 def test_normal_messages_do_not_trigger_ai() -> None:

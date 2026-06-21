@@ -8,6 +8,7 @@ MAIN_MENU_BUTTONS: tuple[str, ...] = (
     "Ask Mongrel",
     "Reports",
     "Settings",
+    "Cancel",
 )
 
 
@@ -16,7 +17,7 @@ def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("Home"), KeyboardButton("Scan"), KeyboardButton("Upload")],
             [KeyboardButton("Findings"), KeyboardButton("Ask Mongrel")],
-            [KeyboardButton("Reports"), KeyboardButton("Settings")],
+            [KeyboardButton("Reports"), KeyboardButton("Settings"), KeyboardButton("Cancel")],
         ],
         resize_keyboard=True,
         is_persistent=True,
