@@ -51,6 +51,13 @@ def run_bot(settings: Settings | None = None) -> None:
         logger.warning("TELEGRAM_BOT_TOKEN is not configured; Telegram bot was not started.")
         return
 
+    logger.info(
+        "AI config: enabled=%s provider=%s ollama_base_url=%s ollama_model=%s",
+        resolved_settings.ai_enabled,
+        resolved_settings.ai_provider,
+        resolved_settings.ollama_base_url or "<empty>",
+        resolved_settings.ollama_model,
+    )
     logger.info("Starting Project Mongrel Telegram bot")
     build_application(resolved_settings).run_polling()
 

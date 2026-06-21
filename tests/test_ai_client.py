@@ -26,6 +26,18 @@ def test_missing_ollama_base_url_handled() -> None:
         assert ask_ai("What should I check?") == "Ollama base URL is not configured."
 
 
+def test_ai_enabled_uses_ollama_client() -> None:
+    settings = Settings(ai_enabled=True, ai_provider="ollama", ollama_base_url="https://ollama.example")
+
+    with (
+        patch("app.services.ai_client.get_settings", return_value=settings),
+        patch("app.services.ai_client.ask_ollama", return_value="Review SSH exposure.") as ask_ollama,
+    ):
+        assert ask_ai("What should I check?") == "Review SSH exposure."
+
+    ask_ollama.assert_called_once_with("What should I check?")
+
+
 def test_ollama_timeout_handled() -> None:
     settings = Settings(ai_enabled=True, ollama_base_url="https://ollama.example")
 
@@ -83,3 +95,20 @@ def test_ollama_success_returns_response_text() -> None:
         json={"model": "qwen3:4b", "prompt": "What should I check?", "stream": False},
         timeout=60,
     )
+
+
+def test_qwen_response_parsing_ignores_thinking() -> None:
+    settings = Settings(ai_enabled=True, ollama_base_url="https://ollama.example")
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {
+            "thinking": "Internal reasoning that must not be sent to Telegram.",
+            "response": "Only this answer should be returned.",
+        },
+    )
+
+    with (
+        patch("app.services.ai_client.get_settings", return_value=settings),
+        patch("app.services.ai_client.httpx.post", return_value=response),
+    ):
+        assert ask_ollama("What should I check?") == "Only this answer should be returned."

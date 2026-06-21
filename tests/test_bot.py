@@ -108,7 +108,22 @@ def test_ai_question_triggers_ask_ai_and_clears_state() -> None:
 
     ask_ai.assert_called_once_with("How do I harden SSH?")
     assert is_ai_waiting(7002) is False
-    assert message.reply_text.call_args.args[0] == "AI integration is not configured yet."
+    assert message.reply_text.call_args_list[0].args[0] == "Mongrel is thinking..."
+    assert message.reply_text.call_args_list[1].args[0] == "AI integration is not configured yet."
+
+
+def test_ai_question_failure_returns_safe_message() -> None:
+    clear_ai_waiting(7005)
+    message = SimpleNamespace(text="How do I harden SSH?", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7005))
+    asyncio.run(ask_handler(SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=7005)), SimpleNamespace()))
+
+    with patch("app.bot.handlers.scan.ask_ai", side_effect=RuntimeError("boom")):
+        asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
+
+    assert is_ai_waiting(7005) is False
+    assert message.reply_text.call_args_list[0].args[0] == "Mongrel is thinking..."
+    assert message.reply_text.call_args_list[1].args[0] == "AI request failed. Check bot logs."
 
 
 def test_normal_messages_do_not_trigger_ai() -> None:

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -24,6 +25,7 @@ from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
+logger = logging.getLogger(__name__)
 
 
 def build_scan_text() -> str:
@@ -230,7 +232,18 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id if update.effective_user is not None else None
     if user_id is not None and is_ai_waiting(user_id):
         clear_ai_waiting(user_id)
-        await update.message.reply_text(ask_ai(update.message.text or ""))
+        logger.info("Ask Mongrel question received for user_id=%s", user_id)
+        await update.message.reply_text("Mongrel is thinking...")
+        try:
+            logger.info("AI request started for user_id=%s", user_id)
+            ai_response = await asyncio.to_thread(ask_ai, update.message.text or "")
+            logger.info("AI request completed for user_id=%s", user_id)
+        except Exception:
+            logger.exception("AI request failed for user_id=%s", user_id)
+            await update.message.reply_text("AI request failed. Check bot logs.")
+            return
+
+        await update.message.reply_text(ai_response)
         return
 
     if update.message.text in MAIN_MENU_BUTTONS:

@@ -8,7 +8,7 @@ def ask_ai(prompt: str) -> str:
     if not settings.ai_enabled:
         return "AI integration is not configured yet."
 
-    if settings.ai_provider != "ollama":
+    if settings.ai_provider.lower() != "ollama":
         return "Unsupported AI provider."
 
     if not settings.ollama_base_url:
