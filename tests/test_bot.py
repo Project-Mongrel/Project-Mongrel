@@ -29,11 +29,17 @@ from app.bot.handlers.start import build_start_text
 from app.bot.handlers.upload import build_upload_text
 from app.bot.handlers.upload import (
     UPLOAD_STATE_AWAITING_NMAP_XML,
+    UPLOAD_EXPLAIN_CALLBACK,
+    build_upload_ai_prompt,
     build_nmap_xml_import_success_text,
     build_upload_success_keyboard,
+    clear_latest_upload_scan_summary,
     clear_upload_state,
+    get_latest_upload_scan_summary,
     get_upload_state,
     set_upload_state,
+    store_latest_upload_scan_summary,
+    upload_callback_handler,
     upload_document_handler,
 )
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard
@@ -613,6 +619,7 @@ def test_malformed_xml_upload_handling() -> None:
 
 def test_uploaded_scan_creates_finding() -> None:
     clear_user_findings(5002)
+    clear_latest_upload_scan_summary(5002)
     set_upload_state(5002, UPLOAD_STATE_AWAITING_NMAP_XML)
     xml_content = (
         "<nmaprun>"
@@ -663,6 +670,9 @@ def test_uploaded_scan_creates_finding() -> None:
     assert "Purpose: Secure Shell remote administration service." in success_text
     assert reply_markup.inline_keyboard[0][0].text == "Open Findings"
     assert reply_markup.inline_keyboard[0][0].callback_data == "finding:list"
+    assert reply_markup.inline_keyboard[1][0].text == "Explain with Mongrel AI"
+    assert reply_markup.inline_keyboard[1][0].callback_data == UPLOAD_EXPLAIN_CALLBACK
+    assert get_latest_upload_scan_summary(5002)["target"] == "192.168.0.24"
 
 
 def test_verdict_generated_from_uploaded_scan() -> None:
@@ -897,6 +907,164 @@ def test_upload_success_includes_open_findings_button() -> None:
 
     assert keyboard.inline_keyboard[0][0].text == "Open Findings"
     assert keyboard.inline_keyboard[0][0].callback_data == "finding:list"
+
+
+def test_upload_success_includes_explain_with_mongrel_ai_button() -> None:
+    keyboard = build_upload_success_keyboard()
+
+    assert keyboard.inline_keyboard[1][0].text == "Explain with Mongrel AI"
+    assert keyboard.inline_keyboard[1][0].callback_data == UPLOAD_EXPLAIN_CALLBACK
+
+
+def test_upload_ai_prompt_contains_scan_summary_and_guardrails() -> None:
+    summary = store_latest_upload_scan_summary(
+        5010,
+        {
+            "target": "192.168.0.24",
+            "risk_level": "high",
+            "open_ports": [
+                {
+                    "port": "445",
+                    "protocol": "tcp",
+                    "service": "microsoft-ds",
+                    "intelligence": {"name": "SMB", "recommendation": "Restrict or disable SMB if not required."},
+                },
+                {
+                    "port": "5357",
+                    "protocol": "tcp",
+                    "service": "wsdapi",
+                    "intelligence": {"name": "WSDAPI", "recommendation": "Review service exposure."},
+                },
+            ],
+            "comparison": {"has_previous": False, "summary": "No previous scan found for this target."},
+            "impact": {"impact_level": "low", "summary": "No material exposure changes detected."},
+        },
+    )
+
+    prompt = build_upload_ai_prompt(summary)
+
+    assert "Target: 192.168.0.24" in prompt
+    assert "Risk level: HIGH" in prompt
+    assert "Open Services:\n445/tcp microsoft-ds\n5357/tcp wsdapi" in prompt
+    assert "- Windows SMB file sharing service exposed." in prompt
+    assert "- WSDAPI service is reachable." in prompt
+    assert "- Restrict or disable SMB if not required." in prompt
+    assert "No previous scan found for this target." in prompt
+    assert "Accuracy is more important than completeness." in prompt
+    assert "- Use only the supplied findings." in prompt
+    assert "- Do not invent services." in prompt
+    assert "- Do not invent ports." in prompt
+    assert "- Do not invent CVEs." in prompt
+    assert "- Do not merge services together." in prompt
+    assert "- Do not reassign services to different ports." in prompt
+    assert "- Assume the user has already read the deterministic report." in prompt
+    assert "- Do not repeat Scan Summary." in prompt
+    assert "- The exact port list has already been shown to the user. Do not repeat it." in prompt
+    assert "- Do not repeat Open Services." in prompt
+    assert "- Do not repeat Risk Level." in prompt
+    assert "- Do not restate the Open Services list." in prompt
+    assert "- Do not produce service-on-port mapping lines." in prompt
+    assert "- Refer to exact ports only when quoting directly from the supplied Open Services list." in prompt
+    assert "- If uncertain, state uncertainty rather than guessing." in prompt
+    assert (
+        "- Use only these four section titles: What this means, Highest priority risks, What to check first, Suggested next steps."
+    ) in prompt
+    assert "- Do not create sections titled Scan Summary, Open Services, or Risk Level." in prompt
+    assert "- Use a maximum of 8 bullet points total." in prompt
+    assert "What this means:\n- Explain the overall exposure in plain English without restating every port." in prompt
+    assert (
+        "Highest priority risks:\n"
+        "- Focus on SSH, SMB, remote administration, file sharing, and exposed web/management surfaces if present in supplied findings."
+    ) in prompt
+
+
+def test_upload_explain_button_uses_latest_parsed_scan_summary() -> None:
+    clear_latest_upload_scan_summary(5011)
+    store_latest_upload_scan_summary(
+        5011,
+        {
+            "target": "scanme.nmap.org",
+            "risk_level": "medium",
+            "open_ports": [
+                {
+                    "port": "80",
+                    "protocol": "tcp",
+                    "service": "http",
+                    "intelligence": {"name": "HTTP", "recommendation": "Review exposed HTTP service."},
+                }
+            ],
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=UPLOAD_EXPLAIN_CALLBACK,
+        answer=AsyncMock(),
+        message=query_message,
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5011))
+
+    with patch("app.bot.handlers.upload.ask_ai", return_value="Plain English explanation.") as ask_ai:
+        asyncio.run(upload_callback_handler(update, SimpleNamespace()))
+
+    prompt = ask_ai.call_args.args[0]
+    assert "Target: scanme.nmap.org" in prompt
+    assert "Open Services:\n80/tcp http" in prompt
+    assert "Review exposed HTTP service." in prompt
+    assert query_message.reply_text.call_args_list[0].args[0] == "Mongrel is analyzing the findings..."
+    assert query_message.reply_text.call_args_list[1].args[0] == "Plain English explanation."
+
+
+def test_upload_explain_button_handles_no_latest_scan() -> None:
+    clear_latest_upload_scan_summary(5012)
+    query = SimpleNamespace(
+        data=UPLOAD_EXPLAIN_CALLBACK,
+        answer=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5012))
+
+    asyncio.run(upload_callback_handler(update, SimpleNamespace()))
+
+    query.edit_message_text.assert_called_once_with("Upload an Nmap XML file first.")
+
+
+def test_upload_explain_button_returns_ai_disabled_fallback() -> None:
+    clear_latest_upload_scan_summary(5013)
+    store_latest_upload_scan_summary(5013, {"target": "127.0.0.1", "risk_level": "low", "open_ports": []})
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=UPLOAD_EXPLAIN_CALLBACK,
+        answer=AsyncMock(),
+        message=query_message,
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5013))
+
+    with patch("app.bot.handlers.upload.ask_ai", return_value="AI integration is not configured yet."):
+        asyncio.run(upload_callback_handler(update, SimpleNamespace()))
+
+    assert query_message.reply_text.call_args_list[1].args[0] == "AI integration is not configured yet."
+
+
+def test_upload_explain_button_handles_ai_failure() -> None:
+    clear_latest_upload_scan_summary(5014)
+    store_latest_upload_scan_summary(5014, {"target": "127.0.0.1", "risk_level": "low", "open_ports": []})
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=UPLOAD_EXPLAIN_CALLBACK,
+        answer=AsyncMock(),
+        message=query_message,
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5014))
+
+    with patch("app.bot.handlers.upload.ask_ai", side_effect=RuntimeError("boom")):
+        asyncio.run(upload_callback_handler(update, SimpleNamespace()))
+
+    assert query_message.reply_text.call_args_list[0].args[0] == "Mongrel is analyzing the findings..."
+    assert query_message.reply_text.call_args_list[1].args[0] == "AI explanation failed. Check bot logs."
 
 
 def test_upload_success_no_findings_fallback_message() -> None:

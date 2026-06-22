@@ -1,16 +1,23 @@
+import asyncio
+import logging
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
 from app.bot.handlers.scan import store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
+from app.services.ai_client import ask_ai
 from app.services.verdict_engine import generate_mongrel_verdict
 
 UPLOAD_STATE_AWAITING_NMAP_XML = "awaiting_nmap_xml"
+UPLOAD_EXPLAIN_CALLBACK = "upload:explain_ai"
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY = 10
 MAX_UPLOAD_REPORT_LENGTH = 3800
 _upload_states: dict[int, str] = {}
+_latest_upload_scan_summaries: dict[int, dict] = {}
+logger = logging.getLogger(__name__)
 
 
 def build_upload_text() -> str:
@@ -34,6 +41,29 @@ def get_upload_state(user_id: int) -> str | None:
 
 def clear_upload_state(user_id: int) -> None:
     _upload_states.pop(user_id, None)
+
+
+def store_latest_upload_scan_summary(user_id: int, finding: dict) -> dict:
+    verdict = generate_mongrel_verdict(finding)
+    summary = {
+        "target": finding.get("target"),
+        "risk_level": verdict.get("risk_level", finding.get("risk_level")),
+        "open_ports": list(finding.get("open_ports") or []),
+        "key_findings": _build_upload_key_findings(finding, verdict),
+        "recommended_actions": _build_upload_recommended_actions(finding, verdict),
+        "comparison": finding.get("comparison"),
+        "impact": finding.get("impact"),
+    }
+    _latest_upload_scan_summaries[user_id] = summary
+    return summary
+
+
+def get_latest_upload_scan_summary(user_id: int) -> dict | None:
+    return _latest_upload_scan_summaries.get(user_id)
+
+
+def clear_latest_upload_scan_summary(user_id: int) -> None:
+    _latest_upload_scan_summaries.pop(user_id, None)
 
 
 def build_nmap_xml_import_success_text(finding: dict) -> str:
@@ -301,7 +331,98 @@ def _truncate_message(message: str) -> str:
 
 
 def build_upload_success_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Open Findings", callback_data="finding:list")]])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Open Findings", callback_data="finding:list")],
+            [InlineKeyboardButton("Explain with Mongrel AI", callback_data=UPLOAD_EXPLAIN_CALLBACK)],
+        ]
+    )
+
+
+def build_upload_ai_prompt(summary: dict) -> str:
+    open_ports = summary.get("open_ports") or []
+    key_findings = summary.get("key_findings") or []
+    recommended_actions = summary.get("recommended_actions") or []
+    comparison_lines = _format_upload_comparison(summary.get("comparison"))
+    impact_lines = _format_upload_impact(summary.get("impact"), summary.get("comparison"))
+
+    return "\n".join(
+        [
+            "Explain these deterministic Nmap XML scan findings in plain English.",
+            "Focus on risk meaning and practical next steps.",
+            "Keep the response concise.",
+            "Accuracy is more important than completeness.",
+            "",
+            "Rules:",
+            "- Use only the supplied findings.",
+            "- Do not invent services.",
+            "- Do not invent ports.",
+            "- Do not invent CVEs.",
+            "- Do not invent vulnerabilities or scan results.",
+            "- Do not merge services together.",
+            "- Do not reassign services to different ports.",
+            "- Assume the user has already read the deterministic report.",
+            "- Do not repeat Scan Summary.",
+            "- The exact port list has already been shown to the user. Do not repeat it.",
+            "- Do not repeat Open Services.",
+            "- Do not repeat Risk Level.",
+            "- Do not restate the Open Services list.",
+            "- Do not produce service-on-port mapping lines.",
+            "- Refer to exact ports only when quoting directly from the supplied Open Services list.",
+            "- If uncertain, state uncertainty rather than guessing.",
+            "",
+            "Output restrictions:",
+            "- Use only these four section titles: What this means, Highest priority risks, What to check first, Suggested next steps.",
+            "- Do not create sections titled Scan Summary, Open Services, or Risk Level.",
+            "- Use a maximum of 8 bullet points total.",
+            "",
+            "Use these output sections:",
+            "What this means:",
+            "- Explain the overall exposure in plain English without restating every port.",
+            "",
+            "Highest priority risks:",
+            "- Focus on SSH, SMB, remote administration, file sharing, and exposed web/management surfaces if present in supplied findings.",
+            "",
+            "What to check first:",
+            "- Practical checks based on supplied findings.",
+            "",
+            "Suggested next steps:",
+            "- Defensive remediation steps.",
+            "",
+            "Grounding data for reference only:",
+            f"Target: {summary.get('target') or 'unknown'}",
+            f"Risk level: {str(summary.get('risk_level') or 'unknown').upper()}",
+            "",
+            "Open Services:",
+            *_format_prompt_open_services(open_ports),
+            "",
+            "Key findings:",
+            *_format_prompt_bullets(key_findings),
+            "",
+            "Recommended actions:",
+            *_format_prompt_bullets(recommended_actions),
+            "",
+            "Comparison summary:",
+            *_format_prompt_bullets(comparison_lines),
+            "",
+            "Impact summary:",
+            *_format_prompt_bullets(impact_lines),
+        ]
+    )
+
+
+def _format_prompt_open_services(open_ports: list[dict]) -> list[str]:
+    if not open_ports:
+        return ["none"]
+
+    return [_format_port_service(open_port) for open_port in open_ports]
+
+
+def _format_prompt_bullets(items: list[str]) -> list[str]:
+    if not items:
+        return ["- none"]
+
+    return [item if str(item).startswith("- ") else f"- {item}" for item in items]
 
 
 async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -345,8 +466,46 @@ async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     finding = store_parsed_nmap_finding(user_id=user_id, parsed_output=parsed_output, source="nmap_xml")
+    store_latest_upload_scan_summary(user_id, finding)
     clear_upload_state(user_id)
     await update.message.reply_text(
         build_nmap_xml_import_success_text(finding),
         reply_markup=build_upload_success_keyboard(),
     )
+
+
+async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+
+    if query.data != UPLOAD_EXPLAIN_CALLBACK:
+        return
+
+    user_id = update.effective_user.id if update.effective_user is not None else None
+    if user_id is None:
+        await query.edit_message_text("Upload an Nmap XML file first.")
+        return
+
+    summary = get_latest_upload_scan_summary(user_id)
+    if summary is None:
+        await query.edit_message_text("Upload an Nmap XML file first.")
+        return
+
+    if query.message is None:
+        return
+
+    await query.message.reply_text("Mongrel is analyzing the findings...")
+    prompt = build_upload_ai_prompt(summary)
+    try:
+        logger.info("Upload findings AI explanation started for user_id=%s", user_id)
+        ai_response = await asyncio.to_thread(ask_ai, prompt)
+        logger.info("Upload findings AI explanation completed for user_id=%s", user_id)
+    except Exception:
+        logger.exception("Upload findings AI explanation failed for user_id=%s", user_id)
+        await query.message.reply_text("AI explanation failed. Check bot logs.")
+        return
+
+    await query.message.reply_text(ai_response)
