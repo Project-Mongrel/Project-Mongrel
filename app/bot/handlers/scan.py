@@ -7,6 +7,7 @@ from telegram.ext import ContextTypes
 from app.bot.handlers.home import build_home_text
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
+from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
 from app.services.chat_state import is_ai_waiting
 from app.services.comparison_engine import compare_findings
@@ -23,6 +24,7 @@ from app.services.service_intelligence import get_service_intelligence
 from app.services.target_normalizer import normalize_target_key
 from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
+from app.tools.nuclei_runner import run_nuclei_scan
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
 logger = logging.getLogger(__name__)
@@ -43,8 +45,16 @@ def build_nmap_target_prompt() -> str:
     return "NMAP scan request created. Send the authorized target hostname or IP address to run the scan."
 
 
+def build_nuclei_target_prompt() -> str:
+    return "Nuclei scan request created. Send the authorized target URL or hostname to run the scan."
+
+
 def build_nmap_scan_started_text(target: str) -> str:
     return f"Running NMAP scan for target: {target}"
+
+
+def build_nuclei_scan_started_text() -> str:
+    return "Running Nuclei scan..."
 
 
 def build_nmap_scan_result_text(result: dict[str, object]) -> str:
@@ -222,6 +232,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_nmap_target_prompt())
         return
 
+    if scan_type == "nuclei":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_nuclei_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -254,7 +270,15 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     scan_request = get_scan_request(user_id=user_id, scan_request_id=scan_request_id)
-    if scan_request is None or scan_request.scan_type != "nmap" or scan_request.status != "awaiting_target":
+    if scan_request is None or scan_request.status != "awaiting_target":
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    if scan_request.scan_type == "nuclei":
+        await _handle_nuclei_target(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type != "nmap":
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -282,3 +306,54 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             finding.get("impact") if finding else None,
         )
     )
+
+
+async def _handle_nuclei_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    target = update.message.text or ""
+    await update.message.reply_text(build_nuclei_scan_started_text())
+
+    try:
+        result = await asyncio.to_thread(run_nuclei_scan, target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid Nuclei target: {exc}")
+        return
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result["target"]),
+        result=result,
+    )
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+
+    if result.get("success") is not True:
+        await update.message.reply_text(f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
+        return
+
+    output = str(result.get("output") or "")
+    if not output.strip():
+        await update.message.reply_text("Nuclei scan completed. No findings were returned.")
+        return
+
+    try:
+        nuclei_findings = parse_nuclei_results(output)
+    except NucleiParserError:
+        await update.message.reply_text("Unable to parse Nuclei scan output.")
+        return
+
+    if not nuclei_findings:
+        await update.message.reply_text("Nuclei scan completed. No findings were returned.")
+        return
+
+    from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
+
+    finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
+    await update.message.reply_text(build_nuclei_import_success_text(finding))

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = ""
     ollama_model: str = "qwen3:4b"
     ai_timeout_seconds: int = 60
+    nuclei_path: str = "nuclei"
 
 
 @lru_cache

@@ -17,10 +17,12 @@ from app.bot.handlers.home import build_home_text, home_handler
 from app.bot.handlers.scan import (
     PENDING_NMAP_REQUEST_KEY,
     append_change_summary,
+    build_nuclei_target_prompt,
     build_nmap_scan_result_text,
     build_nmap_target_prompt,
     build_scan_created_text,
     build_scan_text,
+    scan_callback_handler,
     scan_target_handler,
     store_successful_nmap_finding,
 )
@@ -44,7 +46,7 @@ from app.bot.handlers.upload import (
     upload_callback_handler,
     upload_document_handler,
 )
-from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard
+from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.core.config import Settings
 from app.services.findings_store import add_finding, clear_user_findings, get_user_findings
 from app.services.chat_state import clear_ai_waiting, is_ai_waiting
@@ -237,6 +239,101 @@ def test_scan_workflow_still_runs_when_ai_state_is_not_waiting() -> None:
     assert message.reply_text.call_args_list[0].args[0] == "Running NMAP scan for target: 127.0.0.1"
     assert "Target: 127.0.0.1" in message.reply_text.call_args_list[1].args[0]
     assert get_user_findings(7004)
+
+
+def test_scan_menu_includes_nuclei_scan() -> None:
+    keyboard = build_scan_type_keyboard()
+    rendered_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "Nmap Scan" in rendered_buttons
+    assert "Nuclei Scan" in rendered_buttons
+
+
+def test_nuclei_scan_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7101)
+    query = SimpleNamespace(data="scan:nuclei", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7101))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_nuclei_target_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
+    clear_user_findings(7102)
+    clear_user_scan_requests(7102)
+    scan_request = create_scan_request(user_id=7102, scan_type="nuclei")
+    mark_scan_request_awaiting_target(user_id=7102, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7102))
+    nuclei_output = (
+        '{"template-id":"git-config-exposure","info":{"name":"Exposed Git Repository","severity":"high","tags":["git","exposure"]},'
+        '"host":"https://example.com","matched-at":"https://example.com/.git/config"}'
+    )
+
+    with patch(
+        "app.bot.handlers.scan.run_nuclei_scan",
+        return_value={
+            "success": True,
+            "target": "https://example.com",
+            "output": nuclei_output,
+            "error": "",
+            "returncode": 0,
+        },
+    ) as run_nuclei_scan:
+        asyncio.run(scan_target_handler(update, context))
+
+    run_nuclei_scan.assert_called_once_with("https://example.com")
+    assert message.reply_text.call_args_list[0].args[0] == "Running Nuclei scan..."
+    assert "Nuclei Verdict" in message.reply_text.call_args_list[1].args[0]
+    assert "Risk Level:\nHIGH" in message.reply_text.call_args_list[1].args[0]
+    findings = get_user_findings(7102)
+    assert findings[0]["source"] == "nuclei"
+    assert findings[0]["target"] == "https://example.com"
+    assert context.user_data == {}
+
+
+def test_nuclei_scan_no_findings_output() -> None:
+    clear_user_scan_requests(7103)
+    scan_request = create_scan_request(user_id=7103, scan_type="nuclei")
+    mark_scan_request_awaiting_target(user_id=7103, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7103))
+
+    with patch(
+        "app.bot.handlers.scan.run_nuclei_scan",
+        return_value={"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0},
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    assert message.reply_text.call_args_list[1].args[0] == "Nuclei scan completed. No findings were returned."
+
+
+def test_nuclei_scan_runner_failure_message() -> None:
+    clear_user_scan_requests(7104)
+    scan_request = create_scan_request(user_id=7104, scan_type="nuclei")
+    mark_scan_request_awaiting_target(user_id=7104, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7104))
+
+    with patch(
+        "app.bot.handlers.scan.run_nuclei_scan",
+        return_value={
+            "success": False,
+            "target": "https://example.com",
+            "output": "",
+            "error": "Nuclei executable was not found.",
+            "returncode": None,
+        },
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    assert message.reply_text.call_args_list[1].args[0] == "Nuclei scan failed: Nuclei executable was not found."
 
 
 def test_nmap_result_text_uses_clean_parser_output() -> None:
