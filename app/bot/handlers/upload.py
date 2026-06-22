@@ -2,12 +2,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
-from app.bot.handlers.scan import append_change_summary, store_parsed_nmap_finding
+from app.bot.handlers.scan import store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.services.verdict_engine import generate_mongrel_verdict
 
 UPLOAD_STATE_AWAITING_NMAP_XML = "awaiting_nmap_xml"
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
+MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY = 10
+MAX_UPLOAD_REPORT_LENGTH = 3800
 _upload_states: dict[int, str] = {}
 
 
@@ -36,19 +38,266 @@ def clear_upload_state(user_id: int) -> None:
 
 def build_nmap_xml_import_success_text(finding: dict) -> str:
     verdict = generate_mongrel_verdict(finding)
-    key_findings = verdict.get("key_findings") or ["No significant findings identified."]
-    formatted_key_findings = "\n".join(f"- {key_finding}" for key_finding in key_findings)
+    open_ports = finding.get("open_ports") or []
+    key_findings = _build_upload_key_findings(finding, verdict)
+    recommended_actions = _build_upload_recommended_actions(finding, verdict)
 
-    message = (
-        "Nmap XML Imported\n\n"
-        f"Target: {finding.get('target', 'unknown')}\n\n"
-        f"{str(verdict.get('risk_level', 'unknown')).upper()} RISK\n\n"
-        f"Ports Detected: {len(finding.get('open_ports') or [])}\n\n"
-        "Top Findings:\n"
-        f"{formatted_key_findings}\n\n"
-        "Analysis stored successfully."
+    lines = [
+        "Mongrel Verdict",
+        "",
+        "Target:\n"
+        f"{finding.get('target') or 'unknown'}",
+        "",
+        "Risk Level:",
+        str(verdict.get("risk_level", finding.get("risk_level", "unknown"))).upper(),
+        "",
+        "Summary:",
+        str(verdict.get("summary", "")),
+        "",
+        "Open Services:",
+        *_format_open_services(open_ports),
+        "",
+        "Key Findings:",
+        *_format_bullets(key_findings),
+        "",
+        "Recommended Actions:",
+        *_format_bullets(recommended_actions),
+        "",
+        "Comparison:",
+        *_format_upload_comparison(finding.get("comparison")),
+        "",
+        "Impact Assessment:",
+        *_format_upload_impact(finding.get("impact"), finding.get("comparison")),
+        "",
+        "Technical Details:",
+        *_format_technical_details(open_ports),
+    ]
+    return _truncate_message("\n".join(lines))
+
+
+def _format_open_services(open_ports: list[dict]) -> list[str]:
+    if not open_ports:
+        return ["- No open services detected."]
+
+    lines = []
+    for open_port in open_ports[:MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY]:
+        service_name = _format_service_name(open_port)
+        version = open_port.get("version")
+        version_suffix = f" ({version})" if version else ""
+        lines.append(f"- {_format_port_service(open_port, service_name, version_suffix)}")
+
+    remaining_count = len(open_ports) - MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY
+    if remaining_count > 0:
+        lines.append(f"...and {remaining_count} more services.")
+
+    return lines
+
+
+def _format_service_name(open_port: dict) -> str:
+    intelligence = open_port.get("intelligence") or {}
+    normalized_service = str(open_port.get("service") or "").lower()
+    if normalized_service == "microsoft-ds":
+        return "microsoft-ds"
+
+    return normalized_service or str(intelligence.get("name") or "unknown").lower()
+
+
+def _format_port_service(open_port: dict, service_name: str | None = None, suffix: str = "") -> str:
+    service = service_name or _format_service_name(open_port)
+    return f"{open_port.get('port')}/{open_port.get('protocol')} {service}{suffix}"
+
+
+def _build_upload_key_findings(finding: dict, verdict: dict) -> list[str]:
+    key_findings = _deduplicate_text(list(verdict.get("key_findings") or []))
+    if not key_findings:
+        key_findings.append("No significant findings identified.")
+
+    http_ports = _find_http_ports(finding.get("open_ports") or [])
+    if len(http_ports) > 1:
+        key_findings.append("HTTP services are reachable on multiple ports.")
+
+    has_smb_finding = _has_smb_finding(key_findings)
+    represented_services = {str(key_finding).split(" ", 1)[0].upper() for key_finding in key_findings}
+    for open_port in finding.get("open_ports") or []:
+        if len(http_ports) > 1 and open_port in http_ports:
+            continue
+
+        service_name = _format_finding_service_name(open_port)
+        if service_name == "Microsoft-DS / SMB" and has_smb_finding:
+            continue
+
+        if service_name not in represented_services:
+            key_findings.append(f"{service_name} service is reachable.")
+
+    return _deduplicate_text(key_findings)
+
+
+def _format_finding_service_name(open_port: dict) -> str:
+    normalized_service = str(open_port.get("service") or "").lower()
+    if normalized_service == "microsoft-ds":
+        return "Microsoft-DS / SMB"
+
+    intelligence = open_port.get("intelligence") or {}
+    service_name = intelligence.get("name") or normalized_service or "unknown"
+    return str(service_name).upper()
+
+
+def _build_upload_recommended_actions(finding: dict, verdict: dict) -> list[str]:
+    actions = _deduplicate_text(list(verdict.get("recommended_actions") or []))
+    http_ports = _find_http_ports(finding.get("open_ports") or [])
+    if len(http_ports) > 1:
+        actions.append("Review exposed HTTP services and redirect to HTTPS where appropriate.")
+
+    for open_port in finding.get("open_ports") or []:
+        if len(http_ports) > 1 and open_port in http_ports:
+            continue
+
+        recommendation = (open_port.get("intelligence") or {}).get("recommendation")
+        if recommendation and recommendation not in actions:
+            actions.append(str(recommendation))
+
+    return _deduplicate_text(actions) or ["No immediate action required."]
+
+
+def _deduplicate_text(items: list[str]) -> list[str]:
+    deduplicated = []
+    seen = set()
+    for item in items:
+        text = str(item)
+        if text in seen:
+            continue
+
+        seen.add(text)
+        deduplicated.append(text)
+
+    return deduplicated
+
+
+def _find_http_ports(open_ports: list[dict]) -> list[dict]:
+    return [open_port for open_port in open_ports if _is_http_service(open_port)]
+
+
+def _is_http_service(open_port: dict) -> bool:
+    intelligence = open_port.get("intelligence") or {}
+    service = str(open_port.get("service") or "").lower()
+    intelligence_name = str(intelligence.get("name") or "").lower()
+    return service == "http" or intelligence_name == "http"
+
+
+def _has_smb_finding(key_findings: list[str]) -> bool:
+    return any("SMB" in key_finding.upper() for key_finding in key_findings)
+
+
+def _format_bullets(items: list[str]) -> list[str]:
+    return [f"- {item}" for item in items]
+
+
+def _format_upload_comparison(comparison: object) -> list[str]:
+    if not isinstance(comparison, dict):
+        return ["No previous scan found for this target."]
+
+    if comparison.get("has_previous") is False:
+        return [
+            str(comparison.get("summary", "No previous scan found for this target.")),
+            "This scan has been stored as the baseline for future comparisons.",
+        ]
+
+    lines = [str(comparison.get("summary", "No material changes detected."))]
+    lines.extend(
+        [
+            f"New Ports: {_format_ports(comparison.get('new_ports') or [])}",
+            f"Removed Ports: {_format_ports(comparison.get('removed_ports') or [])}",
+            f"Risk Change: {_format_risk_change(comparison)}",
+            f"Unchanged Ports: {len(comparison.get('unchanged_ports') or [])}",
+        ]
     )
-    return append_change_summary(message, finding.get("comparison"), finding.get("impact"))
+    return lines
+
+
+def _format_upload_impact(impact: object, comparison: object) -> list[str]:
+    if isinstance(comparison, dict) and comparison.get("has_previous") is False:
+        return [
+            "Change Impact: N/A",
+            "No historical comparison available.",
+            "Reason: This is the first recorded scan for this target.",
+        ]
+
+    if not isinstance(impact, dict):
+        return [
+            "Change Impact: LOW",
+            "No material exposure changes detected.",
+            "Reason: No new services appeared and no risky services were removed since the previous scan.",
+        ]
+
+    lines = [
+        f"Change Impact: {str(impact.get('impact_level', 'unknown')).upper()}",
+        str(impact.get("summary", "No material exposure changes detected.")),
+    ]
+    if impact.get("impacts"):
+        lines.extend(_format_bullets(impact.get("impacts") or []))
+    if impact.get("recommendations"):
+        lines.extend(_format_bullets(impact.get("recommendations") or []))
+
+    return lines
+
+
+def _format_technical_details(open_ports: list[dict]) -> list[str]:
+    if not open_ports:
+        return ["No open services detected."]
+
+    lines = []
+    for index, open_port in enumerate(open_ports[:MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY], start=1):
+        intelligence = open_port.get("intelligence") or {}
+        lines.extend(
+            [
+                f"{index}. {_format_port_service(open_port)}",
+                f"   Purpose: {_clean_unknown_text(intelligence.get('description'))}",
+                f"   Risk: {_clean_unknown_text(intelligence.get('common_risk'))}",
+                f"   Recommendation: {_clean_unknown_recommendation(intelligence.get('recommendation'))}",
+                "",
+            ]
+        )
+
+    remaining_count = len(open_ports) - MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY
+    if remaining_count > 0:
+        lines.append(f"...and {remaining_count} more services.")
+
+    return lines
+
+
+def _clean_unknown_text(value: object) -> str:
+    if not value or str(value) == "Description unavailable.":
+        return "Manual review required."
+
+    return str(value)
+
+
+def _clean_unknown_recommendation(value: object) -> str:
+    if not value:
+        return "Manual review recommended."
+
+    return str(value)
+
+
+def _format_ports(open_ports: list[dict]) -> str:
+    if not open_ports:
+        return "none"
+
+    return ", ".join(_format_port_service(open_port) for open_port in open_ports)
+
+
+def _format_risk_change(comparison: dict) -> str:
+    if comparison.get("risk_changed"):
+        return f"{str(comparison.get('previous_risk')).upper()} -> {str(comparison.get('current_risk')).upper()}"
+
+    return "none"
+
+
+def _truncate_message(message: str) -> str:
+    if len(message) <= MAX_UPLOAD_REPORT_LENGTH:
+        return message
+
+    return f"{message[:MAX_UPLOAD_REPORT_LENGTH]}\n\n[output truncated]"
 
 
 def build_upload_success_keyboard() -> InlineKeyboardMarkup:

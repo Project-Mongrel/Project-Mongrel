@@ -12,7 +12,7 @@ def build_home_text() -> str:
         "Available actions:\n"
         "- Home: return to this control panel\n"
         "- Scan: prepare authorized scan workflows\n"
-        "- Upload: send scan output for future analysis\n"
+        "- Upload Findings: send scan output for analysis\n"
         "- Findings: review security findings\n"
         "- Ask Mongrel: ask a defensive security question\n"
         "- Reports: prepare report workflows\n"

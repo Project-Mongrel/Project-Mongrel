@@ -55,13 +55,16 @@ def _extract_open_ports(host: ElementTree.Element) -> list[dict[str, str]]:
             continue
 
         service = port.find("service")
-        open_ports.append(
-            {
-                "port": port.attrib.get("portid", ""),
-                "protocol": port.attrib.get("protocol", ""),
-                "service": service.attrib.get("name", "unknown") if service is not None else "unknown",
-            }
-        )
+        open_port = {
+            "port": port.attrib.get("portid", ""),
+            "protocol": port.attrib.get("protocol", ""),
+            "service": service.attrib.get("name", "unknown") if service is not None else "unknown",
+        }
+        version = _extract_service_version(service)
+        if version:
+            open_port["version"] = version
+
+        open_ports.append(open_port)
 
     return open_ports
 
@@ -73,3 +76,16 @@ def _extract_duration(root: ElementTree.Element) -> str | None:
         return None
 
     return f"{elapsed}s"
+
+
+def _extract_service_version(service: ElementTree.Element | None) -> str | None:
+    if service is None:
+        return None
+
+    parts = [
+        service.attrib.get("product"),
+        service.attrib.get("version"),
+        service.attrib.get("extrainfo"),
+    ]
+    version = " ".join(part for part in parts if part)
+    return version or None

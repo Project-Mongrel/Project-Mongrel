@@ -3,7 +3,7 @@ from telegram import KeyboardButton, ReplyKeyboardMarkup
 MAIN_MENU_BUTTONS: tuple[str, ...] = (
     "Home",
     "Scan",
-    "Upload",
+    "Upload Findings",
     "Findings",
     "Ask Mongrel",
     "Reports",
@@ -15,7 +15,7 @@ MAIN_MENU_BUTTONS: tuple[str, ...] = (
 def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("Home"), KeyboardButton("Scan"), KeyboardButton("Upload")],
+            [KeyboardButton("Home"), KeyboardButton("Scan"), KeyboardButton("Upload Findings")],
             [KeyboardButton("Findings"), KeyboardButton("Ask Mongrel")],
             [KeyboardButton("Reports"), KeyboardButton("Settings"), KeyboardButton("Cancel")],
         ],

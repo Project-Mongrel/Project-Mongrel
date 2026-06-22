@@ -34,7 +34,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("cancel", cancel_handler))
     application.add_handler(MessageHandler(filters.Regex("^Home$"), home_handler))
     application.add_handler(MessageHandler(filters.Regex("^Scan$"), scan_handler))
-    application.add_handler(MessageHandler(filters.Regex("^Upload$"), upload_handler))
+    application.add_handler(MessageHandler(filters.Regex("^(Upload|Upload Findings)$"), upload_handler))
     application.add_handler(MessageHandler(filters.Regex("^Findings$"), findings_handler))
     application.add_handler(MessageHandler(filters.Regex("^Ask Mongrel$"), ask_handler))
     application.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel_handler))

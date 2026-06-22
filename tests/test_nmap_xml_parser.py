@@ -55,3 +55,14 @@ def test_port_extraction() -> None:
 def test_invalid_xml_handling() -> None:
     with pytest.raises(ValueError, match="Unable to parse"):
         parse_nmap_xml("<nmaprun>")
+
+
+def test_service_version_extraction_when_available() -> None:
+    xml_content = (
+        "<nmaprun><host><status state=\"up\" /><address addr=\"scanme.nmap.org\" />"
+        "<ports><port protocol=\"tcp\" portid=\"80\"><state state=\"open\" />"
+        "<service name=\"http\" product=\"Apache httpd\" version=\"2.4.58\" /></port>"
+        "</ports></host></nmaprun>"
+    )
+
+    assert parse_nmap_xml(xml_content)["open_ports"][0]["version"] == "Apache httpd 2.4.58"

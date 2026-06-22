@@ -599,6 +599,18 @@ def test_wrong_file_type_handling() -> None:
     assert message.reply_text.call_args.args[0] == "Please upload an Nmap XML file."
 
 
+def test_malformed_xml_upload_handling() -> None:
+    set_upload_state(5009, UPLOAD_STATE_AWAITING_NMAP_XML)
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray("<nmaprun>", "utf-8")))
+    document = SimpleNamespace(file_name="scan.xml", file_size=9, get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5009))
+
+    asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    assert message.reply_text.call_args.args[0] == "Unable to parse Nmap XML file."
+
+
 def test_uploaded_scan_creates_finding() -> None:
     clear_user_findings(5002)
     set_upload_state(5002, UPLOAD_STATE_AWAITING_NMAP_XML)
@@ -632,16 +644,23 @@ def test_uploaded_scan_creates_finding() -> None:
     assert get_upload_state(5002) is None
     success_text = message.reply_text.call_args.args[0]
     reply_markup = message.reply_text.call_args.kwargs["reply_markup"]
-    assert "Nmap XML Imported" in success_text
-    assert "MEDIUM RISK" in success_text
-    assert "- SSH remote administration service exposed." in success_text
-    assert "Analysis stored successfully." in success_text
-    assert "Comparison" in success_text
+    assert "Mongrel Verdict" in success_text
+    assert "Target:\n192.168.0.24" in success_text
+    assert "Open Services:\n- 22/tcp ssh" in success_text
+    assert "Risk Level:\nMEDIUM" in success_text
+    assert "Summary:\n192.168.0.24 has 1 open port(s) and is currently assessed as medium risk." in success_text
+    assert "Key Findings:\n- SSH remote administration service exposed." in success_text
+    assert "Recommended Actions:" in success_text
+    assert "- Restrict SSH access to trusted networks." in success_text
+    assert "Comparison:" in success_text
     assert "No previous scan found for this target." in success_text
     assert "This scan has been stored as the baseline for future comparisons." in success_text
-    assert "Impact Assessment" in success_text
+    assert "Impact Assessment:" in success_text
     assert "Change Impact: N/A" in success_text
     assert "No historical comparison available." in success_text
+    assert "Technical Details:" in success_text
+    assert "1. 22/tcp ssh" in success_text
+    assert "Purpose: Secure Shell remote administration service." in success_text
     assert reply_markup.inline_keyboard[0][0].text == "Open Findings"
     assert reply_markup.inline_keyboard[0][0].callback_data == "finding:list"
 
@@ -669,7 +688,7 @@ def test_upload_success_includes_risk_level() -> None:
         }
     )
 
-    assert "HIGH RISK" in success_text
+    assert "Risk Level:\nHIGH" in success_text
 
 
 def test_upload_success_includes_key_findings() -> None:
@@ -681,8 +700,196 @@ def test_upload_success_includes_key_findings() -> None:
         }
     )
 
-    assert "Top Findings:" in success_text
+    assert "Key Findings:" in success_text
     assert "- Windows SMB file sharing service exposed." in success_text
+
+
+def test_upload_success_includes_ports_services_and_recommendations() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "scanme.nmap.org",
+            "risk_level": "medium",
+            "open_ports": [
+                {
+                    "port": "22",
+                    "protocol": "tcp",
+                    "service": "ssh",
+                    "intelligence": {"name": "SSH", "recommendation": "Confirm SSH is restricted to authorized users."},
+                },
+                {
+                    "port": "80",
+                    "protocol": "tcp",
+                    "service": "http",
+                    "intelligence": {"name": "HTTP", "recommendation": "Review HTTP service for outdated software or exposed admin paths."},
+                },
+            ],
+        }
+    )
+
+    assert "Target:\nscanme.nmap.org" in success_text
+    assert "- 22/tcp ssh" in success_text
+    assert "- 80/tcp http" in success_text
+    assert "Risk Level:\nMEDIUM" in success_text
+    assert "- SSH remote administration service exposed." in success_text
+    assert "- HTTP service is reachable." in success_text
+    assert "- Confirm SSH is restricted to authorized users." in success_text
+    assert "- Review HTTP service for outdated software or exposed admin paths." in success_text
+
+
+def test_upload_success_collapses_repeated_http_findings_and_actions() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "192.168.0.24",
+            "risk_level": "low",
+            "open_ports": [
+                {
+                    "port": "80",
+                    "protocol": "tcp",
+                    "service": "http",
+                    "intelligence": {
+                        "name": "HTTP",
+                        "description": "Web service.",
+                        "common_risk": "Exposed web surface.",
+                        "recommendation": "Review HTTP service for outdated software or exposed admin paths.",
+                    },
+                },
+                {
+                    "port": "5357",
+                    "protocol": "tcp",
+                    "service": "http",
+                    "intelligence": {
+                        "name": "HTTP",
+                        "description": "Web service.",
+                        "common_risk": "Exposed web surface.",
+                        "recommendation": "Review HTTP service for outdated software or exposed admin paths.",
+                    },
+                },
+            ],
+        }
+    )
+
+    key_findings = success_text.split("Key Findings:\n", 1)[1].split("\n\nRecommended Actions:", 1)[0]
+    actions = success_text.split("Recommended Actions:\n", 1)[1].split("\n\nComparison:", 1)[0]
+    assert key_findings.count("- HTTP services are reachable on multiple ports.") == 1
+    assert "- HTTP service is reachable." not in key_findings
+    assert actions.count("- Review exposed HTTP services and redirect to HTTPS where appropriate.") == 1
+    assert "1. 80/tcp http" in success_text
+    assert "2. 5357/tcp http" in success_text
+
+
+def test_upload_success_prefers_stronger_smb_finding() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "192.168.0.24",
+            "risk_level": "high",
+            "open_ports": [
+                {
+                    "port": "445",
+                    "protocol": "tcp",
+                    "service": "microsoft-ds",
+                    "intelligence": {"name": "SMB"},
+                }
+            ],
+        }
+    )
+
+    key_findings = success_text.split("Key Findings:\n", 1)[1].split("\n\nRecommended Actions:", 1)[0]
+    assert "- Windows SMB file sharing service exposed." in key_findings
+    assert "- Microsoft-DS / SMB service is reachable." not in key_findings
+
+
+def test_upload_success_deduplicates_exact_recommended_actions() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "192.168.0.24",
+            "risk_level": "low",
+            "open_ports": [
+                {
+                    "port": "1234",
+                    "protocol": "tcp",
+                    "service": "alpha",
+                    "intelligence": {"name": "ALPHA", "recommendation": "Review shared exposure."},
+                },
+                {
+                    "port": "1235",
+                    "protocol": "tcp",
+                    "service": "beta",
+                    "intelligence": {"name": "BETA", "recommendation": "Review shared exposure."},
+                },
+            ],
+        }
+    )
+
+    actions = success_text.split("Recommended Actions:\n", 1)[1].split("\n\nComparison:", 1)[0]
+    assert actions.count("- Review shared exposure.") == 1
+    assert "1. 1234/tcp alpha" in success_text
+    assert "2. 1235/tcp beta" in success_text
+
+
+def test_upload_success_limits_open_services_to_first_10() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "192.168.0.24",
+            "risk_level": "medium",
+            "open_ports": [
+                {"port": str(1000 + index), "protocol": "tcp", "service": f"service-{index}"}
+                for index in range(11)
+            ],
+        }
+    )
+
+    assert "- 1000/tcp service-0" in success_text
+    assert "- 1009/tcp service-9" in success_text
+    assert "- 1010/tcp service-10" not in success_text
+    assert "...and 1 more services." in success_text
+
+
+def test_upload_success_includes_service_version_when_available() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "scanme.nmap.org",
+            "risk_level": "low",
+            "open_ports": [
+                {
+                    "port": "80",
+                    "protocol": "tcp",
+                    "service": "http",
+                    "version": "Apache httpd 2.4.58",
+                    "intelligence": {"name": "HTTP"},
+                },
+            ],
+        }
+    )
+
+    assert "- 80/tcp http (Apache httpd 2.4.58)" in success_text
+
+
+def test_upload_success_technical_details_use_manual_review_fallbacks() -> None:
+    success_text = build_nmap_xml_import_success_text(
+        {
+            "target": "192.168.0.24",
+            "risk_level": "low",
+            "open_ports": [
+                {
+                    "port": "135",
+                    "protocol": "tcp",
+                    "service": "msrpc",
+                    "intelligence": {
+                        "description": "Description unavailable.",
+                        "common_risk": "Description unavailable.",
+                        "recommendation": "Manual review recommended.",
+                    },
+                },
+            ],
+        }
+    )
+
+    assert "Technical Details:" in success_text
+    assert "1. 135/tcp msrpc" in success_text
+    assert "Purpose: Manual review required." in success_text
+    assert "Risk: Manual review required." in success_text
+    assert "Recommendation: Manual review recommended." in success_text
+    assert "Description unavailable" not in success_text
 
 
 def test_upload_success_includes_open_findings_button() -> None:
@@ -702,6 +909,7 @@ def test_upload_success_no_findings_fallback_message() -> None:
     )
 
     assert "- No significant findings identified." in success_text
+    assert "- No immediate action required." in success_text
 
 
 def test_live_scan_finding_stores_comparison() -> None:
