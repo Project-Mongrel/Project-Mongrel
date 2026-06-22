@@ -1,0 +1,2 @@
+{"template-id":"git-config-exposure","info":{"name":"Exposed Git Config","severity":"high","tags":["exposure","git"],"remediation":"Restrict access to .git files and remove exposed repository metadata."},"host":"https://example.com","matched-at":"https://example.com/.git/config"}
+{"template-id":"missing-security-headers","info":{"name":"Missing Security Headers","severity":"low","tags":["headers","http"],"remediation":"Add missing HTTP security headers such as CSP, X-Frame-Options, and X-Content-Type-Options."},"host":"https://example.com","matched-at":"https://example.com"}

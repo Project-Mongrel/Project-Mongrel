@@ -7,14 +7,19 @@ from telegram.ext import ContextTypes
 from app.bot.keyboards import build_main_menu_keyboard
 from app.bot.handlers.scan import store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
+from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
+from app.services.findings_store import add_finding
+from app.services.target_normalizer import normalize_target_key
 from app.services.verdict_engine import generate_mongrel_verdict
 
 UPLOAD_STATE_AWAITING_NMAP_XML = "awaiting_nmap_xml"
 UPLOAD_EXPLAIN_CALLBACK = "upload:explain_ai"
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY = 10
+MAX_NUCLEI_FINDINGS_IN_REPORT = 10
 MAX_UPLOAD_REPORT_LENGTH = 3800
+NUCLEI_SEVERITIES = ("critical", "high", "medium", "low", "info")
 _upload_states: dict[int, str] = {}
 _latest_upload_scan_summaries: dict[int, dict] = {}
 logger = logging.getLogger(__name__)
@@ -24,10 +29,11 @@ def build_upload_text() -> str:
     return (
         "Supported Uploads\n\n"
         "- Nmap XML (supported)\n"
-        "- Nuclei (coming soon)\n"
+        "- Nuclei JSON (supported)\n"
+        "- Nuclei JSONL (supported)\n"
         "- BBOT (coming soon)\n"
         "- Logs (coming soon)\n\n"
-        "Send an Nmap XML file to begin analysis."
+        "Send an Nmap XML or Nuclei results file to begin analysis."
     )
 
 
@@ -103,6 +109,149 @@ def build_nmap_xml_import_success_text(finding: dict) -> str:
         *_format_technical_details(open_ports),
     ]
     return _truncate_message("\n".join(lines))
+
+
+def store_nuclei_finding(user_id: int, nuclei_findings: list[dict]) -> dict:
+    severity_summary = _summarize_nuclei_severities(nuclei_findings)
+    target = _extract_nuclei_target(nuclei_findings)
+    risk_level = _score_nuclei_risk(severity_summary)
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nuclei",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "risk_level": risk_level.lower(),
+            "nuclei_findings": nuclei_findings,
+            "finding_count": len(nuclei_findings),
+            "severity_summary": severity_summary,
+        },
+    )
+
+
+def build_nuclei_import_success_text(finding: dict) -> str:
+    nuclei_findings = finding.get("nuclei_findings") or []
+    severity_summary = finding.get("severity_summary") or _summarize_nuclei_severities(nuclei_findings)
+    risk_level = str(finding.get("risk_level") or _score_nuclei_risk(severity_summary)).upper()
+    lines = [
+        "Nuclei Verdict",
+        "",
+        "Target:",
+        str(finding.get("target") or "unknown"),
+        "",
+        "Risk Level:",
+        risk_level,
+        "",
+        "Findings:",
+        str(finding.get("finding_count") or len(nuclei_findings)),
+        "",
+        "Severity Summary:",
+        *_format_nuclei_severity_summary(severity_summary),
+        "",
+        "Top Findings:",
+        *_format_nuclei_top_findings(nuclei_findings),
+        "",
+        "Recommended Actions:",
+        "- Prioritize critical and high findings first.",
+        "- Validate findings manually before remediation.",
+        "- Patch or mitigate affected services.",
+        "",
+        "Technical Details:",
+        *_format_nuclei_technical_details(nuclei_findings),
+    ]
+    return _truncate_message("\n".join(lines))
+
+
+def _summarize_nuclei_severities(nuclei_findings: list[dict]) -> dict[str, int]:
+    summary = {severity: 0 for severity in NUCLEI_SEVERITIES}
+    for finding in nuclei_findings:
+        severity = str(finding.get("severity") or "info").lower()
+        if severity not in summary:
+            severity = "info"
+        summary[severity] += 1
+
+    return summary
+
+
+def _score_nuclei_risk(severity_summary: dict[str, int]) -> str:
+    if severity_summary.get("critical", 0) > 0 or severity_summary.get("high", 0) > 0:
+        return "high"
+    if severity_summary.get("medium", 0) > 0:
+        return "medium"
+    return "low"
+
+
+def _extract_nuclei_target(nuclei_findings: list[dict]) -> str | None:
+    for finding in nuclei_findings:
+        target = finding.get("host") or finding.get("matched_at")
+        if target:
+            return str(target)
+
+    return None
+
+
+def _sort_nuclei_findings(nuclei_findings: list[dict]) -> list[dict]:
+    severity_rank = {severity: index for index, severity in enumerate(NUCLEI_SEVERITIES)}
+    return sorted(
+        nuclei_findings,
+        key=lambda finding: severity_rank.get(str(finding.get("severity") or "info").lower(), severity_rank["info"]),
+    )
+
+
+def _format_nuclei_severity_summary(severity_summary: dict[str, int]) -> list[str]:
+    return [f"{severity.title()}: {severity_summary.get(severity, 0)}" for severity in NUCLEI_SEVERITIES]
+
+
+def _format_nuclei_top_findings(nuclei_findings: list[dict]) -> list[str]:
+    if not nuclei_findings:
+        return ["- No findings detected."]
+
+    return [
+        f"- {finding.get('name') or finding.get('template_id') or 'Unnamed finding'} ({str(finding.get('severity') or 'info').lower()})"
+        for finding in _sort_nuclei_findings(nuclei_findings)[:MAX_NUCLEI_FINDINGS_IN_REPORT]
+    ]
+
+
+def _format_nuclei_technical_details(nuclei_findings: list[dict]) -> list[str]:
+    if not nuclei_findings:
+        return ["No findings detected."]
+
+    lines = []
+    for index, finding in enumerate(_sort_nuclei_findings(nuclei_findings)[:MAX_NUCLEI_FINDINGS_IN_REPORT], start=1):
+        lines.extend(
+            [
+                f"{index}. {finding.get('name') or finding.get('template_id') or 'Unnamed finding'}",
+                f"   Severity: {str(finding.get('severity') or 'info').title()}",
+                f"   Template: {finding.get('template_id') or 'unknown'}",
+                f"   Host: {finding.get('host') or 'unknown'}",
+            ]
+        )
+        tags = finding.get("tags") or []
+        if tags:
+            lines.append(f"   Tags: {', '.join(str(tag) for tag in tags)}")
+
+        remediation = _truncate_nuclei_remediation(finding.get("remediation"))
+        if remediation:
+            lines.append(f"   Remediation: {remediation}")
+
+        lines.append("")
+
+    remaining_count = len(nuclei_findings) - MAX_NUCLEI_FINDINGS_IN_REPORT
+    if remaining_count > 0:
+        lines.append(f"...and {remaining_count} more findings.")
+
+    return lines
+
+
+def _truncate_nuclei_remediation(remediation: object) -> str | None:
+    if not remediation:
+        return None
+
+    text = str(remediation).strip()
+    if len(text) <= 180:
+        return text
+
+    return f"{text[:177]}..."
 
 
 def _format_open_services(open_ports: list[dict]) -> list[str]:
@@ -330,6 +479,14 @@ def _truncate_message(message: str) -> str:
     return f"{message[:MAX_UPLOAD_REPORT_LENGTH]}\n\n[output truncated]"
 
 
+def _get_upload_extension(file_name: str) -> str:
+    normalized_file_name = file_name.strip().lower()
+    if "." not in normalized_file_name:
+        return ""
+
+    return f".{normalized_file_name.rsplit('.', 1)[1]}"
+
+
 def build_upload_success_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -448,8 +605,11 @@ async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     document = update.message.document
-    if not str(document.file_name or "").lower().endswith(".xml"):
-        await update.message.reply_text("Please upload an Nmap XML file.")
+    file_name = str(document.file_name or "")
+    extension = _get_upload_extension(file_name)
+    logger.info("Upload detected: extension=%s", extension or "<none>")
+    if extension not in {".xml", ".json", ".jsonl"}:
+        await update.message.reply_text("Please upload an Nmap XML or Nuclei JSON/JSONL file.")
         return
 
     if document.file_size is not None and document.file_size > MAX_UPLOAD_SIZE_BYTES:
@@ -458,10 +618,32 @@ async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_
 
     telegram_file = await document.get_file()
     file_bytes = await telegram_file.download_as_bytearray()
-
     try:
-        parsed_output = parse_nmap_xml(bytes(file_bytes).decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+        file_text = bytes(file_bytes).decode("utf-8")
+    except UnicodeDecodeError:
+        if extension == ".xml":
+            await update.message.reply_text("Unable to parse Nmap XML file.")
+        else:
+            await update.message.reply_text("Unable to parse Nuclei results file.")
+        return
+
+    if extension in {".json", ".jsonl"}:
+        logger.info("Routing to nuclei parser")
+        try:
+            nuclei_findings = parse_nuclei_results(file_text)
+        except NucleiParserError:
+            await update.message.reply_text("Unable to parse Nuclei results file.")
+            return
+
+        finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
+        clear_upload_state(user_id)
+        await update.message.reply_text(build_nuclei_import_success_text(finding))
+        return
+
+    logger.info("Routing to nmap parser")
+    try:
+        parsed_output = parse_nmap_xml(file_text)
+    except ValueError:
         await update.message.reply_text("Unable to parse Nmap XML file.")
         return
 

@@ -32,12 +32,14 @@ from app.bot.handlers.upload import (
     UPLOAD_EXPLAIN_CALLBACK,
     build_upload_ai_prompt,
     build_nmap_xml_import_success_text,
+    build_nuclei_import_success_text,
     build_upload_success_keyboard,
     clear_latest_upload_scan_summary,
     clear_upload_state,
     get_latest_upload_scan_summary,
     get_upload_state,
     set_upload_state,
+    store_nuclei_finding,
     store_latest_upload_scan_summary,
     upload_callback_handler,
     upload_document_handler,
@@ -88,7 +90,9 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "pending" in build_scan_created_text("nmap")
     assert "authorized target" in build_nmap_target_prompt()
     assert "Nmap XML" in build_upload_text()
-    assert "Send an Nmap XML file to begin analysis." in build_upload_text()
+    assert "- Nuclei JSON (supported)" in build_upload_text()
+    assert "- Nuclei JSONL (supported)" in build_upload_text()
+    assert "Send an Nmap XML or Nuclei results file to begin analysis." in build_upload_text()
     assert build_ask_text() == "Ask Mongrel anything. Cybersecurity is my specialty."
 
 
@@ -602,7 +606,7 @@ def test_wrong_file_type_handling() -> None:
 
     asyncio.run(upload_document_handler(update, SimpleNamespace()))
 
-    assert message.reply_text.call_args.args[0] == "Please upload an Nmap XML file."
+    assert message.reply_text.call_args.args[0] == "Please upload an Nmap XML or Nuclei JSON/JSONL file."
 
 
 def test_malformed_xml_upload_handling() -> None:
@@ -615,6 +619,165 @@ def test_malformed_xml_upload_handling() -> None:
     asyncio.run(upload_document_handler(update, SimpleNamespace()))
 
     assert message.reply_text.call_args.args[0] == "Unable to parse Nmap XML file."
+
+
+def test_json_upload_routes_to_nuclei_parser() -> None:
+    clear_user_findings(5020)
+    set_upload_state(5020, UPLOAD_STATE_AWAITING_NMAP_XML)
+    json_content = '{"template-id":"one","info":{"severity":"low"},"host":"https://example.com"}'
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(json_content, "utf-8")))
+    document = SimpleNamespace(file_name="nuclei_test.json", file_size=len(json_content), get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5020))
+
+    with patch(
+        "app.bot.handlers.upload.parse_nuclei_results",
+        return_value=[{"template_id": "one", "severity": "low", "name": "One", "host": "https://example.com"}],
+    ) as parse_nuclei_results:
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    parse_nuclei_results.assert_called_once_with(json_content)
+    assert "Nuclei Verdict" in message.reply_text.call_args.args[0]
+
+
+def test_jsonl_upload_routes_to_nuclei_parser() -> None:
+    clear_user_findings(5021)
+    set_upload_state(5021, UPLOAD_STATE_AWAITING_NMAP_XML)
+    jsonl_content = '{"template-id":"one","info":{"severity":"low"},"host":"https://example.com"}'
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(jsonl_content, "utf-8")))
+    document = SimpleNamespace(file_name="nuclei_test.jsonl", file_size=len(jsonl_content), get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5021))
+
+    with patch(
+        "app.bot.handlers.upload.parse_nuclei_results",
+        return_value=[{"template_id": "one", "severity": "low", "name": "One", "host": "https://example.com"}],
+    ) as parse_nuclei_results:
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    parse_nuclei_results.assert_called_once_with(jsonl_content)
+    assert "Nuclei Verdict" in message.reply_text.call_args.args[0]
+
+
+def test_xml_upload_routes_to_nmap_parser() -> None:
+    clear_user_findings(5022)
+    set_upload_state(5022, UPLOAD_STATE_AWAITING_NMAP_XML)
+    xml_content = "<nmaprun><host><status state=\"up\" /><address addr=\"127.0.0.1\" /></host></nmaprun>"
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(xml_content, "utf-8")))
+    document = SimpleNamespace(file_name="scan.xml", file_size=len(xml_content), get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5022))
+
+    with patch(
+        "app.bot.handlers.upload.parse_nmap_xml",
+        return_value={"target": "127.0.0.1", "host_status": "Up", "open_ports": []},
+    ) as parse_nmap_xml:
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    parse_nmap_xml.assert_called_once_with(xml_content)
+    assert "Mongrel Verdict" in message.reply_text.call_args.args[0]
+
+
+def test_valid_nuclei_jsonl_upload_creates_finding_and_report() -> None:
+    clear_user_findings(5015)
+    set_upload_state(5015, UPLOAD_STATE_AWAITING_NMAP_XML)
+    jsonl_content = "\n".join(
+        [
+            '{"template-id":"missing-security-headers","info":{"name":"Missing Security Headers","severity":"low","tags":"http,headers","remediation":"Add recommended headers."},"host":"https://example.com","matched-at":"https://example.com/login"}',
+            '{"template-id":"git-config-exposure","info":{"name":"Exposed Git Repository","severity":"high","tags":["exposure","git"]},"host":"https://example.com","matched-at":"https://example.com/.git/config"}',
+        ]
+    )
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(jsonl_content, "utf-8")))
+    document = SimpleNamespace(file_name="nuclei.jsonl", file_size=len(jsonl_content), get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5015))
+
+    asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    findings = get_user_findings(5015)
+    assert findings[0]["source"] == "nuclei"
+    assert findings[0]["target"] == "https://example.com"
+    assert findings[0]["risk_level"] == "high"
+    assert findings[0]["finding_count"] == 2
+    report = message.reply_text.call_args.args[0]
+    assert "Nuclei Verdict" in report
+    assert "Target:\nhttps://example.com" in report
+    assert "Risk Level:\nHIGH" in report
+    assert "Findings:\n2" in report
+    assert "High: 1" in report
+    assert "Low: 1" in report
+    assert "- Exposed Git Repository (high)" in report
+    assert "- Missing Security Headers (low)" in report
+    assert "1. Exposed Git Repository" in report
+    assert "Template: git-config-exposure" in report
+    assert "Tags: exposure, git" in report
+    assert get_upload_state(5015) is None
+
+
+def test_valid_nuclei_json_upload_routes_to_nuclei_parser() -> None:
+    clear_user_findings(5016)
+    set_upload_state(5016, UPLOAD_STATE_AWAITING_NMAP_XML)
+    json_content = (
+        '[{"template-id":"open-redirect","info":{"name":"Open Redirect","severity":"medium"},'
+        '"host":"https://example.com","matched-at":"https://example.com/redirect"}]'
+    )
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(json_content, "utf-8")))
+    document = SimpleNamespace(file_name="nuclei.json", file_size=len(json_content), get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5016))
+
+    asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    latest = get_user_findings(5016)[0]
+    assert latest["source"] == "nuclei"
+    assert latest["risk_level"] == "medium"
+    assert "Nuclei Verdict" in message.reply_text.call_args.args[0]
+    assert "Medium: 1" in message.reply_text.call_args.args[0]
+
+
+def test_nuclei_report_severity_aggregation_risk_scoring_and_ordering() -> None:
+    finding = store_nuclei_finding(
+        5017,
+        [
+            {"template_id": "low-one", "severity": "low", "name": "Low Finding", "host": "https://example.com", "tags": []},
+            {"template_id": "medium-one", "severity": "medium", "name": "Medium Finding", "host": "https://example.com", "tags": []},
+            {"template_id": "critical-one", "severity": "critical", "name": "Critical Finding", "host": "https://example.com", "tags": []},
+            {"template_id": "high-one", "severity": "high", "name": "High Finding", "host": "https://example.com", "tags": []},
+        ],
+    )
+
+    report = build_nuclei_import_success_text(finding)
+
+    assert "Risk Level:\nHIGH" in report
+    assert "Critical: 1" in report
+    assert "High: 1" in report
+    assert "Medium: 1" in report
+    assert "Low: 1" in report
+    assert report.index("- Critical Finding (critical)") < report.index("- High Finding (high)")
+    assert report.index("- High Finding (high)") < report.index("- Medium Finding (medium)")
+    assert report.index("- Medium Finding (medium)") < report.index("- Low Finding (low)")
+
+
+def test_nuclei_medium_only_scores_medium() -> None:
+    finding = store_nuclei_finding(
+        5018,
+        [{"template_id": "medium-one", "severity": "medium", "name": "Medium Finding", "host": "https://example.com"}],
+    )
+
+    assert finding["risk_level"] == "medium"
+    assert "Risk Level:\nMEDIUM" in build_nuclei_import_success_text(finding)
+
+
+def test_malformed_nuclei_upload_handling() -> None:
+    set_upload_state(5019, UPLOAD_STATE_AWAITING_NMAP_XML)
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray("{bad-json", "utf-8")))
+    document = SimpleNamespace(file_name="nuclei.json", file_size=9, get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=5019))
+
+    asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    assert message.reply_text.call_args.args[0] == "Unable to parse Nuclei results file."
 
 
 def test_uploaded_scan_creates_finding() -> None:
