@@ -1,6 +1,10 @@
+import logging
 import subprocess
 
+from app.tools.target_normalizer import normalize_target
+
 NMAP_TIMEOUT_SECONDS = 60
+logger = logging.getLogger(__name__)
 DANGEROUS_SHELL_CHARACTERS: frozenset[str] = frozenset(
     {
         ";",
@@ -19,7 +23,7 @@ DANGEROUS_SHELL_CHARACTERS: frozenset[str] = frozenset(
 
 
 def _validate_target(target: str) -> str:
-    normalized_target = target.strip()
+    normalized_target = normalize_target(target)
     if not normalized_target:
         raise ValueError("Nmap target cannot be empty.")
 
@@ -33,6 +37,7 @@ def run_nmap_scan(target: str) -> dict[str, object]:
     """Run a conservative local Nmap scan and return captured process output."""
 
     validated_target = _validate_target(target)
+    logger.info("Nmap target normalized: raw_target=%s normalized_target=%s", target, validated_target)
     command = ["nmap", "-Pn", "-T3", validated_target]
 
     try:

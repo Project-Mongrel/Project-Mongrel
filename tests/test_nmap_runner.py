@@ -39,6 +39,22 @@ def test_subprocess_called_with_list_args() -> None:
     }
 
 
+def test_nmap_url_target_is_normalized_before_execution() -> None:
+    completed_process = Mock(returncode=0, stdout="scan output", stderr="")
+
+    with patch("app.tools.nmap_runner.subprocess.run", return_value=completed_process) as run_mock:
+        result = run_nmap_scan("https://www.example.com/shop")
+
+    run_mock.assert_called_once_with(
+        ["nmap", "-Pn", "-T3", "www.example.com"],
+        capture_output=True,
+        text=True,
+        timeout=NMAP_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert result["target"] == "www.example.com"
+
+
 def test_timeout_handled() -> None:
     timeout = subprocess.TimeoutExpired(
         cmd=["nmap", "-Pn", "-T3", "example.com"],

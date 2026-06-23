@@ -11,7 +11,7 @@ def _expected_nuclei_command(executable: str = "nuclei") -> list[str]:
     return [
         executable,
         "-u",
-        "https://example.com",
+        "example.com",
         "-jsonl",
         "-silent",
         "-severity",
@@ -55,7 +55,7 @@ def test_nuclei_subprocess_called_with_list_args_and_shell_false() -> None:
         shell=False,
     )
     assert result == {
-        "target": "https://example.com",
+        "target": "example.com",
         "success": True,
         "output": '{"template-id":"one"}\n',
         "error": "",
@@ -102,7 +102,7 @@ def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None
     assert run_mock.call_args.args[0] == [
         "nuclei",
         "-u",
-        "https://example.com",
+        "example.com",
         "-jsonl",
         "-silent",
         "-severity",
@@ -130,7 +130,7 @@ def test_nuclei_timeout_handled() -> None:
         result = run_nuclei_scan("https://example.com")
 
     assert result == {
-        "target": "https://example.com",
+        "target": "example.com",
         "success": False,
         "output": "partial output",
         "error": "Nuclei scan timed out. Try a smaller target or reduce scan scope.",
@@ -146,7 +146,7 @@ def test_nuclei_missing_executable_handled() -> None:
         result = run_nuclei_scan("https://example.com")
 
     assert result == {
-        "target": "https://example.com",
+        "target": "example.com",
         "success": False,
         "output": "",
         "error": "Nuclei executable was not found.",

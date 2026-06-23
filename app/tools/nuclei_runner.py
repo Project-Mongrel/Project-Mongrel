@@ -4,12 +4,13 @@ import time
 
 from app.core.config import get_settings
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
+from app.tools.target_normalizer import normalize_target
 
 logger = logging.getLogger(__name__)
 
 
 def _validate_target(target: str) -> str:
-    normalized_target = target.strip()
+    normalized_target = normalize_target(target)
     if not normalized_target:
         raise ValueError("Nuclei target cannot be empty.")
 
@@ -22,6 +23,7 @@ def _validate_target(target: str) -> str:
 def run_nuclei_scan(target: str) -> dict[str, object]:
     validated_target = _validate_target(target)
     settings = get_settings()
+    logger.info("Nuclei target normalized: raw_target=%s normalized_target=%s", target, validated_target)
     command = [
         settings.nuclei_path,
         "-u",

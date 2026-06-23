@@ -18,6 +18,8 @@ from app.bot.handlers.home import build_home_text, home_handler
 from app.bot.handlers.scan import (
     PENDING_NMAP_REQUEST_KEY,
     append_change_summary,
+    build_clean_nuclei_verdict_text,
+    build_nuclei_status_card,
     build_nuclei_target_prompt,
     build_nmap_scan_result_text,
     build_nmap_target_prompt,
@@ -270,7 +272,8 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
     scan_request = create_scan_request(user_id=7102, scan_type="nuclei")
     mark_scan_request_awaiting_target(user_id=7102, scan_request_id=scan_request.id)
     context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
-    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
     update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7102))
     nuclei_output = (
         '{"template-id":"git-config-exposure","info":{"name":"Exposed Git Repository","severity":"high","tags":["git","exposure"]},'
@@ -297,7 +300,9 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
         run_nuclei_scan.assert_called_once_with("https://example.com")
 
     asyncio.run(run_flow())
-    assert message.reply_text.call_args_list[0].args[0] == "Running Nuclei scan..."
+    assert "Nuclei Scan" in message.reply_text.call_args_list[0].args[0]
+    assert "Status:\nInitializing" in message.reply_text.call_args_list[0].args[0]
+    assert "Status:\nComplete" in status_message.edit_text.call_args.args[0]
     assert "Nuclei Verdict" in message.reply_text.call_args_list[1].args[0]
     assert "Risk Level:\nHIGH" in message.reply_text.call_args_list[1].args[0]
     findings = get_user_findings(7102)
@@ -312,7 +317,8 @@ def test_nuclei_scan_no_findings_output() -> None:
     scan_request = create_scan_request(user_id=7103, scan_type="nuclei")
     mark_scan_request_awaiting_target(user_id=7103, scan_request_id=scan_request.id)
     context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
-    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
     update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7103))
 
     async def run_flow() -> None:
@@ -327,7 +333,27 @@ def test_nuclei_scan_no_findings_output() -> None:
             await active_scan.task
 
     asyncio.run(run_flow())
-    assert message.reply_text.call_args_list[1].args[0] == "Nuclei scan completed. No findings were returned."
+    assert "Status:\nComplete" in status_message.edit_text.call_args.args[0]
+    verdict_text = message.reply_text.call_args_list[1].args[0]
+    assert "Nuclei Verdict" in verdict_text
+    assert "Target:\nhttps://example.com" in verdict_text
+    assert "Risk Level:\nINFO" in verdict_text
+    assert "Findings:\n0" in verdict_text
+    assert "No matching Nuclei findings were identified using the current scan profile." in verdict_text
+    assert "- The target was reachable." in verdict_text
+    assert "- Nuclei executed successfully." in verdict_text
+    assert "- Continue regular patching and monitoring." in verdict_text
+
+
+def test_clean_nuclei_verdict_formatter_for_no_findings() -> None:
+    verdict_text = build_clean_nuclei_verdict_text("hellosundaykids.com")
+
+    assert "Nuclei Verdict" in verdict_text
+    assert "Target:\nhellosundaykids.com" in verdict_text
+    assert "Risk Level:\nINFO" in verdict_text
+    assert "Findings:\n0" in verdict_text
+    assert "What this means:" in verdict_text
+    assert "Recommended Actions:" in verdict_text
 
 
 def test_nuclei_scan_runner_failure_message() -> None:
@@ -336,7 +362,8 @@ def test_nuclei_scan_runner_failure_message() -> None:
     scan_request = create_scan_request(user_id=7104, scan_type="nuclei")
     mark_scan_request_awaiting_target(user_id=7104, scan_request_id=scan_request.id)
     context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
-    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
     update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7104))
 
     async def run_flow() -> None:
@@ -357,6 +384,8 @@ def test_nuclei_scan_runner_failure_message() -> None:
             await active_scan.task
 
     asyncio.run(run_flow())
+    assert "Status:\nFailed" in status_message.edit_text.call_args.args[0]
+    assert "Reason:\nNuclei executable was not found." in status_message.edit_text.call_args.args[0]
     assert message.reply_text.call_args_list[1].args[0] == "Nuclei scan failed: Nuclei executable was not found."
 
 
@@ -366,7 +395,8 @@ def test_nuclei_scan_state_created() -> None:
     scan_request = create_scan_request(user_id=7105, scan_type="nuclei")
     mark_scan_request_awaiting_target(user_id=7105, scan_request_id=scan_request.id)
     context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
-    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
     update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7105))
 
     async def run_flow() -> None:
@@ -378,8 +408,9 @@ def test_nuclei_scan_state_created() -> None:
             active_scan = get_active_scan(7105)
             assert active_scan is not None
             assert active_scan.scan_type == "nuclei"
-            assert active_scan.target == "https://example.com"
+            assert active_scan.target == "example.com"
             assert active_scan.task is not None
+            assert active_scan.status_message is status_message
             active_scan.task.cancel()
             try:
                 await active_scan.task
@@ -395,7 +426,8 @@ def test_cancel_cancels_active_nuclei_scan() -> None:
     scan_request = create_scan_request(user_id=7106, scan_type="nuclei")
     mark_scan_request_awaiting_target(user_id=7106, scan_request_id=scan_request.id)
     context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
-    scan_message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    scan_message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
     cancel_message = SimpleNamespace(text="Cancel", reply_text=AsyncMock())
 
     async def run_flow() -> None:
@@ -422,6 +454,7 @@ def test_cancel_cancels_active_nuclei_scan() -> None:
     asyncio.run(run_flow())
     assert cancel_message.reply_text.call_args.args[0] == "Nuclei scan cancelled."
     assert get_active_scan(7106) is None
+    assert "Status:\nCancelled" in status_message.edit_text.call_args.args[0]
     assert len(scan_message.reply_text.call_args_list) == 1
 
 
@@ -431,7 +464,8 @@ def test_home_clears_active_nuclei_scan_state() -> None:
     scan_request = create_scan_request(user_id=7107, scan_type="nuclei")
     mark_scan_request_awaiting_target(user_id=7107, scan_request_id=scan_request.id)
     context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
-    scan_message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    scan_message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
     home_message = SimpleNamespace(text="Home", reply_text=AsyncMock())
 
     async def run_flow() -> None:
@@ -458,6 +492,7 @@ def test_home_clears_active_nuclei_scan_state() -> None:
     asyncio.run(run_flow())
     assert get_active_scan(7107) is None
     assert "Project Mongrel control panel" in home_message.reply_text.call_args.args[0]
+    assert "Status:\nCancelled" in status_message.edit_text.call_args.args[0]
     assert len(scan_message.reply_text.call_args_list) == 1
 
 

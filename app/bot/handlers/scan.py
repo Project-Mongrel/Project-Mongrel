@@ -9,7 +9,13 @@ from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
-from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan, set_active_scan_task
+from app.services.active_scan_state import (
+    clear_active_scan,
+    get_active_scan,
+    set_active_scan,
+    set_active_scan_status_task,
+    set_active_scan_task,
+)
 from app.services.chat_state import is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
@@ -26,6 +32,7 @@ from app.services.target_normalizer import normalize_target_key
 from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
+from app.tools.target_normalizer import normalize_target
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
 logger = logging.getLogger(__name__)
@@ -56,6 +63,57 @@ def build_nmap_scan_started_text(target: str) -> str:
 
 def build_nuclei_scan_started_text() -> str:
     return "Running Nuclei scan..."
+
+
+def build_nuclei_status_card(target: str, status: str, elapsed_seconds: int, reason: str | None = None) -> str:
+    lines = [
+        "Nuclei Scan",
+        "",
+        "Target:",
+        target or "unknown",
+        "",
+        "Status:",
+        status,
+        "",
+        "Elapsed:",
+        f"{elapsed_seconds}s",
+    ]
+    if reason:
+        lines.extend(["", "Reason:", reason])
+    if status in {"Initializing", "Running"}:
+        lines.extend(["", "Press Cancel to stop."])
+
+    return "\n".join(lines)
+
+
+def build_clean_nuclei_verdict_text(target: str | None) -> str:
+    return "\n".join(
+        [
+            "Nuclei Verdict",
+            "",
+            "Target:",
+            str(target or "unknown"),
+            "",
+            "Risk Level:",
+            "INFO",
+            "",
+            "Findings:",
+            "0",
+            "",
+            "Summary:",
+            "No matching Nuclei findings were identified using the current scan profile.",
+            "",
+            "What this means:",
+            "- The target was reachable.",
+            "- Nuclei executed successfully.",
+            "- No exposures, misconfigurations, or known issues matched the selected template set.",
+            "",
+            "Recommended Actions:",
+            "- Continue regular patching and monitoring.",
+            "- Re-scan after major site, server, or plugin changes.",
+            "- Consider a deeper scan profile if additional assurance is required.",
+        ]
+    )
 
 
 def build_nmap_scan_result_text(result: dict[str, object]) -> str:
@@ -319,16 +377,28 @@ async def _handle_nuclei_target(
         return
 
     target = update.message.text or ""
-    await update.message.reply_text(build_nuclei_scan_started_text())
-    active_scan = set_active_scan(user_id=user_id, scan_type="nuclei", target=target.strip())
+    display_target = normalize_target(target) or target.strip()
+    status_message = await update.message.reply_text(build_nuclei_status_card(display_target, "Initializing", 0))
+    active_scan = set_active_scan(
+        user_id=user_id,
+        scan_type="nuclei",
+        target=display_target,
+        status_message=status_message,
+    )
+    started_at = asyncio.get_running_loop().time()
+    status_task = asyncio.create_task(_update_nuclei_status_card(user_id, status_message, display_target, started_at))
     task = asyncio.create_task(
         _run_nuclei_scan_background(
             user_id=user_id,
             scan_request_id=scan_request_id,
             target=target,
             message=update.message,
+            status_message=status_message,
+            display_target=display_target,
+            started_at=started_at,
         )
     )
+    set_active_scan_status_task(user_id, status_task)
     set_active_scan_task(user_id, task)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     logger.info(
@@ -344,17 +414,21 @@ async def _run_nuclei_scan_background(
     scan_request_id: str,
     target: str,
     message: object,
+    status_message: object,
+    display_target: str,
+    started_at: float,
 ) -> None:
-    started_at = asyncio.get_running_loop().time()
-
     try:
         result = await asyncio.to_thread(run_nuclei_scan, target)
     except ValueError as exc:
+        _stop_nuclei_status_updates(user_id)
         clear_active_scan(user_id)
+        await _finalize_nuclei_status(status_message, display_target, "Failed", started_at, str(exc))
         await message.reply_text(f"Invalid Nuclei target: {exc}")
         return
     except asyncio.CancelledError:
         elapsed_seconds = asyncio.get_running_loop().time() - started_at
+        await _finalize_nuclei_status(status_message, display_target, "Cancelled", started_at)
         logger.info("Nuclei scan cancelled for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
         raise
 
@@ -370,17 +444,26 @@ async def _run_nuclei_scan_background(
         target=str(result["target"]),
         result=result,
     )
+    _stop_nuclei_status_updates(user_id)
     clear_active_scan(user_id)
     elapsed_seconds = asyncio.get_running_loop().time() - started_at
     logger.info("Nuclei scan completed for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
 
     if result.get("success") is not True:
+        await _finalize_nuclei_status(
+            status_message,
+            display_target,
+            "Failed",
+            started_at,
+            str(result.get("error") or "Unknown error."),
+        )
         await message.reply_text(f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
         return
 
+    await _finalize_nuclei_status(status_message, display_target, "Complete", started_at)
     output = str(result.get("output") or "")
     if not output.strip():
-        await message.reply_text("Nuclei scan completed. No findings were returned.")
+        await message.reply_text(build_clean_nuclei_verdict_text(str(result.get("target") or target)))
         return
 
     try:
@@ -390,10 +473,52 @@ async def _run_nuclei_scan_background(
         return
 
     if not nuclei_findings:
-        await message.reply_text("Nuclei scan completed. No findings were returned.")
+        await message.reply_text(build_clean_nuclei_verdict_text(str(result.get("target") or target)))
         return
 
     from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
 
     finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
     await message.reply_text(build_nuclei_import_success_text(finding))
+
+
+async def _update_nuclei_status_card(user_id: int, status_message: object, target: str, started_at: float) -> None:
+    try:
+        while True:
+            await asyncio.sleep(5)
+            active_scan = get_active_scan(user_id)
+            if active_scan is None or active_scan.cancelled:
+                return
+
+            elapsed_seconds = int(asyncio.get_running_loop().time() - started_at)
+            await _edit_status_message(status_message, build_nuclei_status_card(target, "Running", elapsed_seconds))
+    except asyncio.CancelledError:
+        return
+
+
+def _stop_nuclei_status_updates(user_id: int) -> None:
+    active_scan = get_active_scan(user_id)
+    if active_scan is not None and active_scan.status_task is not None and not active_scan.status_task.done():
+        active_scan.status_task.cancel()
+
+
+async def _finalize_nuclei_status(
+    status_message: object,
+    target: str,
+    status: str,
+    started_at: float,
+    reason: str | None = None,
+) -> None:
+    elapsed_seconds = int(asyncio.get_running_loop().time() - started_at)
+    await _edit_status_message(status_message, build_nuclei_status_card(target, status, elapsed_seconds, reason))
+
+
+async def _edit_status_message(status_message: object, text: str) -> None:
+    edit_text = getattr(status_message, "edit_text", None)
+    if edit_text is not None:
+        await edit_text(text)
+        return
+
+    edit_message_text = getattr(status_message, "edit_message_text", None)
+    if edit_message_text is not None:
+        await edit_message_text(text)
