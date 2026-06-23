@@ -4,7 +4,25 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app.core.config import Settings
-from app.tools.nuclei_runner import NUCLEI_TIMEOUT_SECONDS, run_nuclei_scan
+from app.tools.nuclei_runner import run_nuclei_scan
+
+
+def _expected_nuclei_command(executable: str = "nuclei") -> list[str]:
+    return [
+        executable,
+        "-u",
+        "https://example.com",
+        "-jsonl",
+        "-silent",
+        "-severity",
+        "low,medium,high,critical",
+        "-rate-limit",
+        "25",
+        "-timeout",
+        "5",
+        "-retries",
+        "1",
+    ]
 
 
 def test_empty_nuclei_target_rejected() -> None:
@@ -29,10 +47,10 @@ def test_nuclei_subprocess_called_with_list_args_and_shell_false() -> None:
         result = run_nuclei_scan("https://example.com")
 
     run_mock.assert_called_once_with(
-        ["nuclei", "-u", "https://example.com", "-jsonl", "-silent"],
+        _expected_nuclei_command(),
         capture_output=True,
         text=True,
-        timeout=NUCLEI_TIMEOUT_SECONDS,
+        timeout=300,
         check=False,
         shell=False,
     )
@@ -55,21 +73,54 @@ def test_nuclei_command_uses_custom_configured_path() -> None:
     ):
         run_nuclei_scan("https://example.com")
 
+    assert run_mock.call_args.args[0] == _expected_nuclei_command("C:\\Tools\\Nuclei\\nuclei.exe")
+
+
+def test_nuclei_subprocess_timeout_uses_config_value() -> None:
+    completed_process = Mock(returncode=0, stdout="", stderr="")
+    settings = Settings(_env_file=None, nuclei_scan_timeout_seconds=444)
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=settings),
+        patch("app.tools.nuclei_runner.subprocess.run", return_value=completed_process) as run_mock,
+    ):
+        run_nuclei_scan("https://example.com")
+
+    assert run_mock.call_args.kwargs["timeout"] == 444
+
+
+def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None:
+    completed_process = Mock(returncode=0, stdout="", stderr="")
+    settings = Settings(_env_file=None, nuclei_rate_limit=10, nuclei_request_timeout=3, nuclei_retries=2)
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=settings),
+        patch("app.tools.nuclei_runner.subprocess.run", return_value=completed_process) as run_mock,
+    ):
+        run_nuclei_scan("https://example.com")
+
     assert run_mock.call_args.args[0] == [
-        "C:\\Tools\\Nuclei\\nuclei.exe",
+        "nuclei",
         "-u",
         "https://example.com",
         "-jsonl",
         "-silent",
+        "-severity",
+        "low,medium,high,critical",
+        "-rate-limit",
+        "10",
+        "-timeout",
+        "3",
+        "-retries",
+        "2",
     ]
 
 
 def test_nuclei_timeout_handled() -> None:
     timeout = subprocess.TimeoutExpired(
-        cmd=["nuclei", "-u", "https://example.com", "-jsonl", "-silent"],
-        timeout=NUCLEI_TIMEOUT_SECONDS,
+        cmd=_expected_nuclei_command(),
+        timeout=300,
         output="partial output",
-        stderr="partial error",
     )
 
     with (
@@ -82,7 +133,7 @@ def test_nuclei_timeout_handled() -> None:
         "target": "https://example.com",
         "success": False,
         "output": "partial output",
-        "error": "partial error",
+        "error": "Nuclei scan timed out. Try a smaller target or reduce scan scope.",
         "returncode": None,
     }
 

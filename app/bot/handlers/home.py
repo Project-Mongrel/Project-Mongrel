@@ -2,6 +2,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
+from app.services.active_scan_state import cancel_active_scan, clear_active_scan
 from app.services.chat_state import clear_ai_waiting
 
 
@@ -26,6 +27,8 @@ async def home_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if update.effective_user is not None:
         clear_ai_waiting(update.effective_user.id)
+        cancel_active_scan(update.effective_user.id)
+        clear_active_scan(update.effective_user.id)
 
     await update.message.reply_text(
         build_home_text(),

@@ -9,6 +9,7 @@ from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
+from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan, set_active_scan_task
 from app.services.chat_state import is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
@@ -319,11 +320,48 @@ async def _handle_nuclei_target(
 
     target = update.message.text or ""
     await update.message.reply_text(build_nuclei_scan_started_text())
+    active_scan = set_active_scan(user_id=user_id, scan_type="nuclei", target=target.strip())
+    task = asyncio.create_task(
+        _run_nuclei_scan_background(
+            user_id=user_id,
+            scan_request_id=scan_request_id,
+            target=target,
+            message=update.message,
+        )
+    )
+    set_active_scan_task(user_id, task)
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    logger.info(
+        "Nuclei scan started for user_id=%s target=%s started_at=%s",
+        user_id,
+        active_scan.target,
+        active_scan.started_at.isoformat(),
+    )
+
+
+async def _run_nuclei_scan_background(
+    user_id: int,
+    scan_request_id: str,
+    target: str,
+    message: object,
+) -> None:
+    started_at = asyncio.get_running_loop().time()
 
     try:
         result = await asyncio.to_thread(run_nuclei_scan, target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid Nuclei target: {exc}")
+        clear_active_scan(user_id)
+        await message.reply_text(f"Invalid Nuclei target: {exc}")
+        return
+    except asyncio.CancelledError:
+        elapsed_seconds = asyncio.get_running_loop().time() - started_at
+        logger.info("Nuclei scan cancelled for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
+        raise
+
+    active_scan = get_active_scan(user_id)
+    if active_scan is None or active_scan.cancelled:
+        elapsed_seconds = asyncio.get_running_loop().time() - started_at
+        logger.info("Nuclei scan result discarded for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
         return
 
     complete_scan_request(
@@ -332,28 +370,30 @@ async def _handle_nuclei_target(
         target=str(result["target"]),
         result=result,
     )
-    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    clear_active_scan(user_id)
+    elapsed_seconds = asyncio.get_running_loop().time() - started_at
+    logger.info("Nuclei scan completed for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
 
     if result.get("success") is not True:
-        await update.message.reply_text(f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
+        await message.reply_text(f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
         return
 
     output = str(result.get("output") or "")
     if not output.strip():
-        await update.message.reply_text("Nuclei scan completed. No findings were returned.")
+        await message.reply_text("Nuclei scan completed. No findings were returned.")
         return
 
     try:
         nuclei_findings = parse_nuclei_results(output)
     except NucleiParserError:
-        await update.message.reply_text("Unable to parse Nuclei scan output.")
+        await message.reply_text("Unable to parse Nuclei scan output.")
         return
 
     if not nuclei_findings:
-        await update.message.reply_text("Nuclei scan completed. No findings were returned.")
+        await message.reply_text("Nuclei scan completed. No findings were returned.")
         return
 
     from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
 
     finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
-    await update.message.reply_text(build_nuclei_import_success_text(finding))
+    await message.reply_text(build_nuclei_import_success_text(finding))

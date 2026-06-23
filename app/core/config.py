@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen3:4b"
     ai_timeout_seconds: int = 60
     nuclei_path: str = "nuclei"
+    nuclei_scan_timeout_seconds: int = 300
+    nuclei_rate_limit: int = 25
+    nuclei_request_timeout: int = 5
+    nuclei_retries: int = 1
 
 
 @lru_cache
