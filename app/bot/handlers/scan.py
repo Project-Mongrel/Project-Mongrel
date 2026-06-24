@@ -2,9 +2,11 @@ import asyncio
 import logging
 
 from telegram import Update
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ContextTypes
 
 from app.bot.handlers.home import build_home_text
+from app.bot.handlers.findings import build_finding_followup_ai_prompt
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
@@ -16,7 +18,7 @@ from app.services.active_scan_state import (
     set_active_scan_status_task,
     set_active_scan_task,
 )
-from app.services.chat_state import is_ai_waiting
+from app.services.chat_state import clear_finding_analysis_context, get_finding_analysis_context, is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.impact_engine import assess_change_impact
@@ -35,6 +37,7 @@ from app.tools.nuclei_runner import run_nuclei_scan
 from app.tools.target_normalizer import normalize_target
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
+NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS = 15
 logger = logging.getLogger(__name__)
 
 
@@ -67,7 +70,7 @@ def build_nuclei_scan_started_text() -> str:
 
 def build_nuclei_status_card(target: str, status: str, elapsed_seconds: int, reason: str | None = None) -> str:
     lines = [
-        "Nuclei Scan",
+        "Nuclei Fast Scan",
         "",
         "Target:",
         target or "unknown",
@@ -101,7 +104,7 @@ def build_clean_nuclei_verdict_text(target: str | None) -> str:
             "0",
             "",
             "Summary:",
-            "No matching Nuclei findings were identified using the current scan profile.",
+            "No matching Nuclei findings were identified using the fast scan profile.",
             "",
             "What this means:",
             "- The target was reachable.",
@@ -113,6 +116,22 @@ def build_clean_nuclei_verdict_text(target: str | None) -> str:
             "- Re-scan after major site, server, or plugin changes.",
             "- Consider a deeper scan profile if additional assurance is required.",
         ]
+    )
+
+
+def store_clean_nuclei_scan(user_id: int, target: str | None) -> dict:
+    summary = "No matching Nuclei findings were identified using the fast scan profile."
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nuclei",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "risk_level": "info",
+            "finding_count": 0,
+            "status": "clean",
+            "summary": summary,
+        },
     )
 
 
@@ -305,6 +324,30 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     user_id = update.effective_user.id if update.effective_user is not None else None
+    if user_id is not None:
+        finding_analysis_context = get_finding_analysis_context(user_id)
+        if finding_analysis_context is not None:
+            if _is_finding_analysis_exit_message(update.message.text or ""):
+                clear_finding_analysis_context(user_id)
+                logger.info("Finding analysis ended for user_id=%s", user_id)
+                await update.message.reply_text("Exited Finding Analysis Mode.", reply_markup=build_main_menu_keyboard())
+                return
+
+            logger.info("Finding analysis question for user_id=%s", user_id)
+            await update.message.reply_text("Analyzing...")
+            prompt = build_finding_followup_ai_prompt(finding_analysis_context, update.message.text or "")
+            try:
+                logger.info("AI request started for finding analysis user_id=%s", user_id)
+                ai_response = await asyncio.to_thread(ask_ai, prompt)
+                logger.info("AI request completed for finding analysis user_id=%s", user_id)
+            except Exception:
+                logger.exception("Finding analysis AI request failed for user_id=%s", user_id)
+                await update.message.reply_text("AI request failed. Check bot logs.")
+                return
+
+            await update.message.reply_text(ai_response)
+            return
+
     if user_id is not None and is_ai_waiting(user_id):
         logger.info("Ask Mongrel question received for user_id=%s", user_id)
         await update.message.reply_text("Analyzing...")
@@ -367,6 +410,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+def _is_finding_analysis_exit_message(text: str) -> bool:
+    return text.strip().lower() in {"home", "cancel", "/home", "/cancel"}
+
+
 async def _handle_nuclei_target(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -424,7 +471,7 @@ async def _run_nuclei_scan_background(
         _stop_nuclei_status_updates(user_id)
         clear_active_scan(user_id)
         await _finalize_nuclei_status(status_message, display_target, "Failed", started_at, str(exc))
-        await message.reply_text(f"Invalid Nuclei target: {exc}")
+        await _send_scan_message(message, f"Invalid Nuclei target: {exc}")
         return
     except asyncio.CancelledError:
         elapsed_seconds = asyncio.get_running_loop().time() - started_at
@@ -457,35 +504,39 @@ async def _run_nuclei_scan_background(
             started_at,
             str(result.get("error") or "Unknown error."),
         )
-        await message.reply_text(f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
+        await _send_scan_message(message, f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
         return
 
     await _finalize_nuclei_status(status_message, display_target, "Complete", started_at)
     output = str(result.get("output") or "")
     if not output.strip():
-        await message.reply_text(build_clean_nuclei_verdict_text(str(result.get("target") or target)))
+        clean_target = str(result.get("target") or target)
+        store_clean_nuclei_scan(user_id=user_id, target=clean_target)
+        await _send_scan_message(message, build_clean_nuclei_verdict_text(clean_target))
         return
 
     try:
         nuclei_findings = parse_nuclei_results(output)
     except NucleiParserError:
-        await message.reply_text("Unable to parse Nuclei scan output.")
+        await _send_scan_message(message, "Unable to parse Nuclei scan output.")
         return
 
     if not nuclei_findings:
-        await message.reply_text(build_clean_nuclei_verdict_text(str(result.get("target") or target)))
+        clean_target = str(result.get("target") or target)
+        store_clean_nuclei_scan(user_id=user_id, target=clean_target)
+        await _send_scan_message(message, build_clean_nuclei_verdict_text(clean_target))
         return
 
     from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
 
     finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
-    await message.reply_text(build_nuclei_import_success_text(finding))
+    await _send_scan_message(message, build_nuclei_import_success_text(finding))
 
 
 async def _update_nuclei_status_card(user_id: int, status_message: object, target: str, started_at: float) -> None:
     try:
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS)
             active_scan = get_active_scan(user_id)
             if active_scan is None or active_scan.cancelled:
                 return
@@ -515,10 +566,28 @@ async def _finalize_nuclei_status(
 
 async def _edit_status_message(status_message: object, text: str) -> None:
     edit_text = getattr(status_message, "edit_text", None)
-    if edit_text is not None:
-        await edit_text(text)
+    edit_method = edit_text or getattr(status_message, "edit_message_text", None)
+    if edit_method is None:
         return
 
-    edit_message_text = getattr(status_message, "edit_message_text", None)
-    if edit_message_text is not None:
-        await edit_message_text(text)
+    try:
+        await edit_method(text)
+    except TimedOut as exc:
+        logger.warning("Nuclei status card edit timed out: %s", exc)
+    except NetworkError as exc:
+        logger.warning("Nuclei status card edit failed due to Telegram network error: %s", exc)
+    except BadRequest as exc:
+        logger.warning("Nuclei status card edit was rejected by Telegram: %s", exc)
+    except Exception:
+        logger.warning("Nuclei status card edit failed unexpectedly.", exc_info=True)
+
+
+async def _send_scan_message(message: object, text: str) -> None:
+    reply_text = getattr(message, "reply_text", None)
+    if reply_text is None:
+        return
+
+    try:
+        await reply_text(text)
+    except Exception:
+        logger.exception("Failed to send Nuclei scan result message.")

@@ -1,12 +1,18 @@
+import asyncio
+import logging
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
+from app.services.ai_client import ask_ai
+from app.services.chat_state import set_finding_analysis_context
 from app.services.findings_store import clear_user_findings, get_user_finding, get_user_findings
 from app.services.verdict_engine import generate_mongrel_verdict
 
 MAX_FINDINGS_MESSAGE_LENGTH = 3800
 MAX_LATEST_FINDINGS = 5
+logger = logging.getLogger(__name__)
 
 
 def build_findings_text(findings: list[dict] | None = None) -> str:
@@ -15,6 +21,19 @@ def build_findings_text(findings: list[dict] | None = None) -> str:
 
     lines = ["Latest Findings"]
     for index, finding in enumerate(_latest_findings(findings), start=1):
+        if _is_clean_nuclei_scan(finding):
+            lines.extend(
+                [
+                    "",
+                    "Nuclei Fast Scan",
+                    f"Target: {finding.get('target', 'unknown')}",
+                    "Result: Clean",
+                    f"Findings: {finding.get('finding_count', 0)}",
+                    f"Risk Level: {_format_risk_level(finding.get('risk_level'))}",
+                ]
+            )
+            continue
+
         open_ports = finding.get("open_ports") or []
         risk_notes = finding.get("risk_notes") or []
         lines.extend(
@@ -49,6 +68,24 @@ def build_findings_keyboard(findings: list[dict] | None = None) -> InlineKeyboar
 def build_finding_detail_text(finding: dict | None, display_number: int | None = None) -> str:
     if finding is None:
         return "Finding not found."
+
+    if _is_clean_nuclei_scan(finding):
+        return _truncate_message(
+            "\n".join(
+                [
+                    "Nuclei Fast Scan",
+                    "",
+                    f"Target: {finding.get('target', 'unknown')}",
+                    "Result: Clean",
+                    f"Findings: {finding.get('finding_count', 0)}",
+                    f"Risk Level: {_format_risk_level(finding.get('risk_level'))}",
+                    f"Created At: {finding.get('created_at', 'unknown')}",
+                    "",
+                    "Summary:",
+                    str(finding.get("summary", "No matching Nuclei findings were identified using the fast scan profile.")),
+                ]
+            )
+        )
 
     open_ports = finding.get("open_ports") or []
     verdict = generate_mongrel_verdict(finding)
@@ -102,8 +139,116 @@ def build_finding_detail_text(finding: dict | None, display_number: int | None =
     return _truncate_message("\n".join(lines))
 
 
-def build_finding_detail_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Back to Findings", callback_data="finding:list")]])
+def build_finding_detail_keyboard(finding_id: str | None = None) -> InlineKeyboardMarkup:
+    buttons = []
+    if finding_id:
+        buttons.append([InlineKeyboardButton("Explain with Mongrel AI", callback_data=f"explain:finding:{finding_id}")])
+
+    buttons.append([InlineKeyboardButton("Back to Findings", callback_data="finding:list")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_finding_ai_prompt(finding: dict) -> str | None:
+    if _is_clean_nuclei_scan(finding):
+        return _build_clean_nuclei_ai_prompt(finding)
+
+    if finding.get("source") == "nuclei":
+        return _build_nuclei_ai_prompt(finding)
+
+    if finding.get("source") in {"nmap", "nmap_xml"}:
+        return _build_nmap_ai_prompt(finding)
+
+    return None
+
+
+def build_finding_analysis_mode_text(finding: dict) -> str:
+    return "\n".join(
+        [
+            "------------------",
+            "Finding Analysis Mode",
+            f"Target: {finding.get('target', 'unknown')}",
+            "",
+            "You can now ask follow-up questions about this finding.",
+            "",
+            "Use Home or Cancel to exit.",
+            "------------------",
+        ]
+    )
+
+
+def build_finding_analysis_context(finding: dict) -> dict:
+    return {
+        "finding_id": finding.get("id"),
+        "source": finding.get("source"),
+        "target": finding.get("target"),
+        "summary": _summarize_finding_for_context(finding),
+        "finding": dict(finding),
+    }
+
+
+def build_finding_followup_ai_prompt(context: dict, question: str) -> str:
+    finding = context.get("finding") if isinstance(context.get("finding"), dict) else {}
+    source = context.get("source") or finding.get("source") or "unknown"
+    lines = [
+        "Answer this follow-up question about a stored Project Mongrel finding.",
+        "",
+        "Guardrails:",
+        "- Never invent scan results.",
+        "- Never invent ports.",
+        "- Never invent services.",
+        "- Never invent CVEs.",
+        "- Never invent vulnerabilities.",
+        "- Base answers only on stored finding plus user question.",
+        "- If information is unknown, explicitly say so.",
+        "- Keep the answer concise and practical.",
+        "",
+        "Stored finding context:",
+        f"Finding ID: {context.get('finding_id') or finding.get('id') or 'unknown'}",
+        f"Source: {source}",
+        f"Target: {context.get('target') or finding.get('target') or 'unknown'}",
+        f"Summary: {context.get('summary') or _summarize_finding_for_context(finding)}",
+    ]
+    if source in {"nmap", "nmap_xml"}:
+        lines.extend(["", "Open ports:"])
+        open_ports = finding.get("open_ports") or []
+        lines.extend(_format_port_for_prompt(open_port) for open_port in open_ports) if open_ports else lines.append("none")
+        lines.extend(["", f"Risk level: {_format_risk_level(finding.get('risk_level'))}"])
+        lines.append(f"Risk notes: {_format_risk_notes(finding.get('risk_notes') or [])}")
+    elif source == "nuclei":
+        lines.extend(
+            [
+                "",
+                f"Status: {finding.get('status', 'findings')}",
+                f"Risk level: {_format_risk_level(finding.get('risk_level'))}",
+                f"Finding count: {finding.get('finding_count', len(finding.get('nuclei_findings') or []))}",
+                "Severity summary:",
+                *_format_severity_summary_for_prompt(finding.get("severity_summary") or {}),
+                "",
+                "Nuclei findings:",
+            ]
+        )
+        nuclei_findings = finding.get("nuclei_findings") or []
+        lines.extend(_format_nuclei_finding_for_prompt(nuclei_finding) for nuclei_finding in nuclei_findings) if nuclei_findings else lines.append("none")
+
+    lines.extend(["", "Latest user question:", question])
+    return "\n".join(lines)
+
+
+def _summarize_finding_for_context(finding: dict) -> str:
+    if _is_clean_nuclei_scan(finding):
+        return str(finding.get("summary") or "No matching Nuclei findings were identified using the fast scan profile.")
+
+    if finding.get("source") == "nuclei":
+        return (
+            f"{finding.get('finding_count', len(finding.get('nuclei_findings') or []))} Nuclei finding(s) "
+            f"for {finding.get('target', 'unknown')} with risk {_format_risk_level(finding.get('risk_level'))}."
+        )
+
+    open_ports = finding.get("open_ports") or []
+    return (
+        f"{finding.get('target', 'unknown')} has {len(open_ports)} open port(s) "
+        f"with risk {_format_risk_level(finding.get('risk_level'))}."
+    )
 
 
 def _format_risk_notes(risk_notes: object) -> str:
@@ -111,6 +256,126 @@ def _format_risk_notes(risk_notes: object) -> str:
         return ", ".join(str(note) for note in risk_notes)
 
     return "None"
+
+
+def _is_clean_nuclei_scan(finding: dict) -> bool:
+    return finding.get("source") == "nuclei" and finding.get("status") == "clean"
+
+
+def _prompt_guardrails() -> list[str]:
+    return [
+        "Rules:",
+        "- Use only the supplied stored finding data.",
+        "- Do not invent ports.",
+        "- Do not invent services.",
+        "- Do not invent CVEs.",
+        "- Do not invent vulnerabilities.",
+        "- Do not reassign services to ports.",
+        "- Accuracy is more important than completeness.",
+        "- Keep output concise.",
+    ]
+
+
+def _build_nmap_ai_prompt(finding: dict) -> str:
+    open_ports = finding.get("open_ports") or []
+    lines = [
+        "Explain this stored Nmap finding in plain English.",
+        *_prompt_guardrails(),
+        "",
+        "Use these sections:",
+        "What this means",
+        "Highest priority risks",
+        "What to check first",
+        "Suggested next steps",
+        "",
+        "Stored finding data:",
+        f"Source: {finding.get('source', 'nmap')}",
+        f"Target: {finding.get('target', 'unknown')}",
+        f"Host status: {finding.get('host_status', 'unknown')}",
+        f"Risk level: {_format_risk_level(finding.get('risk_level'))}",
+        f"Risk notes: {_format_risk_notes(finding.get('risk_notes') or [])}",
+        "",
+        "Open ports:",
+    ]
+    if not open_ports:
+        lines.append("none")
+    else:
+        lines.extend(_format_port_for_prompt(open_port) for open_port in open_ports)
+
+    return "\n".join(lines)
+
+
+def _build_nuclei_ai_prompt(finding: dict) -> str:
+    nuclei_findings = finding.get("nuclei_findings") or []
+    severity_summary = finding.get("severity_summary") or {}
+    lines = [
+        "Explain these stored Nuclei findings in plain English.",
+        *_prompt_guardrails(),
+        "",
+        "Use these sections:",
+        "What this means",
+        "Highest priority risks",
+        "What to verify first",
+        "Suggested remediation",
+        "",
+        "Stored finding data:",
+        f"Source: {finding.get('source', 'nuclei')}",
+        f"Target: {finding.get('target', 'unknown')}",
+        f"Risk level: {_format_risk_level(finding.get('risk_level'))}",
+        f"Finding count: {finding.get('finding_count', len(nuclei_findings))}",
+        "Severity summary:",
+        *_format_severity_summary_for_prompt(severity_summary),
+        "",
+        "Nuclei findings:",
+    ]
+    if not nuclei_findings:
+        lines.append("none")
+    else:
+        lines.extend(_format_nuclei_finding_for_prompt(nuclei_finding) for nuclei_finding in nuclei_findings)
+
+    return "\n".join(lines)
+
+
+def _build_clean_nuclei_ai_prompt(finding: dict) -> str:
+    return "\n".join(
+        [
+            "Explain this stored clean Nuclei fast scan result in plain English.",
+            *_prompt_guardrails(),
+            "",
+            "Use these sections:",
+            "What this means",
+            "What it does not prove",
+            "What to do next",
+            "",
+            "Stored finding data:",
+            "Source: nuclei",
+            f"Target: {finding.get('target', 'unknown')}",
+            "Status: clean",
+            "Risk level: INFO",
+            "Finding count: 0",
+            f"Summary: {finding.get('summary', 'No matching Nuclei findings were identified using the fast scan profile.')}",
+        ]
+    )
+
+
+def _format_port_for_prompt(open_port: dict) -> str:
+    return f"{open_port.get('port')}/{open_port.get('protocol')} {open_port.get('service')}"
+
+
+def _format_severity_summary_for_prompt(severity_summary: dict) -> list[str]:
+    if not severity_summary:
+        return ["none"]
+
+    return [f"{severity}: {count}" for severity, count in severity_summary.items()]
+
+
+def _format_nuclei_finding_for_prompt(finding: dict) -> str:
+    return (
+        f"{finding.get('severity', 'info')} | "
+        f"{finding.get('name') or finding.get('template_id') or 'Unnamed finding'} | "
+        f"template={finding.get('template_id') or 'unknown'} | "
+        f"host={finding.get('host') or 'unknown'}"
+    )
 
 
 def _format_risk_level(risk_level: object) -> str:
@@ -295,6 +560,10 @@ async def findings_callback_handler(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("No findings available yet.")
         return
 
+    if query.data is not None and query.data.startswith("explain:finding:"):
+        await _explain_finding_callback(update, user_id, query.data.removeprefix("explain:finding:"))
+        return
+
     if query.data is None or not query.data.startswith("finding:view:"):
         return
 
@@ -302,5 +571,41 @@ async def findings_callback_handler(update: Update, context: ContextTypes.DEFAUL
     finding = get_user_finding(user_id=user_id, finding_id=finding_id)
     await query.edit_message_text(
         build_finding_detail_text(finding, display_number=_find_display_number(findings, finding_id)),
-        reply_markup=build_finding_detail_keyboard(),
+        reply_markup=build_finding_detail_keyboard(finding.get("id") if finding else None),
     )
+
+
+async def _explain_finding_callback(update: Update, user_id: int, finding_id: str) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    finding = get_user_finding(user_id=user_id, finding_id=finding_id)
+    if finding is None:
+        await query.edit_message_text("Finding not found.")
+        return
+
+    prompt = build_finding_ai_prompt(finding)
+    if prompt is None:
+        if query.message is not None:
+            await query.message.reply_text("Unsupported finding source.")
+        else:
+            await query.edit_message_text("Unsupported finding source.")
+        return
+
+    if query.message is None:
+        await query.edit_message_text("Mongrel is analyzing this finding...")
+        return
+
+    await query.message.reply_text("Mongrel is analyzing this finding...")
+    try:
+        ai_response = await asyncio.to_thread(ask_ai, prompt)
+    except Exception:
+        logger.exception("Finding AI explanation failed for user_id=%s finding_id=%s", user_id, finding_id)
+        await query.message.reply_text("AI explanation failed. Check bot logs.")
+        return
+
+    set_finding_analysis_context(user_id, build_finding_analysis_context(finding))
+    logger.info("Finding analysis started for user_id=%s finding_id=%s", user_id, finding_id)
+    await query.message.reply_text(ai_response)
+    await query.message.reply_text(build_finding_analysis_mode_text(finding))

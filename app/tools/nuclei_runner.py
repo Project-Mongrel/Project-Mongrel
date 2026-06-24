@@ -32,6 +32,8 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
         "-silent",
         "-severity",
         "low,medium,high,critical",
+        "-tags",
+        settings.nuclei_tags,
         "-rate-limit",
         str(settings.nuclei_rate_limit),
         "-timeout",
@@ -71,7 +73,7 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
             "target": validated_target,
             "success": False,
             "output": exc.stdout or "",
-            "error": exc.stderr or "Nuclei scan timed out. Try a smaller target or reduce scan scope.",
+            "error": exc.stderr or "Nuclei fast scan timed out. Try a smaller target or use a deeper scan profile later.",
             "returncode": None,
         }
     except FileNotFoundError:

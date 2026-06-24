@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 
 from telegram import Update
@@ -5,7 +6,9 @@ from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
 from app.services.active_scan_state import cancel_active_scan, clear_active_scan
-from app.services.chat_state import clear_ai_waiting
+from app.services.chat_state import clear_ai_waiting, clear_finding_analysis_context, is_finding_analysis_active
+
+logger = logging.getLogger(__name__)
 
 
 def build_home_text() -> str:
@@ -29,15 +32,22 @@ async def home_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if update.effective_user is not None:
         clear_ai_waiting(update.effective_user.id)
+        finding_analysis_exited = is_finding_analysis_active(update.effective_user.id)
+        clear_finding_analysis_context(update.effective_user.id)
+        if finding_analysis_exited:
+            logger.info("Finding analysis ended for user_id=%s", update.effective_user.id)
         cancelled_scan = cancel_active_scan(update.effective_user.id)
         if cancelled_scan is not None and cancelled_scan.status_message is not None:
-            from app.bot.handlers.scan import build_nuclei_status_card
+            from app.bot.handlers.scan import build_nuclei_status_card, _edit_status_message
 
             elapsed_seconds = int((datetime.now(UTC) - cancelled_scan.started_at).total_seconds())
-            edit_text = getattr(cancelled_scan.status_message, "edit_text", None)
-            if edit_text is not None:
-                await edit_text(build_nuclei_status_card(cancelled_scan.target, "Cancelled", elapsed_seconds))
+            await _edit_status_message(
+                cancelled_scan.status_message,
+                build_nuclei_status_card(cancelled_scan.target, "Cancelled", elapsed_seconds),
+            )
         clear_active_scan(update.effective_user.id)
+        if finding_analysis_exited:
+            await update.message.reply_text("Exited Finding Analysis Mode.")
 
     await update.message.reply_text(
         build_home_text(),

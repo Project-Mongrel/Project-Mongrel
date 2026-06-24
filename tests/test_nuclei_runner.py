@@ -16,6 +16,8 @@ def _expected_nuclei_command(executable: str = "nuclei") -> list[str]:
         "-silent",
         "-severity",
         "low,medium,high,critical",
+        "-tags",
+        "exposure,misconfig,tech,panel,headers",
         "-rate-limit",
         "25",
         "-timeout",
@@ -50,7 +52,7 @@ def test_nuclei_subprocess_called_with_list_args_and_shell_false() -> None:
         _expected_nuclei_command(),
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=180,
         check=False,
         shell=False,
     )
@@ -91,7 +93,13 @@ def test_nuclei_subprocess_timeout_uses_config_value() -> None:
 
 def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None:
     completed_process = Mock(returncode=0, stdout="", stderr="")
-    settings = Settings(_env_file=None, nuclei_rate_limit=10, nuclei_request_timeout=3, nuclei_retries=2)
+    settings = Settings(
+        _env_file=None,
+        nuclei_tags="exposure,tech",
+        nuclei_rate_limit=10,
+        nuclei_request_timeout=3,
+        nuclei_retries=2,
+    )
 
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=settings),
@@ -107,6 +115,8 @@ def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None
         "-silent",
         "-severity",
         "low,medium,high,critical",
+        "-tags",
+        "exposure,tech",
         "-rate-limit",
         "10",
         "-timeout",
@@ -119,7 +129,7 @@ def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None
 def test_nuclei_timeout_handled() -> None:
     timeout = subprocess.TimeoutExpired(
         cmd=_expected_nuclei_command(),
-        timeout=300,
+        timeout=180,
         output="partial output",
     )
 
@@ -133,7 +143,7 @@ def test_nuclei_timeout_handled() -> None:
         "target": "example.com",
         "success": False,
         "output": "partial output",
-        "error": "Nuclei scan timed out. Try a smaller target or reduce scan scope.",
+        "error": "Nuclei fast scan timed out. Try a smaller target or use a deeper scan profile later.",
         "returncode": None,
     }
 

@@ -3,12 +3,17 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from telegram.error import TimedOut
+
 from app.bot.auth import is_admin
 from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
 from app.bot.handlers.findings import (
     MAX_FINDINGS_MESSAGE_LENGTH,
+    build_finding_analysis_context,
     build_finding_detail_keyboard,
     build_finding_detail_text,
+    build_finding_ai_prompt,
+    build_finding_followup_ai_prompt,
     build_findings_keyboard,
     build_findings_text,
     findings_callback_handler,
@@ -16,7 +21,10 @@ from app.bot.handlers.findings import (
 )
 from app.bot.handlers.home import build_home_text, home_handler
 from app.bot.handlers.scan import (
+    NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS,
     PENDING_NMAP_REQUEST_KEY,
+    _finalize_nuclei_status,
+    _update_nuclei_status_card,
     append_change_summary,
     build_clean_nuclei_verdict_text,
     build_nuclei_status_card,
@@ -27,6 +35,7 @@ from app.bot.handlers.scan import (
     build_scan_text,
     scan_callback_handler,
     scan_target_handler,
+    store_clean_nuclei_scan,
     store_successful_nmap_finding,
 )
 from app.bot.handlers.settings import build_settings_text
@@ -51,9 +60,16 @@ from app.bot.handlers.upload import (
 )
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.core.config import Settings
-from app.services.active_scan_state import clear_active_scan, get_active_scan
+from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
 from app.services.findings_store import add_finding, clear_user_findings, get_user_findings
-from app.services.chat_state import clear_ai_waiting, is_ai_waiting
+from app.services.chat_state import (
+    clear_ai_waiting,
+    clear_finding_analysis_context,
+    get_finding_analysis_context,
+    is_ai_waiting,
+    set_ai_waiting,
+    set_finding_analysis_context,
+)
 from app.services.scan_manager import clear_user_scan_requests, create_scan_request, mark_scan_request_awaiting_target
 from app.services.verdict_engine import generate_mongrel_verdict
 
@@ -300,7 +316,7 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
         run_nuclei_scan.assert_called_once_with("https://example.com")
 
     asyncio.run(run_flow())
-    assert "Nuclei Scan" in message.reply_text.call_args_list[0].args[0]
+    assert "Nuclei Fast Scan" in message.reply_text.call_args_list[0].args[0]
     assert "Status:\nInitializing" in message.reply_text.call_args_list[0].args[0]
     assert "Status:\nComplete" in status_message.edit_text.call_args.args[0]
     assert "Nuclei Verdict" in message.reply_text.call_args_list[1].args[0]
@@ -312,6 +328,7 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
 
 
 def test_nuclei_scan_no_findings_output() -> None:
+    clear_user_findings(7103)
     clear_user_scan_requests(7103)
     clear_active_scan(7103)
     scan_request = create_scan_request(user_id=7103, scan_type="nuclei")
@@ -339,10 +356,16 @@ def test_nuclei_scan_no_findings_output() -> None:
     assert "Target:\nhttps://example.com" in verdict_text
     assert "Risk Level:\nINFO" in verdict_text
     assert "Findings:\n0" in verdict_text
-    assert "No matching Nuclei findings were identified using the current scan profile." in verdict_text
+    assert "No matching Nuclei findings were identified using the fast scan profile." in verdict_text
     assert "- The target was reachable." in verdict_text
     assert "- Nuclei executed successfully." in verdict_text
     assert "- Continue regular patching and monitoring." in verdict_text
+    clean_record = get_user_findings(7103)[0]
+    assert clean_record["source"] == "nuclei"
+    assert clean_record["status"] == "clean"
+    assert clean_record["risk_level"] == "info"
+    assert clean_record["finding_count"] == 0
+    assert clean_record["summary"] == "No matching Nuclei findings were identified using the fast scan profile."
 
 
 def test_clean_nuclei_verdict_formatter_for_no_findings() -> None:
@@ -354,6 +377,30 @@ def test_clean_nuclei_verdict_formatter_for_no_findings() -> None:
     assert "Findings:\n0" in verdict_text
     assert "What this means:" in verdict_text
     assert "Recommended Actions:" in verdict_text
+
+
+def test_clean_nuclei_scan_record_appears_in_findings_view() -> None:
+    finding = store_clean_nuclei_scan(user_id=7108, target="hellosundaykids.com")
+
+    findings_text = build_findings_text([finding])
+
+    assert "Nuclei Fast Scan" in findings_text
+    assert "Target: hellosundaykids.com" in findings_text
+    assert "Result: Clean" in findings_text
+    assert "Findings: 0" in findings_text
+    assert "Risk Level: INFO" in findings_text
+
+
+def test_clean_nuclei_scan_detail_view() -> None:
+    finding = store_clean_nuclei_scan(user_id=7109, target="hellosundaykids.com")
+
+    detail_text = build_finding_detail_text(finding)
+
+    assert "Nuclei Fast Scan" in detail_text
+    assert "Result: Clean" in detail_text
+    assert "Findings: 0" in detail_text
+    assert "Risk Level: INFO" in detail_text
+    assert "No matching Nuclei findings were identified using the fast scan profile." in detail_text
 
 
 def test_nuclei_scan_runner_failure_message() -> None:
@@ -494,6 +541,107 @@ def test_home_clears_active_nuclei_scan_state() -> None:
     assert "Project Mongrel control panel" in home_message.reply_text.call_args.args[0]
     assert "Status:\nCancelled" in status_message.edit_text.call_args.args[0]
     assert len(scan_message.reply_text.call_args_list) == 1
+
+
+def test_status_edit_timeout_does_not_crash_updater(caplog) -> None:
+    clear_active_scan(7110)
+    set_active_scan(user_id=7110, scan_type="nuclei", target="example.com")
+    status_message = SimpleNamespace(edit_text=AsyncMock(side_effect=TimedOut("status timeout")))
+
+    async def fake_sleep(seconds: int) -> None:
+        assert seconds == NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS
+        if status_message.edit_text.await_count:
+            raise asyncio.CancelledError
+
+    async def run_flow() -> None:
+        with patch("app.bot.handlers.scan.asyncio.sleep", side_effect=fake_sleep):
+            await _update_nuclei_status_card(7110, status_message, "example.com", asyncio.get_running_loop().time())
+
+    asyncio.run(run_flow())
+    clear_active_scan(7110)
+
+    assert status_message.edit_text.await_count == 1
+    assert "Nuclei status card edit timed out" in caplog.text
+
+
+def test_final_status_edit_timeout_does_not_prevent_verdict_send() -> None:
+    clear_user_findings(7111)
+    clear_user_scan_requests(7111)
+    clear_active_scan(7111)
+    scan_request = create_scan_request(user_id=7111, scan_type="nuclei")
+    mark_scan_request_awaiting_target(user_id=7111, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock(side_effect=TimedOut("status timeout")))
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7111))
+
+    async def run_flow() -> None:
+        with patch(
+            "app.bot.handlers.scan.run_nuclei_scan",
+            return_value={"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0},
+        ):
+            await scan_target_handler(update, context)
+            active_scan = get_active_scan(7111)
+            assert active_scan is not None
+            assert active_scan.task is not None
+            await active_scan.task
+
+    asyncio.run(run_flow())
+
+    assert "Nuclei Verdict" in message.reply_text.call_args_list[1].args[0]
+    assert "Risk Level:\nINFO" in message.reply_text.call_args_list[1].args[0]
+
+
+def test_failed_status_edit_is_logged(caplog) -> None:
+    status_message = SimpleNamespace(edit_text=AsyncMock(side_effect=TimedOut("final timeout")))
+
+    async def run_flow() -> None:
+        await _finalize_nuclei_status(status_message, "example.com", "Complete", asyncio.get_running_loop().time())
+
+    asyncio.run(run_flow())
+
+    assert "Nuclei status card edit timed out" in caplog.text
+
+
+def test_nuclei_status_update_interval_is_15_seconds() -> None:
+    assert NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS == 15
+
+
+def test_cancel_clears_state_when_status_edit_fails() -> None:
+    clear_user_scan_requests(7112)
+    clear_active_scan(7112)
+    scan_request = create_scan_request(user_id=7112, scan_type="nuclei")
+    mark_scan_request_awaiting_target(user_id=7112, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock(side_effect=TimedOut("cancel timeout")))
+    scan_message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    cancel_message = SimpleNamespace(text="Cancel", reply_text=AsyncMock())
+
+    async def run_flow() -> None:
+        with patch(
+            "app.bot.handlers.scan.run_nuclei_scan",
+            side_effect=lambda target: (time.sleep(0.2) or {"success": True, "target": target, "output": "", "error": "", "returncode": 0}),
+        ):
+            await scan_target_handler(
+                SimpleNamespace(message=scan_message, effective_user=SimpleNamespace(id=7112)),
+                context,
+            )
+            active_scan = get_active_scan(7112)
+            assert active_scan is not None
+            assert active_scan.task is not None
+            await cancel_handler(
+                SimpleNamespace(message=cancel_message, effective_user=SimpleNamespace(id=7112)),
+                SimpleNamespace(),
+            )
+            try:
+                await active_scan.task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run_flow())
+
+    assert get_active_scan(7112) is None
+    assert cancel_message.reply_text.call_args.args[0] == "Nuclei scan cancelled."
 
 
 def test_nmap_result_text_uses_clean_parser_output() -> None:
@@ -673,6 +821,367 @@ def test_back_button_routes_to_findings_list() -> None:
 
     assert keyboard.inline_keyboard[0][0].text == "Back to Findings"
     assert keyboard.inline_keyboard[0][0].callback_data == "finding:list"
+
+
+def test_nmap_detail_includes_explain_with_mongrel_ai_button() -> None:
+    keyboard = build_finding_detail_keyboard("nmap-id")
+
+    assert keyboard.inline_keyboard[0][0].text == "Explain with Mongrel AI"
+    assert keyboard.inline_keyboard[0][0].callback_data == "explain:finding:nmap-id"
+    assert keyboard.inline_keyboard[1][0].callback_data == "finding:list"
+
+
+def test_nuclei_positive_detail_includes_explain_with_mongrel_ai_button() -> None:
+    keyboard = build_finding_detail_keyboard("nuclei-id")
+
+    assert keyboard.inline_keyboard[0][0].text == "Explain with Mongrel AI"
+    assert keyboard.inline_keyboard[0][0].callback_data == "explain:finding:nuclei-id"
+
+
+def test_clean_nuclei_detail_includes_explain_with_mongrel_ai_button() -> None:
+    keyboard = build_finding_detail_keyboard("clean-id")
+
+    assert keyboard.inline_keyboard[0][0].text == "Explain with Mongrel AI"
+    assert keyboard.inline_keyboard[0][0].callback_data == "explain:finding:clean-id"
+
+
+def test_nmap_finding_ai_prompt_includes_ports_services_and_guardrails() -> None:
+    prompt = build_finding_ai_prompt(
+        {
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "host_status": "Up",
+            "risk_level": "high",
+            "risk_notes": ["SSH exposed"],
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        }
+    )
+
+    assert prompt is not None
+    assert "22/tcp ssh" in prompt
+    assert "Target: 127.0.0.1" in prompt
+    assert "What this means" in prompt
+    assert "Highest priority risks" in prompt
+    assert "- Do not invent ports." in prompt
+    assert "- Do not invent services." in prompt
+    assert "- Do not reassign services to ports." in prompt
+    assert "- Accuracy is more important than completeness." in prompt
+
+
+def test_nuclei_finding_ai_prompt_includes_severity_findings_and_guardrails() -> None:
+    prompt = build_finding_ai_prompt(
+        {
+            "source": "nuclei",
+            "target": "https://example.com",
+            "risk_level": "high",
+            "finding_count": 1,
+            "severity_summary": {"high": 1},
+            "nuclei_findings": [
+                {
+                    "template_id": "git-config-exposure",
+                    "severity": "high",
+                    "name": "Exposed Git Repository",
+                    "host": "https://example.com",
+                }
+            ],
+        }
+    )
+
+    assert prompt is not None
+    assert "Exposed Git Repository" in prompt
+    assert "high: 1" in prompt
+    assert "What to verify first" in prompt
+    assert "Suggested remediation" in prompt
+    assert "- Do not invent CVEs." in prompt
+    assert "- Do not invent vulnerabilities." in prompt
+
+
+def test_clean_nuclei_ai_prompt_includes_clean_scan_context() -> None:
+    prompt = build_finding_ai_prompt(
+        {
+            "source": "nuclei",
+            "target": "hellosundaykids.com",
+            "status": "clean",
+            "risk_level": "info",
+            "finding_count": 0,
+            "summary": "No matching Nuclei findings were identified using the fast scan profile.",
+        }
+    )
+
+    assert prompt is not None
+    assert "clean Nuclei fast scan" in prompt
+    assert "Status: clean" in prompt
+    assert "Finding count: 0" in prompt
+    assert "What it does not prove" in prompt
+    assert "What to do next" in prompt
+
+
+def test_findings_explain_callback_returns_ai_response() -> None:
+    clear_user_findings(4010)
+    clear_finding_analysis_context(4010)
+    finding = add_finding(
+        user_id=4010,
+        finding={
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "host_status": "Up",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+            "risk_level": "medium",
+            "risk_notes": ["SSH exposed"],
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"explain:finding:{finding['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=4010))
+
+    with patch("app.bot.handlers.findings.ask_ai", return_value="Plain English finding explanation.") as ask_ai:
+        asyncio.run(findings_callback_handler(update, SimpleNamespace()))
+
+    prompt = ask_ai.call_args.args[0]
+    assert "Target: 127.0.0.1" in prompt
+    assert "22/tcp ssh" in prompt
+    assert query_message.reply_text.call_args_list[0].args[0] == "Mongrel is analyzing this finding..."
+    assert query_message.reply_text.call_args_list[1].args[0] == "Plain English finding explanation."
+    assert "Finding Analysis Mode" in query_message.reply_text.call_args_list[2].args[0]
+    assert get_finding_analysis_context(4010)["finding_id"] == finding["id"]
+
+
+def test_findings_explain_callback_handles_missing_finding() -> None:
+    clear_user_findings(4011)
+    query = SimpleNamespace(
+        data="explain:finding:missing",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=4011))
+
+    asyncio.run(findings_callback_handler(update, SimpleNamespace()))
+
+    query.edit_message_text.assert_called_once_with("Finding not found.")
+
+
+def test_findings_explain_callback_handles_ai_failure() -> None:
+    clear_user_findings(4012)
+    finding = add_finding(
+        user_id=4012,
+        finding={
+            "source": "nuclei",
+            "target": "https://example.com",
+            "risk_level": "high",
+            "finding_count": 1,
+            "severity_summary": {"high": 1},
+            "nuclei_findings": [{"template_id": "git-config-exposure", "severity": "high"}],
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"explain:finding:{finding['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=4012))
+
+    with patch("app.bot.handlers.findings.ask_ai", side_effect=RuntimeError("boom")):
+        asyncio.run(findings_callback_handler(update, SimpleNamespace()))
+
+    assert query_message.reply_text.call_args_list[0].args[0] == "Mongrel is analyzing this finding..."
+    assert query_message.reply_text.call_args_list[1].args[0] == "AI explanation failed. Check bot logs."
+
+
+def test_findings_explain_callback_handles_unsupported_source() -> None:
+    clear_user_findings(4013)
+    finding = add_finding(
+        user_id=4013,
+        finding={
+            "source": "bbot",
+            "target": "https://example.com",
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"explain:finding:{finding['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=4013))
+
+    asyncio.run(findings_callback_handler(update, SimpleNamespace()))
+
+    query_message.reply_text.assert_called_once_with("Unsupported finding source.")
+
+
+def test_finding_analysis_context_builder_stores_structured_data() -> None:
+    finding = {
+        "id": "finding-1",
+        "source": "nmap",
+        "target": "127.0.0.1",
+        "risk_level": "medium",
+        "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+    }
+
+    context = build_finding_analysis_context(finding)
+
+    assert context["finding_id"] == "finding-1"
+    assert context["source"] == "nmap"
+    assert context["target"] == "127.0.0.1"
+    assert "1 open port" in context["summary"]
+    assert context["finding"]["open_ports"][0]["service"] == "ssh"
+
+
+def test_finding_followup_prompt_contains_stored_finding_question_and_guardrails() -> None:
+    context = build_finding_analysis_context(
+        {
+            "id": "finding-2",
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "risk_level": "high",
+            "risk_notes": ["SSH exposed"],
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        }
+    )
+
+    prompt = build_finding_followup_ai_prompt(context, "Why is SSH important?")
+
+    assert "Finding ID: finding-2" in prompt
+    assert "Target: 127.0.0.1" in prompt
+    assert "22/tcp ssh" in prompt
+    assert "Latest user question:\nWhy is SSH important?" in prompt
+    assert "- Never invent scan results." in prompt
+    assert "- Never invent ports." in prompt
+    assert "- Never invent services." in prompt
+    assert "- Never invent CVEs." in prompt
+    assert "- Never invent vulnerabilities." in prompt
+    assert "- Base answers only on stored finding plus user question." in prompt
+    assert "- If information is unknown, explicitly say so." in prompt
+
+
+def test_finding_analysis_followup_question_routed_to_ai() -> None:
+    clear_finding_analysis_context(4014)
+    clear_ai_waiting(4014)
+    finding = {
+        "id": "finding-3",
+        "source": "nuclei",
+        "target": "https://example.com",
+        "risk_level": "high",
+        "finding_count": 1,
+        "severity_summary": {"high": 1},
+        "nuclei_findings": [{"template_id": "git-config-exposure", "severity": "high", "name": "Git exposed"}],
+    }
+    set_finding_analysis_context(4014, build_finding_analysis_context(finding))
+    message = SimpleNamespace(text="What should I verify first?", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=4014))
+
+    with patch("app.bot.handlers.scan.ask_ai", return_value="Verify the exposed Git path.") as ask_ai:
+        asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
+
+    prompt = ask_ai.call_args.args[0]
+    assert "Git exposed" in prompt
+    assert "What should I verify first?" in prompt
+    assert message.reply_text.call_args_list[0].args[0] == "Analyzing..."
+    assert message.reply_text.call_args_list[1].args[0] == "Verify the exposed Git path."
+    assert get_finding_analysis_context(4014) is not None
+
+
+def test_finding_analysis_has_priority_over_ask_mongrel() -> None:
+    clear_finding_analysis_context(4015)
+    clear_ai_waiting(4015)
+    set_finding_analysis_context(
+        4015,
+        build_finding_analysis_context(
+            {
+                "id": "finding-4",
+                "source": "nmap",
+                "target": "127.0.0.1",
+                "open_ports": [{"port": "445", "protocol": "tcp", "service": "microsoft-ds"}],
+            }
+        ),
+    )
+    set_ai_waiting(4015)
+    message = SimpleNamespace(text="Explain this risk.", reply_text=AsyncMock())
+
+    with patch("app.bot.handlers.scan.ask_ai", return_value="SMB explanation.") as ask_ai:
+        asyncio.run(
+            scan_target_handler(
+                SimpleNamespace(message=message, effective_user=SimpleNamespace(id=4015)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    assert "Stored finding context:" in ask_ai.call_args.args[0]
+    assert "445/tcp microsoft-ds" in ask_ai.call_args.args[0]
+
+
+def test_finding_analysis_home_exits_mode() -> None:
+    clear_finding_analysis_context(4016)
+    set_finding_analysis_context(4016, {"finding_id": "finding-5", "target": "127.0.0.1"})
+    message = SimpleNamespace(text="Home", reply_text=AsyncMock())
+
+    asyncio.run(home_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=4016)), SimpleNamespace()))
+
+    assert get_finding_analysis_context(4016) is None
+    assert message.reply_text.call_args_list[0].args[0] == "Exited Finding Analysis Mode."
+    assert "Project Mongrel control panel" in message.reply_text.call_args_list[1].args[0]
+
+
+def test_finding_analysis_cancel_exits_mode() -> None:
+    clear_finding_analysis_context(4017)
+    set_finding_analysis_context(4017, {"finding_id": "finding-6", "target": "127.0.0.1"})
+    message = SimpleNamespace(text="Cancel", reply_text=AsyncMock())
+
+    asyncio.run(cancel_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=4017)), SimpleNamespace()))
+
+    assert get_finding_analysis_context(4017) is None
+    assert message.reply_text.call_args.args[0] == "Exited Finding Analysis Mode."
+
+
+def test_ask_mongrel_still_works_after_finding_analysis_exit() -> None:
+    clear_finding_analysis_context(4018)
+    clear_ai_waiting(4018)
+    set_finding_analysis_context(4018, {"finding_id": "finding-7", "target": "127.0.0.1"})
+    asyncio.run(cancel_handler(SimpleNamespace(message=SimpleNamespace(text="Cancel", reply_text=AsyncMock()), effective_user=SimpleNamespace(id=4018)), SimpleNamespace()))
+    ask_message = SimpleNamespace(reply_text=AsyncMock())
+
+    asyncio.run(ask_handler(SimpleNamespace(message=ask_message, effective_user=SimpleNamespace(id=4018)), SimpleNamespace()))
+
+    assert get_finding_analysis_context(4018) is None
+    assert is_ai_waiting(4018) is True
+    assert ask_message.reply_text.call_args.args[0] == "Ask Mongrel anything. Cybersecurity is my specialty."
+
+
+def test_finding_analysis_ai_failure_keeps_mode_active() -> None:
+    clear_finding_analysis_context(4019)
+    set_finding_analysis_context(
+        4019,
+        build_finding_analysis_context(
+            {
+                "id": "finding-8",
+                "source": "nmap",
+                "target": "127.0.0.1",
+                "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+            }
+        ),
+    )
+    message = SimpleNamespace(text="How serious is this?", reply_text=AsyncMock())
+
+    with patch("app.bot.handlers.scan.ask_ai", side_effect=RuntimeError("boom")):
+        asyncio.run(
+            scan_target_handler(
+                SimpleNamespace(message=message, effective_user=SimpleNamespace(id=4019)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    assert message.reply_text.call_args_list[0].args[0] == "Analyzing..."
+    assert message.reply_text.call_args_list[1].args[0] == "AI request failed. Check bot logs."
+    assert get_finding_analysis_context(4019) is not None
 
 
 def test_max_5_findings_shown() -> None:
