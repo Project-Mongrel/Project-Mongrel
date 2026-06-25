@@ -1,5 +1,6 @@
 import logging
-import subprocess
+# Required to run authorized local Nmap subprocesses.
+import subprocess  # nosec B404
 
 from app.tools.target_normalizer import normalize_target
 
@@ -41,12 +42,14 @@ def run_nmap_scan(target: str) -> dict[str, object]:
     command = ["nmap", "-Pn", "-T3", validated_target]
 
     try:
-        completed_process = subprocess.run(
+        # Command uses explicit args list, shell=False, and a validated target.
+        completed_process = subprocess.run(  # nosec B603
             command,
             capture_output=True,
             text=True,
             timeout=NMAP_TIMEOUT_SECONDS,
             check=False,
+            shell=False,
         )
     except subprocess.TimeoutExpired as exc:
         return {

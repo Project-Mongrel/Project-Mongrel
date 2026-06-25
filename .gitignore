@@ -27,6 +27,7 @@ data/
 coverage/
 htmlcov/
 .pytest_cache/
+.pytest_tmp/
 
 # IDEs
 .vscode/
@@ -57,6 +58,7 @@ keys/
 
 # Security scans
 .bandit
+security_audit.txt
 
 # Temporary files
 *.tmp

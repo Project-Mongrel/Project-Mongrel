@@ -1,5 +1,6 @@
 import logging
-import subprocess
+# Required to run authorized local Nuclei subprocesses.
+import subprocess  # nosec B404
 import time
 
 from app.core.config import get_settings
@@ -52,7 +53,8 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
     )
 
     try:
-        completed_process = subprocess.run(
+        # Command uses explicit args list, shell=False, and a validated target.
+        completed_process = subprocess.run(  # nosec B603
             command,
             capture_output=True,
             text=True,

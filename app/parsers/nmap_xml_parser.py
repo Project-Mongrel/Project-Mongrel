@@ -1,10 +1,12 @@
-from xml.etree import ElementTree
+from defusedxml import ElementTree
+from defusedxml.common import DefusedXmlException
+from typing import Any
 
 
 def parse_nmap_xml(xml_content: str) -> dict:
     try:
         root = ElementTree.fromstring(xml_content)
-    except ElementTree.ParseError as exc:
+    except (ElementTree.ParseError, DefusedXmlException) as exc:
         raise ValueError("Unable to parse Nmap XML file.") from exc
 
     host = root.find("host")
@@ -24,7 +26,7 @@ def parse_nmap_xml(xml_content: str) -> dict:
     }
 
 
-def _extract_target(host: ElementTree.Element) -> str | None:
+def _extract_target(host: Any) -> str | None:
     address = host.find("address")
     if address is not None:
         return address.attrib.get("addr")
@@ -36,7 +38,7 @@ def _extract_target(host: ElementTree.Element) -> str | None:
     return None
 
 
-def _extract_host_status(host: ElementTree.Element) -> str | None:
+def _extract_host_status(host: Any) -> str | None:
     status = host.find("status")
     state = status.attrib.get("state") if status is not None else None
     if state == "up":
@@ -47,7 +49,7 @@ def _extract_host_status(host: ElementTree.Element) -> str | None:
     return state
 
 
-def _extract_open_ports(host: ElementTree.Element) -> list[dict[str, str]]:
+def _extract_open_ports(host: Any) -> list[dict[str, str]]:
     open_ports = []
     for port in host.findall("ports/port"):
         state = port.find("state")
@@ -69,7 +71,7 @@ def _extract_open_ports(host: ElementTree.Element) -> list[dict[str, str]]:
     return open_ports
 
 
-def _extract_duration(root: ElementTree.Element) -> str | None:
+def _extract_duration(root: Any) -> str | None:
     finished = root.find("runstats/finished")
     elapsed = finished.attrib.get("elapsed") if finished is not None else None
     if not elapsed:
@@ -78,7 +80,7 @@ def _extract_duration(root: ElementTree.Element) -> str | None:
     return f"{elapsed}s"
 
 
-def _extract_service_version(service: ElementTree.Element | None) -> str | None:
+def _extract_service_version(service: Any | None) -> str | None:
     if service is None:
         return None
 

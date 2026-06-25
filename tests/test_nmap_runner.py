@@ -29,6 +29,7 @@ def test_subprocess_called_with_list_args() -> None:
         text=True,
         timeout=NMAP_TIMEOUT_SECONDS,
         check=False,
+        shell=False,
     )
     assert result == {
         "target": "example.com",
@@ -51,6 +52,7 @@ def test_nmap_url_target_is_normalized_before_execution() -> None:
         text=True,
         timeout=NMAP_TIMEOUT_SECONDS,
         check=False,
+        shell=False,
     )
     assert result["target"] == "www.example.com"
 
