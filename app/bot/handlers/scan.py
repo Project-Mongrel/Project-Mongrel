@@ -9,6 +9,7 @@ from app.bot.handlers.home import build_home_text
 from app.bot.handlers.findings import build_finding_followup_ai_prompt
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
+from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
 from app.services.active_scan_state import (
@@ -24,6 +25,7 @@ from app.services.findings_store import add_finding, get_latest_user_finding_for
 from app.services.icon_helper import section_label
 from app.services.impact_engine import assess_change_impact
 from app.services.investigation_store import add_investigation_event, get_or_create_latest_open_investigation
+from app.services.observation_store import add_observations
 from app.services.risk_rules import assess_nmap_ports
 from app.services.scan_manager import (
     complete_scan_request,
@@ -36,6 +38,7 @@ from app.services.target_normalizer import normalize_target_key
 from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
+from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
 from app.tools.target_normalizer import normalize_target
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
@@ -60,6 +63,10 @@ def build_nmap_target_prompt() -> str:
 
 def build_nuclei_target_prompt() -> str:
     return "Nuclei scan request created. Send the authorized target URL or hostname to run the scan."
+
+
+def build_bbot_target_prompt() -> str:
+    return "BBOT recon request created. Send the authorized target hostname or domain to run the recon."
 
 
 def build_nmap_scan_started_text(target: str) -> str:
@@ -118,6 +125,73 @@ def build_clean_nuclei_verdict_text(target: str | None) -> str:
             "- Re-scan after major site, server, or plugin changes.",
             "- Consider a deeper scan profile if additional assurance is required.",
         ]
+    )
+
+
+def build_bbot_scan_started_text(target: str) -> str:
+    return "\n".join(["BBOT recon started.", "", "Target:", target])
+
+
+def build_bbot_result_text(result: dict[str, object], observation_counts: dict[str, int] | None = None) -> str:
+    status = "Complete" if result.get("success") is True else "Failed"
+    output = _truncate_bbot_output(str(result.get("output") or result.get("error") or "No output returned."))
+    counts = observation_counts or {}
+    return "\n".join(
+        [
+            section_label("bbot", "BBOT Recon"),
+            "",
+            "Target:",
+            str(result.get("target") or "unknown"),
+            "",
+            "Status:",
+            status,
+            "",
+            "Observations:",
+            f"- Subdomains: {counts.get('subdomain', 0)}",
+            f"- URLs: {counts.get('url', 0)}",
+            f"- IP Addresses: {counts.get('ip_address', 0)}",
+            f"- Emails: {counts.get('email', 0)}",
+            f"- Technologies: {counts.get('technology', 0)}",
+            f"- Raw Events: {counts.get('raw_event', 0)}",
+            "",
+            "Elapsed:",
+            f"{int(float(result.get('elapsed_seconds') or 0))}s",
+            "",
+            "Output:",
+            output,
+        ]
+    )
+
+
+def store_bbot_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
+    status = "completed" if result.get("success") is True else "failed"
+    observations = observations or []
+    observation_counts = summarize_observations(observations)
+    if result.get("success") is True:
+        summary = _build_bbot_summary(observation_counts)
+    else:
+        summary = str(result.get("error") or "BBOT recon failed.")
+    target = str(result.get("target") or "")
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "bbot",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "status": status,
+            "summary": summary,
+            "risk_level": "info",
+            "finding_count": len(observations),
+            "raw_output": str(result.get("output") or ""),
+            "observation_counts": observation_counts,
+            "metadata": {
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "output_dir": result.get("output_dir"),
+                "error": result.get("error"),
+                "observation_count": len(observations),
+            },
+        },
     )
 
 
@@ -334,6 +408,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_nuclei_target_prompt())
         return
 
+    if scan_type == "bbot":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_bbot_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -398,6 +478,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _handle_nuclei_target(update, context, user_id, scan_request_id)
         return
 
+    if scan_request.scan_type == "bbot":
+        await _handle_bbot_target(update, context, user_id, scan_request_id)
+        return
+
     if scan_request.scan_type != "nmap":
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
@@ -449,8 +533,117 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def _handle_bbot_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    target = update.message.text or ""
+    display_target = normalize_target(target) or target.strip()
+    if not is_bbot_available():
+        await update.message.reply_text("BBOT is not installed or not available on PATH.")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=display_target,
+        event_type="bbot_scan_started",
+        tool="bbot",
+        status="started",
+        summary="BBOT recon started",
+    )
+    await update.message.reply_text(build_bbot_scan_started_text(display_target))
+
+    try:
+        result = await asyncio.to_thread(run_bbot_scan, target)
+    except ValueError as exc:
+        add_investigation_event(
+            investigation_id=investigation["id"],
+            user_id=user_id,
+            target=display_target,
+            event_type="bbot_scan_failed",
+            tool="bbot",
+            status="failed",
+            summary="BBOT recon failed",
+        )
+        await update.message.reply_text(f"Invalid BBOT target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result["target"]),
+        result=result,
+    )
+    observations = []
+    if result.get("success") is True:
+        observations = normalize_bbot_output(
+            result.get("output"),
+            target=str(result.get("target") or display_target),
+            user_id=user_id,
+            investigation_id=investigation["id"],
+        )
+        add_observations(observations)
+    observation_counts = summarize_observations(observations)
+    finding = store_bbot_scan_result(user_id=user_id, result=result, observations=observations)
+    event_type = "bbot_scan_completed" if result.get("success") is True else "bbot_scan_failed"
+    observation_count = len(observations)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=str(result["target"]),
+        event_type=event_type,
+        tool="bbot",
+        status="completed" if result.get("success") is True else "failed",
+        summary=(
+            f"BBOT scan completed - {observation_count} observations extracted."
+            if result.get("success") is True
+            else "BBOT recon failed"
+        ),
+        metadata={"finding_id": finding.get("id"), "observation_count": observation_count},
+    )
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    await update.message.reply_text(build_bbot_result_text(result, observation_counts))
+
+
 def _is_finding_analysis_exit_message(text: str) -> bool:
     return text.strip().lower() in {"home", "cancel", "/home", "/cancel"}
+
+
+def _truncate_bbot_output(output: str, limit: int = 900) -> str:
+    normalized_output = output.strip()
+    if not normalized_output:
+        return "No output returned."
+    if len(normalized_output) <= limit:
+        return normalized_output
+    return f"{normalized_output[:limit].rstrip()}\n...[truncated]"
+
+
+def _build_bbot_summary(observation_counts: dict[str, int]) -> str:
+    total_observations = sum(observation_counts.values())
+    if total_observations == 0:
+        return "BBOT completed but no structured observations were extracted."
+
+    return "\n".join(
+        [
+            "BBOT recon completed.",
+            "Observations:",
+            f"- Subdomains: {observation_counts.get('subdomain', 0)}",
+            f"- URLs: {observation_counts.get('url', 0)}",
+            f"- IP Addresses: {observation_counts.get('ip_address', 0)}",
+            f"- Emails: {observation_counts.get('email', 0)}",
+            f"- Technologies: {observation_counts.get('technology', 0)}",
+            f"- Raw Events: {observation_counts.get('raw_event', 0)}",
+        ]
+    )
 
 
 async def _handle_nuclei_target(

@@ -580,6 +580,7 @@ def _source_label(source: object) -> str:
         "nmap": "Nmap",
         "nmap_xml": "Nmap XML Upload",
         "nuclei": "Nuclei",
+        "bbot": "BBOT",
     }
     return labels.get(str(source), str(source or "Unknown"))
 

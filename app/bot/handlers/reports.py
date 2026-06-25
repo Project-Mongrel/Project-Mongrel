@@ -597,6 +597,9 @@ def _format_event_label(event: dict) -> str:
         "nmap_scan_completed": icon_label("nmap", "Nmap Scan Completed"),
         "nuclei_scan_started": icon_label("nuclei", "Nuclei Scan Started"),
         "nuclei_scan_completed": icon_label("nuclei", "Nuclei Scan Completed"),
+        "bbot_scan_started": icon_label("bbot", "BBOT Recon Started"),
+        "bbot_scan_completed": icon_label("bbot", "BBOT Recon Completed"),
+        "bbot_scan_failed": icon_label("bbot", "BBOT Recon Failed"),
         "report_generated": icon_label("report", "Security Report Generated"),
         "ai_report_generated": icon_label("mongrel_ai", "Executive Assessment Generated"),
     }

@@ -35,6 +35,8 @@ from app.bot.handlers.scan import (
     _finalize_nuclei_status,
     _update_nuclei_status_card,
     append_change_summary,
+    build_bbot_result_text,
+    build_bbot_target_prompt,
     build_clean_nuclei_verdict_text,
     build_nuclei_status_card,
     build_nuclei_target_prompt,
@@ -46,6 +48,7 @@ from app.bot.handlers.scan import (
     scan_handler,
     scan_target_handler,
     store_clean_nuclei_scan,
+    store_bbot_scan_result,
     store_successful_nmap_finding,
 )
 from app.bot.handlers.settings import build_settings_text
@@ -86,6 +89,7 @@ from app.services.investigation_store import (
     get_investigation_events,
     get_user_investigations,
 )
+from app.services.observation_store import clear_user_observations, get_investigation_observations, get_user_observations
 from app.services.chat_state import (
     clear_ai_waiting,
     clear_finding_analysis_context,
@@ -682,6 +686,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
 
     assert "Nmap Scan" in rendered_buttons
     assert "Nuclei Scan" in rendered_buttons
+    assert "BBOT Recon" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -694,6 +699,195 @@ def test_nuclei_scan_callback_prompts_for_target() -> None:
 
     assert query.edit_message_text.call_args.args[0] == build_nuclei_target_prompt()
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_bbot_scan_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7201)
+    query = SimpleNamespace(data="scan:bbot", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7201))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_bbot_target_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
+    clear_user_findings(7202)
+    clear_user_investigations(7202)
+    clear_user_observations(7202)
+    clear_user_scan_requests(7202)
+    scan_request = create_scan_request(user_id=7202, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7202, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7202))
+    result = {
+        "success": True,
+        "target": "example.com",
+        "output": "Found app.example.com and https://api.example.com/login",
+        "error": "",
+        "returncode": 0,
+        "elapsed_seconds": 3.4,
+        "output_dir": "data/bbot/example.com",
+    }
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch("app.bot.handlers.scan.run_bbot_scan", return_value=result) as run_bbot_scan,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    run_bbot_scan.assert_called_once_with("https://example.com")
+    assert message.reply_text.call_args_list[0].args[0] == "BBOT recon started.\n\nTarget:\nexample.com"
+    assert "BBOT Recon" in message.reply_text.call_args_list[1].args[0]
+    assert "Status:\nComplete" in message.reply_text.call_args_list[1].args[0]
+    assert "Observations:" in message.reply_text.call_args_list[1].args[0]
+    assert "- Subdomains:" in message.reply_text.call_args_list[1].args[0]
+    assert "- URLs: 1" in message.reply_text.call_args_list[1].args[0]
+    findings = get_user_findings(7202)
+    assert findings[0]["source"] == "bbot"
+    assert findings[0]["target"] == "example.com"
+    assert findings[0]["target_key"] == "example.com"
+    assert findings[0]["status"] == "completed"
+    assert findings[0]["risk_level"] == "info"
+    assert findings[0]["finding_count"] >= 2
+    assert "Observations:" in findings[0]["summary"]
+    investigation = get_user_investigations(7202)[0]
+    events = get_investigation_events(investigation["id"], 7202)
+    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_completed"]
+    assert "observations extracted" in events[-1]["summary"]
+    observations = get_investigation_observations(investigation["id"], 7202)
+    assert observations
+    assert get_user_observations(7202) == observations
+    assert context.user_data == {}
+
+
+def test_bbot_scan_missing_binary_does_not_crash() -> None:
+    clear_user_scan_requests(7203)
+    scan_request = create_scan_request(user_id=7203, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7203, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7203))
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=False),
+        patch("app.bot.handlers.scan.run_bbot_scan") as run_bbot_scan,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    run_bbot_scan.assert_not_called()
+    message.reply_text.assert_called_once_with("BBOT is not installed or not available on PATH.")
+    assert context.user_data == {}
+
+
+def test_bbot_scan_failure_creates_failed_event_and_stores_result() -> None:
+    clear_user_findings(7204)
+    clear_user_investigations(7204)
+    clear_user_scan_requests(7204)
+    scan_request = create_scan_request(user_id=7204, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7204, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7204))
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": False,
+                "target": "example.com",
+                "output": "",
+                "error": "BBOT recon failed.",
+                "returncode": 1,
+                "elapsed_seconds": 2,
+            },
+        ),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    assert "Status:\nFailed" in message.reply_text.call_args_list[1].args[0]
+    finding = get_user_findings(7204)[0]
+    assert finding["source"] == "bbot"
+    assert finding["status"] == "failed"
+    assert finding["summary"] == "BBOT recon failed."
+    investigation = get_user_investigations(7204)[0]
+    events = get_investigation_events(investigation["id"], 7204)
+    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_failed"]
+
+
+def test_bbot_scan_zero_observations_handled_cleanly() -> None:
+    clear_user_findings(7206)
+    clear_user_investigations(7206)
+    clear_user_observations(7206)
+    clear_user_scan_requests(7206)
+    scan_request = create_scan_request(user_id=7206, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7206, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7206))
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": True,
+                "target": "example.com",
+                "output": "scan complete",
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 1,
+            },
+        ),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    assert "Subdomains: 0" in message.reply_text.call_args_list[1].args[0]
+    finding = get_user_findings(7206)[0]
+    assert finding["summary"] == "BBOT completed but no structured observations were extracted."
+    assert get_user_observations(7206) == []
+
+
+def test_bbot_scan_result_formatter_truncates_output() -> None:
+    text = build_bbot_result_text(
+        {
+            "success": True,
+            "target": "example.com",
+            "output": "A" * 1000,
+            "elapsed_seconds": 1,
+        }
+    )
+
+    assert "BBOT Recon" in text
+    assert "...[truncated]" in text
+
+
+def test_store_bbot_scan_result_persists_minimal_history() -> None:
+    clear_user_findings(7205)
+    finding = store_bbot_scan_result(
+        user_id=7205,
+        result={
+            "success": True,
+            "target": "example.com",
+            "output": "bbot output",
+            "error": "",
+            "returncode": 0,
+            "elapsed_seconds": 1.2,
+            "output_dir": "data/bbot/example.com",
+        },
+    )
+
+    assert finding["source"] == "bbot"
+    assert finding["target"] == "example.com"
+    assert finding["status"] == "completed"
+    assert finding["summary"] == "BBOT completed but no structured observations were extracted."
+    assert finding["risk_level"] == "info"
+    assert finding["finding_count"] == 0
+    assert finding["raw_output"] == "bbot output"
 
 
 def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:

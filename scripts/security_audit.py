@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 # Required to run local audit tools with explicit arg lists.
@@ -15,7 +16,7 @@ from typing import Callable, Sequence
 STATUS_PASS = "PASS"  # nosec B105
 STATUS_FAIL = "FAIL"
 STATUS_SKIPPED = "SKIPPED"
-PYTEST_BASETEMP = str(Path(".pytest_tmp") / "security_audit")
+PYTEST_BASETEMP = f".pytest_tmp_security_audit_{os.getpid()}"
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,7 @@ def is_tool_installed(check: AuditCheck) -> bool:
 
 def prepare_check(check: AuditCheck) -> None:
     if check.name == "Tests":
-        Path(".pytest_tmp").mkdir(exist_ok=True)
+        Path(PYTEST_BASETEMP).mkdir(exist_ok=True)
 
 
 def run_check(
