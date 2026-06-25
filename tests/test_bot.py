@@ -228,7 +228,10 @@ def test_ai_report_generation_from_telegram() -> None:
     with patch("app.services.report_generator.ask_ai", return_value="AI assessment: high risk."):
         asyncio.run(reports_callback_handler(update, SimpleNamespace()))
 
-    query.edit_message_text.assert_called_once_with("Generating report...")
+    edited_messages = [call.args[0] for call in query.edit_message_text.call_args_list]
+    assert "Generating AI report /" in edited_messages
+    assert any(message in edited_messages for message in {"Collecting scan history -", "Building deterministic report \\", "Asking Mongrel AI |"})
+    assert edited_messages[-1] == "AI report ready."
     report_text = query_message.reply_text.call_args.args[0]
     assert "## Executive Assessment" in report_text
     assert "AI assessment: high risk." in report_text
@@ -237,6 +240,65 @@ def test_ai_report_generation_from_telegram() -> None:
     assert reports[0]["report_type"] == "ai_assessment"
     assert reports[0]["title"] == "Executive Assessment Report"
     assert reports[0]["overall_risk"] == "high"
+
+
+def test_ai_report_failure_updates_status_and_sends_fallback_report() -> None:
+    clear_user_findings(9110)
+    clear_user_reports(9110)
+    add_finding(
+        user_id=9110,
+        finding={
+            "source": "nuclei",
+            "target": "example.com",
+            "risk_level": "high",
+            "finding_count": 1,
+            "nuclei_findings": [{"template_id": "git-config-exposure", "severity": "high"}],
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(data="report:latest_ai", answer=AsyncMock(), edit_message_text=AsyncMock(), message=query_message)
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9110))
+
+    with patch("app.services.report_generator.ask_ai", side_effect=TimeoutError("timeout")):
+        asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    edited_messages = [call.args[0] for call in query.edit_message_text.call_args_list]
+    assert "Generating AI report /" in edited_messages
+    assert edited_messages[-1] == "AI unavailable. Sending deterministic report with fallback note."
+    report_text = query_message.reply_text.call_args.args[0]
+    assert "## Executive Assessment" in report_text
+    assert "AI assessment unavailable: timeout" in report_text
+    assert "git-config-exposure" in report_text
+
+
+def test_ai_report_progress_edit_failures_do_not_break_generation() -> None:
+    clear_user_findings(9111)
+    clear_user_reports(9111)
+    add_finding(
+        user_id=9111,
+        finding={
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "risk_level": "medium",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data="report:latest_ai",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(side_effect=TimedOut("telegram timeout")),
+        message=query_message,
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9111))
+
+    with patch("app.services.report_generator.ask_ai", return_value="SSH should be hardened."):
+        asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    assert query.edit_message_text.await_count >= 2
+    report_text = query_message.reply_text.call_args.args[0]
+    assert "## Executive Assessment" in report_text
+    assert "SSH should be hardened." in report_text
 
 
 def test_target_specific_report_generation_from_telegram() -> None:

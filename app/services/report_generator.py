@@ -23,6 +23,7 @@ def generate_markdown_report(
     include_ai_assessment: bool = False,
     report_id: str | None = None,
     investigation_name: str | None = None,
+    ai_assessment_lines: list[str] | None = None,
 ) -> str:
     scan_runs = _filter_scan_runs(get_user_scan_runs(user_id), target)
     report_target = target or _infer_report_target(scan_runs)
@@ -69,7 +70,7 @@ def generate_markdown_report(
         *_format_recommendations(scan_runs),
     ]
     if include_ai_assessment:
-        lines.extend(["", "## Executive Assessment", *_format_ai_assessment(scan_runs, report_target)])
+        lines.extend(["", "## Executive Assessment", *(ai_assessment_lines or format_report_ai_assessment(scan_runs, report_target))])
 
     lines.extend(["", "## Appendix / Scan History", *_format_scan_history(scan_runs)])
     return "\n".join(lines)
@@ -149,7 +150,7 @@ def generate_report_id(existing_report_count: int = 0, generated_at: datetime | 
     return f"PM-{timestamp.astimezone(UTC):%Y%m%d}-{existing_report_count + 1:04d}"
 
 
-def _format_ai_assessment(scan_runs: list[dict], target: str | None) -> list[str]:
+def format_report_ai_assessment(scan_runs: list[dict], target: str | None) -> list[str]:
     if not scan_runs:
         return ["AI assessment unavailable: no scan history is available."]
 

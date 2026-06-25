@@ -1,15 +1,33 @@
+import asyncio
+import logging
 from datetime import UTC, datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_report_metadata, get_user_report, get_user_reports, get_user_scan_runs
-from app.services.report_generator import build_report_metadata, generate_markdown_report, generate_report_id
+from app.services.report_generator import (
+    build_report_metadata,
+    format_report_ai_assessment,
+    generate_markdown_report,
+    generate_report_id,
+)
 from app.services.target_normalizer import normalize_target_key
 
 MAX_REPORT_MESSAGE_LENGTH = 3800
+AI_REPORT_PROGRESS_INTERVAL_SECONDS = 1.75
+AI_REPORT_PROGRESS_FRAMES = [
+    "Generating AI report /",
+    "Collecting scan history -",
+    "Building deterministic report \\",
+    "Asking Mongrel AI |",
+    "Writing Executive Assessment /",
+    "Finalising report -",
+]
+logger = logging.getLogger(__name__)
 
 
 def build_reports_text(scan_runs: list[dict] | None = None) -> str:
@@ -227,11 +245,16 @@ async def _send_report_from_callback(
 
     report_scan_runs = _scan_runs_for_target(scan_runs, target)
     report_id = generate_report_id(existing_report_count=len(get_user_reports(user_id)))
+    ai_assessment_lines = None
+    if include_ai_assessment and query.message is not None:
+        ai_assessment_lines = await _build_ai_report_assessment_with_progress(query, report_scan_runs, target)
+
     report = generate_markdown_report(
         user_id=user_id,
         target=target,
         include_ai_assessment=include_ai_assessment,
         report_id=report_id,
+        ai_assessment_lines=ai_assessment_lines,
     )
     add_report_metadata(
         user_id,
@@ -246,9 +269,66 @@ async def _send_report_from_callback(
         await query.edit_message_text(_truncate_message(report))
         return
 
-    await query.edit_message_text("Generating report...")
+    if include_ai_assessment:
+        await _safe_edit_report_status(
+            query,
+            "AI unavailable. Sending deterministic report with fallback note."
+            if _ai_assessment_unavailable(ai_assessment_lines)
+            else "AI report ready.",
+        )
+    else:
+        await query.edit_message_text("Generating report...")
     for chunk in split_report_text(report):
         await query.message.reply_text(chunk)
+
+
+async def _build_ai_report_assessment_with_progress(
+    query: object,
+    scan_runs: list[dict],
+    target: str | None,
+) -> list[str]:
+    await _safe_edit_report_status(query, AI_REPORT_PROGRESS_FRAMES[0])
+    stop_event = asyncio.Event()
+    progress_task = asyncio.create_task(_run_ai_report_progress(query, stop_event))
+    try:
+        return await asyncio.to_thread(format_report_ai_assessment, scan_runs, target)
+    finally:
+        stop_event.set()
+        await progress_task
+
+
+async def _run_ai_report_progress(query: object, stop_event: asyncio.Event) -> None:
+    frame_index = 1
+    while not stop_event.is_set():
+        await _safe_edit_report_status(query, AI_REPORT_PROGRESS_FRAMES[frame_index % len(AI_REPORT_PROGRESS_FRAMES)])
+        frame_index += 1
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=AI_REPORT_PROGRESS_INTERVAL_SECONDS)
+        except TimeoutError:
+            continue
+
+
+async def _safe_edit_report_status(query: object, text: str) -> None:
+    edit_message_text = getattr(query, "edit_message_text", None)
+    if edit_message_text is None:
+        return
+
+    try:
+        await edit_message_text(text)
+    except RetryAfter as exc:
+        logger.warning("Report progress edit was rate limited: %s", exc)
+    except TimedOut as exc:
+        logger.warning("Report progress edit timed out: %s", exc)
+    except NetworkError as exc:
+        logger.warning("Report progress edit failed due to Telegram network error: %s", exc)
+    except BadRequest as exc:
+        logger.warning("Report progress edit was rejected by Telegram: %s", exc)
+    except Exception:
+        logger.warning("Report progress edit failed unexpectedly.", exc_info=True)
+
+
+def _ai_assessment_unavailable(ai_assessment_lines: list[str] | None) -> bool:
+    return any(str(line).startswith("AI assessment unavailable:") for line in (ai_assessment_lines or []))
 
 
 def _extract_targets(scan_runs: list[dict]) -> list[str]:
