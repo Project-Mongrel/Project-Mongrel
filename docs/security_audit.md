@@ -1,64 +1,42 @@
 # Security Audit
 
-Project Mongrel includes a local security audit command for release checks. The
-default audit is the normal release check and avoids slower Semgrep scans.
+The security audit command provides a repeatable local release check for Project Mongrel. It combines tests, static analysis, dependency vulnerability review, and secret detection into a single command.
 
-## Install Tools
-
-The audit runs installed tools and skips missing tools cleanly.
-
-```powershell
-.venv\Scripts\python -m pip install pytest bandit pip-audit detect-secrets
-.venv\Scripts\python -m pip install semgrep
-```
-
-`gitleaks` is optional and is installed separately from the project. See the
-official gitleaks releases for platform-specific installation instructions.
-
-## Run Audit
+## Run
 
 From the project root:
 
 ```powershell
-.venv\Scripts\python scripts\security_audit.py
+python scripts/security_audit.py
 ```
 
-Run the slower full audit when you explicitly want Semgrep included:
+The default audit is the normal release check.
+
+For a slower deeper scan that includes Semgrep:
 
 ```powershell
-.venv\Scripts\python scripts\security_audit.py --full
+python scripts/security_audit.py --full
 ```
 
-## Checks
+## Default Checks
 
-- `pytest`: runs the automated test suite with `python -m pytest --basetemp .pytest_tmp`.
-- `bandit`: scans `app` and `scripts` for common insecure coding patterns.
+- `pytest`: runs the automated test suite.
+- `Bandit`: scans application and script code for common Python security issues.
 - `pip-audit`: checks installed Python dependencies for known vulnerabilities.
-- `detect-secrets`: scans for likely secrets when installed.
-- `semgrep`: runs Semgrep's automatic rules with `semgrep scan --config auto`
-  only when `--full` is passed.
+- `detect-secrets`: scans the repository for likely secrets.
 
-Each check has a timeout so the audit does not hang indefinitely:
+## Optional Deeper Scan
 
-- `pytest`: 180 seconds.
-- `bandit`: 120 seconds.
-- `pip-audit`: 180 seconds.
-- `detect-secrets`: 120 seconds.
-- `semgrep`: 180 seconds in `--full` mode.
+Semgrep is available through `--full`. It runs broader static analysis rules and can take longer than the default release audit.
 
 ## Results
 
-- `PASS`: the tool ran and returned a successful exit code.
-- `FAIL`: the tool ran and returned a non-zero exit code. Review the displayed
-  output or error text before release.
-- `SKIPPED`: the tool was not installed. Install the tool from the shown hint if
-  the check is required for the release.
+- `PASS`: the check ran successfully.
+- `FAIL`: the check ran and returned a non-zero exit code. Review the displayed output before release.
+- `SKIPPED`: the tool is not installed. Install the tool or explicitly accept the skip according to release policy.
 
-The final summary is `FAIL` if any installed check fails. Missing tools are
-reported as `SKIPPED` and do not crash the audit command.
+The final summary is `FAIL` if any installed check fails.
 
 ## Authorization
 
-External scanning must only be run against systems you own or have explicit
-authorization to assess. Do not use Project Mongrel security tooling against
-third-party systems without written permission.
+External scans and security tools must only target systems owned by the operator or systems where explicit authorization has been granted. Project Mongrel must not be used to assess third-party systems without permission.
