@@ -9,6 +9,14 @@ from telegram.ext import ContextTypes
 from app.bot.keyboards import build_main_menu_keyboard
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_report_metadata, get_user_report, get_user_reports, get_user_scan_runs
+from app.services.investigation_store import (
+    add_investigation_event,
+    get_investigation,
+    get_investigation_events,
+    get_latest_investigation_for_target,
+    get_or_create_latest_open_investigation,
+    get_user_investigations,
+)
 from app.services.report_generator import (
     build_report_metadata,
     format_report_ai_assessment,
@@ -49,6 +57,8 @@ def build_reports_keyboard(scan_runs: list[dict] | None = None) -> InlineKeyboar
         [InlineKeyboardButton("Generate Report with AI Assessment", callback_data="report:latest_ai")],
         [InlineKeyboardButton("Reports by Target", callback_data="report:targets")],
         [InlineKeyboardButton("Previous Reports / History", callback_data="report:history")],
+        [InlineKeyboardButton("Investigations", callback_data="report:investigations")],
+        [InlineKeyboardButton("Latest Investigation", callback_data="report:latest_investigation")],
         [InlineKeyboardButton("Back/Home", callback_data="report:home")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -128,6 +138,71 @@ def build_report_metadata_detail_text(report: dict | None) -> str:
     )
 
 
+def build_investigations_text(investigations: list[dict]) -> str:
+    if not investigations:
+        return "No investigations available yet."
+
+    lines = ["Investigations", ""]
+    for investigation in reversed(investigations[-10:]):
+        lines.extend(
+            [
+                _format_investigation_date(investigation),
+                str(investigation.get("name") or "Unnamed investigation"),
+                f"Target: {investigation.get('target') or 'unknown'}",
+                f"Risk: {str(investigation.get('overall_risk') or 'unknown').upper()}",
+                f"Status: {_title_status(investigation.get('status'))}",
+                "",
+            ]
+        )
+    return _truncate_message("\n".join(lines).strip())
+
+
+def build_investigations_keyboard(investigations: list[dict]) -> InlineKeyboardMarkup:
+    buttons = []
+    for index, investigation in enumerate(reversed(investigations[-10:]), start=1):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Timeline {index}",
+                    callback_data=f"report:investigation:{investigation.get('id')}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("Back to Reports", callback_data="report:menu")])
+    buttons.append([InlineKeyboardButton("Back/Home", callback_data="report:home")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_investigation_timeline_text(investigation: dict | None, events: list[dict]) -> str:
+    if investigation is None:
+        return "Investigation not found."
+
+    lines = [
+        "Investigation Timeline",
+        "",
+        "Investigation:",
+        str(investigation.get("name") or "Unnamed investigation"),
+        "",
+        "Target:",
+        str(investigation.get("target") or "unknown"),
+        "",
+    ]
+    if not events:
+        lines.append("No timeline events recorded yet.")
+        return "\n".join(lines)
+
+    current_date = None
+    for event in events:
+        timestamp = event.get("created_at")
+        event_date = _format_event_date(timestamp)
+        if event_date != current_date:
+            current_date = event_date
+            lines.extend([event_date, ""])
+        lines.append(f"{_format_event_time(timestamp)} {_format_event_label(event)}")
+
+    return _truncate_message("\n".join(lines).strip())
+
+
 def split_report_text(report: str, max_length: int = MAX_REPORT_MESSAGE_LENGTH) -> list[str]:
     if len(report) <= max_length:
         return [report]
@@ -176,6 +251,7 @@ async def reports_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
     scan_runs = get_user_scan_runs(user_id)
     reports = get_user_reports(user_id)
+    investigations = get_user_investigations(user_id)
     data = query.data or ""
 
     if data in {"report:menu"}:
@@ -221,6 +297,36 @@ async def reports_callback_handler(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
+    if data == "report:investigations":
+        await query.edit_message_text(
+            build_investigations_text(investigations),
+            reply_markup=build_investigations_keyboard(investigations) if investigations else build_reports_keyboard(scan_runs),
+        )
+        return
+
+    if data == "report:latest_investigation":
+        latest_investigation = investigations[-1] if investigations else None
+        await query.edit_message_text(
+            build_investigation_timeline_text(
+                latest_investigation,
+                get_investigation_events(latest_investigation["id"], user_id) if latest_investigation else [],
+            ),
+            reply_markup=build_investigations_keyboard(investigations) if investigations else build_reports_keyboard(scan_runs),
+        )
+        return
+
+    if data.startswith("report:investigation:"):
+        investigation_id = data.removeprefix("report:investigation:")
+        investigation = get_investigation(investigation_id, user_id)
+        await query.edit_message_text(
+            build_investigation_timeline_text(
+                investigation,
+                get_investigation_events(investigation_id, user_id) if investigation else [],
+            ),
+            reply_markup=build_investigations_keyboard(investigations) if investigations else build_reports_keyboard(scan_runs),
+        )
+        return
+
     if data.startswith("report:history:"):
         report_id = data.removeprefix("report:history:")
         await query.edit_message_text(
@@ -256,7 +362,7 @@ async def _send_report_from_callback(
         report_id=report_id,
         ai_assessment_lines=ai_assessment_lines,
     )
-    add_report_metadata(
+    report_metadata = add_report_metadata(
         user_id,
         build_report_metadata(
             report_scan_runs,
@@ -264,6 +370,13 @@ async def _send_report_from_callback(
             include_ai_assessment=include_ai_assessment,
             report_id=report_id,
         ),
+    )
+    _record_report_investigation_event(
+        user_id=user_id,
+        target=target,
+        report_scan_runs=report_scan_runs,
+        report_metadata=report_metadata,
+        include_ai_assessment=include_ai_assessment,
     )
     if query.message is None:
         await query.edit_message_text(_truncate_message(report))
@@ -331,6 +444,30 @@ def _ai_assessment_unavailable(ai_assessment_lines: list[str] | None) -> bool:
     return any(str(line).startswith("AI assessment unavailable:") for line in (ai_assessment_lines or []))
 
 
+def _record_report_investigation_event(
+    user_id: int,
+    target: str | None,
+    report_scan_runs: list[dict],
+    report_metadata: dict,
+    include_ai_assessment: bool,
+) -> None:
+    event_target = target or _infer_event_target(report_scan_runs)
+    investigation = get_latest_investigation_for_target(user_id, event_target) if event_target else None
+    if investigation is None:
+        investigation = get_or_create_latest_open_investigation(user_id=user_id, target=event_target or "Multiple targets")
+
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=event_target or "Multiple targets",
+        event_type="ai_report_generated" if include_ai_assessment else "report_generated",
+        tool="report",
+        status="completed",
+        summary="AI report generated" if include_ai_assessment else "Report generated",
+        metadata={"report_id": report_metadata.get("id"), "readable_report_id": report_metadata.get("report_id")},
+    )
+
+
 def _extract_targets(scan_runs: list[dict]) -> list[str]:
     targets_by_key = {}
     for scan_run in scan_runs:
@@ -341,6 +478,15 @@ def _extract_targets(scan_runs: list[dict]) -> list[str]:
         targets_by_key.setdefault(target_key, str(target_key if _target_contains_key(str(target), str(target_key)) else target))
 
     return sorted(targets_by_key.values())
+
+
+def _infer_event_target(scan_runs: list[dict]) -> str | None:
+    targets = _extract_targets(scan_runs)
+    if len(targets) == 1:
+        return targets[0]
+    if len(targets) > 1:
+        return "Multiple targets"
+    return None
 
 
 def _scan_runs_for_target(scan_runs: list[dict], target: str | None) -> list[dict]:
@@ -369,6 +515,59 @@ def _format_report_timestamp(report: dict) -> str:
             return timestamp
 
     return str(timestamp or "unknown")
+
+
+def _format_investigation_date(investigation: dict) -> str:
+    timestamp = investigation.get("started_at")
+    if hasattr(timestamp, "strftime"):
+        return timestamp.astimezone(UTC).strftime("%d %b %Y")
+    if isinstance(timestamp, str):
+        try:
+            return datetime.fromisoformat(timestamp).astimezone(UTC).strftime("%d %b %Y")
+        except ValueError:
+            return timestamp
+
+    return "unknown date"
+
+
+def _format_event_date(timestamp: object) -> str:
+    if hasattr(timestamp, "strftime"):
+        return timestamp.astimezone(UTC).strftime("%d %b %Y")
+    if isinstance(timestamp, str):
+        try:
+            return datetime.fromisoformat(timestamp).astimezone(UTC).strftime("%d %b %Y")
+        except ValueError:
+            return timestamp
+
+    return "unknown date"
+
+
+def _format_event_time(timestamp: object) -> str:
+    if hasattr(timestamp, "strftime"):
+        return timestamp.astimezone(UTC).strftime("%H:%M")
+    if isinstance(timestamp, str):
+        try:
+            return datetime.fromisoformat(timestamp).astimezone(UTC).strftime("%H:%M")
+        except ValueError:
+            return "??:??"
+
+    return "??:??"
+
+
+def _format_event_label(event: dict) -> str:
+    labels = {
+        "nmap_scan_started": "Nmap scan started",
+        "nmap_scan_completed": "Nmap scan completed",
+        "nuclei_scan_started": "Nuclei scan started",
+        "nuclei_scan_completed": "Nuclei scan completed",
+        "report_generated": "Report generated",
+        "ai_report_generated": "AI report generated",
+    }
+    return labels.get(str(event.get("event_type")), str(event.get("summary") or event.get("event_type") or "Timeline event"))
+
+
+def _title_status(status: object) -> str:
+    return str(status or "unknown").capitalize()
 
 
 def _format_report_type(report: dict) -> str:

@@ -21,6 +21,8 @@ from app.bot.handlers.findings import (
 )
 from app.bot.handlers.home import build_home_text, home_handler
 from app.bot.handlers.reports import (
+    build_investigation_timeline_text,
+    build_investigations_text,
     build_reports_keyboard,
     build_reports_text,
     reports_callback_handler,
@@ -76,6 +78,13 @@ from app.services.findings_store import (
     clear_user_reports,
     get_user_findings,
     get_user_reports,
+)
+from app.services.investigation_store import (
+    add_investigation_event,
+    clear_user_investigations,
+    create_investigation,
+    get_investigation_events,
+    get_user_investigations,
 )
 from app.services.chat_state import (
     clear_ai_waiting,
@@ -144,6 +153,8 @@ def test_reports_menu_renders() -> None:
     assert "Generate Report with AI Assessment" in rendered_buttons
     assert "Reports by Target" in rendered_buttons
     assert "Previous Reports / History" in rendered_buttons
+    assert "Investigations" in rendered_buttons
+    assert "Latest Investigation" in rendered_buttons
     assert "Back/Home" in rendered_buttons
 
 
@@ -163,6 +174,7 @@ def test_reports_handler_sends_menu() -> None:
 def test_latest_report_generation_from_telegram() -> None:
     clear_user_findings(9102)
     clear_user_reports(9102)
+    clear_user_investigations(9102)
     add_finding(
         user_id=9102,
         finding={
@@ -190,6 +202,9 @@ def test_latest_report_generation_from_telegram() -> None:
     assert reports[0]["report_id"].startswith("PM-")
     assert reports[0]["target"] == "127.0.0.1"
     assert reports[0]["overall_risk"] == "medium"
+    investigation = get_user_investigations(9102)[0]
+    events = get_investigation_events(investigation["id"], 9102)
+    assert events[-1]["event_type"] == "report_generated"
 
 
 def test_report_empty_history_handling() -> None:
@@ -211,6 +226,7 @@ def test_report_empty_history_handling() -> None:
 def test_ai_report_generation_from_telegram() -> None:
     clear_user_findings(9106)
     clear_user_reports(9106)
+    clear_user_investigations(9106)
     add_finding(
         user_id=9106,
         finding={
@@ -240,6 +256,9 @@ def test_ai_report_generation_from_telegram() -> None:
     assert reports[0]["report_type"] == "ai_assessment"
     assert reports[0]["title"] == "Executive Assessment Report"
     assert reports[0]["overall_risk"] == "high"
+    investigation = get_user_investigations(9106)[0]
+    events = get_investigation_events(investigation["id"], 9106)
+    assert events[-1]["event_type"] == "ai_report_generated"
 
 
 def test_ai_report_failure_updates_status_and_sends_fallback_report() -> None:
@@ -434,6 +453,63 @@ def test_selecting_previous_report_details() -> None:
     assert "example.com report generated from 1 scan run." in detail_text
 
 
+def test_investigation_list_rendering() -> None:
+    investigation = create_investigation(user_id=9112, target="127.0.0.1")
+    investigation["overall_risk"] = "high"
+
+    text = build_investigations_text([investigation])
+
+    assert "Investigations" in text
+    assert "Investigation - 127.0.0.1" in text
+    assert "Target: 127.0.0.1" in text
+    assert "Risk: HIGH" in text
+    assert "Status: Open" in text
+
+
+def test_timeline_rendering_with_date_and_time() -> None:
+    investigation = create_investigation(user_id=9113, target="127.0.0.1")
+    event = add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=9113,
+        target="127.0.0.1",
+        event_type="nmap_scan_started",
+        tool="nmap",
+        status="started",
+        summary="Nmap scan started",
+    )
+
+    text = build_investigation_timeline_text(investigation, [event])
+
+    assert "Investigation Timeline" in text
+    assert "Investigation:\nInvestigation - 127.0.0.1" in text
+    assert "Target:\n127.0.0.1" in text
+    assert event["created_at"].strftime("%d %b %Y") in text
+    assert event["created_at"].strftime("%H:%M") in text
+    assert "Nmap scan started" in text
+
+
+def test_investigation_timeline_callback_renders_events() -> None:
+    clear_user_investigations(9114)
+    investigation = create_investigation(user_id=9114, target="example.com")
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=9114,
+        target="example.com",
+        event_type="report_generated",
+        tool="report",
+        status="completed",
+        summary="Report generated",
+    )
+    query = SimpleNamespace(data=f"report:investigation:{investigation['id']}", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9114))
+
+    asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    text = query.edit_message_text.call_args.args[0]
+    assert "Investigation Timeline" in text
+    assert "Report generated" in text
+
+
 def test_long_report_splitting() -> None:
     report = "A" * 3900 + "\n\n" + "B" * 3900
     chunks = split_report_text(report, max_length=3800)
@@ -561,6 +637,7 @@ def test_normal_messages_do_not_trigger_ai() -> None:
 def test_scan_workflow_still_runs_when_ai_state_is_not_waiting() -> None:
     clear_ai_waiting(7004)
     clear_user_findings(7004)
+    clear_user_investigations(7004)
     clear_user_scan_requests(7004)
     scan_request = create_scan_request(user_id=7004, scan_type="nmap")
     mark_scan_request_awaiting_target(user_id=7004, scan_request_id=scan_request.id)
@@ -583,6 +660,9 @@ def test_scan_workflow_still_runs_when_ai_state_is_not_waiting() -> None:
     assert message.reply_text.call_args_list[0].args[0] == "Running NMAP scan for target: 127.0.0.1"
     assert "Target: 127.0.0.1" in message.reply_text.call_args_list[1].args[0]
     assert get_user_findings(7004)
+    investigation = get_user_investigations(7004)[0]
+    events = get_investigation_events(investigation["id"], 7004)
+    assert [event["event_type"] for event in events] == ["nmap_scan_started", "nmap_scan_completed"]
 
 
 def test_scan_menu_includes_nuclei_scan() -> None:
@@ -607,6 +687,7 @@ def test_nuclei_scan_callback_prompts_for_target() -> None:
 
 def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
     clear_user_findings(7102)
+    clear_user_investigations(7102)
     clear_user_scan_requests(7102)
     clear_active_scan(7102)
     scan_request = create_scan_request(user_id=7102, scan_type="nuclei")
@@ -648,6 +729,9 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
     findings = get_user_findings(7102)
     assert findings[0]["source"] == "nuclei"
     assert findings[0]["target"] == "https://example.com"
+    investigation = get_user_investigations(7102)[0]
+    events = get_investigation_events(investigation["id"], 7102)
+    assert [event["event_type"] for event in events] == ["nuclei_scan_started", "nuclei_scan_completed"]
     assert context.user_data == {}
 
 

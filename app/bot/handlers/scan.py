@@ -22,6 +22,7 @@ from app.services.chat_state import clear_finding_analysis_context, get_finding_
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.impact_engine import assess_change_impact
+from app.services.investigation_store import add_investigation_event, get_or_create_latest_open_investigation
 from app.services.risk_rules import assess_nmap_ports
 from app.services.scan_manager import (
     complete_scan_request,
@@ -401,6 +402,17 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     target = update.message.text or ""
+    normalized_target = normalize_target(target) or target.strip()
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=normalized_target)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=normalized_target,
+        event_type="nmap_scan_started",
+        tool="nmap",
+        status="started",
+        summary="Nmap scan started",
+    )
     await update.message.reply_text(build_nmap_scan_started_text(target.strip()))
 
     try:
@@ -416,6 +428,16 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         result=result,
     )
     finding = store_successful_nmap_finding(user_id=user_id, result=result)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=str(result["target"]),
+        event_type="nmap_scan_completed",
+        tool="nmap",
+        status="completed" if result.get("success") is True else "failed",
+        summary="Nmap scan completed" if result.get("success") is True else "Nmap scan failed",
+        metadata={"finding_id": finding.get("id") if finding else None},
+    )
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     await update.message.reply_text(
         append_change_summary(
@@ -441,6 +463,16 @@ async def _handle_nuclei_target(
 
     target = update.message.text or ""
     display_target = normalize_target(target) or target.strip()
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=display_target,
+        event_type="nuclei_scan_started",
+        tool="nuclei",
+        status="started",
+        summary="Nuclei scan started",
+    )
     status_message = await update.message.reply_text(build_nuclei_status_card(display_target, "Initializing", 0))
     active_scan = set_active_scan(
         user_id=user_id,
@@ -459,6 +491,7 @@ async def _handle_nuclei_target(
             status_message=status_message,
             display_target=display_target,
             started_at=started_at,
+            investigation_id=investigation["id"],
         )
     )
     set_active_scan_status_task(user_id, status_task)
@@ -480,6 +513,7 @@ async def _run_nuclei_scan_background(
     status_message: object,
     display_target: str,
     started_at: float,
+    investigation_id: str,
 ) -> None:
     try:
         result = await asyncio.to_thread(run_nuclei_scan, target)
@@ -487,6 +521,15 @@ async def _run_nuclei_scan_background(
         _stop_nuclei_status_updates(user_id)
         clear_active_scan(user_id)
         await _finalize_nuclei_status(status_message, display_target, "Failed", started_at, str(exc))
+        add_investigation_event(
+            investigation_id=investigation_id,
+            user_id=user_id,
+            target=display_target,
+            event_type="nuclei_scan_completed",
+            tool="nuclei",
+            status="failed",
+            summary="Nuclei scan failed",
+        )
         await _send_scan_message(message, f"Invalid Nuclei target: {exc}")
         return
     except asyncio.CancelledError:
@@ -520,6 +563,15 @@ async def _run_nuclei_scan_background(
             started_at,
             str(result.get("error") or "Unknown error."),
         )
+        add_investigation_event(
+            investigation_id=investigation_id,
+            user_id=user_id,
+            target=display_target,
+            event_type="nuclei_scan_completed",
+            tool="nuclei",
+            status="failed",
+            summary="Nuclei scan failed",
+        )
         await _send_scan_message(message, f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
         return
 
@@ -527,7 +579,17 @@ async def _run_nuclei_scan_background(
     output = str(result.get("output") or "")
     if not output.strip():
         clean_target = str(result.get("target") or target)
-        store_clean_nuclei_scan(user_id=user_id, target=clean_target)
+        finding = store_clean_nuclei_scan(user_id=user_id, target=clean_target)
+        add_investigation_event(
+            investigation_id=investigation_id,
+            user_id=user_id,
+            target=clean_target,
+            event_type="nuclei_scan_completed",
+            tool="nuclei",
+            status="completed",
+            summary="Nuclei scan completed with no findings",
+            metadata={"finding_id": finding.get("id")},
+        )
         await _send_scan_message(message, build_clean_nuclei_verdict_text(clean_target))
         return
 
@@ -539,13 +601,33 @@ async def _run_nuclei_scan_background(
 
     if not nuclei_findings:
         clean_target = str(result.get("target") or target)
-        store_clean_nuclei_scan(user_id=user_id, target=clean_target)
+        finding = store_clean_nuclei_scan(user_id=user_id, target=clean_target)
+        add_investigation_event(
+            investigation_id=investigation_id,
+            user_id=user_id,
+            target=clean_target,
+            event_type="nuclei_scan_completed",
+            tool="nuclei",
+            status="completed",
+            summary="Nuclei scan completed with no findings",
+            metadata={"finding_id": finding.get("id")},
+        )
         await _send_scan_message(message, build_clean_nuclei_verdict_text(clean_target))
         return
 
     from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
 
     finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
+    add_investigation_event(
+        investigation_id=investigation_id,
+        user_id=user_id,
+        target=str(finding.get("target") or display_target),
+        event_type="nuclei_scan_completed",
+        tool="nuclei",
+        status="completed",
+        summary="Nuclei scan completed",
+        metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count")},
+    )
     await _send_scan_message(message, build_nuclei_import_success_text(finding))
 
 
