@@ -29,7 +29,7 @@ def test_report_generation_from_nmap_findings() -> None:
     assert "# Project Mongrel" in report
     assert "Security Assessment Report" in report
     assert "Report ID:\nPM-" in report
-    assert "Target:\n127.0.0.1" in report
+    assert "Target / Scope:\n127.0.0.1" in report
     assert "Generated:" in report
     assert "Overall Risk:\nMEDIUM" in report
     assert "## Executive Summary" in report

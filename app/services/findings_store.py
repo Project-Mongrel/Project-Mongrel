@@ -151,8 +151,13 @@ def get_user_scan_runs(user_id: int) -> list[dict]:
 def add_report_metadata(user_id: int, metadata: dict) -> dict:
     generated_at = metadata.get("generated_at") if isinstance(metadata.get("generated_at"), datetime) else datetime.now(UTC)
     report_id = str(uuid4())
+    readable_report_id = metadata.get("report_id")
+    with _get_connection() as connection:
+        if not readable_report_id:
+            readable_report_id = _generate_readable_report_id(connection, user_id, generated_at)
     stored_metadata = {
         **metadata,
+        "report_id": readable_report_id,
         "id": report_id,
         "user_id": user_id,
         "generated_at": generated_at,
@@ -318,6 +323,13 @@ def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name:
     columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
     if column_name not in columns:
         connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def _generate_readable_report_id(connection: sqlite3.Connection, user_id: int, generated_at: datetime) -> str:
+    report_count = connection.execute("SELECT COUNT(*) AS report_count FROM report_metadata WHERE user_id = ?", (user_id,)).fetchone()[
+        "report_count"
+    ]
+    return f"PM-{generated_at.astimezone(UTC):%Y%m%d}-{int(report_count) + 1:04d}"
 
 
 def _derive_finding_count(finding: dict) -> int:

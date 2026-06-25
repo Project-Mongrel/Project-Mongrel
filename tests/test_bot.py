@@ -182,9 +182,12 @@ def test_latest_report_generation_from_telegram() -> None:
     report_text = query_message.reply_text.call_args.args[0]
     assert "# Project Mongrel" in report_text
     assert "Security Assessment Report" in report_text
+    assert "Report ID:\nPM-" in report_text
+    assert "## Assessment Statistics" in report_text
     assert "22/tcp ssh" in report_text
     reports = get_user_reports(9102)
     assert reports[0]["report_type"] == "deterministic"
+    assert reports[0]["report_id"].startswith("PM-")
     assert reports[0]["target"] == "127.0.0.1"
     assert reports[0]["overall_risk"] == "medium"
 
@@ -227,12 +230,12 @@ def test_ai_report_generation_from_telegram() -> None:
 
     query.edit_message_text.assert_called_once_with("Generating report...")
     report_text = query_message.reply_text.call_args.args[0]
-    assert "## AI Assessment" in report_text
+    assert "## Executive Assessment" in report_text
     assert "AI assessment: high risk." in report_text
     assert "git-config-exposure" in report_text
     reports = get_user_reports(9106)
     assert reports[0]["report_type"] == "ai_assessment"
-    assert reports[0]["title"] == "AI Assessment Report"
+    assert reports[0]["title"] == "Executive Assessment Report"
     assert reports[0]["overall_risk"] == "high"
 
 
@@ -265,7 +268,7 @@ def test_target_specific_report_generation_from_telegram() -> None:
     asyncio.run(reports_callback_handler(update, SimpleNamespace()))
 
     report_text = query_message.reply_text.call_args.args[0]
-    assert "Target:\nbeta.example" in report_text
+    assert "Target / Scope:\nbeta.example" in report_text
     assert "git-config-exposure" in report_text
     assert "alpha.example" not in report_text
     reports = get_user_reports(9104)
@@ -298,7 +301,8 @@ def test_report_history_list_loads_from_sqlite() -> None:
         metadata={
             "target": "hellosundaykids.com",
             "report_type": "ai_assessment",
-            "title": "AI Assessment Report",
+            "title": "Executive Assessment Report",
+            "report_id": "PM-20260625-0001",
             "summary": "Generated report.",
             "overall_risk": "medium",
             "source_count": 2,
@@ -316,9 +320,9 @@ def test_report_history_list_loads_from_sqlite() -> None:
     assert "UTC" in history_text
     assert "+00:00" not in history_text
     assert "hellosundaykids.com" in history_text
-    assert "AI Assessment Report" in history_text
+    assert "Report ID: PM-20260625-0001" in history_text
     assert "Target: hellosundaykids.com" in history_text
-    assert "Type: AI Assessment Report" in history_text
+    assert "Type: Executive Assessment Report" in history_text
     assert "Risk: MEDIUM" in history_text
     assert keyboard.inline_keyboard[0][0].callback_data == f"report:history:{report['id']}"
 
@@ -343,6 +347,8 @@ def test_selecting_previous_report_details() -> None:
             "target": "example.com",
             "report_type": "deterministic",
             "title": "Deterministic Security Report",
+            "report_id": "PM-20260625-0002",
+            "investigation_name": "External review",
             "summary": "example.com report generated from 1 scan run.",
             "overall_risk": "low",
             "source_count": 1,
@@ -356,8 +362,10 @@ def test_selecting_previous_report_details() -> None:
 
     detail_text = query.edit_message_text.call_args.args[0]
     assert "Report Details" in detail_text
+    assert "Report ID: PM-20260625-0002" in detail_text
     assert "Generated:" in detail_text
     assert "UTC" in detail_text
+    assert "Investigation: External review" in detail_text
     assert "Target: example.com" in detail_text
     assert "Type: Deterministic Report" in detail_text
     assert "Risk: LOW" in detail_text
@@ -2420,6 +2428,47 @@ def test_live_scan_comparison_matches_normalized_target_key() -> None:
     assert first is not None
     assert second is not None
     assert second["comparison"]["has_previous"] is True
+
+
+def test_nmap_comparison_ignores_intervening_clean_nuclei_scan() -> None:
+    clear_user_findings(6004)
+    first = store_successful_nmap_finding(
+        user_id=6004,
+        result={
+            "success": True,
+            "target": "127.0.0.1",
+            "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n445/tcp open microsoft-ds\n",
+            "error": "",
+        },
+    )
+    add_finding(
+        user_id=6004,
+        finding={
+            "source": "nuclei",
+            "target": "localhost (127.0.0.1)",
+            "risk_level": "info",
+            "finding_count": 0,
+            "status": "clean",
+        },
+    )
+    second = store_successful_nmap_finding(
+        user_id=6004,
+        result={
+            "success": True,
+            "target": "localhost (127.0.0.1)",
+            "output": "Nmap scan report for localhost (127.0.0.1)\nHost is up.\n22/tcp open ssh\n445/tcp open microsoft-ds\n",
+            "error": "",
+        },
+    )
+
+    assert first is not None
+    assert second is not None
+    assert second["comparison"]["has_previous"] is True
+    assert second["comparison"]["risk_changed"] is False
+    assert second["comparison"]["previous_risk"] == "high"
+    assert second["comparison"]["current_risk"] == "high"
+    assert second["comparison"]["new_ports"] == []
+    assert len(second["comparison"]["unchanged_ports"]) == 2
 
 
 def test_xml_upload_finding_stores_comparison() -> None:
