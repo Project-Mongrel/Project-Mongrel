@@ -206,7 +206,11 @@ def store_parsed_nmap_finding(user_id: int, parsed_output: dict, source: str) ->
     assessed_output = dict(parsed_output)
     assessed_output.update(assess_nmap_ports(assessed_output.get("open_ports", [])))
     enriched_open_ports = enrich_open_ports(assessed_output.get("open_ports", []))
-    previous_finding = get_latest_user_finding_for_target(user_id, assessed_output.get("target"))
+    previous_finding = get_latest_user_finding_for_target(
+        user_id,
+        assessed_output.get("target"),
+        sources=_comparison_sources_for(source),
+    )
     comparison = compare_findings(
         previous=previous_finding,
         current={
@@ -230,6 +234,15 @@ def store_parsed_nmap_finding(user_id: int, parsed_output: dict, source: str) ->
             "impact": impact,
         },
     )
+
+
+def _comparison_sources_for(source: str) -> set[str]:
+    if source in {"nmap", "nmap_xml"}:
+        return {"nmap", "nmap_xml"}
+    if source == "nuclei":
+        return {"nuclei"}
+
+    return {source}
 
 
 def enrich_open_ports(open_ports: list[dict]) -> list[dict]:
@@ -267,6 +280,9 @@ def _format_risk_change(comparison: dict) -> str:
 async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
+
+    if update.effective_user is not None:
+        clear_finding_analysis_context(update.effective_user.id)
 
     await update.message.reply_text(
         build_scan_text(),

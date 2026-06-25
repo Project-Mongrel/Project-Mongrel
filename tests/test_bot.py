@@ -20,6 +20,13 @@ from app.bot.handlers.findings import (
     findings_handler,
 )
 from app.bot.handlers.home import build_home_text, home_handler
+from app.bot.handlers.reports import (
+    build_reports_keyboard,
+    build_reports_text,
+    reports_callback_handler,
+    reports_handler,
+    split_report_text,
+)
 from app.bot.handlers.scan import (
     NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS,
     PENDING_NMAP_REQUEST_KEY,
@@ -34,6 +41,7 @@ from app.bot.handlers.scan import (
     build_scan_created_text,
     build_scan_text,
     scan_callback_handler,
+    scan_handler,
     scan_target_handler,
     store_clean_nuclei_scan,
     store_successful_nmap_finding,
@@ -61,7 +69,14 @@ from app.bot.handlers.upload import (
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.core.config import Settings
 from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
-from app.services.findings_store import add_finding, clear_user_findings, get_user_findings
+from app.services.findings_store import (
+    add_finding,
+    add_report_metadata,
+    clear_user_findings,
+    clear_user_reports,
+    get_user_findings,
+    get_user_reports,
+)
 from app.services.chat_state import (
     clear_ai_waiting,
     clear_finding_analysis_context,
@@ -116,6 +131,245 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "- Nuclei JSONL (supported)" in build_upload_text()
     assert "Send an Nmap XML or Nuclei results file to begin analysis." in build_upload_text()
     assert build_ask_text() == "Ask Mongrel anything. Cybersecurity is my specialty."
+    assert "Reports" in build_reports_text([])
+
+
+def test_reports_menu_renders() -> None:
+    text = build_reports_text([])
+    keyboard = build_reports_keyboard([])
+    rendered_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "Persisted scan runs available: 0" in text
+    assert "Generate Latest Report" in rendered_buttons
+    assert "Generate Report with AI Assessment" in rendered_buttons
+    assert "Reports by Target" in rendered_buttons
+    assert "Previous Reports / History" in rendered_buttons
+    assert "Back/Home" in rendered_buttons
+
+
+def test_reports_handler_sends_menu() -> None:
+    clear_user_findings(9101)
+    clear_user_reports(9101)
+    add_finding(user_id=9101, finding={"source": "nmap", "target": "127.0.0.1", "risk_level": "low"})
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=9101))
+
+    asyncio.run(reports_handler(update, SimpleNamespace()))
+
+    assert "Persisted scan runs available: 1" in message.reply_text.call_args.args[0]
+    assert message.reply_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "report:latest"
+
+
+def test_latest_report_generation_from_telegram() -> None:
+    clear_user_findings(9102)
+    clear_user_reports(9102)
+    add_finding(
+        user_id=9102,
+        finding={
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "risk_level": "medium",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(data="report:latest", answer=AsyncMock(), edit_message_text=AsyncMock(), message=query_message)
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9102))
+
+    asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    query.edit_message_text.assert_called_once_with("Generating report...")
+    report_text = query_message.reply_text.call_args.args[0]
+    assert "# Project Mongrel" in report_text
+    assert "Security Assessment Report" in report_text
+    assert "22/tcp ssh" in report_text
+    reports = get_user_reports(9102)
+    assert reports[0]["report_type"] == "deterministic"
+    assert reports[0]["target"] == "127.0.0.1"
+    assert reports[0]["overall_risk"] == "medium"
+
+
+def test_report_empty_history_handling() -> None:
+    clear_user_findings(9103)
+    clear_user_reports(9103)
+    query = SimpleNamespace(
+        data="report:latest",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9103))
+
+    asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    assert query.edit_message_text.call_args.args[0] == "No scan history available yet. Run or upload scans before generating a report."
+
+
+def test_ai_report_generation_from_telegram() -> None:
+    clear_user_findings(9106)
+    clear_user_reports(9106)
+    add_finding(
+        user_id=9106,
+        finding={
+            "source": "nuclei",
+            "target": "example.com",
+            "risk_level": "high",
+            "finding_count": 1,
+            "nuclei_findings": [{"template_id": "git-config-exposure", "severity": "high"}],
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(data="report:latest_ai", answer=AsyncMock(), edit_message_text=AsyncMock(), message=query_message)
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9106))
+
+    with patch("app.services.report_generator.ask_ai", return_value="AI assessment: high risk."):
+        asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    query.edit_message_text.assert_called_once_with("Generating report...")
+    report_text = query_message.reply_text.call_args.args[0]
+    assert "## AI Assessment" in report_text
+    assert "AI assessment: high risk." in report_text
+    assert "git-config-exposure" in report_text
+    reports = get_user_reports(9106)
+    assert reports[0]["report_type"] == "ai_assessment"
+    assert reports[0]["title"] == "AI Assessment Report"
+    assert reports[0]["overall_risk"] == "high"
+
+
+def test_target_specific_report_generation_from_telegram() -> None:
+    clear_user_findings(9104)
+    clear_user_reports(9104)
+    add_finding(
+        user_id=9104,
+        finding={
+            "source": "nmap",
+            "target": "alpha.example",
+            "risk_level": "medium",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        },
+    )
+    add_finding(
+        user_id=9104,
+        finding={
+            "source": "nuclei",
+            "target": "beta.example",
+            "risk_level": "high",
+            "finding_count": 1,
+            "nuclei_findings": [{"template_id": "git-config-exposure", "severity": "high"}],
+        },
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(data="report:target:1", answer=AsyncMock(), edit_message_text=AsyncMock(), message=query_message)
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9104))
+
+    asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    report_text = query_message.reply_text.call_args.args[0]
+    assert "Target:\nbeta.example" in report_text
+    assert "git-config-exposure" in report_text
+    assert "alpha.example" not in report_text
+    reports = get_user_reports(9104)
+    assert reports[0]["target"] == "beta.example"
+    assert reports[0]["scan_count"] == 1
+
+
+def test_report_targets_list_from_telegram() -> None:
+    clear_user_findings(9105)
+    clear_user_reports(9105)
+    add_finding(user_id=9105, finding={"source": "nmap", "target": "alpha.example", "risk_level": "low"})
+    add_finding(user_id=9105, finding={"source": "nuclei", "target": "beta.example", "risk_level": "high"})
+    query = SimpleNamespace(data="report:targets", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9105))
+
+    asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    assert query.edit_message_text.call_args.args[0] == "Choose a target for the report."
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text == "alpha.example"
+    assert keyboard.inline_keyboard[0][0].callback_data == "report:target:0"
+    assert keyboard.inline_keyboard[1][0].text == "beta.example"
+
+
+def test_report_history_list_loads_from_sqlite() -> None:
+    clear_user_findings(9107)
+    clear_user_reports(9107)
+    report = add_report_metadata(
+        user_id=9107,
+        metadata={
+            "target": "hellosundaykids.com",
+            "report_type": "ai_assessment",
+            "title": "AI Assessment Report",
+            "summary": "Generated report.",
+            "overall_risk": "medium",
+            "source_count": 2,
+            "scan_count": 3,
+        },
+    )
+    query = SimpleNamespace(data="report:history", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9107))
+
+    asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    history_text = query.edit_message_text.call_args.args[0]
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert "Previous Reports / History" in history_text
+    assert "UTC" in history_text
+    assert "+00:00" not in history_text
+    assert "hellosundaykids.com" in history_text
+    assert "AI Assessment Report" in history_text
+    assert "Target: hellosundaykids.com" in history_text
+    assert "Type: AI Assessment Report" in history_text
+    assert "Risk: MEDIUM" in history_text
+    assert keyboard.inline_keyboard[0][0].callback_data == f"report:history:{report['id']}"
+
+
+def test_empty_report_history_handling() -> None:
+    clear_user_findings(9108)
+    clear_user_reports(9108)
+    query = SimpleNamespace(data="report:history", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9108))
+
+    asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    assert query.edit_message_text.call_args.args[0] == "No previous reports generated yet."
+
+
+def test_selecting_previous_report_details() -> None:
+    clear_user_findings(9109)
+    clear_user_reports(9109)
+    report = add_report_metadata(
+        user_id=9109,
+        metadata={
+            "target": "example.com",
+            "report_type": "deterministic",
+            "title": "Deterministic Security Report",
+            "summary": "example.com report generated from 1 scan run.",
+            "overall_risk": "low",
+            "source_count": 1,
+            "scan_count": 1,
+        },
+    )
+    query = SimpleNamespace(data=f"report:history:{report['id']}", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9109))
+
+    asyncio.run(reports_callback_handler(update, SimpleNamespace()))
+
+    detail_text = query.edit_message_text.call_args.args[0]
+    assert "Report Details" in detail_text
+    assert "Generated:" in detail_text
+    assert "UTC" in detail_text
+    assert "Target: example.com" in detail_text
+    assert "Type: Deterministic Report" in detail_text
+    assert "Risk: LOW" in detail_text
+    assert "example.com report generated from 1 scan run." in detail_text
+
+
+def test_long_report_splitting() -> None:
+    report = "A" * 3900 + "\n\n" + "B" * 3900
+    chunks = split_report_text(report, max_length=3800)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 3800 for chunk in chunks)
 
 
 def test_ask_mongrel_sets_ai_waiting_state() -> None:
@@ -1051,6 +1305,8 @@ def test_finding_followup_prompt_contains_stored_finding_question_and_guardrails
     prompt = build_finding_followup_ai_prompt(context, "Why is SSH important?")
 
     assert "Finding ID: finding-2" in prompt
+    assert "Finding source: nmap" in prompt
+    assert "Tools already used: Nmap" in prompt
     assert "Target: 127.0.0.1" in prompt
     assert "22/tcp ssh" in prompt
     assert "Latest user question:\nWhy is SSH important?" in prompt
@@ -1061,6 +1317,61 @@ def test_finding_followup_prompt_contains_stored_finding_question_and_guardrails
     assert "- Never invent vulnerabilities." in prompt
     assert "- Base answers only on stored finding plus user question." in prompt
     assert "- If information is unknown, explicitly say so." in prompt
+    assert (
+        "- Do not recommend the same tool as the primary next step if it was already used, unless suggesting a specific re-scan or different scan mode."
+    ) in prompt
+
+
+def test_nmap_followup_prompt_suggests_alternative_next_tools() -> None:
+    context = build_finding_analysis_context(
+        {
+            "id": "finding-nmap-tools",
+            "source": "nmap",
+            "target": "example.com",
+            "open_ports": [{"port": "443", "protocol": "tcp", "service": "https"}],
+        }
+    )
+
+    prompt = build_finding_followup_ai_prompt(context, "What other tools should I use?")
+
+    assert "Finding source: nmap" in prompt
+    assert "Tools already used: Nmap" in prompt
+    assert "Useful next tools for Nmap findings:" in prompt
+    assert "- Nuclei" in prompt
+    assert "- OWASP ZAP baseline scan" in prompt
+    assert "- Burp Suite manual testing" in prompt
+    assert "- SSL Labs / testssl.sh for TLS" in prompt
+    assert "- securityheaders.com or header checks" in prompt
+    assert "- technology fingerprinting" in prompt
+    assert "- manual config review" in prompt
+
+
+def test_nuclei_followup_prompt_includes_source_and_validation_guidance() -> None:
+    context = build_finding_analysis_context(
+        {
+            "id": "finding-nuclei-tools",
+            "source": "nuclei",
+            "target": "https://example.com",
+            "risk_level": "high",
+            "finding_count": 1,
+            "severity_summary": {"high": 1},
+            "nuclei_findings": [{"template_id": "git-config-exposure", "severity": "high"}],
+        }
+    )
+
+    prompt = build_finding_followup_ai_prompt(context, "What should I do next?")
+
+    assert "Finding source: nuclei" in prompt
+    assert "Tools already used: Nuclei" in prompt
+    assert "Useful next actions/tools for Nuclei findings:" in prompt
+    assert "- manual validation" in prompt
+    assert "- browser verification" in prompt
+    assert "- Burp Suite/ZAP" in prompt
+    assert "- patch/config review" in prompt
+    assert "- re-scan after remediation" in prompt
+    assert (
+        "- Do not recommend the same tool as the primary next step if it was already used, unless suggesting a specific re-scan or different scan mode."
+    ) in prompt
 
 
 def test_finding_analysis_followup_question_routed_to_ai() -> None:
@@ -1117,6 +1428,53 @@ def test_finding_analysis_has_priority_over_ask_mongrel() -> None:
 
     assert "Stored finding context:" in ask_ai.call_args.args[0]
     assert "445/tcp microsoft-ds" in ask_ai.call_args.args[0]
+
+
+def test_scan_exits_finding_analysis_and_target_goes_to_scan_flow() -> None:
+    clear_finding_analysis_context(4020)
+    clear_user_findings(4020)
+    clear_user_scan_requests(4020)
+    set_finding_analysis_context(
+        4020,
+        build_finding_analysis_context(
+            {
+                "id": "finding-scan-exit",
+                "source": "nmap",
+                "target": "127.0.0.1",
+                "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+            }
+        ),
+    )
+    context = SimpleNamespace(user_data={})
+    scan_message = SimpleNamespace(text="Scan", reply_text=AsyncMock())
+
+    asyncio.run(scan_handler(SimpleNamespace(message=scan_message, effective_user=SimpleNamespace(id=4020)), context))
+
+    assert get_finding_analysis_context(4020) is None
+
+    query = SimpleNamespace(data="scan:nmap", answer=AsyncMock(), edit_message_text=AsyncMock())
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=4020)), context))
+
+    target_message = SimpleNamespace(text="127.0.0.1", reply_text=AsyncMock())
+    with patch("app.bot.handlers.scan.ask_ai") as ask_ai, patch(
+        "app.bot.handlers.scan.run_nmap_scan",
+        return_value={
+            "success": True,
+            "target": "127.0.0.1",
+            "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n",
+            "error": "",
+        },
+    ) as run_nmap_scan:
+        asyncio.run(
+            scan_target_handler(
+                SimpleNamespace(message=target_message, effective_user=SimpleNamespace(id=4020)),
+                context,
+            )
+        )
+
+    ask_ai.assert_not_called()
+    run_nmap_scan.assert_called_once_with("127.0.0.1")
+    assert target_message.reply_text.call_args_list[0].args[0] == "Running NMAP scan for target: 127.0.0.1"
 
 
 def test_finding_analysis_home_exits_mode() -> None:

@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
 from app.services.ai_client import ask_ai
-from app.services.chat_state import set_finding_analysis_context
+from app.services.chat_state import clear_finding_analysis_context, set_finding_analysis_context
 from app.services.findings_store import clear_user_findings, get_user_finding, get_user_findings
 from app.services.verdict_engine import generate_mongrel_verdict
 
@@ -189,6 +189,7 @@ def build_finding_analysis_context(finding: dict) -> dict:
 def build_finding_followup_ai_prompt(context: dict, question: str) -> str:
     finding = context.get("finding") if isinstance(context.get("finding"), dict) else {}
     source = context.get("source") or finding.get("source") or "unknown"
+    tools_used = _tools_used_for_source(str(source))
     lines = [
         "Answer this follow-up question about a stored Project Mongrel finding.",
         "",
@@ -201,14 +202,29 @@ def build_finding_followup_ai_prompt(context: dict, question: str) -> str:
         "- Base answers only on stored finding plus user question.",
         "- If information is unknown, explicitly say so.",
         "- Keep the answer concise and practical.",
+        "- Do not recommend the same tool as the primary next step if it was already used, unless suggesting a specific re-scan or different scan mode.",
         "",
         "Stored finding context:",
         f"Finding ID: {context.get('finding_id') or finding.get('id') or 'unknown'}",
-        f"Source: {source}",
+        f"Finding source: {source}",
+        f"Tools already used: {tools_used}",
         f"Target: {context.get('target') or finding.get('target') or 'unknown'}",
         f"Summary: {context.get('summary') or _summarize_finding_for_context(finding)}",
     ]
     if source in {"nmap", "nmap_xml"}:
+        lines.extend(
+            [
+                "",
+                "Useful next tools for Nmap findings:",
+                "- Nuclei",
+                "- OWASP ZAP baseline scan",
+                "- Burp Suite manual testing",
+                "- SSL Labs / testssl.sh for TLS",
+                "- securityheaders.com or header checks",
+                "- technology fingerprinting",
+                "- manual config review",
+            ]
+        )
         lines.extend(["", "Open ports:"])
         open_ports = finding.get("open_ports") or []
         lines.extend(_format_port_for_prompt(open_port) for open_port in open_ports) if open_ports else lines.append("none")
@@ -217,6 +233,13 @@ def build_finding_followup_ai_prompt(context: dict, question: str) -> str:
     elif source == "nuclei":
         lines.extend(
             [
+                "",
+                "Useful next actions/tools for Nuclei findings:",
+                "- manual validation",
+                "- browser verification",
+                "- Burp Suite/ZAP",
+                "- patch/config review",
+                "- re-scan after remediation",
                 "",
                 f"Status: {finding.get('status', 'findings')}",
                 f"Risk level: {_format_risk_level(finding.get('risk_level'))}",
@@ -232,6 +255,16 @@ def build_finding_followup_ai_prompt(context: dict, question: str) -> str:
 
     lines.extend(["", "Latest user question:", question])
     return "\n".join(lines)
+
+
+def _tools_used_for_source(source: str) -> str:
+    if source in {"nmap", "nmap_xml"}:
+        return "Nmap"
+
+    if source == "nuclei":
+        return "Nuclei"
+
+    return source or "unknown"
 
 
 def _summarize_finding_for_context(finding: dict) -> str:
@@ -527,6 +560,9 @@ async def findings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     user_id = update.effective_user.id if update.effective_user is not None else None
+    if user_id is not None:
+        clear_finding_analysis_context(user_id)
+
     findings = get_user_findings(user_id) if user_id is not None else []
 
     await update.message.reply_text(

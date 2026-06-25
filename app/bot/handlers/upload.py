@@ -9,6 +9,7 @@ from app.bot.handlers.scan import store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
+from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
 from app.services.target_normalizer import normalize_target_key
 from app.services.verdict_engine import generate_mongrel_verdict
@@ -588,6 +589,7 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = update.effective_user.id if update.effective_user is not None else None
     if user_id is not None:
+        clear_finding_analysis_context(user_id)
         set_upload_state(user_id, UPLOAD_STATE_AWAITING_NMAP_XML)
 
     await update.message.reply_text(
