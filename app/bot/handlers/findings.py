@@ -8,6 +8,7 @@ from app.bot.keyboards import build_main_menu_keyboard
 from app.services.ai_client import ask_ai
 from app.services.chat_state import clear_finding_analysis_context, set_finding_analysis_context
 from app.services.findings_store import clear_user_findings, get_user_finding, get_user_findings
+from app.services.icon_helper import section_label
 from app.services.verdict_engine import generate_mongrel_verdict
 
 MAX_FINDINGS_MESSAGE_LENGTH = 3800
@@ -19,13 +20,13 @@ def build_findings_text(findings: list[dict] | None = None) -> str:
     if not findings:
         return "No findings available yet."
 
-    lines = ["Latest Findings"]
+    lines = [section_label("observation", "Latest Findings")]
     for index, finding in enumerate(_latest_findings(findings), start=1):
         if _is_clean_nuclei_scan(finding):
             lines.extend(
                 [
                     "",
-                    "Nuclei Fast Scan",
+                    section_label("nuclei", "Nuclei Fast Scan"),
                     f"Target: {finding.get('target', 'unknown')}",
                     "Result: Clean",
                     f"Findings: {finding.get('finding_count', 0)}",
@@ -39,7 +40,7 @@ def build_findings_text(findings: list[dict] | None = None) -> str:
         lines.extend(
             [
                 "",
-                f"#{index} {_format_risk_level(finding.get('risk_level'))} - {finding.get('source', 'unknown')}",
+                f"#{index} {_format_risk_level(finding.get('risk_level'))} - {_source_with_icon(finding.get('source', 'unknown'))}",
                 f"Target: {finding.get('target', 'unknown')}",
                 f"Host: {finding.get('host_status', 'unknown')}",
                 f"Open Ports: {len(open_ports)}",
@@ -73,7 +74,7 @@ def build_finding_detail_text(finding: dict | None, display_number: int | None =
         return _truncate_message(
             "\n".join(
                 [
-                    "Nuclei Fast Scan",
+                    section_label("nuclei", "Nuclei Fast Scan"),
                     "",
                     f"Target: {finding.get('target', 'unknown')}",
                     "Result: Clean",
@@ -91,7 +92,7 @@ def build_finding_detail_text(finding: dict | None, display_number: int | None =
     verdict = generate_mongrel_verdict(finding)
     title = f"Finding #{display_number}" if display_number is not None else "Finding"
     lines = [
-        "Mongrel Verdict",
+        section_label("mongrel_ai", "Mongrel Verdict"),
         "",
         f"Target: {finding.get('target', 'unknown')}",
         "",
@@ -108,17 +109,17 @@ def build_finding_detail_text(finding: dict | None, display_number: int | None =
         "",
         "--------------------------------",
         "",
-        "Comparison",
+        section_label("statistics", "Comparison"),
         *_format_comparison(finding.get("comparison")),
         "",
         "--------------------------------",
         "",
-        "Impact Assessment",
+        section_label("risk", "Impact Assessment"),
         *_format_impact(finding.get("impact"), finding.get("comparison")),
         "",
         "--------------------------------",
         "",
-        "Technical Details",
+        section_label("observation", "Technical Details"),
         "",
         title,
         "",
@@ -265,6 +266,18 @@ def _tools_used_for_source(source: str) -> str:
         return "Nuclei"
 
     return source or "unknown"
+
+
+def _source_with_icon(source: object) -> str:
+    normalized = str(source or "unknown")
+    if normalized in {"nmap", "nmap_xml"}:
+        return f"{normalized} ⌁"
+    if normalized == "nuclei":
+        return f"{normalized} ◇"
+    if normalized == "bbot":
+        return f"{normalized} ◆"
+
+    return f"{normalized} ◌"
 
 
 def _summarize_finding_for_context(finding: dict) -> str:

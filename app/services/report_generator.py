@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 from app.services.ai_client import ask_ai
 from app.services.findings_store import get_user_scan_runs
+from app.services.icon_helper import icon, section_label
 from app.services.target_normalizer import normalize_target_key
 
 AI_UNAVAILABLE_RESPONSES = {
@@ -33,7 +34,7 @@ def generate_markdown_report(
 
     lines = [
         "# Project Mongrel",
-        "Security Assessment Report",
+        section_label("security", "Security Assessment Report"),
         "",
         "Report ID:",
         readable_report_id,
@@ -51,28 +52,28 @@ def generate_markdown_report(
         "## Executive Summary",
         *_format_executive_summary(scan_runs, report_target),
         "",
-        "## Assessment Statistics",
+        f"## {section_label('statistics', 'Assessment Statistics')}",
         *_format_assessment_statistics(scan_runs, generated_at),
         "",
-        "## Scan Sources Used",
+        f"## {section_label('saved', 'Scan Sources Used')}",
         *_format_scan_sources(scan_runs),
         "",
-        "## Risk Overview",
+        f"## {section_label('risk', 'Risk Overview')}",
         *_format_risk_overview(scan_runs),
         "",
-        "## Technical Findings",
+        f"## {section_label('observation', 'Technical Findings')}",
         *_format_technical_findings(scan_runs),
         "",
-        "## Clean Scan Notes",
+        f"## {section_label('completed', 'Clean Scan Notes')}",
         *_format_clean_scan_notes(scan_runs),
         "",
-        "## Recommendations",
+        f"## {section_label('security', 'Recommendations')}",
         *_format_recommendations(scan_runs),
     ]
     if include_ai_assessment:
-        lines.extend(["", "## Executive Assessment", *(ai_assessment_lines or format_report_ai_assessment(scan_runs, report_target))])
+        lines.extend(["", f"## {section_label('mongrel_ai', 'Executive Assessment')}", *(ai_assessment_lines or format_report_ai_assessment(scan_runs, report_target))])
 
-    lines.extend(["", "## Appendix / Scan History", *_format_scan_history(scan_runs)])
+    lines.extend(["", f"## {section_label('saved', 'Appendix / Scan History')}", *_format_scan_history(scan_runs)])
     return "\n".join(lines)
 
 
@@ -87,6 +88,10 @@ def build_report_ai_assessment_prompt(scan_runs: list[dict], target: str | None 
         "- Do not invent services.",
         "- Do not invent CVEs.",
         "- If evidence is missing, say it is unknown from the available scan history.",
+        "- Give context-aware recommendations based on the supplied services and findings.",
+        "- Never recommend closing ports blindly.",
+        "- Avoid absolute statements such as close all open ports.",
+        "- For administrative services, prefer reviewing whether the service is required, restricting access to trusted networks, disabling it if unnecessary, and confirming secure configuration.",
         "",
         "Assess:",
         "- Overall risk",
@@ -254,7 +259,7 @@ def _format_scan_sources(scan_runs: list[dict]) -> list[str]:
         return ["- None"]
 
     sources = sorted({_source_label(scan_run.get("source")) for scan_run in scan_runs})
-    return [f"- {source}" for source in sources]
+    return [f"- {source} {_source_icon(source)}".rstrip() for source in sources]
 
 
 def _format_risk_overview(scan_runs: list[dict]) -> list[str]:
@@ -344,13 +349,7 @@ def _format_clean_scan_notes(scan_runs: list[dict]) -> list[str]:
     if not clean_scans:
         return ["No clean scan results were recorded."]
 
-    return [
-        (
-            f"- {_source_label(scan_run.get('source'))} clean result for {scan_run.get('target') or 'unknown target'}: "
-            f"{scan_run.get('summary') or 'No matching findings were identified.'}"
-        )
-        for scan_run in clean_scans
-    ]
+    return _format_deduplicated_clean_scan_notes(clean_scans)
 
 
 def _format_recommendations(scan_runs: list[dict]) -> list[str]:
@@ -378,17 +377,23 @@ def _format_scan_history(scan_runs: list[dict]) -> list[str]:
         return ["No historical scan runs found."]
 
     lines = []
-    for index, scan_run in enumerate(scan_runs, start=1):
-        lines.extend(
-            [
-                f"{index}. {_source_label(scan_run.get('source'))}",
-                f"   - Target: {scan_run.get('target') or 'unknown'}",
-                f"   - Risk Level: {str(scan_run.get('risk_level') or 'unknown').upper()}",
-                f"   - Findings: {_finding_count(scan_run)}",
-                f"   - Status: {scan_run.get('status') or 'findings'}",
-                f"   - Created: {_format_human_timestamp(scan_run.get('created_at'))}",
-            ]
-        )
+    grouped_runs: dict[str, list[dict]] = {}
+    for scan_run in scan_runs:
+        grouped_runs.setdefault(_source_label(scan_run.get("source")), []).append(scan_run)
+
+    for source_label in sorted(grouped_runs):
+        lines.append(section_label(_source_icon_key(source_label), f"{source_label} History"))
+        for scan_run in grouped_runs[source_label]:
+            lines.extend(
+                [
+                    _format_short_history_timestamp(scan_run.get("created_at")),
+                    f"   - Target: {scan_run.get('target') or 'unknown'}",
+                    f"   - Risk Level: {str(scan_run.get('risk_level') or 'unknown').upper()}",
+                    f"   - Findings: {_finding_count(scan_run)}",
+                    f"   - Status: {scan_run.get('status') or 'findings'}",
+                ]
+            )
+        lines.append("")
     return lines
 
 
@@ -436,6 +441,68 @@ def _format_human_timestamp(value: object) -> str:
         return "unknown"
 
     return timestamp.astimezone(UTC).strftime("%d %b %Y %H:%M UTC")
+
+
+def _format_short_history_timestamp(value: object) -> str:
+    if isinstance(value, datetime):
+        timestamp = value
+    elif isinstance(value, str):
+        try:
+            timestamp = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    else:
+        return "unknown"
+
+    return timestamp.astimezone(UTC).strftime("%d %b %H:%M")
+
+
+def _format_deduplicated_clean_scan_notes(clean_scans: list[dict]) -> list[str]:
+    lines: list[str] = []
+    index = 0
+    while index < len(clean_scans):
+        current = clean_scans[index]
+        group = [current]
+        index += 1
+        while index < len(clean_scans) and _clean_scan_signature(clean_scans[index]) == _clean_scan_signature(current):
+            group.append(clean_scans[index])
+            index += 1
+
+        if len(group) > 1 and current.get("source") == "nuclei":
+            lines.extend(
+                [
+                    f"{_number_word(len(group))} consecutive Nuclei Fast Scans completed with no findings.",
+                    "",
+                    "Latest:",
+                    _format_human_timestamp(group[-1].get("created_at")),
+                    "",
+                    "Previous:",
+                    _format_human_timestamp(group[-2].get("created_at")),
+                ]
+            )
+        else:
+            lines.append(
+                f"- {_source_label(current.get('source'))} clean result for {current.get('target') or 'unknown target'}: "
+                f"{current.get('summary') or 'No matching findings were identified.'}"
+            )
+
+        if index < len(clean_scans):
+            lines.append("")
+
+    return lines
+
+
+def _clean_scan_signature(scan_run: dict) -> tuple[str, str, str]:
+    return (
+        str(scan_run.get("source") or ""),
+        str(scan_run.get("target_key") or normalize_target_key(scan_run.get("target")) or scan_run.get("target") or ""),
+        str(scan_run.get("summary") or ""),
+    )
+
+
+def _number_word(value: int) -> str:
+    words = {2: "Two", 3: "Three", 4: "Four", 5: "Five"}
+    return words.get(value, str(value))
 
 
 def _format_finding_aware_recommendations(scan_runs: list[dict]) -> list[str]:
@@ -515,3 +582,18 @@ def _source_label(source: object) -> str:
         "nuclei": "Nuclei",
     }
     return labels.get(str(source), str(source or "Unknown"))
+
+
+def _source_icon(source_label: str) -> str:
+    return icon(_source_icon_key(source_label))
+
+
+def _source_icon_key(source_label: str) -> str:
+    normalized = source_label.lower()
+    if normalized.startswith("nmap"):
+        return "nmap"
+    if normalized.startswith("nuclei"):
+        return "nuclei"
+    if normalized.startswith("bbot"):
+        return "bbot"
+    return "observation"

@@ -177,15 +177,30 @@ def complete_investigation(
     summary: str | None = None,
 ) -> dict | None:
     completed_at = datetime.now(UTC)
+    investigation = get_investigation(investigation_id, user_id)
+    if investigation is None:
+        return None
+
+    duration_seconds = max(0, int((completed_at - investigation["started_at"]).total_seconds()))
+    metadata = {**(investigation.get("metadata") or {}), "duration_seconds": duration_seconds}
     with _get_connection() as connection:
         _initialize_schema(connection)
         connection.execute(
             """
             UPDATE investigations
-            SET status = ?, completed_at = ?, overall_risk = COALESCE(?, overall_risk), summary = COALESCE(?, summary)
+            SET status = ?, completed_at = ?, overall_risk = COALESCE(?, overall_risk),
+                summary = COALESCE(?, summary), metadata_json = ?
             WHERE id = ? AND user_id = ?
             """,
-            ("completed", _format_datetime(completed_at), overall_risk, summary, investigation_id, user_id),
+            (
+                "completed",
+                _format_datetime(completed_at),
+                overall_risk,
+                summary,
+                _to_json(metadata),
+                investigation_id,
+                user_id,
+            ),
         )
 
     return get_investigation(investigation_id, user_id)

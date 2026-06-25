@@ -216,6 +216,8 @@ def test_report_ai_prompt_is_grounded() -> None:
     assert "Do not invent vulnerabilities." in prompt
     assert "Do not invent CVEs." in prompt
     assert "git-config-exposure" in prompt
+    assert "Never recommend closing ports blindly." in prompt
+    assert "Review whether the service is required" in prompt or "reviewing whether the service is required" in prompt
 
 
 def test_report_uses_readable_timestamps_and_header() -> None:
@@ -274,7 +276,8 @@ def test_repeated_nmap_findings_are_deduplicated() -> None:
 
     assert report.count("Nmap identified 1 open port(s)") == 1
     assert "Previous matching Nmap scan found; no port changes detected." in report
-    assert report.count("Created:") == 2
+    assert "Nmap History" in report
+    assert report.count("   - Target: 127.0.0.1") == 2
 
 
 def test_report_header_supports_investigation_name() -> None:
@@ -283,3 +286,34 @@ def test_report_header_supports_investigation_name() -> None:
     report = generate_markdown_report(user_id=9014, target="example.com", investigation_name="External perimeter review")
 
     assert "Investigation:\nExternal perimeter review" in report
+
+
+def test_repeated_clean_nuclei_scans_are_deduplicated() -> None:
+    clean_finding = {
+        "source": "nuclei",
+        "target": "example.com",
+        "risk_level": "info",
+        "finding_count": 0,
+        "status": "clean",
+        "summary": "No matching Nuclei findings were identified using the fast scan profile.",
+    }
+    add_finding(user_id=9015, finding=clean_finding)
+    add_finding(user_id=9015, finding=clean_finding)
+
+    report = generate_markdown_report(user_id=9015, target="example.com")
+
+    assert "Two consecutive Nuclei Fast Scans completed with no findings." in report
+    assert "Latest:" in report
+    assert "Previous:" in report
+    assert report.count("No matching Nuclei findings were identified using the fast scan profile.") < 3
+
+
+def test_report_appendix_groups_history_by_tool() -> None:
+    add_finding(user_id=9016, finding={"source": "nmap", "target": "example.com", "risk_level": "low"})
+    add_finding(user_id=9016, finding={"source": "nuclei", "target": "example.com", "risk_level": "info", "finding_count": 0})
+
+    report = generate_markdown_report(user_id=9016, target="example.com")
+
+    assert "Nmap History" in report
+    assert "Nuclei History" in report
+    assert report.index("Nmap History") < report.index("Nuclei History")

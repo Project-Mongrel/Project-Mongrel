@@ -21,6 +21,7 @@ from app.services.active_scan_state import (
 from app.services.chat_state import clear_finding_analysis_context, get_finding_analysis_context, is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
+from app.services.icon_helper import section_label
 from app.services.impact_engine import assess_change_impact
 from app.services.investigation_store import add_investigation_event, get_or_create_latest_open_investigation
 from app.services.risk_rules import assess_nmap_ports
@@ -71,7 +72,7 @@ def build_nuclei_scan_started_text() -> str:
 
 def build_nuclei_status_card(target: str, status: str, elapsed_seconds: int, reason: str | None = None) -> str:
     lines = [
-        "Nuclei Fast Scan",
+        section_label("nuclei", "Nuclei Fast Scan"),
         "",
         "Target:",
         target or "unknown",
@@ -93,7 +94,7 @@ def build_nuclei_status_card(target: str, status: str, elapsed_seconds: int, rea
 def build_clean_nuclei_verdict_text(target: str | None) -> str:
     return "\n".join(
         [
-            "Nuclei Verdict",
+            section_label("nuclei", "Nuclei Verdict"),
             "",
             "Target:",
             str(target or "unknown"),

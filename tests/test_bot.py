@@ -205,6 +205,9 @@ def test_latest_report_generation_from_telegram() -> None:
     investigation = get_user_investigations(9102)[0]
     events = get_investigation_events(investigation["id"], 9102)
     assert events[-1]["event_type"] == "report_generated"
+    assert get_user_investigations(9102)[0]["status"] == "completed"
+    assert get_user_investigations(9102)[0]["completed_at"] is not None
+    assert get_user_investigations(9102)[0]["metadata"]["duration_seconds"] >= 0
 
 
 def test_report_empty_history_handling() -> None:
@@ -245,8 +248,11 @@ def test_ai_report_generation_from_telegram() -> None:
         asyncio.run(reports_callback_handler(update, SimpleNamespace()))
 
     edited_messages = [call.args[0] for call in query.edit_message_text.call_args_list]
-    assert "Generating AI report /" in edited_messages
-    assert any(message in edited_messages for message in {"Collecting scan history -", "Building deterministic report \\", "Asking Mongrel AI |"})
+    assert any(message.endswith("Generating AI report /") for message in edited_messages)
+    assert any(
+        message.endswith(("Collecting scan history -", "Building deterministic report \\", "Asking Mongrel AI |"))
+        for message in edited_messages
+    )
     assert edited_messages[-1] == "AI report ready."
     report_text = query_message.reply_text.call_args.args[0]
     assert "## Executive Assessment" in report_text
@@ -259,6 +265,7 @@ def test_ai_report_generation_from_telegram() -> None:
     investigation = get_user_investigations(9106)[0]
     events = get_investigation_events(investigation["id"], 9106)
     assert events[-1]["event_type"] == "ai_report_generated"
+    assert get_user_investigations(9106)[0]["status"] == "completed"
 
 
 def test_ai_report_failure_updates_status_and_sends_fallback_report() -> None:
@@ -282,7 +289,7 @@ def test_ai_report_failure_updates_status_and_sends_fallback_report() -> None:
         asyncio.run(reports_callback_handler(update, SimpleNamespace()))
 
     edited_messages = [call.args[0] for call in query.edit_message_text.call_args_list]
-    assert "Generating AI report /" in edited_messages
+    assert any(message.endswith("Generating AI report /") for message in edited_messages)
     assert edited_messages[-1] == "AI unavailable. Sending deterministic report with fallback note."
     report_text = query_message.reply_text.call_args.args[0]
     assert "## Executive Assessment" in report_text
@@ -480,12 +487,16 @@ def test_timeline_rendering_with_date_and_time() -> None:
 
     text = build_investigation_timeline_text(investigation, [event])
 
+    assert "Investigation" in text
+    assert "Investigation - 127.0.0.1" in text
+    assert "Status:\nOpen" in text
+    assert "Duration:\nIn progress" in text
+    assert "Tools Used:\nNmap" in text
     assert "Investigation Timeline" in text
-    assert "Investigation:\nInvestigation - 127.0.0.1" in text
     assert "Target:\n127.0.0.1" in text
     assert event["created_at"].strftime("%d %b %Y") in text
     assert event["created_at"].strftime("%H:%M") in text
-    assert "Nmap scan started" in text
+    assert "Nmap Scan Started" in text
 
 
 def test_investigation_timeline_callback_renders_events() -> None:
@@ -507,7 +518,7 @@ def test_investigation_timeline_callback_renders_events() -> None:
 
     text = query.edit_message_text.call_args.args[0]
     assert "Investigation Timeline" in text
-    assert "Report generated" in text
+    assert "Security Report Generated" in text
 
 
 def test_long_report_splitting() -> None:

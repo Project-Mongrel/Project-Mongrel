@@ -11,6 +11,7 @@ from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
+from app.services.icon_helper import section_label
 from app.services.target_normalizer import normalize_target_key
 from app.services.verdict_engine import generate_mongrel_verdict
 
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 def build_upload_text() -> str:
     return (
-        "Supported Uploads\n\n"
+        f"{section_label('upload', 'Supported Uploads')}\n\n"
         "- Nmap XML (supported)\n"
         "- Nuclei JSON (supported)\n"
         "- Nuclei JSONL (supported)\n"
@@ -80,7 +81,7 @@ def build_nmap_xml_import_success_text(finding: dict) -> str:
     recommended_actions = _build_upload_recommended_actions(finding, verdict)
 
     lines = [
-        "Mongrel Verdict",
+        section_label("mongrel_ai", "Mongrel Verdict"),
         "",
         "Target:\n"
         f"{finding.get('target') or 'unknown'}",
@@ -135,7 +136,7 @@ def build_nuclei_import_success_text(finding: dict) -> str:
     severity_summary = finding.get("severity_summary") or _summarize_nuclei_severities(nuclei_findings)
     risk_level = str(finding.get("risk_level") or _score_nuclei_risk(severity_summary)).upper()
     lines = [
-        "Nuclei Verdict",
+        section_label("nuclei", "Nuclei Verdict"),
         "",
         "Target:",
         str(finding.get("target") or "unknown"),

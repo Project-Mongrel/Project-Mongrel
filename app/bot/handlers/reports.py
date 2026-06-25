@@ -9,8 +9,10 @@ from telegram.ext import ContextTypes
 from app.bot.keyboards import build_main_menu_keyboard
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_report_metadata, get_user_report, get_user_reports, get_user_scan_runs
+from app.services.icon_helper import icon_label, section_label
 from app.services.investigation_store import (
     add_investigation_event,
+    complete_investigation,
     get_investigation,
     get_investigation_events,
     get_latest_investigation_for_target,
@@ -28,12 +30,12 @@ from app.services.target_normalizer import normalize_target_key
 MAX_REPORT_MESSAGE_LENGTH = 3800
 AI_REPORT_PROGRESS_INTERVAL_SECONDS = 1.75
 AI_REPORT_PROGRESS_FRAMES = [
-    "Generating AI report /",
-    "Collecting scan history -",
-    "Building deterministic report \\",
-    "Asking Mongrel AI |",
-    "Writing Executive Assessment /",
-    "Finalising report -",
+    f"{icon_label('mongrel_ai', 'Generating AI report')} /",
+    f"{icon_label('saved', 'Collecting scan history')} -",
+    f"{icon_label('report', 'Building deterministic report')} \\",
+    f"{icon_label('mongrel_ai', 'Asking Mongrel AI')} |",
+    f"{icon_label('mongrel_ai', 'Writing Executive Assessment')} /",
+    f"{icon_label('report', 'Finalising report')} -",
 ]
 logger = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ def build_reports_text(scan_runs: list[dict] | None = None) -> str:
     scan_count = len(scan_runs or [])
     return "\n".join(
         [
-            "Reports",
+            section_label("report", "Reports"),
             "",
             f"Persisted scan runs available: {scan_count}",
             "",
@@ -82,7 +84,7 @@ def build_report_history_text(reports: list[dict]) -> str:
     if not reports:
         return "No previous reports generated yet."
 
-    lines = ["Previous Reports / History", ""]
+    lines = [section_label("report", "Previous Reports / History"), ""]
     for index, report in enumerate(reversed(reports[-10:]), start=1):
         lines.extend(
             [
@@ -121,7 +123,7 @@ def build_report_metadata_detail_text(report: dict | None) -> str:
 
     return "\n".join(
         [
-            "Report Details",
+            section_label("report", "Report Details"),
             "",
             f"Report ID: {_format_readable_report_id(report)}",
             f"Generated: {_format_report_timestamp(report)}",
@@ -142,7 +144,7 @@ def build_investigations_text(investigations: list[dict]) -> str:
     if not investigations:
         return "No investigations available yet."
 
-    lines = ["Investigations", ""]
+    lines = [section_label("investigation", "Investigations"), ""]
     for investigation in reversed(investigations[-10:]):
         lines.extend(
             [
@@ -177,16 +179,7 @@ def build_investigation_timeline_text(investigation: dict | None, events: list[d
     if investigation is None:
         return "Investigation not found."
 
-    lines = [
-        "Investigation Timeline",
-        "",
-        "Investigation:",
-        str(investigation.get("name") or "Unnamed investigation"),
-        "",
-        "Target:",
-        str(investigation.get("target") or "unknown"),
-        "",
-    ]
+    lines = [*build_investigation_summary_lines(investigation, events), "", "Investigation Timeline", ""]
     if not events:
         lines.append("No timeline events recorded yet.")
         return "\n".join(lines)
@@ -198,9 +191,47 @@ def build_investigation_timeline_text(investigation: dict | None, events: list[d
         if event_date != current_date:
             current_date = event_date
             lines.extend([event_date, ""])
-        lines.append(f"{_format_event_time(timestamp)} {_format_event_label(event)}")
+        lines.extend([_format_event_time(timestamp), _format_event_label(event), ""])
 
     return _truncate_message("\n".join(lines).strip())
+
+
+def build_investigation_summary_lines(investigation: dict, events: list[dict]) -> list[str]:
+    return [
+        section_label("investigation", "Investigation"),
+        "",
+        str(investigation.get("name") or "Unnamed investigation"),
+        "",
+        "Target:",
+        str(investigation.get("target") or "unknown"),
+        "",
+        "Status:",
+        _title_status(investigation.get("status")),
+        "",
+        "Started:",
+        _format_compact_time(investigation.get("started_at")),
+        "",
+        "Completed:",
+        _format_compact_time(investigation.get("completed_at")) if investigation.get("completed_at") else "Open",
+        "",
+        "Duration:",
+        _format_investigation_duration(investigation),
+        "",
+        "Overall Risk:",
+        str(investigation.get("overall_risk") or "unknown").upper(),
+        "",
+        "Tools Used:",
+        _format_tools_used(events),
+        "",
+        "Scan Runs:",
+        str(len([event for event in events if str(event.get("event_type")).endswith("_scan_completed")])),
+        "",
+        "Reports Generated:",
+        str(len([event for event in events if event.get("event_type") in {"report_generated", "ai_report_generated"}])),
+        "",
+        "Last Updated:",
+        _format_last_updated(investigation, events),
+    ]
 
 
 def split_report_text(report: str, max_length: int = MAX_REPORT_MESSAGE_LENGTH) -> list[str]:
@@ -466,6 +497,12 @@ def _record_report_investigation_event(
         summary="AI report generated" if include_ai_assessment else "Report generated",
         metadata={"report_id": report_metadata.get("id"), "readable_report_id": report_metadata.get("report_id")},
     )
+    complete_investigation(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        overall_risk=report_metadata.get("overall_risk"),
+        summary=report_metadata.get("summary"),
+    )
 
 
 def _extract_targets(scan_runs: list[dict]) -> list[str]:
@@ -556,14 +593,66 @@ def _format_event_time(timestamp: object) -> str:
 
 def _format_event_label(event: dict) -> str:
     labels = {
-        "nmap_scan_started": "Nmap scan started",
-        "nmap_scan_completed": "Nmap scan completed",
-        "nuclei_scan_started": "Nuclei scan started",
-        "nuclei_scan_completed": "Nuclei scan completed",
-        "report_generated": "Report generated",
-        "ai_report_generated": "AI report generated",
+        "nmap_scan_started": icon_label("nmap", "Nmap Scan Started"),
+        "nmap_scan_completed": icon_label("nmap", "Nmap Scan Completed"),
+        "nuclei_scan_started": icon_label("nuclei", "Nuclei Scan Started"),
+        "nuclei_scan_completed": icon_label("nuclei", "Nuclei Scan Completed"),
+        "report_generated": icon_label("report", "Security Report Generated"),
+        "ai_report_generated": icon_label("mongrel_ai", "Executive Assessment Generated"),
     }
     return labels.get(str(event.get("event_type")), str(event.get("summary") or event.get("event_type") or "Timeline event"))
+
+
+def _format_compact_time(timestamp: object) -> str:
+    if hasattr(timestamp, "strftime"):
+        return timestamp.astimezone(UTC).strftime("%H:%M")
+    if isinstance(timestamp, str):
+        try:
+            return datetime.fromisoformat(timestamp).astimezone(UTC).strftime("%H:%M")
+        except ValueError:
+            return timestamp
+
+    return "unknown"
+
+
+def _format_investigation_duration(investigation: dict) -> str:
+    duration_seconds = (investigation.get("metadata") or {}).get("duration_seconds")
+    if duration_seconds is None and investigation.get("started_at") and investigation.get("completed_at"):
+        duration_seconds = int((investigation["completed_at"] - investigation["started_at"]).total_seconds())
+    if duration_seconds is None:
+        return "In progress"
+
+    return _format_duration(int(duration_seconds))
+
+
+def _format_duration(total_seconds: int) -> str:
+    total_seconds = max(0, total_seconds)
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def _format_tools_used(events: list[dict]) -> str:
+    tools = sorted({str(event.get("tool")).title() for event in events if event.get("tool") and event.get("tool") != "report"})
+    return ", ".join(tools) if tools else "None"
+
+
+def _format_last_updated(investigation: dict, events: list[dict]) -> str:
+    timestamps = [event.get("created_at") for event in events if event.get("created_at")]
+    if investigation.get("completed_at"):
+        timestamps.append(investigation.get("completed_at"))
+    if not timestamps:
+        timestamps.append(investigation.get("started_at"))
+
+    latest = max((timestamp for timestamp in timestamps if hasattr(timestamp, "astimezone")), default=None)
+    return _format_report_timestamp({"generated_at": latest}) if latest is not None else "unknown"
 
 
 def _title_status(status: object) -> str:

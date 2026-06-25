@@ -79,6 +79,7 @@ def test_complete_and_update_investigation() -> None:
     assert updated["overall_risk"] == "high"
     assert completed["status"] == "completed"
     assert completed["completed_at"] is not None
+    assert completed["metadata"]["duration_seconds"] >= 0
 
 
 def test_investigations_survive_connection_reload() -> None:
