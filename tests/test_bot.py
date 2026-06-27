@@ -742,10 +742,10 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     run_bbot_scan.assert_called_once_with("https://example.com")
     assert message.reply_text.call_args_list[0].args[0] == "BBOT recon started.\n\nTarget:\nexample.com"
     assert "BBOT Recon" in message.reply_text.call_args_list[1].args[0]
-    assert "Status:\nComplete" in message.reply_text.call_args_list[1].args[0]
-    assert "Observations:" in message.reply_text.call_args_list[1].args[0]
+    assert "Recon Overview" in message.reply_text.call_args_list[1].args[0]
     assert "- Subdomains:" in message.reply_text.call_args_list[1].args[0]
     assert "- URLs: 1" in message.reply_text.call_args_list[1].args[0]
+    assert "Recommended Next Actions" in message.reply_text.call_args_list[1].args[0]
     findings = get_user_findings(7202)
     assert findings[0]["source"] == "bbot"
     assert findings[0]["target"] == "example.com"
@@ -757,7 +757,7 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     investigation = get_user_investigations(7202)[0]
     events = get_investigation_events(investigation["id"], 7202)
     assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_completed"]
-    assert "observations extracted" in events[-1]["summary"]
+    assert "Recon Summary Generated" in events[-1]["summary"]
     observations = get_investigation_observations(investigation["id"], 7202)
     assert observations
     assert get_user_observations(7202) == observations
@@ -846,23 +846,74 @@ def test_bbot_scan_zero_observations_handled_cleanly() -> None:
     ):
         asyncio.run(scan_target_handler(update, context))
 
-    assert "Subdomains: 0" in message.reply_text.call_args_list[1].args[0]
+    assert "Observations Collected: 0" in message.reply_text.call_args_list[1].args[0]
+    assert "Continue reconnaissance using additional observation sources." in message.reply_text.call_args_list[1].args[0]
     finding = get_user_findings(7206)[0]
     assert finding["summary"] == "BBOT completed but no structured observations were extracted."
     assert get_user_observations(7206) == []
 
 
-def test_bbot_scan_result_formatter_truncates_output() -> None:
+def test_bbot_scan_summary_chunks_are_sent() -> None:
+    clear_user_findings(7207)
+    clear_user_investigations(7207)
+    clear_user_observations(7207)
+    clear_user_scan_requests(7207)
+    scan_request = create_scan_request(user_id=7207, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7207, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7207))
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": True,
+                "target": "example.com",
+                "output": "Found app.example.com",
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 1,
+            },
+        ),
+        patch("app.bot.handlers.scan.split_report_text", return_value=["chunk one", "chunk two"]) as splitter,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    splitter.assert_called_once()
+    assert [call.args[0] for call in message.reply_text.call_args_list] == [
+        "BBOT recon started.\n\nTarget:\nexample.com",
+        "chunk one",
+        "chunk two",
+    ]
+
+
+def test_bbot_scan_result_formatter_uses_recon_summary() -> None:
     text = build_bbot_result_text(
         {
             "success": True,
             "target": "example.com",
             "output": "A" * 1000,
             "elapsed_seconds": 1,
+        },
+        recon_summary="BBOT Recon Summary\n\nTarget:\nexample.com",
+    )
+
+    assert text == "BBOT Recon Summary\n\nTarget:\nexample.com"
+
+
+def test_bbot_scan_result_formatter_keeps_failure_output_concise() -> None:
+    text = build_bbot_result_text(
+        {
+            "success": False,
+            "target": "example.com",
+            "error": "A" * 1000,
+            "elapsed_seconds": 1,
         }
     )
 
-    assert "BBOT Recon" in text
+    assert "Status:\nFailed" in text
     assert "...[truncated]" in text
 
 

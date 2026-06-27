@@ -10,6 +10,7 @@ from app.bot.handlers.findings import build_finding_followup_ai_prompt
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
+from app.bot.handlers.reports import split_report_text
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
 from app.services.active_scan_state import (
@@ -19,6 +20,7 @@ from app.services.active_scan_state import (
     set_active_scan_status_task,
     set_active_scan_task,
 )
+from app.services.bbot_summary import build_bbot_recon_summary
 from app.services.chat_state import clear_finding_analysis_context, get_finding_analysis_context, is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
@@ -132,7 +134,14 @@ def build_bbot_scan_started_text(target: str) -> str:
     return "\n".join(["BBOT recon started.", "", "Target:", target])
 
 
-def build_bbot_result_text(result: dict[str, object], observation_counts: dict[str, int] | None = None) -> str:
+def build_bbot_result_text(
+    result: dict[str, object],
+    observation_counts: dict[str, int] | None = None,
+    recon_summary: str | None = None,
+) -> str:
+    if result.get("success") is True and recon_summary:
+        return recon_summary
+
     status = "Complete" if result.get("success") is True else "Failed"
     output = _truncate_bbot_output(str(result.get("output") or result.get("error") or "No output returned."))
     counts = observation_counts or {}
@@ -596,6 +605,13 @@ async def _handle_bbot_target(
     finding = store_bbot_scan_result(user_id=user_id, result=result, observations=observations)
     event_type = "bbot_scan_completed" if result.get("success") is True else "bbot_scan_failed"
     observation_count = len(observations)
+    recon_summary = None
+    if result.get("success") is True:
+        recon_summary = build_bbot_recon_summary(
+            user_id=user_id,
+            investigation_id=investigation["id"],
+            target=str(result.get("target") or display_target),
+        )
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
@@ -604,14 +620,15 @@ async def _handle_bbot_target(
         tool="bbot",
         status="completed" if result.get("success") is True else "failed",
         summary=(
-            f"BBOT scan completed - {observation_count} observations extracted."
+            f"BBOT scan completed - Recon Summary Generated ({observation_count} observations)."
             if result.get("success") is True
             else "BBOT recon failed"
         ),
         metadata={"finding_id": finding.get("id"), "observation_count": observation_count},
     )
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
-    await update.message.reply_text(build_bbot_result_text(result, observation_counts))
+    for chunk in split_report_text(build_bbot_result_text(result, observation_counts, recon_summary=recon_summary)):
+        await update.message.reply_text(chunk)
 
 
 def _is_finding_analysis_exit_message(text: str) -> bool:
