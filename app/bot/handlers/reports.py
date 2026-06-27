@@ -600,6 +600,8 @@ def _format_event_label(event: dict) -> str:
         "bbot_scan_started": icon_label("bbot", "BBOT Recon Started"),
         "bbot_scan_completed": icon_label("bbot", "BBOT Recon Completed"),
         "bbot_scan_failed": icon_label("bbot", "BBOT Recon Failed"),
+        "bbot_ai_assessment_generated": icon_label("mongrel_ai", "BBOT AI Recon Assessment Generated"),
+        "bbot_ai_assessment_fallback": icon_label("mongrel_ai", "BBOT AI Recon Assessment Fallback"),
         "report_generated": icon_label("report", "Security Report Generated"),
         "ai_report_generated": icon_label("mongrel_ai", "Executive Assessment Generated"),
     }

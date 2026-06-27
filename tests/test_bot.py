@@ -35,6 +35,7 @@ from app.bot.handlers.scan import (
     _finalize_nuclei_status,
     _update_nuclei_status_card,
     append_change_summary,
+    build_bbot_ai_assessment_keyboard,
     build_bbot_result_text,
     build_bbot_target_prompt,
     build_clean_nuclei_verdict_text,
@@ -74,6 +75,7 @@ from app.bot.handlers.upload import (
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.core.config import Settings
 from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
+from app.services.bbot_ai_assessment import FALLBACK_LINES
 from app.services.findings_store import (
     add_finding,
     add_report_metadata,
@@ -89,7 +91,7 @@ from app.services.investigation_store import (
     get_investigation_events,
     get_user_investigations,
 )
-from app.services.observation_store import clear_user_observations, get_investigation_observations, get_user_observations
+from app.services.observation_store import add_observation, clear_user_observations, get_investigation_observations, get_user_observations
 from app.services.chat_state import (
     clear_ai_waiting,
     clear_finding_analysis_context,
@@ -746,6 +748,9 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     assert "- Subdomains:" in message.reply_text.call_args_list[1].args[0]
     assert "- URLs: 1" in message.reply_text.call_args_list[1].args[0]
     assert "Recommended Next Actions" in message.reply_text.call_args_list[1].args[0]
+    keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text == "Generate AI Recon Assessment"
+    assert keyboard.inline_keyboard[0][0].callback_data.startswith("bbot_ai:")
     findings = get_user_findings(7202)
     assert findings[0]["source"] == "bbot"
     assert findings[0]["target"] == "example.com"
@@ -762,6 +767,104 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     assert observations
     assert get_user_observations(7202) == observations
     assert context.user_data == {}
+
+
+def test_bbot_ai_assessment_keyboard_exists() -> None:
+    keyboard = build_bbot_ai_assessment_keyboard("investigation-1")
+
+    assert keyboard is not None
+    assert keyboard.inline_keyboard[0][0].text == "Generate AI Recon Assessment"
+    assert keyboard.inline_keyboard[0][0].callback_data == "bbot_ai:investigation-1"
+
+
+def test_bbot_ai_assessment_callback_success_sends_assessment_and_timeline_event() -> None:
+    clear_user_investigations(7210)
+    clear_user_observations(7210)
+    investigation = create_investigation(user_id=7210, target="example.com")
+    add_observation(
+        user_id=7210,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="subdomain",
+        value="admin.example.com",
+        target="example.com",
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"bbot_ai:{investigation['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7210))
+
+    with patch(
+        "app.bot.handlers.scan.generate_bbot_ai_assessment",
+        return_value=["AI Recon Assessment", "Confidence:", "MEDIUM"],
+    ):
+        asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
+
+    query.answer.assert_called_once()
+    edited_messages = [call.args[0] for call in query.edit_message_text.call_args_list]
+    assert "Generating AI Recon Assessment /" in edited_messages
+    assert edited_messages[-1] == "AI Recon Assessment ready."
+    query_message.reply_text.assert_called_once_with("AI Recon Assessment\nConfidence:\nMEDIUM")
+    events = get_investigation_events(investigation["id"], 7210)
+    assert events[-1]["event_type"] == "bbot_ai_assessment_generated"
+    assert events[-1]["summary"] == "BBOT AI Recon Assessment Generated"
+
+
+def test_bbot_ai_assessment_callback_failure_sends_fallback_and_timeline_event() -> None:
+    clear_user_investigations(7211)
+    clear_user_observations(7211)
+    investigation = create_investigation(user_id=7211, target="example.com")
+    add_observation(
+        user_id=7211,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="subdomain",
+        value="app.example.com",
+        target="example.com",
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"bbot_ai:{investigation['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7211))
+
+    with patch("app.bot.handlers.scan.generate_bbot_ai_assessment", return_value=FALLBACK_LINES):
+        asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
+
+    assert query.edit_message_text.call_args_list[-1].args[0] == "AI Recon Assessment unavailable."
+    query_message.reply_text.assert_called_once_with("\n".join(FALLBACK_LINES))
+    events = get_investigation_events(investigation["id"], 7211)
+    assert events[-1]["event_type"] == "bbot_ai_assessment_fallback"
+    assert events[-1]["summary"] == "BBOT AI Recon Assessment Fallback"
+
+
+def test_bbot_ai_assessment_callback_chunks_response() -> None:
+    clear_user_investigations(7212)
+    investigation = create_investigation(user_id=7212, target="example.com")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"bbot_ai:{investigation['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7212))
+
+    with (
+        patch("app.bot.handlers.scan.generate_bbot_ai_assessment", return_value=["AI Recon Assessment", "Confidence:", "LOW"]),
+        patch("app.bot.handlers.scan.split_report_text", return_value=["chunk one", "chunk two"]) as splitter,
+    ):
+        asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
+
+    splitter.assert_called_once_with("AI Recon Assessment\nConfidence:\nLOW")
+    assert [call.args[0] for call in query_message.reply_text.call_args_list] == ["chunk one", "chunk two"]
 
 
 def test_bbot_scan_missing_binary_does_not_crash() -> None:

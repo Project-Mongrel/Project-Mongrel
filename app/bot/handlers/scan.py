@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ContextTypes
 
@@ -20,13 +20,14 @@ from app.services.active_scan_state import (
     set_active_scan_status_task,
     set_active_scan_task,
 )
+from app.services.bbot_ai_assessment import FALLBACK_LINES, generate_bbot_ai_assessment
 from app.services.bbot_summary import build_bbot_recon_summary
 from app.services.chat_state import clear_finding_analysis_context, get_finding_analysis_context, is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.icon_helper import section_label
 from app.services.impact_engine import assess_change_impact
-from app.services.investigation_store import add_investigation_event, get_or_create_latest_open_investigation
+from app.services.investigation_store import add_investigation_event, get_investigation, get_or_create_latest_open_investigation
 from app.services.observation_store import add_observations
 from app.services.risk_rules import assess_nmap_ports
 from app.services.scan_manager import (
@@ -45,6 +46,7 @@ from app.tools.target_normalizer import normalize_target
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
 NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS = 15
+BBOT_AI_ASSESSMENT_CALLBACK_PREFIX = "bbot_ai"
 logger = logging.getLogger(__name__)
 
 
@@ -132,6 +134,15 @@ def build_clean_nuclei_verdict_text(target: str | None) -> str:
 
 def build_bbot_scan_started_text(target: str) -> str:
     return "\n".join(["BBOT recon started.", "", "Target:", target])
+
+
+def build_bbot_ai_assessment_keyboard(investigation_id: str | None) -> InlineKeyboardMarkup | None:
+    if not investigation_id:
+        return None
+
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Generate AI Recon Assessment", callback_data=f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:{investigation_id}")]]
+    )
 
 
 def build_bbot_result_text(
@@ -391,6 +402,14 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             )
         return
 
+    if query.data and query.data.startswith(f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:"):
+        user_id = update.effective_user.id if update.effective_user is not None else None
+        if user_id is None:
+            await query.edit_message_text("Unable to identify Telegram user.")
+            return
+        await _handle_bbot_ai_assessment_callback(query, user_id)
+        return
+
     if query.data is None or not query.data.startswith("scan:"):
         return
 
@@ -627,8 +646,62 @@ async def _handle_bbot_target(
         metadata={"finding_id": finding.get("id"), "observation_count": observation_count},
     )
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
-    for chunk in split_report_text(build_bbot_result_text(result, observation_counts, recon_summary=recon_summary)):
-        await update.message.reply_text(chunk)
+    chunks = split_report_text(build_bbot_result_text(result, observation_counts, recon_summary=recon_summary))
+    keyboard = build_bbot_ai_assessment_keyboard(investigation["id"]) if result.get("success") is True else None
+    for index, chunk in enumerate(chunks):
+        kwargs = {"reply_markup": keyboard} if keyboard is not None and index == len(chunks) - 1 else {}
+        await update.message.reply_text(chunk, **kwargs)
+
+
+async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> None:
+    data = str(getattr(query, "data", "") or "")
+    investigation_id = data.removeprefix(f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:")
+    investigation = get_investigation(investigation_id, user_id)
+    if investigation is None:
+        await query.edit_message_text("Investigation not found for BBOT AI assessment.")
+        return
+
+    await _safe_edit_bbot_ai_status(query, "Generating AI Recon Assessment /")
+    assessment_lines = await asyncio.to_thread(
+        generate_bbot_ai_assessment,
+        user_id,
+        investigation_id=investigation_id,
+        target=investigation.get("target"),
+    )
+    fallback = assessment_lines == FALLBACK_LINES
+    event = add_investigation_event(
+        investigation_id=investigation_id,
+        user_id=user_id,
+        target=investigation.get("target"),
+        event_type="bbot_ai_assessment_fallback" if fallback else "bbot_ai_assessment_generated",
+        tool="bbot",
+        status="completed" if not fallback else "fallback",
+        summary="BBOT AI Recon Assessment Generated" if not fallback else "BBOT AI Recon Assessment Fallback",
+        metadata={"line_count": len(assessment_lines), "fallback": fallback},
+    )
+    await _safe_edit_bbot_ai_status(query, "AI Recon Assessment unavailable." if fallback else "AI Recon Assessment ready.")
+    message = getattr(query, "message", None)
+    if message is None:
+        await query.edit_message_text("\n".join(assessment_lines))
+        return
+
+    for chunk in split_report_text("\n".join(assessment_lines)):
+        await message.reply_text(chunk)
+
+    logger.info("BBOT AI assessment event recorded: id=%s fallback=%s", event.get("id"), fallback)
+
+
+async def _safe_edit_bbot_ai_status(query: object, text: str) -> None:
+    edit_message_text = getattr(query, "edit_message_text", None)
+    if edit_message_text is None:
+        return
+
+    try:
+        await edit_message_text(text)
+    except (TimedOut, NetworkError, BadRequest) as exc:
+        logger.warning("BBOT AI assessment status edit failed: %s", exc)
+    except Exception:
+        logger.warning("BBOT AI assessment status edit failed unexpectedly.", exc_info=True)
 
 
 def _is_finding_analysis_exit_message(text: str) -> bool:
