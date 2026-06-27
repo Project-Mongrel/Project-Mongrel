@@ -153,6 +153,18 @@ def build_bbot_result_text(
     if result.get("success") is True and recon_summary:
         return recon_summary
 
+    if result.get("error_type") == "runtime_incompatible":
+        return "\n".join(
+            [
+                section_label("bbot", "BBOT Recon"),
+                "",
+                "Target:",
+                str(result.get("target") or "unknown"),
+                "",
+                str(result.get("error") or "BBOT is installed but cannot run in this Windows environment."),
+            ]
+        )
+
     status = "Complete" if result.get("success") is True else "Failed"
     output = _truncate_bbot_output(str(result.get("output") or result.get("error") or "No output returned."))
     counts = observation_counts or {}

@@ -76,6 +76,7 @@ from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build
 from app.core.config import Settings
 from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
 from app.services.bbot_ai_assessment import FALLBACK_LINES
+from app.tools.bbot_runner import BBOT_RUNTIME_INCOMPATIBLE_ERROR
 from app.services.findings_store import (
     add_finding,
     add_report_metadata,
@@ -1018,6 +1019,26 @@ def test_bbot_scan_result_formatter_keeps_failure_output_concise() -> None:
 
     assert "Status:\nFailed" in text
     assert "...[truncated]" in text
+
+
+def test_bbot_runtime_incompatible_traceback_not_shown_in_telegram() -> None:
+    text = build_bbot_result_text(
+        {
+            "success": False,
+            "target": "example.com",
+            "error": BBOT_RUNTIME_INCOMPATIBLE_ERROR,
+            "error_type": "runtime_incompatible",
+            "output": "Traceback (most recent call last): ModuleNotFoundError: No module named 'fcntl'",
+            "elapsed_seconds": 1,
+        }
+    )
+
+    assert "BBOT is installed but cannot run in this Windows environment." in text
+    assert "BBOT requires a Linux-compatible runtime for this scan mode." in text
+    assert "- Run Mongrel under WSL, Kali, or Linux." in text
+    assert "Traceback" not in text
+    assert "ModuleNotFoundError" not in text
+    assert "fcntl" not in text
 
 
 def test_store_bbot_scan_result_persists_minimal_history() -> None:
