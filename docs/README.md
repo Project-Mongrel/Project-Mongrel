@@ -10,6 +10,7 @@ This documentation set is intended for future developers, reviewers, and release
 - [Roadmap](roadmap.md)
 - [Investigations](investigations.md)
 - [Agents](agents.md)
+- [Setup](SETUP.md)
 - [Security Audit](security_audit.md)
 - [Coding Standards](coding_standards.md)
 - [Release Checklist](RELEASE_CHECKLIST.md)
