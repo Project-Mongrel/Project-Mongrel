@@ -770,6 +770,44 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     assert context.user_data == {}
 
 
+def test_bbot_scan_json_output_populates_observation_store_and_summary() -> None:
+    clear_user_findings(7220)
+    clear_user_investigations(7220)
+    clear_user_observations(7220)
+    clear_user_scan_requests(7220)
+    scan_request = create_scan_request(user_id=7220, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7220, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7220))
+    result = {
+        "success": True,
+        "target": "example.com",
+        "output": '{"type":"DNS_NAME","data":"app.example.com"}',
+        "error": "",
+        "returncode": 0,
+        "elapsed_seconds": 19.0,
+        "output_dir": "data/bbot/example.com",
+        "json_output_found": True,
+        "json_output_paths": ["data/bbot/example.com/scan/output/output.jsonl"],
+    }
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch("app.bot.handlers.scan.run_bbot_scan", return_value=result),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    observations = get_user_observations(7220)
+    assert len(observations) == 1
+    assert observations[0]["observation_type"] == "subdomain"
+    assert observations[0]["value"] == "app.example.com"
+    summary_text = message.reply_text.call_args_list[1].args[0]
+    assert "Observations Collected: 1" in summary_text
+    assert "- Subdomains: 1" in summary_text
+    assert "- app.example.com" in summary_text
+
+
 def test_bbot_ai_assessment_keyboard_exists() -> None:
     keyboard = build_bbot_ai_assessment_keyboard("investigation-1")
 
