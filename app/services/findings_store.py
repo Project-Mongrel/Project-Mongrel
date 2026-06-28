@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -7,21 +8,24 @@ from uuid import uuid4
 from app.core.config import get_settings
 from app.services.target_normalizer import normalize_target_key
 
-_connection: sqlite3.Connection | None = None
+_connection_state = threading.local()
 _database_path_override: Path | None = None
+_database_generation = 0
 
 
 def configure_findings_database(database_path: Path | str | None) -> None:
-    global _database_path_override
+    global _database_path_override, _database_generation
     close_findings_database()
     _database_path_override = Path(database_path) if database_path is not None else None
+    _database_generation += 1
 
 
 def close_findings_database() -> None:
-    global _connection
-    if _connection is not None:
-        _connection.close()
-        _connection = None
+    connection = getattr(_connection_state, "connection", None)
+    if connection is not None:
+        connection.close()
+    _connection_state.connection = None
+    _connection_state.generation = None
 
 
 def add_finding(user_id: int, finding: dict) -> dict:
@@ -227,16 +231,23 @@ def clear_user_reports(user_id: int) -> None:
 
 
 def _get_connection() -> sqlite3.Connection:
-    global _connection
-    if _connection is None:
+    connection = getattr(_connection_state, "connection", None)
+    connection_generation = getattr(_connection_state, "generation", None)
+    if connection is not None and connection_generation != _database_generation:
+        connection.close()
+        connection = None
+
+    if connection is None:
         database_path = _resolve_database_path()
         if str(database_path) != ":memory:":
             database_path.parent.mkdir(parents=True, exist_ok=True)
-        _connection = sqlite3.connect(database_path)
-        _connection.row_factory = sqlite3.Row
-        _initialize_schema(_connection)
+        connection = sqlite3.connect(database_path)
+        connection.row_factory = sqlite3.Row
+        _initialize_schema(connection)
+        _connection_state.connection = connection
+        _connection_state.generation = _database_generation
 
-    return _connection
+    return connection
 
 
 def _resolve_database_path() -> Path:

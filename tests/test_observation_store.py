@@ -1,6 +1,12 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
+
 import pytest
 
-from app.services.findings_store import close_findings_database, configure_findings_database
+from app.services.bbot_ai_assessment import generate_bbot_ai_assessment
+from app.services.findings_store import _get_connection, close_findings_database, configure_findings_database
+from app.services.investigation_store import create_investigation
 from app.services.observation_store import (
     add_observation,
     add_observations,
@@ -135,3 +141,58 @@ def test_clear_user_observations() -> None:
     clear_user_observations(8008)
 
     assert get_user_observations(8008) == []
+
+
+def test_get_investigation_observations_from_worker_thread() -> None:
+    add_observation(
+        user_id=8009,
+        investigation_id="investigation-worker",
+        source="bbot",
+        observation_type="subdomain",
+        value="worker.example.com",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        observations = executor.submit(get_investigation_observations, "investigation-worker", 8009).result()
+
+    assert len(observations) == 1
+    assert observations[0]["value"] == "worker.example.com"
+
+
+def test_add_get_operations_from_different_threads_use_different_sqlite_connections() -> None:
+    add_observation(user_id=8010, source="bbot", observation_type="subdomain", value="main.example.com")
+    main_connection_id = id(_get_connection())
+
+    def worker() -> tuple[int, list[dict]]:
+        add_observation(user_id=8010, source="bbot", observation_type="url", value="https://main.example.com")
+        return id(_get_connection()), get_user_observations(8010)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        worker_connection_id, observations = executor.submit(worker).result()
+
+    assert worker_connection_id != main_connection_id
+    assert [observation["value"] for observation in observations] == ["main.example.com", "https://main.example.com"]
+
+
+def test_bbot_ai_assessment_from_worker_thread_does_not_reuse_main_sqlite_connection() -> None:
+    investigation = create_investigation(user_id=8011, target="example.com")
+    add_observation(
+        user_id=8011,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="subdomain",
+        value="app.example.com",
+        target="example.com",
+    )
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value="AI Recon Assessment\nConfidence:\nMEDIUM"):
+        lines = asyncio.run(
+            asyncio.to_thread(
+                generate_bbot_ai_assessment,
+                8011,
+                investigation_id=investigation["id"],
+                target="example.com",
+            )
+        )
+
+    assert "AI Recon Assessment" in "\n".join(lines)
