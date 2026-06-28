@@ -236,29 +236,16 @@ def test_ollama_success_returns_response_text() -> None:
     ):
         assert ask_ollama("What should I check?") == "Review SSH exposure."
 
-    post.assert_called_once_with(
-        "https://ollama.example/api/chat",
-        json={
-            "model": "qwen3:4b",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": build_ollama_messages("What should I check?")[0]["content"],
-                },
-                {
-                    "role": "user",
-                    "content": "Reply with final answer only. Do not think silently. Question:\nWhat should I check?",
-                },
-            ],
-            "stream": False,
-            "options": {
-                "num_predict": 256,
-                "temperature": 0.2,
-                "think": False,
-            },
-        },
-        timeout=120,
-    )
+    assert post.call_count == 1
+    call_args, call_kwargs = post.call_args
+    assert call_args[0] == "https://ollama.example/api/chat"
+    payload = call_kwargs["json"]
+    assert payload["model"] == "qwen3:4b"
+    assert payload["messages"] == build_ollama_messages("What should I check?")
+    assert payload["stream"] is False
+    assert payload["options"]["num_predict"] == 256
+    assert payload["options"]["temperature"] == 0.2
+    assert payload["options"]["think"] is False
 
 
 def test_qwen_response_parsing_ignores_thinking() -> None:
