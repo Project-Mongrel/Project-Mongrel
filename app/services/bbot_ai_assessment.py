@@ -1,5 +1,3 @@
-import json
-
 from app.services.ai_client import ask_ai
 from app.services.bbot_summary import build_bbot_recon_summary
 from app.services.investigation_store import get_investigation
@@ -21,6 +19,32 @@ FALLBACK_LINES = [
     "AI recon assessment unavailable.",
     "Use the deterministic BBOT Recon Summary for next actions.",
 ]
+FORBIDDEN_TERMS = (
+    "bbot",
+    "scanner",
+    "module",
+    "scan name",
+    "stdout",
+    "stderr",
+    "json",
+    "ansible",
+    "dependency installation",
+    "implementation detail",
+    "internal id",
+    "observation store",
+)
+ALLOWED_OBSERVATION_TYPES = {
+    "subdomain": "DNS names",
+    "dns_record": "DNS records",
+    "ip_address": "IP addresses",
+    "url": "URLs",
+    "technology": "Technologies",
+    "certificate": "Certificates",
+    "email": "Email addresses",
+    "social_profile": "Social profiles",
+    "open_port": "Open ports",
+    "finding": "Findings",
+}
 
 
 def generate_bbot_ai_assessment(
@@ -34,25 +58,23 @@ def generate_bbot_ai_assessment(
 
     if not observations:
         return [
-            "AI Recon Assessment",
+            "Executive Summary",
+            "- Available reconnaissance evidence is insufficient to assess the target beyond the provided scope.",
             "",
-            "Overall Recon Posture:",
-            "UNKNOWN",
+            "Key Findings",
+            "- No normalized reconnaissance observations are available for this target.",
             "",
-            "Key Observations:",
-            "- No stored BBOT observations are available for this scope.",
+            "Observed Assets",
+            "- None observed.",
             "",
-            "Why It Matters:",
-            "- Evidence is limited, so no meaningful reconnaissance posture can be assessed.",
-            "",
-            "Priority Follow-Up:",
-            "- Use the deterministic BBOT Recon Summary and consider collecting additional observations.",
+            "Potential Risks",
+            "- Evidence is limited because there is not enough information to identify concrete exposure patterns.",
             "",
             "Confidence:",
-            "LOW",
+            "Low",
             "",
-            "Evidence Limitations:",
-            "- Assessment is limited because the Observation Store contains no BBOT observations for this scope.",
+            "Recommended Next Actions",
+            "- Continue reconnaissance using additional evidence sources.",
         ]
 
     prompt = build_bbot_ai_assessment_prompt(
@@ -73,7 +95,7 @@ def generate_bbot_ai_assessment(
     if not cleaned_response:
         return list(FALLBACK_LINES)
 
-    return cleaned_response.splitlines()
+    return _sanitize_response_lines(cleaned_response.splitlines())
 
 
 def build_bbot_ai_assessment_prompt(
@@ -84,38 +106,40 @@ def build_bbot_ai_assessment_prompt(
 ) -> str:
     return "\n".join(
         [
-            "Create a grounded AI Recon Assessment for BBOT reconnaissance.",
+            "You are a senior penetration tester preparing reconnaissance notes for another security consultant.",
             "",
             "Rules:",
-            "- Only use the supplied observations and recon summary.",
+            "- Only use the supplied normalized evidence and deterministic Recon Summary.",
             "- Do not invent vulnerabilities.",
+            "- Do not invent assets, findings, technologies, ports, or certificates.",
             "- Do not claim compromise.",
             "- Do not recommend exploitation.",
             "- Do not say a service is vulnerable unless evidence supports it.",
             "- Use cautious language such as review, verify, consider, prioritize, and may indicate.",
             "- If evidence is limited, say so.",
-            "- Include confidence level.",
+            "- Confidence must be High, Medium, or Low, based only on available evidence.",
+            "- Recommended next actions must be practical and tied to observed evidence.",
+            "- Discuss only consultant-facing evidence and avoid collection mechanics or platform internals.",
             "- Return final answer only.",
             "",
             "Required sections:",
-            "AI Recon Assessment",
-            "Overall Recon Posture:",
-            "Key Observations:",
-            "Why It Matters:",
-            "Priority Follow-Up:",
-            "Confidence:",
-            "Evidence Limitations:",
+            "Executive Summary",
+            "Key Findings",
+            "Observed Assets",
+            "Potential Risks",
+            "Confidence",
+            "Recommended Next Actions",
             "",
-            "Target:",
+            "Investigation Target:",
             str(target or _target_from_observations(observations) or "unknown"),
             "",
-            "Investigation Context:",
+            "Investigation Context",
             _format_investigation_context(investigation),
             "",
-            "Deterministic BBOT Recon Summary:",
-            recon_summary,
+            "Deterministic Recon Summary",
+            _sanitize_recon_summary(recon_summary),
             "",
-            "Stored Observations:",
+            "Normalized Evidence",
             _format_observations(observations),
         ]
     )
@@ -140,34 +164,37 @@ def _load_bbot_observations(user_id: int, investigation_id: str | None, target: 
 
 def _format_investigation_context(investigation: dict | None) -> str:
     if investigation is None:
-        return "No investigation metadata supplied."
+        return "- No additional investigation context supplied."
 
-    context = {
-        "id": investigation.get("id"),
-        "name": investigation.get("name"),
-        "target": investigation.get("target"),
-        "status": investigation.get("status"),
-        "overall_risk": investigation.get("overall_risk"),
-        "summary": investigation.get("summary"),
-    }
-    return json.dumps(context, sort_keys=True, default=str)
+    lines = []
+    if investigation.get("target"):
+        lines.append(f"- Target: {investigation['target']}")
+    if investigation.get("overall_risk"):
+        lines.append(f"- Current risk rating: {investigation['overall_risk']}")
+    if investigation.get("summary"):
+        lines.append(f"- Existing summary: {_sanitize_text(str(investigation['summary']))}")
+    return "\n".join(lines) if lines else "- No additional investigation context supplied."
 
 
 def _format_observations(observations: list[dict]) -> str:
-    formatted = []
+    grouped: dict[str, list[str]] = {}
     for observation in observations:
-        formatted.append(
-            {
-                "source": observation.get("source"),
-                "type": observation.get("observation_type"),
-                "value": observation.get("value"),
-                "target": observation.get("target"),
-                "confidence": observation.get("confidence"),
-                "risk_level": observation.get("risk_level"),
-                "summary": observation.get("summary"),
-            }
-        )
-    return json.dumps(formatted, sort_keys=True, default=str)
+        observation_type = str(observation.get("observation_type") or "")
+        label = ALLOWED_OBSERVATION_TYPES.get(observation_type)
+        value = _sanitize_text(str(observation.get("value") or "").strip())
+        if not label or not value:
+            continue
+        grouped.setdefault(label, [])
+        if value.lower() not in {item.lower() for item in grouped[label]}:
+            grouped[label].append(value)
+
+    if not grouped:
+        return "- No supported normalized evidence supplied."
+
+    lines = [f"- Observation count: {sum(len(values) for values in grouped.values())}"]
+    for label in sorted(grouped):
+        lines.append(f"- {label}: {', '.join(grouped[label][:10])}")
+    return "\n".join(lines)
 
 
 def _target_from_observations(observations: list[dict]) -> str | None:
@@ -180,3 +207,46 @@ def _target_from_observations(observations: list[dict]) -> str | None:
 def _is_unavailable_response(response: str) -> bool:
     normalized = str(response or "").strip()
     return any(normalized.startswith(message) for message in AI_UNAVAILABLE_MESSAGES)
+
+
+def _sanitize_recon_summary(recon_summary: str) -> str:
+    sanitized_lines = []
+    for line in str(recon_summary or "").splitlines():
+        sanitized_line = _sanitize_text(line)
+        if sanitized_line.strip():
+            sanitized_lines.append(sanitized_line)
+    return "\n".join(sanitized_lines) if sanitized_lines else "- No deterministic summary supplied."
+
+
+def _sanitize_response_lines(lines: list[str]) -> list[str]:
+    sanitized_lines = []
+    for line in lines:
+        if _contains_forbidden_term(line):
+            continue
+        sanitized_lines.append(line)
+    return sanitized_lines if sanitized_lines else list(FALLBACK_LINES)
+
+
+def _sanitize_text(text: str) -> str:
+    sanitized = str(text)
+    replacements = {
+        "BBOT Recon Summary": "Recon Summary",
+        "BBOT recon summary": "Recon summary",
+        "BBOT Recon": "Recon",
+        "BBOT recon": "Recon",
+        "BBOT identified": "Observed",
+        "BBOT produced": "Observed",
+        "BBOT": "Recon",
+        "Observation Store": "evidence source",
+        "JSON": "structured",
+        "stdout": "output",
+        "stderr": "error output",
+    }
+    for old, new in replacements.items():
+        sanitized = sanitized.replace(old, new)
+    return sanitized
+
+
+def _contains_forbidden_term(text: str) -> bool:
+    normalized = str(text or "").lower()
+    return any(term in normalized for term in FORBIDDEN_TERMS)
