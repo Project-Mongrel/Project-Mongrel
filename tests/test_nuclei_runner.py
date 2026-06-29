@@ -1,10 +1,12 @@
+from io import StringIO
 import subprocess
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
 from app.core.config import Settings
+from app.parsers.nuclei_parser import parse_nuclei_results
 from app.tools.nuclei_runner import _build_nuclei_command, _resolve_nuclei_executable, run_nuclei_scan
 
 
@@ -40,64 +42,68 @@ def test_dangerous_nuclei_target_rejected(target: str) -> None:
 
 
 def test_nuclei_subprocess_called_with_list_args_and_shell_false() -> None:
-    completed_process = Mock(returncode=0, stdout='{"template-id":"one"}\n', stderr="")
+    process = FakeNucleiProcess(returncode=0, stdout='{"template-id":"one"}\n', stderr="")
     settings = Settings(_env_file=None)
 
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=settings),
         patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
-        patch("app.tools.nuclei_runner.subprocess.run", return_value=completed_process) as run_mock,
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process) as popen_mock,
     ):
         result = run_nuclei_scan("https://example.com")
 
-    run_mock.assert_called_once_with(
+    popen_mock.assert_called_once_with(
         _expected_nuclei_command(),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=180,
-        check=False,
+        bufsize=1,
         cwd=str(Path.cwd().resolve()),
         shell=False,
     )
     assert result["target"] == "example.com"
     assert result["success"] is True
-    assert result["output"] == '{"template-id":"one"}\n'
+    assert result["output"] == '{"template-id":"one"}'
     assert result["error"] == ""
     assert result["error_type"] is None
     assert result["returncode"] == 0
+    assert result["exit_code"] == 0
     assert result["command"] == _expected_nuclei_command()
     assert result["working_directory"] == str(Path.cwd().resolve())
+    assert result["stdout_len"] == len('{"template-id":"one"}')
+    assert result["stderr_len"] == 0
 
 
 def test_nuclei_command_uses_custom_configured_path() -> None:
-    completed_process = Mock(returncode=0, stdout="", stderr="")
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr="")
     settings = Settings(_env_file=None, nuclei_path="C:\\Tools\\Nuclei\\nuclei.exe")
 
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=settings),
-        patch("app.tools.nuclei_runner.subprocess.run", return_value=completed_process) as run_mock,
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process) as popen_mock,
     ):
         run_nuclei_scan("https://example.com")
 
-    assert run_mock.call_args.args[0] == _expected_nuclei_command("C:\\Tools\\Nuclei\\nuclei.exe")
+    assert popen_mock.call_args.args[0] == _expected_nuclei_command("C:\\Tools\\Nuclei\\nuclei.exe")
 
 
 def test_nuclei_subprocess_timeout_uses_config_value() -> None:
-    completed_process = Mock(returncode=0, stdout="", stderr="")
+    process = FakeNucleiProcess(returncode=-9, stdout="", stderr="", timeout=True)
     settings = Settings(_env_file=None, nuclei_scan_timeout_seconds=444)
 
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=settings),
         patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
-        patch("app.tools.nuclei_runner.subprocess.run", return_value=completed_process) as run_mock,
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
     ):
-        run_nuclei_scan("https://example.com")
+        result = run_nuclei_scan("https://example.com")
 
-    assert run_mock.call_args.kwargs["timeout"] == 444
+    assert process.wait_timeouts == [444]
+    assert result["error_type"] == "timeout"
 
 
 def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None:
-    completed_process = Mock(returncode=0, stdout="", stderr="")
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr="")
     settings = Settings(
         _env_file=None,
         nuclei_tags="exposure,tech",
@@ -109,11 +115,11 @@ def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=settings),
         patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
-        patch("app.tools.nuclei_runner.subprocess.run", return_value=completed_process) as run_mock,
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process) as popen_mock,
     ):
         run_nuclei_scan("https://example.com")
 
-    assert run_mock.call_args.args[0] == [
+    assert popen_mock.call_args.args[0] == [
         "nuclei",
         "-u",
         "example.com",
@@ -133,16 +139,12 @@ def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None
 
 
 def test_nuclei_timeout_handled() -> None:
-    timeout = subprocess.TimeoutExpired(
-        cmd=_expected_nuclei_command(),
-        timeout=180,
-        output="partial output",
-    )
+    process = FakeNucleiProcess(returncode=-9, stdout="partial output\n", stderr="", timeout=True)
 
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
-        patch("app.tools.nuclei_runner.subprocess.run", side_effect=timeout),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
     ):
         result = run_nuclei_scan("https://example.com")
 
@@ -151,13 +153,17 @@ def test_nuclei_timeout_handled() -> None:
     assert result["output"] == "partial output"
     assert result["error"] == "Nuclei fast scan timed out. Try a smaller target or use a deeper scan profile later."
     assert result["error_type"] == "timeout"
-    assert result["returncode"] is None
+    assert result["returncode"] == -9
+    assert result["exit_code"] == -9
+    assert result["stdout_len"] == len("partial output")
+    assert result["stderr_len"] == 0
+    assert process.killed is True
 
 
 def test_nuclei_configured_executable_missing_at_subprocess_handled() -> None:
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None, nuclei_path="missing-nuclei")),
-        patch("app.tools.nuclei_runner.subprocess.run", side_effect=FileNotFoundError),
+        patch("app.tools.nuclei_runner.subprocess.Popen", side_effect=FileNotFoundError),
     ):
         result = run_nuclei_scan("https://example.com")
 
@@ -221,11 +227,11 @@ def test_nuclei_missing_binary_handled_before_subprocess() -> None:
         patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.nuclei_runner.shutil.which", return_value=None),
         patch("app.tools.nuclei_runner.Path.is_file", return_value=False),
-        patch("app.tools.nuclei_runner.subprocess.run") as run_mock,
+        patch("app.tools.nuclei_runner.subprocess.Popen") as popen_mock,
     ):
         result = run_nuclei_scan("https://example.com")
 
-    run_mock.assert_not_called()
+    popen_mock.assert_not_called()
     assert result["success"] is False
     assert result["error"] == "Nuclei executable was not found."
     assert result["error_type"] == "missing_binary"
@@ -236,7 +242,7 @@ def test_nuclei_execution_failure_classified() -> None:
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
-        patch("app.tools.nuclei_runner.subprocess.run", side_effect=PermissionError("denied")),
+        patch("app.tools.nuclei_runner.subprocess.Popen", side_effect=PermissionError("denied")),
     ):
         result = run_nuclei_scan("https://example.com")
 
@@ -247,12 +253,12 @@ def test_nuclei_execution_failure_classified() -> None:
 
 
 def test_nuclei_nonzero_exit_classified_as_execution_failed() -> None:
-    completed_process = Mock(returncode=2, stdout="", stderr="bad flags")
+    process = FakeNucleiProcess(returncode=2, stdout="", stderr="bad flags\n")
 
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
-        patch("app.tools.nuclei_runner.subprocess.run", return_value=completed_process),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
     ):
         result = run_nuclei_scan("https://example.com")
 
@@ -260,13 +266,14 @@ def test_nuclei_nonzero_exit_classified_as_execution_failed() -> None:
     assert result["error"] == "bad flags"
     assert result["error_type"] == "execution_failed"
     assert result["returncode"] == 2
+    assert result["exit_code"] == 2
 
 
 def test_nuclei_runner_error_classified() -> None:
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
-        patch("app.tools.nuclei_runner.subprocess.run", side_effect=RuntimeError("boom")),
+        patch("app.tools.nuclei_runner.subprocess.Popen", side_effect=RuntimeError("boom")),
     ):
         result = run_nuclei_scan("https://example.com")
 
@@ -298,15 +305,91 @@ def test_nuclei_argv_generation() -> None:
 
 
 def test_nuclei_linux_regression_uses_common_path_when_path_lookup_fails() -> None:
-    completed_process = Mock(returncode=0, stdout="", stderr="")
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr="")
 
     with (
         patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.nuclei_runner.shutil.which", return_value=None),
         patch("app.tools.nuclei_runner.Path.is_file", autospec=True, side_effect=lambda path: path == Path("/usr/local/bin/nuclei")),
-        patch("app.tools.nuclei_runner.subprocess.run", return_value=completed_process) as run_mock,
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process) as popen_mock,
     ):
         result = run_nuclei_scan("https://scanme.nmap.org")
 
     assert result["success"] is True
-    assert run_mock.call_args.args[0][0] == str(Path("/usr/local/bin/nuclei"))
+    assert popen_mock.call_args.args[0][0] == str(Path("/usr/local/bin/nuclei"))
+
+
+def test_nuclei_streaming_stdout_jsonl_can_be_parsed_into_findings() -> None:
+    process = FakeNucleiProcess(
+        returncode=0,
+        stdout='{"template-id":"one","info":{"severity":"high","name":"One"},"host":"https://example.com"}\n',
+        stderr="",
+    )
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_nuclei_scan("https://example.com")
+
+    findings = parse_nuclei_results(str(result["output"]))
+    assert result["success"] is True
+    assert findings[0]["template_id"] == "one"
+    assert findings[0]["severity"] == "high"
+    assert findings[0]["host"] == "https://example.com"
+
+
+def test_nuclei_stderr_streaming_does_not_block() -> None:
+    stderr = "\n".join(f"debug line {index}" for index in range(50)) + "\n"
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr=stderr)
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_nuclei_scan("https://example.com")
+
+    assert result["success"] is True
+    assert str(result["error"]).startswith("debug line 0")
+    assert result["stderr_len"] == len(stderr.rstrip("\n"))
+
+
+def test_nuclei_manual_success_empty_output_is_clean_scan() -> None:
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_nuclei_scan("https://scanme.nmap.org")
+
+    assert result["success"] is True
+    assert result["output"] == ""
+    assert result["error"] == ""
+    assert result["error_type"] is None
+    assert result["stdout_len"] == 0
+    assert result["stderr_len"] == 0
+
+
+class FakeNucleiProcess:
+    def __init__(self, returncode: int, stdout: str, stderr: str, timeout: bool = False) -> None:
+        self.returncode = returncode
+        self.stdout = StringIO(stdout)
+        self.stderr = StringIO(stderr)
+        self.timeout = timeout
+        self.killed = False
+        self.wait_timeouts: list[int] = []
+
+    def wait(self, timeout: int | None = None) -> int:
+        if timeout is not None:
+            self.wait_timeouts.append(timeout)
+        if self.timeout and not self.killed:
+            raise subprocess.TimeoutExpired(cmd="nuclei", timeout=timeout)
+
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True

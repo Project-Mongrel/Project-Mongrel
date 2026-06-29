@@ -3,6 +3,7 @@ from pathlib import Path
 # Required to run authorized local Nuclei subprocesses.
 import subprocess  # nosec B404
 import shutil
+import threading
 import time
 
 from app.core.config import get_settings
@@ -47,6 +48,9 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
             "elapsed_seconds": 0,
             "command": None,
             "working_directory": str(working_directory),
+            "stdout_len": 0,
+            "stderr_len": 0,
+            "exit_code": None,
         }
 
     command = _build_nuclei_command(executable, validated_target, settings)
@@ -63,14 +67,16 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
     logger.info("Nuclei working directory: %s", working_directory)
     logger.info("Nuclei subprocess timeout: %s", settings.nuclei_scan_timeout_seconds)
 
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
     try:
         # Command uses explicit args list, shell=False, and a validated target.
-        completed_process = subprocess.run(  # nosec B603
+        process = subprocess.Popen(  # nosec B603
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=settings.nuclei_scan_timeout_seconds,
-            check=False,
+            bufsize=1,
             cwd=str(working_directory),
             shell=False,
         )
@@ -90,9 +96,12 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
             "error": exc.stderr or NUCLEI_TIMEOUT_ERROR,
             "error_type": "timeout",
             "returncode": None,
+            "exit_code": None,
             "elapsed_seconds": elapsed_seconds,
             "command": command,
             "working_directory": str(working_directory),
+            "stdout_len": len(exc.stdout or ""),
+            "stderr_len": len(exc.stderr or ""),
         }
     except FileNotFoundError:
         elapsed_seconds = time.monotonic() - start_time
@@ -108,9 +117,12 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
             "error": NUCLEI_NOT_AVAILABLE_ERROR,
             "error_type": "missing_binary",
             "returncode": None,
+            "exit_code": None,
             "elapsed_seconds": elapsed_seconds,
             "command": command,
             "working_directory": str(working_directory),
+            "stdout_len": 0,
+            "stderr_len": 0,
         }
     except OSError as exc:
         elapsed_seconds = time.monotonic() - start_time
@@ -127,9 +139,12 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
             "error": "Nuclei execution failed.",
             "error_type": "execution_failed",
             "returncode": None,
+            "exit_code": None,
             "elapsed_seconds": elapsed_seconds,
             "command": command,
             "working_directory": str(working_directory),
+            "stdout_len": 0,
+            "stderr_len": 0,
         }
     except Exception:
         elapsed_seconds = time.monotonic() - start_time
@@ -141,30 +156,77 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
             "error": "Nuclei runner error.",
             "error_type": "runner_error",
             "returncode": None,
+            "exit_code": None,
             "elapsed_seconds": elapsed_seconds,
             "command": command,
             "working_directory": str(working_directory),
+            "stdout_len": 0,
+            "stderr_len": 0,
         }
 
+    stdout_thread = _start_stream_thread(process.stdout, stdout_lines, "stdout")
+    stderr_thread = _start_stream_thread(process.stderr, stderr_lines, "stderr")
+    try:
+        returncode = process.wait(timeout=settings.nuclei_scan_timeout_seconds)
+    except subprocess.TimeoutExpired:
+        logger.warning("Nuclei scan timed out after %ss: argv=%r cwd=%s", settings.nuclei_scan_timeout_seconds, command, working_directory)
+        process.kill()
+        returncode = process.wait()
+        _join_stream_thread(stdout_thread, "stdout")
+        _join_stream_thread(stderr_thread, "stderr")
+        elapsed_seconds = time.monotonic() - start_time
+        stdout = "\n".join(stdout_lines)
+        stderr = "\n".join(stderr_lines)
+        logger.warning(
+            "Nuclei scan timed out: target=%s elapsed_seconds=%.2f stdout_len=%s stderr_len=%s exit_code=%s",
+            validated_target,
+            elapsed_seconds,
+            len(stdout),
+            len(stderr),
+            returncode,
+        )
+        return {
+            "target": validated_target,
+            "success": False,
+            "output": stdout,
+            "error": stderr or NUCLEI_TIMEOUT_ERROR,
+            "error_type": "timeout",
+            "returncode": returncode,
+            "exit_code": returncode,
+            "elapsed_seconds": elapsed_seconds,
+            "command": command,
+            "working_directory": str(working_directory),
+            "stdout_len": len(stdout),
+            "stderr_len": len(stderr),
+        }
+
+    logger.info("Nuclei process exited: exit_code=%s", returncode)
+    _join_stream_thread(stdout_thread, "stdout")
+    _join_stream_thread(stderr_thread, "stderr")
     elapsed_seconds = time.monotonic() - start_time
+    stdout = "\n".join(stdout_lines)
+    stderr = "\n".join(stderr_lines)
     logger.info(
         "Nuclei scan completed: target=%s elapsed_seconds=%.2f stdout_len=%s stderr_len=%s exit_code=%s",
         validated_target,
         elapsed_seconds,
-        len(completed_process.stdout or ""),
-        len(completed_process.stderr or ""),
-        completed_process.returncode,
+        len(stdout),
+        len(stderr),
+        returncode,
     )
     return {
         "target": validated_target,
-        "success": completed_process.returncode == 0,
-        "output": completed_process.stdout,
-        "error": completed_process.stderr,
-        "error_type": None if completed_process.returncode == 0 else "execution_failed",
-        "returncode": completed_process.returncode,
+        "success": returncode == 0,
+        "output": stdout,
+        "error": stderr,
+        "error_type": None if returncode == 0 else "execution_failed",
+        "returncode": returncode,
+        "exit_code": returncode,
         "elapsed_seconds": elapsed_seconds,
         "command": command,
         "working_directory": str(working_directory),
+        "stdout_len": len(stdout),
+        "stderr_len": len(stderr),
     }
 
 
@@ -215,3 +277,37 @@ def _build_nuclei_command(executable: str, target: str, settings: object) -> lis
         "-retries",
         str(settings.nuclei_retries),
     ]
+
+
+def _start_stream_thread(pipe: object, lines: list[str], stream_name: str) -> threading.Thread:
+    thread = threading.Thread(target=_stream_output, args=(pipe, lines, stream_name), daemon=True)
+    thread.start()
+    return thread
+
+
+def _stream_output(pipe: object, lines: list[str], stream_name: str) -> None:
+    if pipe is None:
+        return
+
+    try:
+        for line in pipe:
+            cleaned_line = str(line).rstrip("\r\n")
+            lines.append(cleaned_line)
+            logger.info("Nuclei %s: %s", stream_name, _truncate_stream_line(cleaned_line))
+    finally:
+        close = getattr(pipe, "close", None)
+        if close is not None:
+            close()
+
+
+def _join_stream_thread(thread: threading.Thread, stream_name: str) -> None:
+    thread.join(timeout=5)
+    if thread.is_alive():
+        logger.warning("Nuclei %s stream reader still running after process exit.", stream_name)
+
+
+def _truncate_stream_line(line: str, limit: int = 1000) -> str:
+    if len(line) <= limit:
+        return line
+
+    return f"{line[:limit]}... [truncated {len(line) - limit} chars]"
