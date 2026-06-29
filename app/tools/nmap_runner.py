@@ -2,7 +2,7 @@ import logging
 # Required to run authorized local Nmap subprocesses.
 import subprocess  # nosec B404
 
-from app.tools.target_normalizer import normalize_target
+from app.services.target_normalizer import normalize_for_nmap
 
 NMAP_TIMEOUT_SECONDS = 60
 logger = logging.getLogger(__name__)
@@ -24,12 +24,10 @@ DANGEROUS_SHELL_CHARACTERS: frozenset[str] = frozenset(
 
 
 def _validate_target(target: str) -> str:
-    normalized_target = normalize_target(target)
-    if not normalized_target:
-        raise ValueError("Nmap target cannot be empty.")
-
-    if any(character in normalized_target for character in DANGEROUS_SHELL_CHARACTERS):
+    if any(character in target for character in DANGEROUS_SHELL_CHARACTERS):
         raise ValueError("Nmap target contains unsupported shell characters.")
+
+    normalized_target = normalize_for_nmap(target)
 
     return normalized_target
 

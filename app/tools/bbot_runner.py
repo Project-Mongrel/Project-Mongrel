@@ -7,7 +7,7 @@ import time
 import shutil
 
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
-from app.tools.target_normalizer import normalize_target
+from app.services.target_normalizer import normalize_for_bbot
 
 BBOT_TIMEOUT_SECONDS = 180
 BBOT_OUTPUT_DIR = Path("data") / "bbot"
@@ -156,12 +156,10 @@ def run_bbot_scan(target: str) -> dict[str, object]:
 
 
 def _validate_target(target: str) -> str:
-    normalized_target = normalize_target(target)
-    if not normalized_target:
-        raise ValueError("BBOT target cannot be empty.")
-
-    if any(character in normalized_target for character in DANGEROUS_SHELL_CHARACTERS):
+    if any(character in target for character in DANGEROUS_SHELL_CHARACTERS):
         raise ValueError("BBOT target contains unsupported shell characters.")
+
+    normalized_target = normalize_for_bbot(target)
 
     return normalized_target
 

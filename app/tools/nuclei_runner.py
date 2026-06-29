@@ -5,10 +5,10 @@ import subprocess  # nosec B404
 import shutil
 import threading
 import time
-from urllib.parse import urlparse
 
 from app.core.config import get_settings
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
+from app.services.target_normalizer import normalize_for_nuclei
 
 logger = logging.getLogger(__name__)
 NUCLEI_NOT_AVAILABLE_ERROR = "Nuclei executable was not found."
@@ -16,32 +16,12 @@ NUCLEI_TIMEOUT_ERROR = "Nuclei fast scan timed out. Try a smaller target or use 
 
 
 def _validate_target(target: str) -> str:
-    normalized_target = _normalize_nuclei_target(target)
-    if not normalized_target:
-        raise ValueError("Nuclei target cannot be empty.")
-
-    if any(character in normalized_target for character in DANGEROUS_SHELL_CHARACTERS):
+    if any(character in target for character in DANGEROUS_SHELL_CHARACTERS):
         raise ValueError("Nuclei target contains unsupported shell characters.")
 
+    normalized_target = normalize_for_nuclei(target)
+
     return normalized_target
-
-
-def _normalize_nuclei_target(target: str) -> str:
-    stripped_target = target.strip()
-    if not stripped_target:
-        return stripped_target
-
-    parsed_target = urlparse(stripped_target)
-    if parsed_target.scheme:
-        if parsed_target.scheme not in {"http", "https"} or not parsed_target.hostname:
-            raise ValueError("Nuclei target must be a valid http or https URL or hostname.")
-
-        return stripped_target
-
-    if "://" in stripped_target:
-        raise ValueError("Nuclei target must be a valid http or https URL or hostname.")
-
-    return f"https://{stripped_target}"
 
 
 def run_nuclei_scan(target: str) -> dict[str, object]:

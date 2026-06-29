@@ -1,4 +1,6 @@
-from app.services.target_normalizer import normalize_target_key
+import pytest
+
+from app.services.target_normalizer import normalize_for_bbot, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
 
 
 def test_none_or_empty_target_returns_none() -> None:
@@ -20,3 +22,66 @@ def test_plain_ipv4_returns_ip() -> None:
 
 def test_hostname_matching_is_lowercase() -> None:
     assert normalize_target_key("Example.COM") == "example.com"
+
+
+@pytest.mark.parametrize(
+    ("raw_target", "expected_target"),
+    [
+        ("scanme.nmap.org", "scanme.nmap.org"),
+        ("https://scanme.nmap.org", "scanme.nmap.org"),
+        ("Https://scanme.nmap.org", "scanme.nmap.org"),
+        ("http://example.com/path?x=1", "example.com"),
+        ("www.example.com", "www.example.com"),
+        ("192.168.1.10", "192.168.1.10"),
+    ],
+)
+def test_normalize_for_nmap(raw_target: str, expected_target: str) -> None:
+    assert normalize_for_nmap(raw_target) == expected_target
+
+
+@pytest.mark.parametrize(
+    ("raw_target", "expected_target"),
+    [
+        ("scanme.nmap.org", "scanme.nmap.org"),
+        ("https://scanme.nmap.org", "scanme.nmap.org"),
+        ("Https://scanme.nmap.org", "scanme.nmap.org"),
+        ("http://example.com/path?x=1", "example.com"),
+        ("www.example.com", "www.example.com"),
+        ("192.168.1.10", "192.168.1.10"),
+    ],
+)
+def test_normalize_for_bbot(raw_target: str, expected_target: str) -> None:
+    assert normalize_for_bbot(raw_target) == expected_target
+
+
+@pytest.mark.parametrize(
+    ("raw_target", "expected_target"),
+    [
+        ("scanme.nmap.org", "https://scanme.nmap.org"),
+        ("https://scanme.nmap.org", "https://scanme.nmap.org"),
+        ("Https://scanme.nmap.org", "https://scanme.nmap.org"),
+        ("http://example.com/path?x=1", "http://example.com/path?x=1"),
+        ("www.example.com", "https://www.example.com"),
+        ("192.168.1.10", "https://192.168.1.10"),
+    ],
+)
+def test_normalize_for_nuclei(raw_target: str, expected_target: str) -> None:
+    assert normalize_for_nuclei(raw_target) == expected_target
+
+
+@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei])
+def test_unsupported_scheme_rejected(normalizer: object) -> None:
+    with pytest.raises(ValueError, match="valid http or https URL or hostname"):
+        normalizer("ftp://example.com")
+
+
+@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei])
+def test_empty_input_rejected(normalizer: object) -> None:
+    with pytest.raises(ValueError, match="cannot be empty"):
+        normalizer("   ")
+
+
+@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei])
+def test_malformed_input_rejected(normalizer: object) -> None:
+    with pytest.raises(ValueError, match="malformed|valid http or https"):
+        normalizer("https:///scanme.nmap.org")

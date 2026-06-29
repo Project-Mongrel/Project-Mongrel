@@ -1331,7 +1331,7 @@ def test_nuclei_scan_state_created() -> None:
             active_scan = get_active_scan(7105)
             assert active_scan is not None
             assert active_scan.scan_type == "nuclei"
-            assert active_scan.target == "example.com"
+            assert active_scan.target == "https://example.com"
             assert active_scan.task is not None
             assert active_scan.status_message is status_message
             active_scan.task.cancel()

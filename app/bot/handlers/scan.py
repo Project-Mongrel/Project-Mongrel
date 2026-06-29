@@ -38,12 +38,11 @@ from app.services.scan_manager import (
     mark_scan_request_awaiting_target,
 )
 from app.services.service_intelligence import get_service_intelligence
-from app.services.target_normalizer import normalize_target_key
+from app.services.target_normalizer import normalize_for_bbot, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
 from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
-from app.tools.target_normalizer import normalize_target
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
 NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS = 15
@@ -63,15 +62,41 @@ def build_scan_created_text(scan_type: str) -> str:
 
 
 def build_nmap_target_prompt() -> str:
-    return "NMAP scan request created. Send the authorized target hostname or IP address to run the scan."
+    return "\n".join(
+        [
+            "NMAP scan request created. Send the authorized target hostname or IP address.",
+            "",
+            "Examples:",
+            "scanme.nmap.org",
+            "192.168.1.10",
+        ]
+    )
 
 
 def build_nuclei_target_prompt() -> str:
-    return "Nuclei scan request created. Send the authorized target URL or hostname to run the scan."
+    return "\n".join(
+        [
+            "Nuclei scan request created. Send the authorized target URL.",
+            "",
+            "Examples:",
+            "https://example.com",
+            "https://scanme.nmap.org",
+            "",
+            "HTTPS is recommended.",
+        ]
+    )
 
 
 def build_bbot_target_prompt() -> str:
-    return "BBOT recon request created. Send the authorized target hostname or domain to run the recon."
+    return "\n".join(
+        [
+            "BBOT recon request created. Send the authorized target domain or hostname.",
+            "",
+            "Examples:",
+            "scanme.nmap.org",
+            "example.com",
+        ]
+    )
 
 
 def build_nmap_scan_started_text(target: str) -> str:
@@ -532,7 +557,13 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     target = update.message.text or ""
-    normalized_target = normalize_target(target) or target.strip()
+    try:
+        normalized_target = normalize_for_nmap(target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid NMAP target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
     investigation = get_or_create_latest_open_investigation(user_id=user_id, target=normalized_target)
     add_investigation_event(
         investigation_id=investigation["id"],
@@ -543,7 +574,7 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         status="started",
         summary="Nmap scan started",
     )
-    await update.message.reply_text(build_nmap_scan_started_text(target.strip()))
+    await update.message.reply_text(build_nmap_scan_started_text(normalized_target))
 
     try:
         result = await asyncio.to_thread(run_nmap_scan, target)
@@ -588,7 +619,13 @@ async def _handle_bbot_target(
         return
 
     target = update.message.text or ""
-    display_target = normalize_target(target) or target.strip()
+    try:
+        display_target = normalize_for_bbot(target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid BBOT target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
     if not is_bbot_available():
         await update.message.reply_text("BBOT is not installed or not available on PATH.")
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
@@ -779,7 +816,13 @@ async def _handle_nuclei_target(
         return
 
     target = update.message.text or ""
-    display_target = normalize_target(target) or target.strip()
+    try:
+        display_target = normalize_for_nuclei(target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid Nuclei target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
     investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
     add_investigation_event(
         investigation_id=investigation["id"],

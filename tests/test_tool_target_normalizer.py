@@ -16,3 +16,8 @@ from app.tools.target_normalizer import normalize_target
 )
 def test_normalize_target(raw_target: str, expected_target: str) -> None:
     assert normalize_target(raw_target) == expected_target
+
+
+def test_normalize_target_empty_rejected() -> None:
+    with pytest.raises(ValueError, match="cannot be empty"):
+        normalize_target("   ")
