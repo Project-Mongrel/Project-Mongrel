@@ -10,11 +10,11 @@ from app.parsers.nuclei_parser import parse_nuclei_results
 from app.tools.nuclei_runner import _build_nuclei_command, _resolve_nuclei_executable, run_nuclei_scan
 
 
-def _expected_nuclei_command(executable: str = "nuclei") -> list[str]:
+def _expected_nuclei_command(executable: str = "nuclei", target: str = "https://example.com") -> list[str]:
     return [
         executable,
         "-u",
-        "example.com",
+        target,
         "-jsonl",
         "-silent",
         "-severity",
@@ -41,6 +41,54 @@ def test_dangerous_nuclei_target_rejected(target: str) -> None:
         run_nuclei_scan(target)
 
 
+def test_nuclei_preserves_https_url_scheme() -> None:
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process) as popen_mock,
+    ):
+        result = run_nuclei_scan("https://scanme.nmap.org")
+
+    assert result["target"] == "https://scanme.nmap.org"
+    assert popen_mock.call_args.args[0] == _expected_nuclei_command(target="https://scanme.nmap.org")
+
+
+def test_nuclei_preserves_http_url_scheme() -> None:
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process) as popen_mock,
+    ):
+        result = run_nuclei_scan("http://example.com")
+
+    assert result["target"] == "http://example.com"
+    assert popen_mock.call_args.args[0] == _expected_nuclei_command(target="http://example.com")
+
+
+def test_nuclei_defaults_bare_hostname_to_https() -> None:
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process) as popen_mock,
+    ):
+        result = run_nuclei_scan("scanme.nmap.org")
+
+    assert result["target"] == "https://scanme.nmap.org"
+    assert popen_mock.call_args.args[0] == _expected_nuclei_command(target="https://scanme.nmap.org")
+
+
+@pytest.mark.parametrize("target", ["https://", "https:///scanme.nmap.org", "ftp://example.com"])
+def test_malformed_nuclei_url_rejected_cleanly(target: str) -> None:
+    with pytest.raises(ValueError, match="valid http or https URL or hostname"):
+        run_nuclei_scan(target)
+
+
 def test_nuclei_subprocess_called_with_list_args_and_shell_false() -> None:
     process = FakeNucleiProcess(returncode=0, stdout='{"template-id":"one"}\n', stderr="")
     settings = Settings(_env_file=None)
@@ -61,7 +109,7 @@ def test_nuclei_subprocess_called_with_list_args_and_shell_false() -> None:
         cwd=str(Path.cwd().resolve()),
         shell=False,
     )
-    assert result["target"] == "example.com"
+    assert result["target"] == "https://example.com"
     assert result["success"] is True
     assert result["output"] == '{"template-id":"one"}'
     assert result["error"] == ""
@@ -122,7 +170,7 @@ def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None
     assert popen_mock.call_args.args[0] == [
         "nuclei",
         "-u",
-        "example.com",
+        "https://example.com",
         "-jsonl",
         "-silent",
         "-severity",
@@ -148,7 +196,7 @@ def test_nuclei_timeout_handled() -> None:
     ):
         result = run_nuclei_scan("https://example.com")
 
-    assert result["target"] == "example.com"
+    assert result["target"] == "https://example.com"
     assert result["success"] is False
     assert result["output"] == "partial output"
     assert result["error"] == "Nuclei fast scan timed out. Try a smaller target or use a deeper scan profile later."
@@ -167,7 +215,7 @@ def test_nuclei_configured_executable_missing_at_subprocess_handled() -> None:
     ):
         result = run_nuclei_scan("https://example.com")
 
-    assert result["target"] == "example.com"
+    assert result["target"] == "https://example.com"
     assert result["success"] is False
     assert result["output"] == ""
     assert result["error"] == "Nuclei executable was not found."
