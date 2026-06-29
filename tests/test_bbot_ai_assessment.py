@@ -34,14 +34,18 @@ def test_prompt_is_grounded() -> None:
     assert "Do not invent assets, findings, technologies, ports, or certificates." in prompt
     assert "Do not claim compromise." in prompt
     assert "Do not recommend exploitation." in prompt
-    assert "Do not say a service is vulnerable unless evidence supports it." in prompt
-    assert "Use cautious language" in prompt
+    assert "Use cautious validation language" in prompt
     assert "Confidence must be High, Medium, or Low" in prompt
     assert "Executive Summary" in prompt
-    assert "Key Findings" in prompt
+    assert "Observed Facts" in prompt
+    assert "Key Findings" not in prompt
     assert "Observed Assets" in prompt
     assert "Potential Risks" in prompt
     assert "Recommended Next Actions" in prompt
+    assert "Never speculate." in prompt
+    assert "Never infer compromise." in prompt
+    assert "Never imply a vulnerability without explicit supporting evidence." in prompt
+    assert "No confirmed vulnerabilities were identified during reconnaissance" in prompt
 
 
 def test_prompt_uses_normalized_evidence_not_raw_output() -> None:
@@ -107,8 +111,8 @@ def test_successful_ai_response() -> None:
         [
             "Executive Summary",
             "- Several externally visible assets were observed.",
-            "Key Findings",
-            "- admin.example.com may indicate an administrative surface.",
+            "Observed Facts",
+            "- admin.example.com was observed.",
             "Confidence:",
             "Medium",
         ]
@@ -155,12 +159,13 @@ def test_empty_observations_returns_limited_evidence_assessment() -> None:
     text = "\n".join(lines)
 
     assert "Executive Summary" in text
-    assert "Key Findings" in text
+    assert "Observed Facts" in text
     assert "Observed Assets" in text
     assert "Potential Risks" in text
     assert "Confidence:\nLow" in text
     assert "Recommended Next Actions" in text
     assert "Evidence is limited" in text
+    assert "No confirmed vulnerabilities were identified during reconnaissance." in text
     assert "BBOT" not in text
     assert "Observation Store" not in text
 
@@ -202,6 +207,104 @@ def test_ai_response_scanner_internals_are_removed() -> None:
     assert "BBOT" not in text
     assert "spasmodic_melvin" not in text
     assert "stdout" not in text
+
+
+def test_ai_response_speculation_from_technology_is_removed() -> None:
+    investigation = create_investigation(user_id=11007, target="example.com")
+    add_observation(
+        user_id=11007,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="technology",
+        value="Apache HTTP Server",
+        target="example.com",
+    )
+    ai_response = "\n".join(
+        [
+            "Executive Summary",
+            "- Apache HTTP Server detected.",
+            "Observed Facts",
+            "- Apache HTTP Server detected.",
+            "Potential Risks",
+            "- Apache is likely vulnerable.",
+            "- Detected software versions should be validated against current CVEs.",
+            "Recommended Next Actions",
+            "- Review detected software versions.",
+        ]
+    )
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=ai_response):
+        lines = generate_bbot_ai_assessment(11007, investigation_id=investigation["id"], target="example.com")
+
+    text = "\n".join(lines)
+    assert "Apache HTTP Server detected." in text
+    assert "Detected software versions should be validated against current CVEs." in text
+    assert "Review detected software versions." in text
+    assert "likely vulnerable" not in text
+
+
+def test_ai_response_social_media_risk_inference_is_removed() -> None:
+    investigation = create_investigation(user_id=11008, target="example.com")
+    add_observation(
+        user_id=11008,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="social_profile",
+        value="https://github.com/example",
+        target="example.com",
+    )
+    ai_response = "\n".join(
+        [
+            "Observed Facts",
+            "- GitHub profile referenced.",
+            "Potential Risks",
+            "- Popular social media platforms suggest potential exposure.",
+            "- Public repositories should be reviewed for exposed secrets.",
+            "Recommended Next Actions",
+            "- Inspect public repositories for exposed credentials.",
+        ]
+    )
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=ai_response):
+        lines = generate_bbot_ai_assessment(11008, investigation_id=investigation["id"], target="example.com")
+
+    text = "\n".join(lines)
+    assert "GitHub profile referenced." in text
+    assert "Public repositories should be reviewed for exposed secrets." in text
+    assert "Inspect public repositories for exposed credentials." in text
+    assert "suggest" not in text.lower()
+    assert "potential exposure" not in text.lower()
+
+
+def test_ai_response_distinguishes_observations_from_recommendations() -> None:
+    investigation = create_investigation(user_id=11009, target="example.com")
+    add_observation(
+        user_id=11009,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="url",
+        value="https://app.example.com",
+        target="example.com",
+    )
+    ai_response = "\n".join(
+        [
+            "Observed Facts",
+            "- Public HTTP endpoint discovered.",
+            "Potential Risks",
+            "- Public-facing services should undergo vulnerability assessment.",
+            "Recommended Next Actions",
+            "- Run Nuclei against discovered web services.",
+            "- Enumerate identified web applications.",
+        ]
+    )
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=ai_response):
+        lines = generate_bbot_ai_assessment(11009, investigation_id=investigation["id"], target="example.com")
+
+    text = "\n".join(lines)
+    assert text.index("Observed Facts") < text.index("Recommended Next Actions")
+    assert "- Public HTTP endpoint discovered." in text
+    assert "- Run Nuclei against discovered web services." in text
 
 
 def _observation(observation_type: str, value: str) -> dict:

@@ -33,6 +33,15 @@ FORBIDDEN_TERMS = (
     "internal id",
     "observation store",
 )
+SPECULATIVE_PHRASES = (
+    "appears to",
+    "suggests",
+    "may indicate",
+    "potentially vulnerable",
+    "potential exposure",
+    "likely vulnerable",
+    "possible compromise",
+)
 ALLOWED_OBSERVATION_TYPES = {
     "subdomain": "DNS names",
     "dns_record": "DNS records",
@@ -61,7 +70,7 @@ def generate_bbot_ai_assessment(
             "Executive Summary",
             "- Available reconnaissance evidence is insufficient to assess the target beyond the provided scope.",
             "",
-            "Key Findings",
+            "Observed Facts",
             "- No normalized reconnaissance observations are available for this target.",
             "",
             "Observed Assets",
@@ -69,6 +78,7 @@ def generate_bbot_ai_assessment(
             "",
             "Potential Risks",
             "- Evidence is limited because there is not enough information to identify concrete exposure patterns.",
+            "- No confirmed vulnerabilities were identified during reconnaissance.",
             "",
             "Confidence:",
             "Low",
@@ -113,18 +123,23 @@ def build_bbot_ai_assessment_prompt(
             "- Do not invent vulnerabilities.",
             "- Do not invent assets, findings, technologies, ports, or certificates.",
             "- Do not claim compromise.",
+            "- Never speculate.",
+            "- Never infer compromise.",
             "- Do not recommend exploitation.",
-            "- Do not say a service is vulnerable unless evidence supports it.",
-            "- Use cautious language such as review, verify, consider, prioritize, and may indicate.",
+            "- Never imply a vulnerability without explicit supporting evidence.",
+            "- Separate observed facts from potential risks and recommendations.",
+            '- State "No confirmed vulnerabilities were identified during reconnaissance" when appropriate.',
+            "- Use cautious validation language such as review, verify, consider, and prioritize.",
             "- If evidence is limited, say so.",
             "- Confidence must be High, Medium, or Low, based only on available evidence.",
+            "- Confidence describes evidence completeness, not severity.",
             "- Recommended next actions must be practical and tied to observed evidence.",
             "- Discuss only consultant-facing evidence and avoid collection mechanics or platform internals.",
             "- Return final answer only.",
             "",
             "Required sections:",
             "Executive Summary",
-            "Key Findings",
+            "Observed Facts",
             "Observed Assets",
             "Potential Risks",
             "Confidence",
@@ -223,6 +238,8 @@ def _sanitize_response_lines(lines: list[str]) -> list[str]:
     for line in lines:
         if _contains_forbidden_term(line):
             continue
+        if _contains_unsupported_speculation(line):
+            continue
         sanitized_lines.append(line)
     return sanitized_lines if sanitized_lines else list(FALLBACK_LINES)
 
@@ -250,3 +267,14 @@ def _sanitize_text(text: str) -> str:
 def _contains_forbidden_term(text: str) -> bool:
     normalized = str(text or "").lower()
     return any(term in normalized for term in FORBIDDEN_TERMS)
+
+
+def _contains_unsupported_speculation(text: str) -> bool:
+    normalized = str(text or "").lower()
+    if any(phrase in normalized for phrase in SPECULATIVE_PHRASES):
+        return True
+    if "vulnerable" in normalized and "confirmed" not in normalized:
+        return True
+    if "compromise" in normalized and "do not" not in normalized:
+        return True
+    return False
