@@ -33,6 +33,10 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
     logger.info("Nuclei target normalized: raw_target=%s normalized_target=%s", target, validated_target)
     logger.info("Nuclei resolved executable: %s", executable)
     if executable is None:
+        logger.warning(
+            "Nuclei executable missing. Checked PATH lookup and candidate paths: %s",
+            [str(candidate) for candidate in _nuclei_executable_candidates()],
+        )
         return {
             "target": validated_target,
             "success": False,
@@ -176,13 +180,18 @@ def _resolve_nuclei_executable(configured_path: str = "nuclei") -> str | None:
         if candidate.is_file():
             return str(candidate)
 
+    logger.warning(
+        "Nuclei executable not found in PATH or candidate paths: %s",
+        [str(candidate) for candidate in _nuclei_executable_candidates()],
+    )
     return None
 
 
-def _nuclei_executable_candidates() -> tuple[Path, Path, Path, Path]:
+def _nuclei_executable_candidates() -> tuple[Path, Path, Path, Path, Path]:
     return (
         Path("/usr/local/bin/nuclei"),
         Path("/usr/bin/nuclei"),
+        Path.home() / "go" / "bin" / "nuclei",
         Path(".venv") / "Scripts" / "nuclei.exe",
         Path(".venv") / "bin" / "nuclei",
     )

@@ -184,6 +184,18 @@ def test_nuclei_linux_executable_discovery() -> None:
         assert _resolve_nuclei_executable() == str(linux_nuclei)
 
 
+def test_nuclei_home_go_bin_executable_discovery() -> None:
+    home_directory = Path("/home/mongrel")
+    go_bin_nuclei = home_directory / "go" / "bin" / "nuclei"
+
+    with (
+        patch("app.tools.nuclei_runner.shutil.which", return_value=None),
+        patch("app.tools.nuclei_runner.Path.home", return_value=home_directory),
+        patch("app.tools.nuclei_runner.Path.is_file", autospec=True, side_effect=lambda path: path == go_bin_nuclei),
+    ):
+        assert _resolve_nuclei_executable() == str(go_bin_nuclei)
+
+
 def test_nuclei_windows_executable_discovery() -> None:
     windows_nuclei = Path(".venv") / "Scripts" / "nuclei.exe"
 
