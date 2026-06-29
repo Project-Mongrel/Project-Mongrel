@@ -336,24 +336,34 @@ def test_ai_report_progress_edit_failures_do_not_break_generation() -> None:
 
 
 def test_progress_spinner_cycles_through_multiple_frames() -> None:
-    status_message = SimpleNamespace(edit_text=AsyncMock())
     stop_event = asyncio.Event()
     frames = build_spinner_frames("Generating AI Recon Assessment")
+    edited_messages: list[str] = []
+
+    async def record_edit(text: str) -> None:
+        edited_messages.append(text)
+        if len(edited_messages) == len(frames):
+            stop_event.set()
+
+    status_message = SimpleNamespace(edit_text=AsyncMock(side_effect=record_edit))
 
     async def run_flow() -> None:
-        progress_task = asyncio.create_task(
-            run_progress_frames(status_message, frames, stop_event, interval_seconds=0.01, context="Test progress")
+        await run_progress_frames(
+            status_message,
+            frames,
+            stop_event,
+            interval_seconds=0,
+            context="Test progress",
         )
-        await asyncio.sleep(0.035)
-        stop_event.set()
-        await progress_task
 
     asyncio.run(run_flow())
 
-    edited_messages = [call.args[0] for call in status_message.edit_text.call_args_list]
-    assert "Generating AI Recon Assessment /" in edited_messages
-    assert "Generating AI Recon Assessment -" in edited_messages
-    assert "Generating AI Recon Assessment \\" in edited_messages
+    assert edited_messages == [
+        "Generating AI Recon Assessment /",
+        "Generating AI Recon Assessment -",
+        "Generating AI Recon Assessment \\",
+        "Generating AI Recon Assessment |",
+    ]
 
 
 def test_progress_edit_errors_are_swallowed_and_logged(caplog) -> None:
