@@ -8,6 +8,7 @@ from telegram.ext import ContextTypes
 from app.bot.handlers.home import build_home_text
 from app.bot.handlers.findings import build_finding_followup_ai_prompt
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
+from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edit_text
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
 from app.bot.handlers.reports import split_report_text
@@ -133,7 +134,7 @@ def build_clean_nuclei_verdict_text(target: str | None) -> str:
 
 
 def build_bbot_scan_started_text(target: str) -> str:
-    return "\n".join(["BBOT recon started.", "", "Target:", target])
+    return "\n".join(["BBOT Recon Running", "", "Target:", target, "", "Status:", "Running"])
 
 
 def build_bbot_ai_assessment_keyboard(investigation_id: str | None) -> InlineKeyboardMarkup | None:
@@ -677,13 +678,38 @@ async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> No
         await query.edit_message_text("Investigation not found for BBOT AI assessment.")
         return
 
-    await _safe_edit_bbot_ai_status(query, "Generating AI Recon Assessment /")
-    assessment_lines = await asyncio.to_thread(
-        generate_bbot_ai_assessment,
-        user_id,
-        investigation_id=investigation_id,
-        target=investigation.get("target"),
-    )
+    message = getattr(query, "message", None)
+    progress_message = None
+    stop_event: asyncio.Event | None = None
+    progress_task: asyncio.Task | None = None
+    progress_frames = build_spinner_frames("Generating AI Recon Assessment")
+    if message is not None:
+        progress_message = await message.reply_text(progress_frames[0])
+        stop_event = asyncio.Event()
+        progress_task = asyncio.create_task(
+            run_progress_frames(
+                progress_message,
+                progress_frames,
+                stop_event,
+                start_index=1,
+                context="BBOT AI assessment status",
+            )
+        )
+    else:
+        await safe_edit_text(query, progress_frames[0], context="BBOT AI assessment status")
+
+    try:
+        assessment_lines = await asyncio.to_thread(
+            generate_bbot_ai_assessment,
+            user_id,
+            investigation_id=investigation_id,
+            target=investigation.get("target"),
+        )
+    finally:
+        if stop_event is not None and progress_task is not None:
+            stop_event.set()
+            await progress_task
+
     fallback = assessment_lines == FALLBACK_LINES
     event = add_investigation_event(
         investigation_id=investigation_id,
@@ -695,8 +721,12 @@ async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> No
         summary="BBOT AI Recon Assessment Generated" if not fallback else "BBOT AI Recon Assessment Fallback",
         metadata={"line_count": len(assessment_lines), "fallback": fallback},
     )
-    await _safe_edit_bbot_ai_status(query, "AI Recon Assessment unavailable." if fallback else "AI Recon Assessment ready.")
-    message = getattr(query, "message", None)
+    final_status = "AI Recon Assessment unavailable." if fallback else "AI Recon Assessment ready."
+    if progress_message is not None:
+        await safe_edit_text(progress_message, final_status, context="BBOT AI assessment status")
+    else:
+        await safe_edit_text(query, final_status, context="BBOT AI assessment status")
+
     if message is None:
         await query.edit_message_text("\n".join(assessment_lines))
         return
@@ -705,19 +735,6 @@ async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> No
         await message.reply_text(chunk)
 
     logger.info("BBOT AI assessment event recorded: id=%s fallback=%s", event.get("id"), fallback)
-
-
-async def _safe_edit_bbot_ai_status(query: object, text: str) -> None:
-    edit_message_text = getattr(query, "edit_message_text", None)
-    if edit_message_text is None:
-        return
-
-    try:
-        await edit_message_text(text)
-    except (TimedOut, NetworkError, BadRequest) as exc:
-        logger.warning("BBOT AI assessment status edit failed: %s", exc)
-    except Exception:
-        logger.warning("BBOT AI assessment status edit failed unexpectedly.", exc_info=True)
 
 
 def _is_finding_analysis_exit_message(text: str) -> bool:

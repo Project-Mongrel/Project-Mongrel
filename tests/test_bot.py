@@ -73,6 +73,7 @@ from app.bot.handlers.upload import (
     upload_document_handler,
 )
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
+from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edit_text
 from app.core.config import Settings
 from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
 from app.services.bbot_ai_assessment import FALLBACK_LINES
@@ -332,6 +333,36 @@ def test_ai_report_progress_edit_failures_do_not_break_generation() -> None:
     report_text = query_message.reply_text.call_args.args[0]
     assert "## Executive Assessment" in report_text
     assert "SSH should be hardened." in report_text
+
+
+def test_progress_spinner_cycles_through_multiple_frames() -> None:
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    stop_event = asyncio.Event()
+    frames = build_spinner_frames("Generating AI Recon Assessment")
+
+    async def run_flow() -> None:
+        progress_task = asyncio.create_task(
+            run_progress_frames(status_message, frames, stop_event, interval_seconds=0.01, context="Test progress")
+        )
+        await asyncio.sleep(0.035)
+        stop_event.set()
+        await progress_task
+
+    asyncio.run(run_flow())
+
+    edited_messages = [call.args[0] for call in status_message.edit_text.call_args_list]
+    assert "Generating AI Recon Assessment /" in edited_messages
+    assert "Generating AI Recon Assessment -" in edited_messages
+    assert "Generating AI Recon Assessment \\" in edited_messages
+
+
+def test_progress_edit_errors_are_swallowed_and_logged(caplog) -> None:
+    status_message = SimpleNamespace(edit_text=AsyncMock(side_effect=TimedOut("status timeout")))
+
+    asyncio.run(safe_edit_text(status_message, "Generating AI Recon Assessment /", context="Test progress"))
+
+    assert status_message.edit_text.await_count == 1
+    assert "Test progress edit timed out" in caplog.text
 
 
 def test_target_specific_report_generation_from_telegram() -> None:
@@ -743,7 +774,7 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
         asyncio.run(scan_target_handler(update, context))
 
     run_bbot_scan.assert_called_once_with("https://example.com")
-    assert message.reply_text.call_args_list[0].args[0] == "BBOT recon started.\n\nTarget:\nexample.com"
+    assert message.reply_text.call_args_list[0].args[0] == "BBOT Recon Running\n\nTarget:\nexample.com\n\nStatus:\nRunning"
     assert "BBOT Recon" in message.reply_text.call_args_list[1].args[0]
     assert "Recon Overview" in message.reply_text.call_args_list[1].args[0]
     assert "- Subdomains:" in message.reply_text.call_args_list[1].args[0]
@@ -828,7 +859,8 @@ def test_bbot_ai_assessment_callback_success_sends_assessment_and_timeline_event
         value="admin.example.com",
         target="example.com",
     )
-    query_message = SimpleNamespace(reply_text=AsyncMock())
+    progress_message = SimpleNamespace(edit_text=AsyncMock())
+    query_message = SimpleNamespace(reply_text=AsyncMock(side_effect=[progress_message, None]))
     query = SimpleNamespace(
         data=f"bbot_ai:{investigation['id']}",
         answer=AsyncMock(),
@@ -844,10 +876,10 @@ def test_bbot_ai_assessment_callback_success_sends_assessment_and_timeline_event
         asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
 
     query.answer.assert_called_once()
-    edited_messages = [call.args[0] for call in query.edit_message_text.call_args_list]
-    assert "Generating AI Recon Assessment /" in edited_messages
-    assert edited_messages[-1] == "AI Recon Assessment ready."
-    query_message.reply_text.assert_called_once_with("AI Recon Assessment\nConfidence:\nMEDIUM")
+    query.edit_message_text.assert_not_called()
+    assert query_message.reply_text.call_args_list[0].args[0] == "Generating AI Recon Assessment /"
+    assert query_message.reply_text.call_args_list[-1].args[0] == "AI Recon Assessment\nConfidence:\nMEDIUM"
+    assert progress_message.edit_text.call_args_list[-1].args[0] == "AI Recon Assessment ready."
     events = get_investigation_events(investigation["id"], 7210)
     assert events[-1]["event_type"] == "bbot_ai_assessment_generated"
     assert events[-1]["summary"] == "BBOT AI Recon Assessment Generated"
@@ -865,7 +897,8 @@ def test_bbot_ai_assessment_callback_failure_sends_fallback_and_timeline_event()
         value="app.example.com",
         target="example.com",
     )
-    query_message = SimpleNamespace(reply_text=AsyncMock())
+    progress_message = SimpleNamespace(edit_text=AsyncMock())
+    query_message = SimpleNamespace(reply_text=AsyncMock(side_effect=[progress_message, None]))
     query = SimpleNamespace(
         data=f"bbot_ai:{investigation['id']}",
         answer=AsyncMock(),
@@ -877,8 +910,10 @@ def test_bbot_ai_assessment_callback_failure_sends_fallback_and_timeline_event()
     with patch("app.bot.handlers.scan.generate_bbot_ai_assessment", return_value=FALLBACK_LINES):
         asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
 
-    assert query.edit_message_text.call_args_list[-1].args[0] == "AI Recon Assessment unavailable."
-    query_message.reply_text.assert_called_once_with("\n".join(FALLBACK_LINES))
+    query.edit_message_text.assert_not_called()
+    assert query_message.reply_text.call_args_list[0].args[0] == "Generating AI Recon Assessment /"
+    assert query_message.reply_text.call_args_list[-1].args[0] == "\n".join(FALLBACK_LINES)
+    assert progress_message.edit_text.call_args_list[-1].args[0] == "AI Recon Assessment unavailable."
     events = get_investigation_events(investigation["id"], 7211)
     assert events[-1]["event_type"] == "bbot_ai_assessment_fallback"
     assert events[-1]["summary"] == "BBOT AI Recon Assessment Fallback"
@@ -887,7 +922,8 @@ def test_bbot_ai_assessment_callback_failure_sends_fallback_and_timeline_event()
 def test_bbot_ai_assessment_callback_chunks_response() -> None:
     clear_user_investigations(7212)
     investigation = create_investigation(user_id=7212, target="example.com")
-    query_message = SimpleNamespace(reply_text=AsyncMock())
+    progress_message = SimpleNamespace(edit_text=AsyncMock())
+    query_message = SimpleNamespace(reply_text=AsyncMock(side_effect=[progress_message, None, None]))
     query = SimpleNamespace(
         data=f"bbot_ai:{investigation['id']}",
         answer=AsyncMock(),
@@ -903,7 +939,11 @@ def test_bbot_ai_assessment_callback_chunks_response() -> None:
         asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
 
     splitter.assert_called_once_with("AI Recon Assessment\nConfidence:\nLOW")
-    assert [call.args[0] for call in query_message.reply_text.call_args_list] == ["chunk one", "chunk two"]
+    assert [call.args[0] for call in query_message.reply_text.call_args_list] == [
+        "Generating AI Recon Assessment /",
+        "chunk one",
+        "chunk two",
+    ]
 
 
 def test_bbot_scan_missing_binary_does_not_crash() -> None:
@@ -1025,7 +1065,7 @@ def test_bbot_scan_summary_chunks_are_sent() -> None:
 
     splitter.assert_called_once()
     assert [call.args[0] for call in message.reply_text.call_args_list] == [
-        "BBOT recon started.\n\nTarget:\nexample.com",
+        "BBOT Recon Running\n\nTarget:\nexample.com\n\nStatus:\nRunning",
         "chunk one",
         "chunk two",
     ]

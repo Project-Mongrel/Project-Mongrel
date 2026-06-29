@@ -3,10 +3,10 @@ import logging
 from datetime import UTC, datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
+from app.bot.progress import run_progress_frames, safe_edit_text
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_report_metadata, get_user_report, get_user_reports, get_user_scan_runs
 from app.services.icon_helper import icon_label, section_label
@@ -442,33 +442,18 @@ async def _build_ai_report_assessment_with_progress(
 
 
 async def _run_ai_report_progress(query: object, stop_event: asyncio.Event) -> None:
-    frame_index = 1
-    while not stop_event.is_set():
-        await _safe_edit_report_status(query, AI_REPORT_PROGRESS_FRAMES[frame_index % len(AI_REPORT_PROGRESS_FRAMES)])
-        frame_index += 1
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=AI_REPORT_PROGRESS_INTERVAL_SECONDS)
-        except TimeoutError:
-            continue
+    await run_progress_frames(
+        query,
+        AI_REPORT_PROGRESS_FRAMES,
+        stop_event,
+        interval_seconds=AI_REPORT_PROGRESS_INTERVAL_SECONDS,
+        start_index=1,
+        context="Report progress",
+    )
 
 
 async def _safe_edit_report_status(query: object, text: str) -> None:
-    edit_message_text = getattr(query, "edit_message_text", None)
-    if edit_message_text is None:
-        return
-
-    try:
-        await edit_message_text(text)
-    except RetryAfter as exc:
-        logger.warning("Report progress edit was rate limited: %s", exc)
-    except TimedOut as exc:
-        logger.warning("Report progress edit timed out: %s", exc)
-    except NetworkError as exc:
-        logger.warning("Report progress edit failed due to Telegram network error: %s", exc)
-    except BadRequest as exc:
-        logger.warning("Report progress edit was rejected by Telegram: %s", exc)
-    except Exception:
-        logger.warning("Report progress edit failed unexpectedly.", exc_info=True)
+    await safe_edit_text(query, text, context="Report progress")
 
 
 def _ai_assessment_unavailable(ai_assessment_lines: list[str] | None) -> bool:
