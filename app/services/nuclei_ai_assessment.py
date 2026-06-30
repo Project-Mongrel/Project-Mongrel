@@ -17,8 +17,11 @@ FALLBACK_LINES = [
     "Use the deterministic Nuclei result for observed findings and next actions.",
 ]
 
-CLEAN_SCAN_LIMITATION = "Nuclei only reports issues matched by the selected templates/profile."
-CLEAN_SCAN_FACT = "No matching Nuclei findings were observed with the selected template/profile."
+CLEAN_SCAN_LIMITATION = (
+    "The assessment is limited to the templates that were executed and should not be interpreted as confirmation "
+    "that the target is free of vulnerabilities."
+)
+CLEAN_SCAN_FACT = "No matching Nuclei findings were observed using the selected template/profile."
 
 
 def generate_nuclei_ai_assessment(finding: dict) -> list[str]:
@@ -53,7 +56,7 @@ def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
             f"- For clean scans, explain this limitation: {CLEAN_SCAN_LIMITATION}",
             '- State "No confirmed vulnerabilities were identified during reconnaissance" when appropriate.',
             "- Mention uncertainty clearly when evidence is limited.",
-            "- Confidence must be High, Medium, or Low and must reflect evidence completeness only.",
+            "- Confidence must describe assessment quality based on the executed template set, not target security.",
             "- Recommended next actions must map directly to observed evidence.",
             "- Return final answer only.",
             "",

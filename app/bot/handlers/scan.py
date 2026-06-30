@@ -130,7 +130,7 @@ def build_clean_nuclei_verdict_text(target: str | None, elapsed: str | None = No
         risk="INFO",
         summary="\n".join(
             [
-                "No matching Nuclei findings were identified using the fast scan profile.",
+                "No matching Nuclei findings were observed using the selected template/profile.",
                 "",
                 "Recommended Actions:",
                 "- Continue regular patching and monitoring.",
@@ -901,7 +901,12 @@ async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> No
         await query.edit_message_text("\n".join(assessment_lines))
         return
 
-    for chunk in split_report_text("\n".join(assessment_lines)):
+    assessment_text = (
+        "\n".join(assessment_lines)
+        if fallback
+        else render_ai_summary_card(assessment_lines, title="BBOT AI Assessment")
+    )
+    for chunk in split_report_text(assessment_text):
         await message.reply_text(chunk)
 
     logger.info("BBOT AI assessment event recorded: id=%s fallback=%s", event.get("id"), fallback)

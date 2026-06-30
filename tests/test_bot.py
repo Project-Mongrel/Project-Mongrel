@@ -872,8 +872,8 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     )
     assert "BBOT Recon" in message.reply_text.call_args_list[1].args[0]
     assert "Recon Overview" in message.reply_text.call_args_list[1].args[0]
-    assert "- Subdomains:" in message.reply_text.call_args_list[1].args[0]
-    assert "- URLs: 1" in message.reply_text.call_args_list[1].args[0]
+    assert "subdomains" in message.reply_text.call_args_list[1].args[0]
+    assert "1 URLs" in message.reply_text.call_args_list[1].args[0]
     assert "Recommended Next Actions" in message.reply_text.call_args_list[1].args[0]
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].text == "AI Summary"
@@ -932,8 +932,8 @@ def test_bbot_scan_json_output_populates_observation_store_and_summary() -> None
     assert observations[0]["value"] == "app.example.com"
     summary_text = message.reply_text.call_args_list[1].args[0]
     assert "Observations Collected: 1" in summary_text
-    assert "- Subdomains: 1" in summary_text
-    assert "- app.example.com" in summary_text
+    assert "1 subdomains" in summary_text
+    assert "app.example.com" in summary_text
 
 
 def test_bbot_ai_assessment_keyboard_exists() -> None:
@@ -968,14 +968,16 @@ def test_bbot_ai_assessment_callback_success_sends_assessment_and_timeline_event
 
     with patch(
         "app.bot.handlers.scan.generate_bbot_ai_assessment",
-        return_value=["AI Recon Assessment", "Confidence:", "MEDIUM"],
+        return_value=["Executive Summary", "- Admin host observed.", "", "Confidence:", "Medium"],
     ):
         asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
 
     query.answer.assert_called_once()
     query.edit_message_text.assert_not_called()
     assert query_message.reply_text.call_args_list[0].args[0] == "Generating AI Recon Assessment /"
-    assert query_message.reply_text.call_args_list[-1].args[0] == "AI Recon Assessment\nConfidence:\nMEDIUM"
+    assert "BBOT AI Assessment" in query_message.reply_text.call_args_list[-1].args[0]
+    assert "Executive Summary\n- Admin host observed." in query_message.reply_text.call_args_list[-1].args[0]
+    assert "Confidence\nMedium" in query_message.reply_text.call_args_list[-1].args[0]
     assert progress_message.edit_text.call_args_list[-1].args[0] == "AI Recon Assessment ready."
     events = get_investigation_events(investigation["id"], 7210)
     assert events[-1]["event_type"] == "bbot_ai_assessment_generated"
@@ -1029,13 +1031,16 @@ def test_bbot_ai_assessment_callback_chunks_response() -> None:
     )
     update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7212))
 
+    assessment_lines = ["AI Recon Assessment", "Confidence:", "LOW"]
     with (
-        patch("app.bot.handlers.scan.generate_bbot_ai_assessment", return_value=["AI Recon Assessment", "Confidence:", "LOW"]),
+        patch("app.bot.handlers.scan.generate_bbot_ai_assessment", return_value=assessment_lines),
         patch("app.bot.handlers.scan.split_report_text", return_value=["chunk one", "chunk two"]) as splitter,
     ):
         asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
 
-    splitter.assert_called_once_with("AI Recon Assessment\nConfidence:\nLOW")
+    split_input = splitter.call_args.args[0]
+    assert "BBOT AI Assessment" in split_input
+    assert "Confidence\nLOW" in split_input
     assert [call.args[0] for call in query_message.reply_text.call_args_list] == [
         "Generating AI Recon Assessment /",
         "chunk one",
@@ -1408,7 +1413,7 @@ def test_nuclei_scan_no_findings_output() -> None:
                     "- No matching findings were observed.",
                     "",
                     "Observed Facts",
-                    "- No matching Nuclei findings were observed with the selected template/profile.",
+                    "- No matching Nuclei findings were observed using the selected template/profile.",
                     "",
                     "Confidence",
                     "Low",
@@ -1430,7 +1435,7 @@ def test_nuclei_scan_no_findings_output() -> None:
     assert "Time\n" in verdict_text
     assert "Risk\nINFO" in verdict_text
     assert "Findings\n- 0 findings" in verdict_text
-    assert "No matching Nuclei findings were identified using the fast scan profile." in verdict_text
+    assert "No matching Nuclei findings were observed using the selected template/profile." in verdict_text
     assert "- The target was reachable." in verdict_text
     assert "- Nuclei executed successfully." in verdict_text
     assert "- Continue regular patching and monitoring." in verdict_text

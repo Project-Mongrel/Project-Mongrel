@@ -18,9 +18,9 @@ def test_empty_observations() -> None:
 
     assert "BBOT Recon Summary" in summary
     assert "example.com" in summary
-    assert "- Observations Collected: 0" in summary
-    assert "- No significant BBOT discoveries stored yet." in summary
-    assert "- Continue reconnaissance using additional observation sources." in summary
+    assert "Observations Collected: 0" in summary
+    assert "No significant BBOT discoveries stored yet." in summary
+    assert "Continue reconnaissance using additional observation sources." in summary
 
 
 def test_subdomains_summary() -> None:
@@ -28,9 +28,9 @@ def test_subdomains_summary() -> None:
 
     summary = build_bbot_recon_summary(user_id=1002, target="example.com")
 
-    assert "- Subdomains: 1" in summary
-    assert "- app.example.com" in summary
-    assert "- Run Nuclei against discovered web services." in summary
+    assert "1 subdomains" in summary
+    assert "app.example.com" in summary
+    assert "Run Nuclei against discovered web services." in summary
 
 
 def test_urls_summary() -> None:
@@ -38,9 +38,9 @@ def test_urls_summary() -> None:
 
     summary = build_bbot_recon_summary(user_id=1003, target="example.com")
 
-    assert "- URLs: 1" in summary
-    assert "- https://app.example.com/login" in summary
-    assert "- Run Nuclei against discovered web services." in summary
+    assert "1 URLs" in summary
+    assert "https://app.example.com/login" in summary
+    assert "Run Nuclei against discovered web services." in summary
 
 
 def test_ips_summary() -> None:
@@ -48,8 +48,8 @@ def test_ips_summary() -> None:
 
     summary = build_bbot_recon_summary(user_id=1004, target="example.com")
 
-    assert "- IP Addresses: 1" in summary
-    assert "- 192.0.2.10" in summary
+    assert "1 IP addresses" in summary
+    assert "192.0.2.10" in summary
 
 
 def test_technologies_summary() -> None:
@@ -57,9 +57,9 @@ def test_technologies_summary() -> None:
 
     summary = build_bbot_recon_summary(user_id=1005, target="example.com")
 
-    assert "- Technologies: 1" in summary
-    assert "- nginx" in summary
-    assert "- Review software versions for known vulnerabilities." in summary
+    assert "1 technologies" in summary
+    assert "nginx" in summary
+    assert "Review software versions for known vulnerabilities." in summary
 
 
 def test_certificates_summary() -> None:
@@ -67,9 +67,9 @@ def test_certificates_summary() -> None:
 
     summary = build_bbot_recon_summary(user_id=1006, target="example.com")
 
-    assert "- Certificates: 1" in summary
-    assert "- CN=example.com" in summary
-    assert "- Review certificate validity and exposure." in summary
+    assert "1 certificates" in summary
+    assert "CN=example.com" in summary
+    assert "Review certificate validity and exposure." in summary
 
 
 def test_emails_summary() -> None:
@@ -77,8 +77,8 @@ def test_emails_summary() -> None:
 
     summary = build_bbot_recon_summary(user_id=1007, target="example.com")
 
-    assert "- Email Addresses: 1" in summary
-    assert "- security@example.com" in summary
+    assert "1 email addresses" in summary
+    assert "security@example.com" in summary
 
 
 def test_mixed_observations_summary() -> None:
@@ -92,14 +92,14 @@ def test_mixed_observations_summary() -> None:
 
     summary = build_bbot_recon_summary(user_id=1008, target="example.com")
 
-    assert "- Observations Collected: 7" in summary
-    assert "- Subdomains: 1" in summary
-    assert "- URLs: 1" in summary
-    assert "- IP Addresses: 1" in summary
-    assert "- DNS Records: 1" in summary
-    assert "- Technologies: 1" in summary
-    assert "- Certificates: 1" in summary
-    assert "- Email Addresses: 1" in summary
+    assert "Observations Collected: 7" in summary
+    assert "1 subdomains" in summary
+    assert "1 URLs" in summary
+    assert "1 IP addresses" in summary
+    assert "1 DNS records" in summary
+    assert "1 technologies" in summary
+    assert "1 certificates" in summary
+    assert "1 email addresses" in summary
 
 
 def test_admin_like_host_detection() -> None:
@@ -107,7 +107,7 @@ def test_admin_like_host_detection() -> None:
 
     summary = build_bbot_recon_summary(user_id=1009, target="example.com")
 
-    assert "- Review authentication and internet exposure for admin-like hosts." in summary
+    assert "Review authentication and internet exposure for admin-like hosts." in summary
 
 
 def test_recommendation_generation_is_deterministic() -> None:
@@ -130,7 +130,7 @@ def test_filters_by_investigation_and_target() -> None:
 
     summary = build_bbot_recon_summary(user_id=1011, investigation_id="inv-1", target="example.com")
 
-    assert "- Observations Collected: 1" in summary
+    assert "Observations Collected: 1" in summary
     assert "app.example.com" in summary
     assert "api.other.com" not in summary
 

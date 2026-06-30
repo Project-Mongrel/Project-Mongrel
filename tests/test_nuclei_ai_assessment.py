@@ -71,6 +71,7 @@ def test_nuclei_ai_prompt_clean_scan_includes_template_limitation() -> None:
 
     assert CLEAN_SCAN_FACT in prompt
     assert CLEAN_SCAN_LIMITATION in prompt
+    assert "should not be interpreted as confirmation" in prompt
 
 
 def test_nuclei_ai_assessment_success_returns_response_lines() -> None:

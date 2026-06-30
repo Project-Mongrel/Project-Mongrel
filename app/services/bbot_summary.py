@@ -14,13 +14,13 @@ ASSET_TYPES = (
     "email",
 )
 ASSET_LABELS = {
-    "subdomain": "Subdomains",
+    "subdomain": "subdomains",
     "url": "URLs",
-    "ip_address": "IP Addresses",
-    "dns_record": "DNS Records",
-    "technology": "Technologies",
-    "certificate": "Certificates",
-    "email": "Email Addresses",
+    "ip_address": "IP addresses",
+    "dns_record": "DNS records",
+    "technology": "technologies",
+    "certificate": "certificates",
+    "email": "email addresses",
 }
 DISCOVERY_TYPES = ("subdomain", "url", "ip_address", "technology", "certificate", "email", "dns_record")
 ADMIN_HOST_TOKENS = {"admin", "auth", "login", "manage", "management", "portal", "vpn", "staging"}
@@ -46,20 +46,20 @@ def build_bbot_recon_summary(
         "",
         "Recon Overview",
         "",
-        f"- Observations Collected: {len(observations)}",
+        f"Observations Collected: {len(observations)}",
         "",
         icon_label("statistics", "Assets"),
         "",
     ]
-    lines.extend(f"- {ASSET_LABELS[asset_type]}: {counts.get(asset_type, 0)}" for asset_type in ASSET_TYPES)
+    lines.extend(f"{counts.get(asset_type, 0)} {ASSET_LABELS[asset_type]}" for asset_type in ASSET_TYPES)
     lines.extend(["", icon_label("observation", "Interesting Discoveries"), ""])
     if discoveries:
-        lines.extend(f"- {discovery}" for discovery in discoveries)
+        lines.extend(discoveries)
     else:
-        lines.append("- No significant BBOT discoveries stored yet.")
+        lines.append("No significant BBOT discoveries stored yet.")
 
     lines.extend(["", icon_label("risk", "Recommended Next Actions"), ""])
-    lines.extend(f"- {recommendation}" for recommendation in recommendations)
+    lines.extend(recommendations)
     return "\n".join(lines)
 
 
