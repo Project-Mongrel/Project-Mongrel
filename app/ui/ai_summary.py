@@ -11,11 +11,11 @@ AI_SUMMARY_SECTIONS = (
 )
 
 
-def render_ai_summary_card(summary: str | list[str]) -> str:
+def render_ai_summary_card(summary: str | list[str], title: str = "AI Summary") -> str:
     lines = summary if isinstance(summary, list) else str(summary or "").splitlines()
     sections = _parse_sections([str(line).rstrip() for line in lines])
     title_icon = icon("ai")
-    rendered = [f"{title_icon} AI Summary".strip()]
+    rendered = [f"{title_icon} {title}".strip()]
 
     for section_title in AI_SUMMARY_SECTIONS:
         body = sections.get(section_title, [])

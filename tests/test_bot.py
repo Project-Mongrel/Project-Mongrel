@@ -77,6 +77,8 @@ from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edi
 from app.core.config import Settings
 from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
 from app.services.bbot_ai_assessment import FALLBACK_LINES
+from app.services.nmap_ai_assessment import FALLBACK_LINES as NMAP_AI_FALLBACK_LINES
+from app.services.nuclei_ai_assessment import FALLBACK_LINES as NUCLEI_AI_FALLBACK_LINES
 from app.tools.bbot_runner import BBOT_RUNTIME_INCOMPATIBLE_ERROR
 from app.services.findings_store import (
     add_finding,
@@ -732,6 +734,78 @@ def test_scan_workflow_still_runs_when_ai_state_is_not_waiting() -> None:
     assert [event["event_type"] for event in events] == ["nmap_scan_started", "nmap_scan_completed"]
 
 
+def test_nmap_scan_sends_result_card_before_ai_assessment() -> None:
+    clear_user_findings(7009)
+    clear_user_investigations(7009)
+    clear_user_scan_requests(7009)
+    scan_request = create_scan_request(user_id=7009, scan_type="nmap")
+    mark_scan_request_awaiting_target(user_id=7009, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="127.0.0.1", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7009))
+    assessment_lines = [
+        "Executive Summary",
+        "- SSH service was observed.",
+        "",
+        "Observed Facts",
+        "- 22/tcp ssh",
+        "",
+        "Confidence",
+        "Medium",
+    ]
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_nmap_scan",
+            return_value={
+                "success": True,
+                "target": "127.0.0.1",
+                "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n",
+                "error": "",
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_nmap_ai_assessment", return_value=assessment_lines),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert "Nmap Scan Complete" in sent_messages[1]
+    assert "AI Summary" in message.reply_text.call_args_list[1].kwargs["reply_markup"].inline_keyboard[0][0].text
+    assert sent_messages[2] == "Generating Nmap AI assessment..."
+    assert "Nmap AI Assessment" in sent_messages[3]
+    assert "Observed Facts\n- 22/tcp ssh" in sent_messages[3]
+
+
+def test_nmap_ai_assessment_failure_does_not_fail_scan() -> None:
+    clear_user_findings(7010)
+    clear_user_investigations(7010)
+    clear_user_scan_requests(7010)
+    scan_request = create_scan_request(user_id=7010, scan_type="nmap")
+    mark_scan_request_awaiting_target(user_id=7010, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="127.0.0.1", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7010))
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_nmap_scan",
+            return_value={
+                "success": True,
+                "target": "127.0.0.1",
+                "output": "Nmap scan report for 127.0.0.1\nHost is up.\n",
+                "error": "",
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_nmap_ai_assessment", return_value=NMAP_AI_FALLBACK_LINES),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert "Nmap Scan Complete" in sent_messages[1]
+    assert "Nmap AI assessment unavailable." in sent_messages[-1]
+    assert get_user_findings(7010)
+
+
 def test_scan_menu_includes_nuclei_scan() -> None:
     keyboard = build_scan_type_keyboard()
     rendered_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
@@ -1253,16 +1327,31 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
     )
 
     async def run_flow() -> None:
-        with patch(
-            "app.bot.handlers.scan.run_nuclei_scan",
-            return_value={
-                "success": True,
-                "target": "https://example.com",
-                "output": nuclei_output,
-                "error": "",
-                "returncode": 0,
-            },
-        ) as run_nuclei_scan:
+        with (
+            patch(
+                "app.bot.handlers.scan.run_nuclei_scan",
+                return_value={
+                    "success": True,
+                    "target": "https://example.com",
+                    "output": nuclei_output,
+                    "error": "",
+                    "returncode": 0,
+                },
+            ) as run_nuclei_scan,
+            patch(
+                "app.bot.handlers.scan.generate_nuclei_ai_assessment",
+                return_value=[
+                    "Executive Summary",
+                    "- One matched finding was observed.",
+                    "",
+                    "Observed Facts",
+                    "- git-config-exposure matched https://example.com/.git/config.",
+                    "",
+                    "Confidence",
+                    "Medium",
+                ],
+            ),
+        ):
             await scan_target_handler(update, context)
             active_scan = get_active_scan(7102)
             assert active_scan is not None
@@ -1274,13 +1363,18 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
     asyncio.run(run_flow())
     assert " Nuclei Scan" in message.reply_text.call_args_list[0].args[0]
     assert f"{icon('running')} Status\nLaunching scan..." in message.reply_text.call_args_list[0].args[0]
-    assert f"{icon('success')} Status\nComplete" in status_message.edit_text.call_args.args[0]
+    status_edits = [call.args[0] for call in status_message.edit_text.call_args_list]
+    assert any(f"{icon('success')} Status\nComplete" in edit for edit in status_edits)
     assert "Nuclei Scan Complete" in message.reply_text.call_args_list[1].args[0]
     assert "Time\n" in message.reply_text.call_args_list[1].args[0]
     assert "Risk\nHIGH" in message.reply_text.call_args_list[1].args[0]
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].text == "AI Summary"
     assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:nuclei:")
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert sent_messages[2] == "Generating Nuclei AI assessment..."
+    assert "Nuclei AI Assessment" in sent_messages[3]
+    assert "Observed Facts\n- git-config-exposure matched https://example.com/.git/config." in sent_messages[3]
     findings = get_user_findings(7102)
     assert findings[0]["source"] == "nuclei"
     assert findings[0]["target"] == "https://example.com"
@@ -1302,9 +1396,24 @@ def test_nuclei_scan_no_findings_output() -> None:
     update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7103))
 
     async def run_flow() -> None:
-        with patch(
-            "app.bot.handlers.scan.run_nuclei_scan",
-            return_value={"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0},
+        with (
+            patch(
+                "app.bot.handlers.scan.run_nuclei_scan",
+                return_value={"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0},
+            ),
+            patch(
+                "app.bot.handlers.scan.generate_nuclei_ai_assessment",
+                return_value=[
+                    "Executive Summary",
+                    "- No matching findings were observed.",
+                    "",
+                    "Observed Facts",
+                    "- No matching Nuclei findings were observed with the selected template/profile.",
+                    "",
+                    "Confidence",
+                    "Low",
+                ],
+            ),
         ):
             await scan_target_handler(update, context)
             active_scan = get_active_scan(7103)
@@ -1313,7 +1422,8 @@ def test_nuclei_scan_no_findings_output() -> None:
             await active_scan.task
 
     asyncio.run(run_flow())
-    assert f"{icon('success')} Status\nComplete" in status_message.edit_text.call_args.args[0]
+    status_edits = [call.args[0] for call in status_message.edit_text.call_args_list]
+    assert any(f"{icon('success')} Status\nComplete" in edit for edit in status_edits)
     verdict_text = message.reply_text.call_args_list[1].args[0]
     assert "Nuclei Scan Complete" in verdict_text
     assert "Target\nhttps://example.com" in verdict_text
@@ -1327,12 +1437,47 @@ def test_nuclei_scan_no_findings_output() -> None:
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].text == "AI Summary"
     assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:nuclei:")
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert sent_messages[2] == "Generating Nuclei AI assessment..."
+    assert "Nuclei AI Assessment" in sent_messages[3]
     clean_record = get_user_findings(7103)[0]
     assert clean_record["source"] == "nuclei"
     assert clean_record["status"] == "clean"
     assert clean_record["risk_level"] == "info"
     assert clean_record["finding_count"] == 0
     assert clean_record["summary"] == "No matching Nuclei findings were identified using the fast scan profile."
+
+
+def test_nuclei_ai_assessment_failure_does_not_fail_scan() -> None:
+    clear_user_findings(7114)
+    clear_user_scan_requests(7114)
+    clear_active_scan(7114)
+    scan_request = create_scan_request(user_id=7114, scan_type="nuclei")
+    mark_scan_request_awaiting_target(user_id=7114, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7114))
+
+    async def run_flow() -> None:
+        with (
+            patch(
+                "app.bot.handlers.scan.run_nuclei_scan",
+                return_value={"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0},
+            ),
+            patch("app.bot.handlers.scan.generate_nuclei_ai_assessment", return_value=NUCLEI_AI_FALLBACK_LINES),
+        ):
+            await scan_target_handler(update, context)
+            active_scan = get_active_scan(7114)
+            assert active_scan is not None
+            assert active_scan.task is not None
+            await active_scan.task
+
+    asyncio.run(run_flow())
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert "Nuclei Scan Complete" in sent_messages[1]
+    assert sent_messages[-1] == "\n".join(NUCLEI_AI_FALLBACK_LINES)
+    assert get_user_findings(7114)
 
 
 def test_clean_nuclei_verdict_formatter_for_no_findings() -> None:

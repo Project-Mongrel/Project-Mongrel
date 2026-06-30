@@ -39,6 +39,10 @@ from app.services.scan_manager import (
     mark_scan_request_awaiting_target,
 )
 from app.services.scan_ai_summary import FALLBACK_SUMMARY_LINES, generate_scan_ai_summary
+from app.services.nmap_ai_assessment import FALLBACK_LINES as NMAP_AI_FALLBACK_LINES
+from app.services.nmap_ai_assessment import generate_nmap_ai_assessment
+from app.services.nuclei_ai_assessment import FALLBACK_LINES as NUCLEI_AI_FALLBACK_LINES
+from app.services.nuclei_ai_assessment import generate_nuclei_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
 from app.services.target_normalizer import normalize_for_bbot, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
@@ -277,6 +281,7 @@ def store_clean_nuclei_scan(user_id: int, target: str | None) -> dict:
             "finding_count": 0,
             "status": "clean",
             "summary": summary,
+            "metadata": {"scan_profile": "fast"},
         },
     )
 
@@ -691,6 +696,36 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         ),
         reply_markup=build_scan_result_actions(finding.get("id") if finding else None, "nmap"),
     )
+    if result.get("success") is True and finding:
+        await _send_nmap_ai_assessment(update.message, finding)
+
+
+async def _send_nmap_ai_assessment(message: object, finding: dict) -> None:
+    progress_message = await message.reply_text("Generating Nmap AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_nmap_ai_assessment, finding)
+    if assessment_lines == NMAP_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "Nmap AI assessment unavailable.", context="Nmap AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="Nmap AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="Nmap AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
+async def _send_nuclei_ai_assessment(message: object, finding: dict) -> None:
+    progress_message = await message.reply_text("Generating Nuclei AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_nuclei_ai_assessment, finding)
+    if assessment_lines == NUCLEI_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "Nuclei AI assessment unavailable.", context="Nuclei AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="Nuclei AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="Nuclei AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
 
 
 async def _handle_bbot_target(
@@ -1088,6 +1123,9 @@ async def _run_nuclei_scan_background(
             build_clean_nuclei_verdict_text(clean_target, elapsed=elapsed_label),
             reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
         )
+        finding.setdefault("metadata", {})
+        finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
+        await _send_nuclei_ai_assessment(message, finding)
         return
 
     try:
@@ -1114,11 +1152,16 @@ async def _run_nuclei_scan_background(
             build_clean_nuclei_verdict_text(clean_target, elapsed=elapsed_label),
             reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
         )
+        finding.setdefault("metadata", {})
+        finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
+        await _send_nuclei_ai_assessment(message, finding)
         return
 
     from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
 
     finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
+    finding.setdefault("metadata", {})
+    finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
     add_investigation_event(
         investigation_id=investigation_id,
         user_id=user_id,
@@ -1134,6 +1177,7 @@ async def _run_nuclei_scan_background(
         build_nuclei_import_success_text(finding, elapsed=elapsed_label),
         reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
     )
+    await _send_nuclei_ai_assessment(message, finding)
 
 
 async def _update_nuclei_status_card(user_id: int, status_message: object, target: str, started_at: float) -> None:
