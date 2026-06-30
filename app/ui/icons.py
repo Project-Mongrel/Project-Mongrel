@@ -1,14 +1,14 @@
 ICONS = {
     "scan": "",
-    "target": "",
+    "target": "◎",
     "status": "✅",
     "running": "⏳",
     "elapsed": "⏱️",
     "risk": "⚠️",
-    "summary": "",
-    "findings": "",
-    "assets": "",
-    "ai": "",
+    "summary": "▣",
+    "findings": "○",
+    "assets": "▥",
+    "ai": "✦",
     "report": "",
     "success": "✅",
     "warning": "⚠️",
@@ -32,6 +32,8 @@ ICONS = {
     "saved": "▥",
     "statistics": "▦",
     "security": "⌾",
+    "comparison": "▦",
+    "impact": "⚠️",
 }
 
 

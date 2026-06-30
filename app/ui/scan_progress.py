@@ -5,10 +5,11 @@ from app.ui.icons import icon
 
 
 def render_scan_loading_card(title: str, target: str, status: str, elapsed_seconds: int) -> str:
+    status_icon = icon("success") if str(status or "").strip().lower() == "complete" else icon("running")
     return (
         f" {title}\n\n"
-        f" Target\n{target or 'unknown'}\n\n"
-        f"{icon('running')} Status\n{status}\n\n"
+        f"{icon('target')} Target\n{target or 'unknown'}\n\n"
+        f"{status_icon} Status\n{status}\n\n"
         f"{icon('elapsed')} Elapsed\n{elapsed_seconds}s"
     )
 

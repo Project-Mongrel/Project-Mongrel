@@ -45,9 +45,10 @@ from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
+from app.ui.ai_summary import render_ai_summary_card
 from app.ui.scan_progress import ScanProgressCard, render_scan_loading_card
 from app.ui.scan_actions import AI_SUMMARY_CALLBACK_PREFIX, build_scan_result_actions
-from app.ui.result_cards import render_scan_result_card
+from app.ui.result_cards import render_scan_result_card, render_section
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
 NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS = 15
@@ -117,10 +118,11 @@ def build_nuclei_status_card(target: str, status: str, elapsed_seconds: int, rea
     return render_scan_loading_card("Nuclei Scan", target, status_text, elapsed_seconds)
 
 
-def build_clean_nuclei_verdict_text(target: str | None) -> str:
+def build_clean_nuclei_verdict_text(target: str | None, elapsed: str | None = None) -> str:
     return render_scan_result_card(
         tool_name="Nuclei",
         target=str(target or "unknown"),
+        elapsed=elapsed,
         risk="INFO",
         summary="\n".join(
             [
@@ -166,6 +168,8 @@ def _combine_inline_keyboards(*keyboards: InlineKeyboardMarkup | None) -> Inline
 
 
 def _bbot_result_findings_from_counts(counts: dict[str, int]) -> list[str]:
+    if sum(int(value or 0) for value in counts.values()) == 0:
+        return []
     return [
         f"Observations collected: {sum(int(value or 0) for value in counts.values())}",
         f"Subdomains: {counts.get('subdomain', 0)}",
@@ -177,6 +181,8 @@ def _bbot_result_findings_from_counts(counts: dict[str, int]) -> list[str]:
 
 
 def _bbot_result_assets_from_counts(counts: dict[str, int]) -> list[str]:
+    if sum(int(value or 0) for value in counts.values()) == 0:
+        return []
     return [
         f"Subdomains: {counts.get('subdomain', 0)}",
         f"URLs: {counts.get('url', 0)}",
@@ -198,8 +204,6 @@ def build_bbot_result_text(
             elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
             risk="INFO",
             summary=recon_summary,
-            findings=_bbot_result_findings_from_counts(observation_counts or {}),
-            assets=_bbot_result_assets_from_counts(observation_counts or {}),
         )
 
     if result.get("error_type") == "runtime_incompatible":
@@ -299,9 +303,9 @@ def build_nmap_scan_result_text(result: dict[str, object]) -> str:
     )
     host_status = parsed_output.get("host_status") or "Unknown"
     notes = parsed_output.get("risk_notes") or []
-    summary_lines = [f"Host Status: {host_status}"]
+    summary_lines = [_format_nmap_host_status(host_status)]
     if notes:
-        summary_lines.append(f"Notes: {', '.join(str(note) for note in notes)}")
+        summary_lines.extend(_format_nmap_notes(notes))
     return render_scan_result_card(
         tool_name="Nmap",
         target=target,
@@ -314,6 +318,30 @@ def build_nmap_scan_result_text(result: dict[str, object]) -> str:
     )
 
 
+def _format_nmap_host_status(host_status: object) -> str:
+    normalized = str(host_status or "").strip().lower()
+    if normalized == "up":
+        return "Host reachable."
+    if normalized == "down":
+        return "Host appears unreachable."
+    return "Host status unknown."
+
+
+def _format_nmap_notes(notes: list[object]) -> list[str]:
+    formatted_notes = []
+    for note in notes:
+        text = str(note or "").strip()
+        if not text:
+            continue
+        if text.lower().endswith(" exposed"):
+            service = text[: -len(" exposed")].strip()
+            text = f"{service} service exposed."
+        elif not text.endswith("."):
+            text = f"{text}."
+        formatted_notes.append(text)
+    return formatted_notes
+
+
 def append_change_summary(message: str, comparison: dict | None, impact: dict | None = None) -> str:
     if comparison is None:
         return message
@@ -323,35 +351,43 @@ def append_change_summary(message: str, comparison: dict | None, impact: dict | 
             [
                 message,
                 "",
-                "Comparison",
-                comparison.get("summary", "No previous scan found for this target."),
+                render_section("Comparison", "\n".join(
+                    [
+                        comparison.get("summary", "No previous scan found for this target."),
+                        "This scan has been stored as the baseline for future comparisons.",
+                    ]
+                ), "comparison"),
                 "",
-                "This scan has been stored as the baseline for future comparisons.",
-                "",
-                "Impact Assessment",
-                "Change Impact: N/A",
-                "",
-                "Summary:",
-                "No historical comparison available.",
-                "",
-                "Reason:",
-                "This is the first recorded scan for this target.",
+                render_section("Impact", "\n".join(
+                    [
+                        "Change Impact: N/A",
+                        "",
+                        "Summary:",
+                        "No historical comparison available.",
+                        "",
+                        "Reason:",
+                        "This is the first recorded scan for this target.",
+                    ]
+                ), "impact"),
             ]
         )
 
     lines = [
         message,
         "",
-        "Comparison",
-        comparison.get("summary", "No previous scan found for this target."),
-        "",
-        f"New Ports: {_format_ports(comparison.get('new_ports') or [])}",
-        f"Removed Ports: {_format_ports(comparison.get('removed_ports') or [])}",
-        f"Risk Change: {_format_risk_change(comparison)}",
-        f"Unchanged Ports: {len(comparison.get('unchanged_ports') or [])}",
+        render_section("Comparison", "\n".join(
+            [
+                comparison.get("summary", "No previous scan found for this target."),
+                "",
+                f"New Ports: {_format_ports(comparison.get('new_ports') or [])}",
+                f"Removed Ports: {_format_ports(comparison.get('removed_ports') or [])}",
+                f"Risk Change: {_format_risk_change(comparison)}",
+                f"Unchanged Ports: {len(comparison.get('unchanged_ports') or [])}",
+            ]
+        ), "comparison"),
     ]
     if impact is not None:
-        lines.extend(["", "Impact", impact.get("summary", "No material exposure changes detected.")])
+        lines.extend(["", render_section("Impact", impact.get("summary", "No material exposure changes detected."), "impact")])
 
     return "\n".join(lines)
 
@@ -859,7 +895,7 @@ async def _handle_scan_ai_summary_callback(query: object, user_id: int) -> None:
     final_status = "AI summary unavailable." if summary_lines == FALLBACK_SUMMARY_LINES else "AI summary ready."
     await safe_edit_text(progress_message, final_status, context="Scan AI summary status")
 
-    summary_text = "\n".join(summary_lines)
+    summary_text = render_ai_summary_card(summary_lines)
     for chunk in split_report_text(summary_text):
         await message.reply_text(chunk)
 
@@ -1015,6 +1051,7 @@ async def _run_nuclei_scan_background(
     _stop_nuclei_status_updates(user_id)
     clear_active_scan(user_id)
     elapsed_seconds = time.monotonic() - started_at
+    elapsed_label = f"{int(elapsed_seconds)}s"
     logger.info("Nuclei scan completed for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
 
     if result.get("success") is not True:
@@ -1048,7 +1085,7 @@ async def _run_nuclei_scan_background(
         )
         await _send_scan_message(
             message,
-            build_clean_nuclei_verdict_text(clean_target),
+            build_clean_nuclei_verdict_text(clean_target, elapsed=elapsed_label),
             reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
         )
         return
@@ -1074,7 +1111,7 @@ async def _run_nuclei_scan_background(
         )
         await _send_scan_message(
             message,
-            build_clean_nuclei_verdict_text(clean_target),
+            build_clean_nuclei_verdict_text(clean_target, elapsed=elapsed_label),
             reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
         )
         return
@@ -1094,7 +1131,7 @@ async def _run_nuclei_scan_background(
     )
     await _send_scan_message(
         message,
-        build_nuclei_import_success_text(finding),
+        build_nuclei_import_success_text(finding, elapsed=elapsed_label),
         reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
     )
 

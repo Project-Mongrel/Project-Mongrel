@@ -1,9 +1,7 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.ui.icons import icon
-
 AI_SUMMARY_CALLBACK_PREFIX = "ai_summary"
-AI_SUMMARY_BUTTON_TEXT = f"{icon('ai')} Summarize with AI".strip()
+AI_SUMMARY_BUTTON_TEXT = "AI Summary"
 
 
 def build_scan_result_actions(scan_id: str | None, tool: str | None) -> InlineKeyboardMarkup | None:

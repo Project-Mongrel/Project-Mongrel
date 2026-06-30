@@ -104,6 +104,8 @@ from app.services.chat_state import (
 )
 from app.services.scan_manager import clear_user_scan_requests, create_scan_request, mark_scan_request_awaiting_target
 from app.services.verdict_engine import generate_mongrel_verdict
+from app.ui.ai_summary import render_ai_summary_card
+from app.ui.icons import icon
 
 
 def test_main_menu_keyboard_contains_expected_buttons() -> None:
@@ -717,11 +719,12 @@ def test_scan_workflow_still_runs_when_ai_state_is_not_waiting() -> None:
 
     run_nmap_scan.assert_called_once_with("127.0.0.1")
     assert message.reply_text.call_args_list[0].args[0] == (
-        " Nmap Scan\n\n Target\n127.0.0.1\n\n⏳ Status\nLaunching scan...\n\n⏱️ Elapsed\n0s"
+        f" Nmap Scan\n\n{icon('target')} Target\n127.0.0.1\n\n"
+        f"{icon('running')} Status\nLaunching scan...\n\n{icon('elapsed')} Elapsed\n0s"
     )
-    assert "Target\n127.0.0.1" in message.reply_text.call_args_list[1].args[0]
+    assert f"{icon('target')} Target\n127.0.0.1" in message.reply_text.call_args_list[1].args[0]
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
-    assert keyboard.inline_keyboard[0][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[0][0].text == "AI Summary"
     assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:nmap:")
     assert get_user_findings(7004)
     investigation = get_user_investigations(7004)[0]
@@ -790,7 +793,8 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
 
     run_bbot_scan.assert_called_once_with("https://example.com")
     assert message.reply_text.call_args_list[0].args[0] == (
-        " BBOT Scan\n\n Target\nexample.com\n\n⏳ Status\nLaunching scan...\n\n⏱️ Elapsed\n0s"
+        f" BBOT Scan\n\n{icon('target')} Target\nexample.com\n\n"
+        f"{icon('running')} Status\nLaunching scan...\n\n{icon('elapsed')} Elapsed\n0s"
     )
     assert "BBOT Recon" in message.reply_text.call_args_list[1].args[0]
     assert "Recon Overview" in message.reply_text.call_args_list[1].args[0]
@@ -798,7 +802,7 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     assert "- URLs: 1" in message.reply_text.call_args_list[1].args[0]
     assert "Recommended Next Actions" in message.reply_text.call_args_list[1].args[0]
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
-    assert keyboard.inline_keyboard[0][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[0][0].text == "AI Summary"
     assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:bbot:")
     assert keyboard.inline_keyboard[1][0].text == "Generate AI Recon Assessment"
     assert keyboard.inline_keyboard[1][0].callback_data.startswith("bbot_ai:")
@@ -1014,7 +1018,7 @@ def test_scan_ai_summary_callback_sends_new_summary_message() -> None:
     query.answer.assert_called_once()
     query.edit_message_text.assert_not_called()
     assert query_message.reply_text.call_args_list[0].args[0] == "Generating AI summary..."
-    assert query_message.reply_text.call_args_list[1].args[0] == "\n".join(summary_lines)
+    assert query_message.reply_text.call_args_list[1].args[0] == render_ai_summary_card(summary_lines)
     assert progress_message.edit_text.call_args_list[-1].args[0] == "AI summary ready."
 
 
@@ -1151,7 +1155,8 @@ def test_bbot_scan_summary_chunks_are_sent() -> None:
 
     splitter.assert_called_once()
     assert [call.args[0] for call in message.reply_text.call_args_list] == [
-        " BBOT Scan\n\n Target\nexample.com\n\n⏳ Status\nLaunching scan...\n\n⏱️ Elapsed\n0s",
+        f" BBOT Scan\n\n{icon('target')} Target\nexample.com\n\n"
+        f"{icon('running')} Status\nLaunching scan...\n\n{icon('elapsed')} Elapsed\n0s",
         "chunk one",
         "chunk two",
     ]
@@ -1170,6 +1175,7 @@ def test_bbot_scan_result_formatter_uses_recon_summary() -> None:
 
     assert "BBOT Scan Complete" in text
     assert "Summary\nBBOT Recon Summary\n\nTarget:\nexample.com" in text
+    assert "Findings\n- Observations collected:" not in text
 
 
 def test_bbot_scan_result_formatter_keeps_failure_output_concise() -> None:
@@ -1267,12 +1273,13 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
 
     asyncio.run(run_flow())
     assert " Nuclei Scan" in message.reply_text.call_args_list[0].args[0]
-    assert "⏳ Status\nLaunching scan..." in message.reply_text.call_args_list[0].args[0]
-    assert "⏳ Status\nComplete" in status_message.edit_text.call_args.args[0]
+    assert f"{icon('running')} Status\nLaunching scan..." in message.reply_text.call_args_list[0].args[0]
+    assert f"{icon('success')} Status\nComplete" in status_message.edit_text.call_args.args[0]
     assert "Nuclei Scan Complete" in message.reply_text.call_args_list[1].args[0]
+    assert "Time\n" in message.reply_text.call_args_list[1].args[0]
     assert "Risk\nHIGH" in message.reply_text.call_args_list[1].args[0]
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
-    assert keyboard.inline_keyboard[0][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[0][0].text == "AI Summary"
     assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:nuclei:")
     findings = get_user_findings(7102)
     assert findings[0]["source"] == "nuclei"
@@ -1306,10 +1313,11 @@ def test_nuclei_scan_no_findings_output() -> None:
             await active_scan.task
 
     asyncio.run(run_flow())
-    assert "⏳ Status\nComplete" in status_message.edit_text.call_args.args[0]
+    assert f"{icon('success')} Status\nComplete" in status_message.edit_text.call_args.args[0]
     verdict_text = message.reply_text.call_args_list[1].args[0]
     assert "Nuclei Scan Complete" in verdict_text
     assert "Target\nhttps://example.com" in verdict_text
+    assert "Time\n" in verdict_text
     assert "Risk\nINFO" in verdict_text
     assert "Findings\n- 0 findings" in verdict_text
     assert "No matching Nuclei findings were identified using the fast scan profile." in verdict_text
@@ -1317,7 +1325,7 @@ def test_nuclei_scan_no_findings_output() -> None:
     assert "- Nuclei executed successfully." in verdict_text
     assert "- Continue regular patching and monitoring." in verdict_text
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
-    assert keyboard.inline_keyboard[0][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[0][0].text == "AI Summary"
     assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:nuclei:")
     clean_record = get_user_findings(7103)[0]
     assert clean_record["source"] == "nuclei"
@@ -1328,10 +1336,11 @@ def test_nuclei_scan_no_findings_output() -> None:
 
 
 def test_clean_nuclei_verdict_formatter_for_no_findings() -> None:
-    verdict_text = build_clean_nuclei_verdict_text("hellosundaykids.com")
+    verdict_text = build_clean_nuclei_verdict_text("hellosundaykids.com", elapsed="9s")
 
     assert "Nuclei Scan Complete" in verdict_text
     assert "Target\nhellosundaykids.com" in verdict_text
+    assert "Time\n9s" in verdict_text
     assert "Risk\nINFO" in verdict_text
     assert "Findings\n- 0 findings" in verdict_text
     assert "Summary" in verdict_text
@@ -1620,11 +1629,11 @@ def test_nmap_result_text_uses_clean_parser_output() -> None:
     )
 
     assert "Target\n127.0.0.1" in result_text
-    assert "Host Status: Up" in result_text
+    assert "Host reachable." in result_text
     assert "22/tcp ssh" in result_text
     assert "Time\n0.32s" in result_text
     assert "Risk\nMEDIUM" in result_text
-    assert "Notes: SSH exposed" in result_text
+    assert "SSH service exposed." in result_text
     assert "https://nmap.org" not in result_text
 
 
@@ -2178,7 +2187,8 @@ def test_scan_exits_finding_analysis_and_target_goes_to_scan_flow() -> None:
     ask_ai.assert_not_called()
     run_nmap_scan.assert_called_once_with("127.0.0.1")
     assert target_message.reply_text.call_args_list[0].args[0] == (
-        " Nmap Scan\n\n Target\n127.0.0.1\n\n⏳ Status\nLaunching scan...\n\n⏱️ Elapsed\n0s"
+        f" Nmap Scan\n\n{icon('target')} Target\n127.0.0.1\n\n"
+        f"{icon('running')} Status\nLaunching scan...\n\n{icon('elapsed')} Elapsed\n0s"
     )
 
 
@@ -2662,7 +2672,7 @@ def test_uploaded_scan_creates_finding() -> None:
     assert "Purpose: Secure Shell remote administration service." in success_text
     assert reply_markup.inline_keyboard[0][0].text == "Open Findings"
     assert reply_markup.inline_keyboard[0][0].callback_data == "finding:list"
-    assert reply_markup.inline_keyboard[1][0].text == "Summarize with AI"
+    assert reply_markup.inline_keyboard[1][0].text == "AI Summary"
     assert reply_markup.inline_keyboard[1][0].callback_data.startswith("ai_summary:nmap_xml:")
     assert reply_markup.inline_keyboard[2][0].text == "Explain with Mongrel AI"
     assert reply_markup.inline_keyboard[2][0].callback_data == UPLOAD_EXPLAIN_CALLBACK
@@ -2906,7 +2916,7 @@ def test_upload_success_includes_open_findings_button() -> None:
 def test_upload_success_includes_explain_with_mongrel_ai_button() -> None:
     keyboard = build_upload_success_keyboard("finding-1", "nmap_xml")
 
-    assert keyboard.inline_keyboard[1][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[1][0].text == "AI Summary"
     assert keyboard.inline_keyboard[1][0].callback_data == "ai_summary:nmap_xml:finding-1"
     assert keyboard.inline_keyboard[2][0].text == "Explain with Mongrel AI"
     assert keyboard.inline_keyboard[2][0].callback_data == UPLOAD_EXPLAIN_CALLBACK

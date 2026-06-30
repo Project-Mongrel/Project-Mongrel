@@ -25,6 +25,8 @@ def test_icons_contains_required_keys() -> None:
         "cancel",
         "back",
         "complete",
+        "comparison",
+        "impact",
     }
 
     assert required_keys <= set(ICONS)

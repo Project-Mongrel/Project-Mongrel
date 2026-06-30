@@ -24,13 +24,13 @@ def test_render_scan_result_card_includes_standard_sections() -> None:
     )
 
     assert "Nmap Scan Complete" in card
-    assert "Target\nscanme.nmap.org" in card
+    assert f"{icon('target')} Target\nscanme.nmap.org" in card
     assert f"{icon('status')} Status\nComplete" in card
     assert f"{icon('elapsed')} Time\n1s" in card
     assert f"{icon('risk')} Risk\nLOW" in card
-    assert "Summary\nHost is up." in card
-    assert "Findings\n- 22/tcp ssh" in card
-    assert "Observed Assets\n- scanme.nmap.org" in card
+    assert f"{icon('summary')} Summary\nHost is up." in card
+    assert f"{icon('findings')} Findings\n- 22/tcp ssh" in card
+    assert f"{icon('assets')} Observed Assets\n- scanme.nmap.org" in card
 
 
 def test_render_scan_result_card_omits_empty_sections() -> None:
@@ -49,3 +49,15 @@ def test_render_scan_result_card_caps_lists() -> None:
     )
 
     assert "+1 more" in card
+
+
+def test_render_scan_result_card_includes_comparison_and_impact_icons() -> None:
+    card = render_scan_result_card(
+        tool_name="Nmap",
+        target="scanme.nmap.org",
+        comparison="No previous scan found.",
+        impact="No material exposure changes detected.",
+    )
+
+    assert f"{icon('comparison')} Comparison\nNo previous scan found." in card
+    assert f"{icon('impact')} Impact\nNo material exposure changes detected." in card

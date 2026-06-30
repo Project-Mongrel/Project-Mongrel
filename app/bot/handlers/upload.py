@@ -133,7 +133,7 @@ def store_nuclei_finding(user_id: int, nuclei_findings: list[dict]) -> dict:
     )
 
 
-def build_nuclei_import_success_text(finding: dict) -> str:
+def build_nuclei_import_success_text(finding: dict, elapsed: str | None = None) -> str:
     nuclei_findings = finding.get("nuclei_findings") or []
     severity_summary = finding.get("severity_summary") or _summarize_nuclei_severities(nuclei_findings)
     risk_level = str(finding.get("risk_level") or _score_nuclei_risk(severity_summary)).upper()
@@ -156,6 +156,7 @@ def build_nuclei_import_success_text(finding: dict) -> str:
         render_scan_result_card(
             tool_name="Nuclei",
             target=str(finding.get("target") or "unknown"),
+            elapsed=elapsed,
             risk=risk_level,
             summary=summary,
             findings=_format_nuclei_top_findings(nuclei_findings),

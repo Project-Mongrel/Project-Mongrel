@@ -40,6 +40,8 @@ def render_scan_result_card(
     summary: str | None = None,
     findings: list[str] | str | None = None,
     assets: list[str] | str | None = None,
+    comparison: str | list[str] | None = None,
+    impact: str | list[str] | None = None,
     ai_assessment: str | None = None,
 ) -> str:
     sections = [
@@ -55,6 +57,8 @@ def render_scan_result_card(
         render_section("Summary", summary, "summary"),
         render_section("Findings", findings, "findings"),
         render_section("Observed Assets", assets, "assets"),
+        render_section("Comparison", comparison, "comparison"),
+        render_section("Impact", impact, "impact"),
         render_section("AI Assessment", ai_assessment, "ai"),
     ]
     for section in optional_sections:
