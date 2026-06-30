@@ -1,6 +1,4 @@
 import logging
-from datetime import UTC, datetime
-
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -46,13 +44,15 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.info("Finding analysis ended for user_id=%s", update.effective_user.id)
         cancelled_scan = cancel_active_scan(update.effective_user.id)
         if cancelled_scan is not None and cancelled_scan.status_message is not None:
-            from app.bot.handlers.scan import build_nuclei_status_card, _edit_status_message
+            from app.ui.scan_progress import ScanProgressCard
 
-            elapsed_seconds = int((datetime.now(UTC) - cancelled_scan.started_at).total_seconds())
-            await _edit_status_message(
+            progress_card = ScanProgressCard.from_status_message(
                 cancelled_scan.status_message,
-                build_nuclei_status_card(cancelled_scan.target, "Cancelled", elapsed_seconds),
+                f"{cancelled_scan.scan_type.title()} Scan",
+                cancelled_scan.target,
+                cancelled_scan.progress_started_at,
             )
+            await progress_card.update("Cancelled")
         clear_active_scan(update.effective_user.id)
 
     await update.message.reply_text(

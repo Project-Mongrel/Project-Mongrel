@@ -5,6 +5,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
+from app.ui.scan_actions import build_scan_result_actions
+from app.ui.result_cards import render_scan_result_card
 from app.bot.handlers.scan import store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
@@ -135,33 +137,31 @@ def build_nuclei_import_success_text(finding: dict) -> str:
     nuclei_findings = finding.get("nuclei_findings") or []
     severity_summary = finding.get("severity_summary") or _summarize_nuclei_severities(nuclei_findings)
     risk_level = str(finding.get("risk_level") or _score_nuclei_risk(severity_summary)).upper()
-    lines = [
-        section_label("nuclei", "Nuclei Verdict"),
-        "",
-        "Target:",
-        str(finding.get("target") or "unknown"),
-        "",
-        "Risk Level:",
-        risk_level,
-        "",
-        "Findings:",
-        str(finding.get("finding_count") or len(nuclei_findings)),
-        "",
-        "Severity Summary:",
-        *_format_nuclei_severity_summary(severity_summary),
-        "",
-        "Top Findings:",
-        *_format_nuclei_top_findings(nuclei_findings),
-        "",
-        "Recommended Actions:",
-        "- Prioritize critical and high findings first.",
-        "- Validate findings manually before remediation.",
-        "- Patch or mitigate affected services.",
-        "",
-        "Technical Details:",
-        *_format_nuclei_technical_details(nuclei_findings),
-    ]
-    return _truncate_message("\n".join(lines))
+    summary = "\n".join(
+        [
+            f"Findings detected: {finding.get('finding_count') or len(nuclei_findings)}",
+            "Severity Summary:",
+            *_format_nuclei_severity_summary(severity_summary),
+            "",
+            "Recommended Actions:",
+            "- Prioritize critical and high findings first.",
+            "- Validate findings manually before remediation.",
+            "- Patch or mitigate affected services.",
+            "",
+            "Technical Details:",
+            *_format_nuclei_technical_details(nuclei_findings),
+        ]
+    )
+    return _truncate_message(
+        render_scan_result_card(
+            tool_name="Nuclei",
+            target=str(finding.get("target") or "unknown"),
+            risk=risk_level,
+            summary=summary,
+            findings=_format_nuclei_top_findings(nuclei_findings),
+            assets=_nuclei_observed_assets(nuclei_findings),
+        )
+    )
 
 
 def _summarize_nuclei_severities(nuclei_findings: list[dict]) -> dict[str, int]:
@@ -212,6 +212,18 @@ def _format_nuclei_top_findings(nuclei_findings: list[dict]) -> list[str]:
         f"- {finding.get('name') or finding.get('template_id') or 'Unnamed finding'} ({str(finding.get('severity') or 'info').lower()})"
         for finding in _sort_nuclei_findings(nuclei_findings)[:MAX_NUCLEI_FINDINGS_IN_REPORT]
     ]
+
+
+def _nuclei_observed_assets(nuclei_findings: list[dict]) -> list[str]:
+    assets = []
+    seen = set()
+    for finding in nuclei_findings:
+        asset = str(finding.get("host") or finding.get("matched_at") or "").strip()
+        if not asset or asset.lower() in seen:
+            continue
+        seen.add(asset.lower())
+        assets.append(asset)
+    return assets
 
 
 def _format_nuclei_technical_details(nuclei_findings: list[dict]) -> list[str]:
@@ -489,13 +501,13 @@ def _get_upload_extension(file_name: str) -> str:
     return f".{normalized_file_name.rsplit('.', 1)[1]}"
 
 
-def build_upload_success_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Open Findings", callback_data="finding:list")],
-            [InlineKeyboardButton("Explain with Mongrel AI", callback_data=UPLOAD_EXPLAIN_CALLBACK)],
-        ]
-    )
+def build_upload_success_keyboard(finding_id: str | None = None, tool: str = "nmap_xml") -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton("Open Findings", callback_data="finding:list")]]
+    summary_actions = build_scan_result_actions(finding_id, tool)
+    if summary_actions is not None:
+        buttons.extend(summary_actions.inline_keyboard)
+    buttons.append([InlineKeyboardButton("Explain with Mongrel AI", callback_data=UPLOAD_EXPLAIN_CALLBACK)])
+    return InlineKeyboardMarkup(buttons)
 
 
 def build_upload_ai_prompt(summary: dict) -> str:
@@ -640,7 +652,10 @@ async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_
 
         finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
         clear_upload_state(user_id)
-        await update.message.reply_text(build_nuclei_import_success_text(finding))
+        await update.message.reply_text(
+            build_nuclei_import_success_text(finding),
+            reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
+        )
         return
 
     logger.info("Routing to nmap parser")
@@ -655,7 +670,7 @@ async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_
     clear_upload_state(user_id)
     await update.message.reply_text(
         build_nmap_xml_import_success_text(finding),
-        reply_markup=build_upload_success_keyboard(),
+        reply_markup=build_upload_success_keyboard(finding.get("id"), "nmap_xml"),
     )
 
 

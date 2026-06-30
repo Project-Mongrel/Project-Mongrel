@@ -1,8 +1,8 @@
 import asyncio
 import logging
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ContextTypes
 
 from app.bot.handlers.home import build_home_text
@@ -26,6 +26,7 @@ from app.services.bbot_summary import build_bbot_recon_summary
 from app.services.chat_state import clear_finding_analysis_context, get_finding_analysis_context, is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
+from app.services.findings_store import get_user_finding
 from app.services.icon_helper import section_label
 from app.services.impact_engine import assess_change_impact
 from app.services.investigation_store import add_investigation_event, get_investigation, get_or_create_latest_open_investigation
@@ -37,12 +38,16 @@ from app.services.scan_manager import (
     get_scan_request,
     mark_scan_request_awaiting_target,
 )
+from app.services.scan_ai_summary import FALLBACK_SUMMARY_LINES, generate_scan_ai_summary
 from app.services.service_intelligence import get_service_intelligence
 from app.services.target_normalizer import normalize_for_bbot, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
-from app.tools.nmap_parser import format_nmap_result, parse_nmap_output
+from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
+from app.ui.scan_progress import ScanProgressCard, render_scan_loading_card
+from app.ui.scan_actions import AI_SUMMARY_CALLBACK_PREFIX, build_scan_result_actions
+from app.ui.result_cards import render_scan_result_card
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
 NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS = 15
@@ -100,7 +105,7 @@ def build_bbot_target_prompt() -> str:
 
 
 def build_nmap_scan_started_text(target: str) -> str:
-    return f"Running NMAP scan for target: {target}"
+    return render_scan_loading_card("Nmap Scan", target, "Launching scan...", 0)
 
 
 def build_nuclei_scan_started_text() -> str:
@@ -108,58 +113,38 @@ def build_nuclei_scan_started_text() -> str:
 
 
 def build_nuclei_status_card(target: str, status: str, elapsed_seconds: int, reason: str | None = None) -> str:
-    lines = [
-        section_label("nuclei", "Nuclei Fast Scan"),
-        "",
-        "Target:",
-        target or "unknown",
-        "",
-        "Status:",
-        status,
-        "",
-        "Elapsed:",
-        f"{elapsed_seconds}s",
-    ]
-    if reason:
-        lines.extend(["", "Reason:", reason])
-    if status in {"Initializing", "Running"}:
-        lines.extend(["", "Press Cancel to stop."])
-
-    return "\n".join(lines)
+    status_text = f"{status}: {reason}" if reason else status
+    return render_scan_loading_card("Nuclei Scan", target, status_text, elapsed_seconds)
 
 
 def build_clean_nuclei_verdict_text(target: str | None) -> str:
-    return "\n".join(
-        [
-            section_label("nuclei", "Nuclei Verdict"),
-            "",
-            "Target:",
-            str(target or "unknown"),
-            "",
-            "Risk Level:",
-            "INFO",
-            "",
-            "Findings:",
-            "0",
-            "",
-            "Summary:",
-            "No matching Nuclei findings were identified using the fast scan profile.",
-            "",
-            "What this means:",
-            "- The target was reachable.",
-            "- Nuclei executed successfully.",
-            "- No exposures, misconfigurations, or known issues matched the selected template set.",
-            "",
-            "Recommended Actions:",
-            "- Continue regular patching and monitoring.",
-            "- Re-scan after major site, server, or plugin changes.",
-            "- Consider a deeper scan profile if additional assurance is required.",
-        ]
+    return render_scan_result_card(
+        tool_name="Nuclei",
+        target=str(target or "unknown"),
+        risk="INFO",
+        summary="\n".join(
+            [
+                "No matching Nuclei findings were identified using the fast scan profile.",
+                "",
+                "Recommended Actions:",
+                "- Continue regular patching and monitoring.",
+                "- Re-scan after major site, server, or plugin changes.",
+                "- Consider a deeper scan profile if additional assurance is required.",
+            ]
+        ),
+        findings=[
+            "0 findings",
+            "The target was reachable.",
+            "Nuclei executed successfully.",
+            "No exposures, misconfigurations, or known issues matched the selected template set.",
+        ],
+        assets=[str(target)] if target else None,
+        ai_assessment=None,
     )
 
 
 def build_bbot_scan_started_text(target: str) -> str:
-    return "\n".join(["BBOT Recon Running", "", "Target:", target, "", "Status:", "Running"])
+    return render_scan_loading_card("BBOT Scan", target, "Launching scan...", 0)
 
 
 def build_bbot_ai_assessment_keyboard(investigation_id: str | None) -> InlineKeyboardMarkup | None:
@@ -171,53 +156,72 @@ def build_bbot_ai_assessment_keyboard(investigation_id: str | None) -> InlineKey
     )
 
 
+def _combine_inline_keyboards(*keyboards: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup | None:
+    rows = []
+    for keyboard in keyboards:
+        if keyboard is not None:
+            rows.extend(keyboard.inline_keyboard)
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _bbot_result_findings_from_counts(counts: dict[str, int]) -> list[str]:
+    return [
+        f"Observations collected: {sum(int(value or 0) for value in counts.values())}",
+        f"Subdomains: {counts.get('subdomain', 0)}",
+        f"URLs: {counts.get('url', 0)}",
+        f"IP Addresses: {counts.get('ip_address', 0)}",
+        f"Technologies: {counts.get('technology', 0)}",
+        f"Raw Events: {counts.get('raw_event', 0)}",
+    ]
+
+
+def _bbot_result_assets_from_counts(counts: dict[str, int]) -> list[str]:
+    return [
+        f"Subdomains: {counts.get('subdomain', 0)}",
+        f"URLs: {counts.get('url', 0)}",
+        f"IP Addresses: {counts.get('ip_address', 0)}",
+        f"Emails: {counts.get('email', 0)}",
+        f"Technologies: {counts.get('technology', 0)}",
+    ]
+
+
 def build_bbot_result_text(
     result: dict[str, object],
     observation_counts: dict[str, int] | None = None,
     recon_summary: str | None = None,
 ) -> str:
     if result.get("success") is True and recon_summary:
-        return recon_summary
+        return render_scan_result_card(
+            tool_name="BBOT",
+            target=str(result.get("target") or "unknown"),
+            elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+            risk="INFO",
+            summary=recon_summary,
+            findings=_bbot_result_findings_from_counts(observation_counts or {}),
+            assets=_bbot_result_assets_from_counts(observation_counts or {}),
+        )
 
     if result.get("error_type") == "runtime_incompatible":
-        return "\n".join(
-            [
-                section_label("bbot", "BBOT Recon"),
-                "",
-                "Target:",
-                str(result.get("target") or "unknown"),
-                "",
-                str(result.get("error") or "BBOT is installed but cannot run in this Windows environment."),
-            ]
+        return render_scan_result_card(
+            tool_name="BBOT",
+            target=str(result.get("target") or "unknown"),
+            status="Failed",
+            summary=str(result.get("error") or "BBOT is installed but cannot run in this Windows environment."),
         )
 
     status = "Complete" if result.get("success") is True else "Failed"
     output = _truncate_bbot_output(str(result.get("output") or result.get("error") or "No output returned."))
     counts = observation_counts or {}
-    return "\n".join(
-        [
-            section_label("bbot", "BBOT Recon"),
-            "",
-            "Target:",
-            str(result.get("target") or "unknown"),
-            "",
-            "Status:",
-            status,
-            "",
-            "Observations:",
-            f"- Subdomains: {counts.get('subdomain', 0)}",
-            f"- URLs: {counts.get('url', 0)}",
-            f"- IP Addresses: {counts.get('ip_address', 0)}",
-            f"- Emails: {counts.get('email', 0)}",
-            f"- Technologies: {counts.get('technology', 0)}",
-            f"- Raw Events: {counts.get('raw_event', 0)}",
-            "",
-            "Elapsed:",
-            f"{int(float(result.get('elapsed_seconds') or 0))}s",
-            "",
-            "Output:",
-            output,
-        ]
+    return render_scan_result_card(
+        tool_name="BBOT",
+        target=str(result.get("target") or "unknown"),
+        status=status,
+        elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+        risk="INFO" if result.get("success") is True else None,
+        summary=output,
+        findings=_bbot_result_findings_from_counts(counts),
+        assets=_bbot_result_assets_from_counts(counts),
     )
 
 
@@ -277,8 +281,37 @@ def build_nmap_scan_result_text(result: dict[str, object]) -> str:
     output = str(result.get("output") or "")
     fallback_output = str(result.get("error") or output or "No output returned.")
     parsed_output = parse_nmap_result(result)
+    target = str(parsed_output.get("target") or result.get("target") or "unknown")
+    open_ports = parsed_output.get("open_ports") or []
+    if not parsed_output.get("target") and not parsed_output.get("host_status") and not open_ports and not parsed_output.get("duration"):
+        summary = _safe_truncated_text(fallback_output)
+        return render_scan_result_card(
+            tool_name="Nmap",
+            target=target,
+            status="Complete" if result.get("success") is True else "Failed",
+            summary=summary,
+        )
 
-    return format_nmap_result(parsed_output, fallback_output=fallback_output)
+    findings = (
+        [f"{open_port.get('port')}/{open_port.get('protocol')} {open_port.get('service')}" for open_port in open_ports]
+        if open_ports
+        else ["No open ports found."]
+    )
+    host_status = parsed_output.get("host_status") or "Unknown"
+    notes = parsed_output.get("risk_notes") or []
+    summary_lines = [f"Host Status: {host_status}"]
+    if notes:
+        summary_lines.append(f"Notes: {', '.join(str(note) for note in notes)}")
+    return render_scan_result_card(
+        tool_name="Nmap",
+        target=target,
+        status="Complete" if result.get("success") is True else "Failed",
+        elapsed=str(parsed_output.get("duration") or "") or None,
+        risk=str(parsed_output.get("risk_level") or "").upper() or None,
+        summary="\n".join(summary_lines),
+        findings=findings,
+        assets=[target],
+    )
 
 
 def append_change_summary(message: str, comparison: dict | None, impact: dict | None = None) -> str:
@@ -452,6 +485,14 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _handle_bbot_ai_assessment_callback(query, user_id)
         return
 
+    if query.data and query.data.startswith(f"{AI_SUMMARY_CALLBACK_PREFIX}:"):
+        user_id = update.effective_user.id if update.effective_user is not None else None
+        if user_id is None:
+            await query.edit_message_text("Unable to identify Telegram user.")
+            return
+        await _handle_scan_ai_summary_callback(query, user_id)
+        return
+
     if query.data is None or not query.data.startswith("scan:"):
         return
 
@@ -574,11 +615,13 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         status="started",
         summary="Nmap scan started",
     )
-    await update.message.reply_text(build_nmap_scan_started_text(normalized_target))
+    progress_card = ScanProgressCard(update.message, "Nmap Scan", normalized_target)
+    await progress_card.start("Launching scan...")
 
     try:
         result = await asyncio.to_thread(run_nmap_scan, target)
     except ValueError as exc:
+        await progress_card.fail(str(exc))
         await update.message.reply_text(f"Invalid NMAP target: {exc}")
         return
 
@@ -600,12 +643,17 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         metadata={"finding_id": finding.get("id") if finding else None},
     )
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         append_change_summary(
             build_nmap_scan_result_text(result),
             finding.get("comparison") if finding else None,
             finding.get("impact") if finding else None,
-        )
+        ),
+        reply_markup=build_scan_result_actions(finding.get("id") if finding else None, "nmap"),
     )
 
 
@@ -641,11 +689,13 @@ async def _handle_bbot_target(
         status="started",
         summary="BBOT recon started",
     )
-    await update.message.reply_text(build_bbot_scan_started_text(display_target))
+    progress_card = ScanProgressCard(update.message, "BBOT Scan", display_target)
+    await progress_card.start("Launching scan...")
 
     try:
         result = await asyncio.to_thread(run_bbot_scan, target)
     except ValueError as exc:
+        await progress_card.fail(str(exc))
         add_investigation_event(
             investigation_id=investigation["id"],
             user_id=user_id,
@@ -667,6 +717,7 @@ async def _handle_bbot_target(
     )
     observations = []
     if result.get("success") is True:
+        await progress_card.update("Collecting observations...")
         observations = normalize_bbot_output(
             result.get("output"),
             target=str(result.get("target") or display_target),
@@ -700,8 +751,19 @@ async def _handle_bbot_target(
         metadata={"finding_id": finding.get("id"), "observation_count": observation_count},
     )
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
     chunks = split_report_text(build_bbot_result_text(result, observation_counts, recon_summary=recon_summary))
-    keyboard = build_bbot_ai_assessment_keyboard(investigation["id"]) if result.get("success") is True else None
+    keyboard = (
+        _combine_inline_keyboards(
+            build_scan_result_actions(finding.get("id"), "bbot"),
+            build_bbot_ai_assessment_keyboard(investigation["id"]),
+        )
+        if result.get("success") is True
+        else None
+    )
     for index, chunk in enumerate(chunks):
         kwargs = {"reply_markup": keyboard} if keyboard is not None and index == len(chunks) - 1 else {}
         await update.message.reply_text(chunk, **kwargs)
@@ -774,12 +836,51 @@ async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> No
     logger.info("BBOT AI assessment event recorded: id=%s fallback=%s", event.get("id"), fallback)
 
 
+async def _handle_scan_ai_summary_callback(query: object, user_id: int) -> None:
+    data = str(getattr(query, "data", "") or "")
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        await query.edit_message_text("Invalid AI summary request.")
+        return
+
+    _, tool, finding_id = parts
+    finding = get_user_finding(user_id=user_id, finding_id=finding_id)
+    if finding is None:
+        await query.edit_message_text("Stored scan result not found.")
+        return
+
+    message = getattr(query, "message", None)
+    if message is None:
+        await query.edit_message_text("Generating AI summary...")
+        return
+
+    progress_message = await message.reply_text("Generating AI summary...")
+    summary_lines = await asyncio.to_thread(generate_scan_ai_summary, finding)
+    final_status = "AI summary unavailable." if summary_lines == FALLBACK_SUMMARY_LINES else "AI summary ready."
+    await safe_edit_text(progress_message, final_status, context="Scan AI summary status")
+
+    summary_text = "\n".join(summary_lines)
+    for chunk in split_report_text(summary_text):
+        await message.reply_text(chunk)
+
+    logger.info("Scan AI summary generated for user_id=%s tool=%s finding_id=%s", user_id, tool, finding_id)
+
+
 def _is_finding_analysis_exit_message(text: str) -> bool:
     return text.strip().lower() in {"home", "cancel", "/home", "/cancel"}
 
 
 def _truncate_bbot_output(output: str, limit: int = 900) -> str:
     normalized_output = output.strip()
+    if not normalized_output:
+        return "No output returned."
+    if len(normalized_output) <= limit:
+        return normalized_output
+    return f"{normalized_output[:limit].rstrip()}\n...[truncated]"
+
+
+def _safe_truncated_text(output: str, limit: int = 3000) -> str:
+    normalized_output = str(output or "").strip()
     if not normalized_output:
         return "No output returned."
     if len(normalized_output) <= limit:
@@ -833,14 +934,15 @@ async def _handle_nuclei_target(
         status="started",
         summary="Nuclei scan started",
     )
-    status_message = await update.message.reply_text(build_nuclei_status_card(display_target, "Initializing", 0))
+    progress_card = ScanProgressCard(update.message, "Nuclei Scan", display_target)
+    status_message = await progress_card.start("Launching scan...")
     active_scan = set_active_scan(
         user_id=user_id,
         scan_type="nuclei",
         target=display_target,
         status_message=status_message,
     )
-    started_at = asyncio.get_running_loop().time()
+    started_at = progress_card.started_at
     status_task = asyncio.create_task(_update_nuclei_status_card(user_id, status_message, display_target, started_at))
     task = asyncio.create_task(
         _run_nuclei_scan_background(
@@ -848,7 +950,7 @@ async def _handle_nuclei_target(
             scan_request_id=scan_request_id,
             target=target,
             message=update.message,
-            status_message=status_message,
+            progress_card=progress_card,
             display_target=display_target,
             started_at=started_at,
             investigation_id=investigation["id"],
@@ -870,7 +972,7 @@ async def _run_nuclei_scan_background(
     scan_request_id: str,
     target: str,
     message: object,
-    status_message: object,
+    progress_card: ScanProgressCard,
     display_target: str,
     started_at: float,
     investigation_id: str,
@@ -880,7 +982,7 @@ async def _run_nuclei_scan_background(
     except ValueError as exc:
         _stop_nuclei_status_updates(user_id)
         clear_active_scan(user_id)
-        await _finalize_nuclei_status(status_message, display_target, "Failed", started_at, str(exc))
+        await progress_card.fail(str(exc))
         add_investigation_event(
             investigation_id=investigation_id,
             user_id=user_id,
@@ -893,14 +995,14 @@ async def _run_nuclei_scan_background(
         await _send_scan_message(message, f"Invalid Nuclei target: {exc}")
         return
     except asyncio.CancelledError:
-        elapsed_seconds = asyncio.get_running_loop().time() - started_at
-        await _finalize_nuclei_status(status_message, display_target, "Cancelled", started_at)
+        elapsed_seconds = time.monotonic() - started_at
+        await progress_card.update("Cancelled")
         logger.info("Nuclei scan cancelled for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
         raise
 
     active_scan = get_active_scan(user_id)
     if active_scan is None or active_scan.cancelled:
-        elapsed_seconds = asyncio.get_running_loop().time() - started_at
+        elapsed_seconds = time.monotonic() - started_at
         logger.info("Nuclei scan result discarded for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
         return
 
@@ -912,17 +1014,11 @@ async def _run_nuclei_scan_background(
     )
     _stop_nuclei_status_updates(user_id)
     clear_active_scan(user_id)
-    elapsed_seconds = asyncio.get_running_loop().time() - started_at
+    elapsed_seconds = time.monotonic() - started_at
     logger.info("Nuclei scan completed for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
 
     if result.get("success") is not True:
-        await _finalize_nuclei_status(
-            status_message,
-            display_target,
-            "Failed",
-            started_at,
-            str(result.get("error") or "Unknown error."),
-        )
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
         add_investigation_event(
             investigation_id=investigation_id,
             user_id=user_id,
@@ -935,7 +1031,7 @@ async def _run_nuclei_scan_background(
         await _send_scan_message(message, f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
         return
 
-    await _finalize_nuclei_status(status_message, display_target, "Complete", started_at)
+    await progress_card.complete()
     output = str(result.get("output") or "")
     if not output.strip():
         clean_target = str(result.get("target") or target)
@@ -950,7 +1046,11 @@ async def _run_nuclei_scan_background(
             summary="Nuclei scan completed with no findings",
             metadata={"finding_id": finding.get("id")},
         )
-        await _send_scan_message(message, build_clean_nuclei_verdict_text(clean_target))
+        await _send_scan_message(
+            message,
+            build_clean_nuclei_verdict_text(clean_target),
+            reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
+        )
         return
 
     try:
@@ -972,7 +1072,11 @@ async def _run_nuclei_scan_background(
             summary="Nuclei scan completed with no findings",
             metadata={"finding_id": finding.get("id")},
         )
-        await _send_scan_message(message, build_clean_nuclei_verdict_text(clean_target))
+        await _send_scan_message(
+            message,
+            build_clean_nuclei_verdict_text(clean_target),
+            reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
+        )
         return
 
     from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
@@ -988,10 +1092,15 @@ async def _run_nuclei_scan_background(
         summary="Nuclei scan completed",
         metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count")},
     )
-    await _send_scan_message(message, build_nuclei_import_success_text(finding))
+    await _send_scan_message(
+        message,
+        build_nuclei_import_success_text(finding),
+        reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
+    )
 
 
 async def _update_nuclei_status_card(user_id: int, status_message: object, target: str, started_at: float) -> None:
+    progress_card = ScanProgressCard.from_status_message(status_message, "Nuclei Scan", target, started_at)
     try:
         while True:
             await asyncio.sleep(NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS)
@@ -999,8 +1108,7 @@ async def _update_nuclei_status_card(user_id: int, status_message: object, targe
             if active_scan is None or active_scan.cancelled:
                 return
 
-            elapsed_seconds = int(asyncio.get_running_loop().time() - started_at)
-            await _edit_status_message(status_message, build_nuclei_status_card(target, "Running", elapsed_seconds))
+            await progress_card.update("Running")
     except asyncio.CancelledError:
         return
 
@@ -1018,34 +1126,26 @@ async def _finalize_nuclei_status(
     started_at: float,
     reason: str | None = None,
 ) -> None:
-    elapsed_seconds = int(asyncio.get_running_loop().time() - started_at)
-    await _edit_status_message(status_message, build_nuclei_status_card(target, status, elapsed_seconds, reason))
+    progress_card = ScanProgressCard.from_status_message(status_message, "Nuclei Scan", target, started_at)
+    if status == "Complete":
+        await progress_card.complete()
+    elif status == "Failed":
+        await progress_card.fail(reason or "Unknown error.")
+    else:
+        await progress_card.update(status)
 
 
 async def _edit_status_message(status_message: object, text: str) -> None:
-    edit_text = getattr(status_message, "edit_text", None)
-    edit_method = edit_text or getattr(status_message, "edit_message_text", None)
-    if edit_method is None:
-        return
-
-    try:
-        await edit_method(text)
-    except TimedOut as exc:
-        logger.warning("Nuclei status card edit timed out: %s", exc)
-    except NetworkError as exc:
-        logger.warning("Nuclei status card edit failed due to Telegram network error: %s", exc)
-    except BadRequest as exc:
-        logger.warning("Nuclei status card edit was rejected by Telegram: %s", exc)
-    except Exception:
-        logger.warning("Nuclei status card edit failed unexpectedly.", exc_info=True)
+    await safe_edit_text(status_message, text, context="Scan progress")
 
 
-async def _send_scan_message(message: object, text: str) -> None:
+async def _send_scan_message(message: object, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
     reply_text = getattr(message, "reply_text", None)
     if reply_text is None:
         return
 
     try:
-        await reply_text(text)
+        kwargs = {"reply_markup": reply_markup} if reply_markup is not None else {}
+        await reply_text(text, **kwargs)
     except Exception:
         logger.exception("Failed to send Nuclei scan result message.")

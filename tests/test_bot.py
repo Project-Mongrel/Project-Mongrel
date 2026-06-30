@@ -716,8 +716,13 @@ def test_scan_workflow_still_runs_when_ai_state_is_not_waiting() -> None:
         asyncio.run(scan_target_handler(update, context))
 
     run_nmap_scan.assert_called_once_with("127.0.0.1")
-    assert message.reply_text.call_args_list[0].args[0] == "Running NMAP scan for target: 127.0.0.1"
-    assert "Target: 127.0.0.1" in message.reply_text.call_args_list[1].args[0]
+    assert message.reply_text.call_args_list[0].args[0] == (
+        " Nmap Scan\n\n Target\n127.0.0.1\n\n⏳ Status\nLaunching scan...\n\n⏱️ Elapsed\n0s"
+    )
+    assert "Target\n127.0.0.1" in message.reply_text.call_args_list[1].args[0]
+    keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:nmap:")
     assert get_user_findings(7004)
     investigation = get_user_investigations(7004)[0]
     events = get_investigation_events(investigation["id"], 7004)
@@ -784,15 +789,19 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
         asyncio.run(scan_target_handler(update, context))
 
     run_bbot_scan.assert_called_once_with("https://example.com")
-    assert message.reply_text.call_args_list[0].args[0] == "BBOT Recon Running\n\nTarget:\nexample.com\n\nStatus:\nRunning"
+    assert message.reply_text.call_args_list[0].args[0] == (
+        " BBOT Scan\n\n Target\nexample.com\n\n⏳ Status\nLaunching scan...\n\n⏱️ Elapsed\n0s"
+    )
     assert "BBOT Recon" in message.reply_text.call_args_list[1].args[0]
     assert "Recon Overview" in message.reply_text.call_args_list[1].args[0]
     assert "- Subdomains:" in message.reply_text.call_args_list[1].args[0]
     assert "- URLs: 1" in message.reply_text.call_args_list[1].args[0]
     assert "Recommended Next Actions" in message.reply_text.call_args_list[1].args[0]
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
-    assert keyboard.inline_keyboard[0][0].text == "Generate AI Recon Assessment"
-    assert keyboard.inline_keyboard[0][0].callback_data.startswith("bbot_ai:")
+    assert keyboard.inline_keyboard[0][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:bbot:")
+    assert keyboard.inline_keyboard[1][0].text == "Generate AI Recon Assessment"
+    assert keyboard.inline_keyboard[1][0].callback_data.startswith("bbot_ai:")
     findings = get_user_findings(7202)
     assert findings[0]["source"] == "bbot"
     assert findings[0]["target"] == "example.com"
@@ -956,6 +965,73 @@ def test_bbot_ai_assessment_callback_chunks_response() -> None:
     ]
 
 
+def test_scan_ai_summary_callback_sends_new_summary_message() -> None:
+    clear_user_findings(7213)
+    finding = add_finding(
+        user_id=7213,
+        finding={
+            "source": "nmap",
+            "target": "127.0.0.1",
+            "risk_level": "medium",
+            "finding_count": 1,
+            "status": "completed",
+            "summary": "One open SSH service.",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        },
+    )
+    progress_message = SimpleNamespace(edit_text=AsyncMock())
+    query_message = SimpleNamespace(reply_text=AsyncMock(side_effect=[progress_message, None]))
+    query = SimpleNamespace(
+        data=f"ai_summary:nmap:{finding['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7213))
+    summary_lines = [
+        "Executive Summary",
+        "- SSH was observed.",
+        "",
+        "Observed Facts",
+        "- 22/tcp ssh",
+        "",
+        "Observed Assets",
+        "- 127.0.0.1",
+        "",
+        "Potential Risks",
+        "- Public-facing services should be validated.",
+        "",
+        "Confidence",
+        "Medium",
+        "",
+        "Recommended Next Actions",
+        "- Validate externally exposed services.",
+    ]
+
+    with patch("app.bot.handlers.scan.generate_scan_ai_summary", return_value=summary_lines):
+        asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
+
+    query.answer.assert_called_once()
+    query.edit_message_text.assert_not_called()
+    assert query_message.reply_text.call_args_list[0].args[0] == "Generating AI summary..."
+    assert query_message.reply_text.call_args_list[1].args[0] == "\n".join(summary_lines)
+    assert progress_message.edit_text.call_args_list[-1].args[0] == "AI summary ready."
+
+
+def test_scan_ai_summary_callback_missing_finding_edits_callback_message() -> None:
+    query = SimpleNamespace(
+        data="ai_summary:nmap:missing",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7214))
+
+    asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
+
+    query.edit_message_text.assert_called_once_with("Stored scan result not found.")
+
+
 def test_bbot_scan_missing_binary_does_not_crash() -> None:
     clear_user_scan_requests(7203)
     scan_request = create_scan_request(user_id=7203, scan_type="bbot")
@@ -1001,7 +1077,7 @@ def test_bbot_scan_failure_creates_failed_event_and_stores_result() -> None:
     ):
         asyncio.run(scan_target_handler(update, context))
 
-    assert "Status:\nFailed" in message.reply_text.call_args_list[1].args[0]
+    assert "Status\nFailed" in message.reply_text.call_args_list[1].args[0]
     finding = get_user_findings(7204)[0]
     assert finding["source"] == "bbot"
     assert finding["status"] == "failed"
@@ -1075,7 +1151,7 @@ def test_bbot_scan_summary_chunks_are_sent() -> None:
 
     splitter.assert_called_once()
     assert [call.args[0] for call in message.reply_text.call_args_list] == [
-        "BBOT Recon Running\n\nTarget:\nexample.com\n\nStatus:\nRunning",
+        " BBOT Scan\n\n Target\nexample.com\n\n⏳ Status\nLaunching scan...\n\n⏱️ Elapsed\n0s",
         "chunk one",
         "chunk two",
     ]
@@ -1092,7 +1168,8 @@ def test_bbot_scan_result_formatter_uses_recon_summary() -> None:
         recon_summary="BBOT Recon Summary\n\nTarget:\nexample.com",
     )
 
-    assert text == "BBOT Recon Summary\n\nTarget:\nexample.com"
+    assert "BBOT Scan Complete" in text
+    assert "Summary\nBBOT Recon Summary\n\nTarget:\nexample.com" in text
 
 
 def test_bbot_scan_result_formatter_keeps_failure_output_concise() -> None:
@@ -1105,7 +1182,7 @@ def test_bbot_scan_result_formatter_keeps_failure_output_concise() -> None:
         }
     )
 
-    assert "Status:\nFailed" in text
+    assert "Status\nFailed" in text
     assert "...[truncated]" in text
 
 
@@ -1189,11 +1266,14 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
         run_nuclei_scan.assert_called_once_with("https://example.com")
 
     asyncio.run(run_flow())
-    assert "Nuclei Fast Scan" in message.reply_text.call_args_list[0].args[0]
-    assert "Status:\nInitializing" in message.reply_text.call_args_list[0].args[0]
-    assert "Status:\nComplete" in status_message.edit_text.call_args.args[0]
-    assert "Nuclei Verdict" in message.reply_text.call_args_list[1].args[0]
-    assert "Risk Level:\nHIGH" in message.reply_text.call_args_list[1].args[0]
+    assert " Nuclei Scan" in message.reply_text.call_args_list[0].args[0]
+    assert "⏳ Status\nLaunching scan..." in message.reply_text.call_args_list[0].args[0]
+    assert "⏳ Status\nComplete" in status_message.edit_text.call_args.args[0]
+    assert "Nuclei Scan Complete" in message.reply_text.call_args_list[1].args[0]
+    assert "Risk\nHIGH" in message.reply_text.call_args_list[1].args[0]
+    keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:nuclei:")
     findings = get_user_findings(7102)
     assert findings[0]["source"] == "nuclei"
     assert findings[0]["target"] == "https://example.com"
@@ -1226,16 +1306,19 @@ def test_nuclei_scan_no_findings_output() -> None:
             await active_scan.task
 
     asyncio.run(run_flow())
-    assert "Status:\nComplete" in status_message.edit_text.call_args.args[0]
+    assert "⏳ Status\nComplete" in status_message.edit_text.call_args.args[0]
     verdict_text = message.reply_text.call_args_list[1].args[0]
-    assert "Nuclei Verdict" in verdict_text
-    assert "Target:\nhttps://example.com" in verdict_text
-    assert "Risk Level:\nINFO" in verdict_text
-    assert "Findings:\n0" in verdict_text
+    assert "Nuclei Scan Complete" in verdict_text
+    assert "Target\nhttps://example.com" in verdict_text
+    assert "Risk\nINFO" in verdict_text
+    assert "Findings\n- 0 findings" in verdict_text
     assert "No matching Nuclei findings were identified using the fast scan profile." in verdict_text
     assert "- The target was reachable." in verdict_text
     assert "- Nuclei executed successfully." in verdict_text
     assert "- Continue regular patching and monitoring." in verdict_text
+    keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:nuclei:")
     clean_record = get_user_findings(7103)[0]
     assert clean_record["source"] == "nuclei"
     assert clean_record["status"] == "clean"
@@ -1247,12 +1330,11 @@ def test_nuclei_scan_no_findings_output() -> None:
 def test_clean_nuclei_verdict_formatter_for_no_findings() -> None:
     verdict_text = build_clean_nuclei_verdict_text("hellosundaykids.com")
 
-    assert "Nuclei Verdict" in verdict_text
-    assert "Target:\nhellosundaykids.com" in verdict_text
-    assert "Risk Level:\nINFO" in verdict_text
-    assert "Findings:\n0" in verdict_text
-    assert "What this means:" in verdict_text
-    assert "Recommended Actions:" in verdict_text
+    assert "Nuclei Scan Complete" in verdict_text
+    assert "Target\nhellosundaykids.com" in verdict_text
+    assert "Risk\nINFO" in verdict_text
+    assert "Findings\n- 0 findings" in verdict_text
+    assert "Summary" in verdict_text
 
 
 def test_clean_nuclei_scan_record_appears_in_findings_view() -> None:
@@ -1307,8 +1389,7 @@ def test_nuclei_scan_runner_failure_message() -> None:
             await active_scan.task
 
     asyncio.run(run_flow())
-    assert "Status:\nFailed" in status_message.edit_text.call_args.args[0]
-    assert "Reason:\nNuclei executable was not found." in status_message.edit_text.call_args.args[0]
+    assert "⏳ Status\nFailed: Nuclei executable was not found." in status_message.edit_text.call_args.args[0]
     assert message.reply_text.call_args_list[1].args[0] == "Nuclei scan failed: Nuclei executable was not found."
 
 
@@ -1377,7 +1458,7 @@ def test_cancel_cancels_active_nuclei_scan() -> None:
     asyncio.run(run_flow())
     assert cancel_message.reply_text.call_args.args[0] == "Nuclei scan cancelled."
     assert get_active_scan(7106) is None
-    assert "Status:\nCancelled" in status_message.edit_text.call_args.args[0]
+    assert "⏳ Status\nCancelled" in status_message.edit_text.call_args.args[0]
     assert len(scan_message.reply_text.call_args_list) == 1
 
 
@@ -1415,7 +1496,7 @@ def test_home_clears_active_nuclei_scan_state() -> None:
     asyncio.run(run_flow())
     assert get_active_scan(7107) is None
     assert "Project Mongrel control panel" in home_message.reply_text.call_args.args[0]
-    assert "Status:\nCancelled" in status_message.edit_text.call_args.args[0]
+    assert "⏳ Status\nCancelled" in status_message.edit_text.call_args.args[0]
     assert len(scan_message.reply_text.call_args_list) == 1
 
 
@@ -1437,7 +1518,7 @@ def test_status_edit_timeout_does_not_crash_updater(caplog) -> None:
     clear_active_scan(7110)
 
     assert status_message.edit_text.await_count == 1
-    assert "Nuclei status card edit timed out" in caplog.text
+    assert "Nuclei Scan progress edit timed out" in caplog.text
 
 
 def test_final_status_edit_timeout_does_not_prevent_verdict_send() -> None:
@@ -1464,8 +1545,8 @@ def test_final_status_edit_timeout_does_not_prevent_verdict_send() -> None:
 
     asyncio.run(run_flow())
 
-    assert "Nuclei Verdict" in message.reply_text.call_args_list[1].args[0]
-    assert "Risk Level:\nINFO" in message.reply_text.call_args_list[1].args[0]
+    assert "Nuclei Scan Complete" in message.reply_text.call_args_list[1].args[0]
+    assert "Risk\nINFO" in message.reply_text.call_args_list[1].args[0]
 
 
 def test_failed_status_edit_is_logged(caplog) -> None:
@@ -1476,7 +1557,7 @@ def test_failed_status_edit_is_logged(caplog) -> None:
 
     asyncio.run(run_flow())
 
-    assert "Nuclei status card edit timed out" in caplog.text
+    assert "Nuclei Scan progress edit timed out" in caplog.text
 
 
 def test_nuclei_status_update_interval_is_15_seconds() -> None:
@@ -1538,11 +1619,11 @@ def test_nmap_result_text_uses_clean_parser_output() -> None:
         }
     )
 
-    assert "Target: 127.0.0.1" in result_text
+    assert "Target\n127.0.0.1" in result_text
     assert "Host Status: Up" in result_text
     assert "22/tcp ssh" in result_text
-    assert "Duration: 0.32s" in result_text
-    assert "Risk: medium" in result_text
+    assert "Time\n0.32s" in result_text
+    assert "Risk\nMEDIUM" in result_text
     assert "Notes: SSH exposed" in result_text
     assert "https://nmap.org" not in result_text
 
@@ -2096,7 +2177,9 @@ def test_scan_exits_finding_analysis_and_target_goes_to_scan_flow() -> None:
 
     ask_ai.assert_not_called()
     run_nmap_scan.assert_called_once_with("127.0.0.1")
-    assert target_message.reply_text.call_args_list[0].args[0] == "Running NMAP scan for target: 127.0.0.1"
+    assert target_message.reply_text.call_args_list[0].args[0] == (
+        " Nmap Scan\n\n Target\n127.0.0.1\n\n⏳ Status\nLaunching scan...\n\n⏱️ Elapsed\n0s"
+    )
 
 
 def test_finding_analysis_home_exits_mode() -> None:
@@ -2383,7 +2466,7 @@ def test_json_upload_routes_to_nuclei_parser() -> None:
         asyncio.run(upload_document_handler(update, SimpleNamespace()))
 
     parse_nuclei_results.assert_called_once_with(json_content)
-    assert "Nuclei Verdict" in message.reply_text.call_args.args[0]
+    assert "Nuclei Scan Complete" in message.reply_text.call_args.args[0]
 
 
 def test_jsonl_upload_routes_to_nuclei_parser() -> None:
@@ -2402,7 +2485,7 @@ def test_jsonl_upload_routes_to_nuclei_parser() -> None:
         asyncio.run(upload_document_handler(update, SimpleNamespace()))
 
     parse_nuclei_results.assert_called_once_with(jsonl_content)
-    assert "Nuclei Verdict" in message.reply_text.call_args.args[0]
+    assert "Nuclei Scan Complete" in message.reply_text.call_args.args[0]
 
 
 def test_xml_upload_routes_to_nmap_parser() -> None:
@@ -2446,10 +2529,10 @@ def test_valid_nuclei_jsonl_upload_creates_finding_and_report() -> None:
     assert findings[0]["risk_level"] == "high"
     assert findings[0]["finding_count"] == 2
     report = message.reply_text.call_args.args[0]
-    assert "Nuclei Verdict" in report
-    assert "Target:\nhttps://example.com" in report
-    assert "Risk Level:\nHIGH" in report
-    assert "Findings:\n2" in report
+    assert "Nuclei Scan Complete" in report
+    assert "Target\nhttps://example.com" in report
+    assert "Risk\nHIGH" in report
+    assert "Findings detected: 2" in report
     assert "High: 1" in report
     assert "Low: 1" in report
     assert "- Exposed Git Repository (high)" in report
@@ -2477,7 +2560,7 @@ def test_valid_nuclei_json_upload_routes_to_nuclei_parser() -> None:
     latest = get_user_findings(5016)[0]
     assert latest["source"] == "nuclei"
     assert latest["risk_level"] == "medium"
-    assert "Nuclei Verdict" in message.reply_text.call_args.args[0]
+    assert "Nuclei Scan Complete" in message.reply_text.call_args.args[0]
     assert "Medium: 1" in message.reply_text.call_args.args[0]
 
 
@@ -2494,7 +2577,7 @@ def test_nuclei_report_severity_aggregation_risk_scoring_and_ordering() -> None:
 
     report = build_nuclei_import_success_text(finding)
 
-    assert "Risk Level:\nHIGH" in report
+    assert "Risk\nHIGH" in report
     assert "Critical: 1" in report
     assert "High: 1" in report
     assert "Medium: 1" in report
@@ -2511,7 +2594,7 @@ def test_nuclei_medium_only_scores_medium() -> None:
     )
 
     assert finding["risk_level"] == "medium"
-    assert "Risk Level:\nMEDIUM" in build_nuclei_import_success_text(finding)
+    assert "Risk\nMEDIUM" in build_nuclei_import_success_text(finding)
 
 
 def test_malformed_nuclei_upload_handling() -> None:
@@ -2579,8 +2662,10 @@ def test_uploaded_scan_creates_finding() -> None:
     assert "Purpose: Secure Shell remote administration service." in success_text
     assert reply_markup.inline_keyboard[0][0].text == "Open Findings"
     assert reply_markup.inline_keyboard[0][0].callback_data == "finding:list"
-    assert reply_markup.inline_keyboard[1][0].text == "Explain with Mongrel AI"
-    assert reply_markup.inline_keyboard[1][0].callback_data == UPLOAD_EXPLAIN_CALLBACK
+    assert reply_markup.inline_keyboard[1][0].text == "Summarize with AI"
+    assert reply_markup.inline_keyboard[1][0].callback_data.startswith("ai_summary:nmap_xml:")
+    assert reply_markup.inline_keyboard[2][0].text == "Explain with Mongrel AI"
+    assert reply_markup.inline_keyboard[2][0].callback_data == UPLOAD_EXPLAIN_CALLBACK
     assert get_latest_upload_scan_summary(5002)["target"] == "192.168.0.24"
 
 
@@ -2819,10 +2904,12 @@ def test_upload_success_includes_open_findings_button() -> None:
 
 
 def test_upload_success_includes_explain_with_mongrel_ai_button() -> None:
-    keyboard = build_upload_success_keyboard()
+    keyboard = build_upload_success_keyboard("finding-1", "nmap_xml")
 
-    assert keyboard.inline_keyboard[1][0].text == "Explain with Mongrel AI"
-    assert keyboard.inline_keyboard[1][0].callback_data == UPLOAD_EXPLAIN_CALLBACK
+    assert keyboard.inline_keyboard[1][0].text == "Summarize with AI"
+    assert keyboard.inline_keyboard[1][0].callback_data == "ai_summary:nmap_xml:finding-1"
+    assert keyboard.inline_keyboard[2][0].text == "Explain with Mongrel AI"
+    assert keyboard.inline_keyboard[2][0].callback_data == UPLOAD_EXPLAIN_CALLBACK
 
 
 def test_upload_ai_prompt_contains_scan_summary_and_guardrails() -> None:

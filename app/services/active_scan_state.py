@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -13,6 +14,7 @@ class ActiveScan:
     status_message: object | None = None
     cancelled: bool = False
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    progress_started_at: float = field(default_factory=time.monotonic)
 
 
 _active_scans: dict[int, ActiveScan] = {}
