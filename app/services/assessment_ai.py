@@ -28,7 +28,12 @@ def answer_assessment_question(question: str, context: dict) -> str:
     if _is_unavailable_response(response):
         return FALLBACK_ANSWER
 
-    return str(response or "").strip() or FALLBACK_ANSWER
+    answer = str(response or "").strip()
+    if not answer:
+        return FALLBACK_ANSWER
+    if _is_secure_question(question) and "cannot conclude" not in answer.lower():
+        answer = "Based on this assessment alone, I cannot conclude the target is secure.\n\n" + answer
+    return answer
 
 
 def generate_assessment_ai_report(context: dict) -> str:
@@ -56,8 +61,11 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             "- Never invent findings.",
             "- Never assume vulnerabilities.",
             "- Never claim exploitation.",
+            '- Never say the target is "safe" or "secure".',
             "- If evidence is missing, say so.",
             "- If evidence is insufficient, recommend the next assessment step.",
+            "- For secure/safe questions, start with: Based on this assessment alone, I cannot conclude the target is secure.",
+            "- For secure/safe questions, explain observed evidence, unassessed areas, whether confirmed vulnerabilities were found, and recommended next steps.",
             "- Keep the answer concise and consultant-focused.",
             "- Do not use evidence from other assessments.",
             "",
@@ -87,7 +95,9 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Never assume vulnerabilities.",
             "- Never claim exploitation.",
             '- Never state a target is "safe".',
+            "- Never imply a clean Nuclei scan means the target is secure.",
             "- If evidence is missing, explain what has not yet been assessed.",
+            "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
             "- Base conclusions only on Nmap, BBOT, Nuclei, assessment history, artifacts, and notes in the supplied context.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
@@ -134,6 +144,18 @@ def _format_assessment_context(context: dict) -> str:
         lines.append("- Scan history:")
         for scan in scans[:20]:
             lines.append(_format_scan(scan))
+        represented_tools = sorted(
+            {
+                str(scan.get("tool") or "unknown").lower()
+                for scan in scans
+                if str(scan.get("status") or "").lower() in {"completed", "partial"}
+            }
+        )
+        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei") if tool not in represented_tools]
+        lines.append("- Represented tools:")
+        lines.append("  - " + (", ".join(represented_tools) if represented_tools else "none"))
+        lines.append("- Missing or not represented:")
+        lines.append("  - " + (", ".join(missing_tools) if missing_tools else "none"))
     else:
         lines.append("- Scan history: no scans recorded")
 
@@ -219,3 +241,8 @@ def _clean(value: object) -> str:
 def _is_unavailable_response(response: object) -> bool:
     text = str(response or "").strip()
     return not text or any(text.startswith(message) for message in AI_UNAVAILABLE_MESSAGES)
+
+
+def _is_secure_question(question: object) -> bool:
+    normalized = str(question or "").lower()
+    return any(term in normalized for term in ("secure", "safe"))

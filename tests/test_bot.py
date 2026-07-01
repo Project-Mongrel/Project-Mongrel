@@ -581,6 +581,34 @@ def test_assessment_ai_report_callback_returns_fallback_when_ai_unavailable() ->
     assert "Assessment AI report unavailable." in query_message.reply_text.call_args.args[0]
 
 
+def test_assessment_ai_report_callback_splits_long_reports() -> None:
+    assessment = create_assessment("Assessment AI Long Report")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:ai_report:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    report = "\u2726 Assessment AI Report\n\n" + ("Evidence reviewed.\n" * 500)
+
+    with (
+        patch("app.services.assessment_ai.ask_ai", return_value=report),
+        patch("app.bot.handlers.reports.split_report_text", return_value=["chunk one", "chunk two"]) as splitter,
+    ):
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8135)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    assert splitter.call_count == 1
+    assert splitter.call_args.args[0].startswith("\u2726 Assessment AI Report")
+    assert "Evidence reviewed." in splitter.call_args.args[0]
+    assert [call.args[0] for call in query_message.reply_text.call_args_list] == ["chunk one", "chunk two"]
+
+
 def test_assessment_markdown_report_callback_edits_when_message_missing() -> None:
     assessment = create_assessment("Placeholder Fallback Assessment")
     query = SimpleNamespace(
@@ -1660,6 +1688,39 @@ def test_bbot_scan_nonzero_with_observations_is_partial_and_clean() -> None:
     assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_partial"]
 
 
+def test_bbot_scan_starts_and_stops_progress_auto_refresh() -> None:
+    clear_user_findings(7208)
+    clear_user_investigations(7208)
+    clear_user_observations(7208)
+    clear_user_scan_requests(7208)
+    scan_request = create_scan_request(user_id=7208, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7208, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7208))
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": True,
+                "target": "example.com",
+                "output": "Found app.example.com",
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 3,
+            },
+        ),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock) as start_auto_refresh,
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock) as stop_auto_refresh,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    start_auto_refresh.assert_awaited_once_with("Launching scan...", interval_seconds=5)
+    assert stop_auto_refresh.await_count >= 1
+
+
 def test_assessment_bbot_partial_scan_records_partial_status() -> None:
     clear_user_findings(8124)
     clear_user_investigations(8124)
@@ -2103,7 +2164,7 @@ def test_nuclei_scan_runner_failure_message() -> None:
             await active_scan.task
 
     asyncio.run(run_flow())
-    assert "⏳ Status\nFailed: Nuclei executable was not found." in status_message.edit_text.call_args.args[0]
+    assert f"{icon('success')} Status\nFailed: Nuclei executable was not found." in status_message.edit_text.call_args.args[0]
     assert message.reply_text.call_args_list[1].args[0] == "Nuclei scan failed: Nuclei executable was not found."
 
 

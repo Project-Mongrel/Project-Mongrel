@@ -35,6 +35,8 @@ def test_assessment_ai_prompt_includes_evidence_and_constraints() -> None:
     assert "Answer ONLY using evidence supplied." in prompt
     assert "Never invent findings." in prompt
     assert "Never assume vulnerabilities." in prompt
+    assert 'Never say the target is "safe" or "secure".' in prompt
+    assert "Based on this assessment alone, I cannot conclude the target is secure." in prompt
     assert "scanme.nmap.org" in prompt
     assert "22/tcp ssh" in prompt
     assert "Authorized test." in prompt
@@ -46,16 +48,53 @@ def test_assessment_ai_success_returns_ai_answer() -> None:
         assert answer_assessment_question("What's the biggest concern?", {"assessment": {"name": "A"}}) == "SSH is the main observed service."
 
 
+def test_assessment_ai_secure_question_prepends_cautious_finding() -> None:
+    with patch("app.services.assessment_ai.ask_ai", return_value="No confirmed vulnerabilities were identified."):
+        answer = answer_assessment_question("Is this secure?", {"assessment": {"name": "A"}})
+
+    assert answer.startswith("Based on this assessment alone, I cannot conclude the target is secure.")
+    assert "No confirmed vulnerabilities were identified." in answer
+
+
 def test_assessment_ai_unavailable_returns_fallback() -> None:
     with patch("app.services.assessment_ai.ask_ai", return_value="AI integration is not configured yet."):
         assert answer_assessment_question("Summarise this assessment.", {"assessment": {"name": "A"}}) == FALLBACK_ANSWER
+
+
+def test_assessment_ai_secure_question_prompt_is_cautious_and_evidence_based() -> None:
+    prompt = build_assessment_ai_prompt(
+        "Is this secure?",
+        {
+            "assessment": {"name": "Secure Question Assessment", "status": "active"},
+            "targets": [{"address": "example.com"}],
+            "scans": [{"tool": "nmap", "status": "completed"}],
+            "findings": [
+                {
+                    "source": "nmap",
+                    "target": "example.com",
+                    "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        },
+    )
+
+    assert "Based on this assessment alone, I cannot conclude the target is secure." in prompt
+    assert "explain observed evidence, unassessed areas, whether confirmed vulnerabilities were found" in prompt
+    assert 'Never say the target is "safe" or "secure".' in prompt
+    assert "22/tcp ssh" in prompt
 
 
 def test_assessment_ai_report_prompt_includes_required_sections_and_limitations() -> None:
     context = {
         "assessment": {"name": "Report Assessment", "status": "active"},
         "targets": [{"address": "example.com"}],
-        "scans": [{"tool": "nmap", "status": "completed"}, {"tool": "nuclei", "status": "failed"}],
+        "scans": [
+            {"tool": "nmap", "status": "completed"},
+            {"tool": "bbot", "status": "partial"},
+            {"tool": "nuclei", "status": "failed"},
+        ],
         "findings": [{"source": "nmap", "target": "example.com", "summary": "SSH observed."}],
         "artifacts": [],
         "notes": [],
@@ -66,12 +105,19 @@ def test_assessment_ai_report_prompt_includes_required_sections_and_limitations(
     assert "Evidence-only." in prompt
     assert "Never invent vulnerabilities." in prompt
     assert 'Never state a target is "safe".' in prompt
+    assert "Never imply a clean Nuclei scan means the target is secure." in prompt
+    assert "Include completed and partial scans as represented evidence" in prompt
     assert "explain what has not yet been assessed" in prompt
-    assert "✦ Assessment AI Report" in prompt
+    assert "\u2726 Assessment AI Report" in prompt
     assert "Completed Activities" in prompt
     assert "Evidence Limitations" in prompt
     assert "tool=nmap status=completed" in prompt
+    assert "tool=bbot status=partial" in prompt
     assert "tool=nuclei status=failed" in prompt
+    assert "Represented tools:" in prompt
+    assert "bbot, nmap" in prompt
+    assert "Missing or not represented:" in prompt
+    assert "nuclei" in prompt
     assert "SSH observed." in prompt
 
 

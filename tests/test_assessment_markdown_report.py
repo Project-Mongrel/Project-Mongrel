@@ -23,7 +23,7 @@ def test_assessment_markdown_report_handles_empty_assessment() -> None:
     assert report.startswith("# Assessment Report")
     assert "Assessment Name: Empty Assessment" in report
     assert "Primary Target(s):\n- Not set" in report
-    assert "No completed assessment scans are recorded" in report
+    assert "No completed or partial assessment scans are recorded" in report
     assert "## Evidence Limitations" in report
     assert "- Absence of findings is not evidence of security." in report
 
@@ -123,4 +123,40 @@ def test_assessment_markdown_report_renders_multi_tool_evidence() -> None:
     assert "## Assessment History" in report
     assert "Nmap Completed - Risk: MEDIUM" in report
     assert "- Review SSH exposure, authentication policy, and network access restrictions." in report
-    assert "- Only completed tools are represented in the scan summary." in report
+    assert "- Only completed and partial tools are represented in the scan summary." in report
+
+
+def test_assessment_markdown_report_includes_partial_bbot_evidence() -> None:
+    report = generate_assessment_markdown_report(
+        {
+            "assessment": {
+                "name": "Partial Assessment",
+                "status": "active",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "updated_at": datetime(2026, 1, 2, tzinfo=UTC),
+            },
+            "targets": [{"address": "example.com"}],
+            "scans": [
+                {
+                    "tool": "bbot",
+                    "status": "partial",
+                    "risk": "info",
+                    "completed_at": datetime(2026, 1, 1, 11, tzinfo=UTC),
+                    "finding": {
+                        "summary": "Partial reconnaissance observations collected.",
+                        "target": "example.com",
+                        "observation_counts": {"subdomain": 1, "url": 1},
+                    },
+                }
+            ],
+            "findings": [{"target": "example.com", "observation_counts": {"subdomain": 1, "url": 1}}],
+            "artifacts": [],
+            "notes": [],
+        }
+    )
+
+    assert "completed or partial assessment scan(s)" in report
+    assert "### BBOT" in report
+    assert "Partial reconnaissance observations collected." in report
+    assert "BBOT Partial - Risk: INFO" in report
+    assert "- BBOT: 2 reconnaissance observation(s) recorded." in report

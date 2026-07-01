@@ -908,6 +908,7 @@ async def _handle_bbot_target(
     )
     progress_card = ScanProgressCard(update.message, "BBOT Scan", display_target)
     await progress_card.start("Launching scan...")
+    await progress_card.start_auto_refresh("Launching scan...", interval_seconds=5)
 
     try:
         result = await asyncio.to_thread(run_bbot_scan, target)
@@ -925,6 +926,8 @@ async def _handle_bbot_target(
         await update.message.reply_text(f"Invalid BBOT target: {exc}")
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
+    finally:
+        await progress_card.stop_auto_refresh()
 
     complete_scan_request(
         user_id=user_id,
@@ -986,7 +989,9 @@ async def _handle_bbot_target(
     assessment_context = _pop_assessment_scan_context(context, "bbot")
     _record_assessment_scan(assessment_context, tool="bbot", result=result, finding=finding)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
-    if is_successful_or_partial:
+    if is_partial:
+        await progress_card.partial()
+    elif result.get("success") is True:
         await progress_card.complete()
     else:
         await progress_card.fail(str(result.get("error") or "Unknown error."))

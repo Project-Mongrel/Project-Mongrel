@@ -44,6 +44,10 @@ def build_nmap_ai_assessment_prompt(finding: dict) -> str:
             "- Do not claim compromise.",
             "- Do not recommend exploitation.",
             "- Do not claim the target is safe or secure.",
+            "- Never contradict the supplied evidence.",
+            "- Never say no open services were observed if open ports are supplied.",
+            "- Observed Assets must include the target host or IP when supplied.",
+            "- Observed Assets must include observed services when open ports are supplied.",
             "- Do not say a service is vulnerable unless explicit evidence supports it.",
             "- Separate observed facts from potential risks and recommendations.",
             '- State "No confirmed vulnerabilities were identified during reconnaissance" when appropriate.',
@@ -85,6 +89,12 @@ def _format_nmap_evidence(finding: dict) -> str:
         lines.append("- Open ports and services:")
         for open_port in open_ports[:20]:
             lines.append(_format_open_port(open_port))
+        lines.append("- Observed assets derived from Nmap evidence:")
+        lines.append(f"  - Host: {_clean(finding.get('target') or 'unknown')}")
+        resolved_ip = _clean(finding.get("resolved_ip") or finding.get("ip_address") or "")
+        if resolved_ip:
+            lines.append(f"  - IP: {resolved_ip}")
+        lines.append(f"  - Services: {_format_ports(open_ports)}")
     else:
         lines.append("- Open ports and services: none observed by this scan")
 

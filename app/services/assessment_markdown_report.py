@@ -63,7 +63,7 @@ def generate_assessment_markdown_report(context: dict) -> str:
         "",
         "## Evidence Limitations",
         "",
-        "- Only completed tools are represented in the scan summary.",
+        "- Only completed and partial tools are represented in the scan summary.",
         "- Absence of findings is not evidence of security.",
         "- Additional assessment activities may be required.",
     ]
@@ -79,19 +79,19 @@ def _format_targets(targets: list[dict]) -> list[str]:
 def _format_executive_summary(context: dict) -> list[str]:
     targets = context.get("targets") or []
     scans = context.get("scans") or []
-    completed_scans = _completed_scans(scans)
-    highest_risk = _highest_risk(completed_scans)
+    represented_scans = _represented_scans(scans)
+    highest_risk = _highest_risk(represented_scans)
     target_text = ", ".join(_clean(target.get("address") or "unknown") for target in targets) or "the configured scope"
 
-    if not completed_scans:
+    if not represented_scans:
         return [
-            f"No completed assessment scans are recorded for {target_text}.",
+            f"No completed or partial assessment scans are recorded for {target_text}.",
             "The assessment report is limited until scan evidence is collected.",
         ]
 
     return [
         (
-            f"{target_text} has {len(completed_scans)} completed assessment scan(s) "
+            f"{target_text} has {len(represented_scans)} completed or partial assessment scan(s) "
             f"with highest recorded risk of {highest_risk.upper()}."
         ),
         "This report is based only on stored assessment evidence.",
@@ -101,8 +101,8 @@ def _format_executive_summary(context: dict) -> list[str]:
 def _format_assessment_overview(context: dict) -> list[str]:
     targets = context.get("targets") or []
     scans = context.get("scans") or []
-    completed_scans = _completed_scans(scans)
-    tools = ", ".join(sorted({str(scan.get("tool") or "unknown").upper() for scan in completed_scans})) or "None completed"
+    represented_scans = _represented_scans(scans)
+    tools = ", ".join(sorted({str(scan.get("tool") or "unknown").upper() for scan in represented_scans})) or "None completed or partial"
     status = _clean((context.get("assessment") or {}).get("status") or "unknown").title()
     return [
         f"- Scope: {', '.join(_clean(target.get('address') or 'unknown') for target in targets) or 'No primary target configured.'}",
@@ -112,9 +112,9 @@ def _format_assessment_overview(context: dict) -> list[str]:
 
 
 def _format_scan_summary(scans: list[dict]) -> list[str]:
-    completed = _completed_scans(scans)
+    completed = _represented_scans(scans)
     if not completed:
-        return ["No completed scans are recorded yet."]
+        return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
     for tool in ("nmap", "bbot", "nuclei"):
@@ -159,9 +159,9 @@ def _format_observed_assets(targets: list[dict], findings: list[dict]) -> list[s
 
 
 def _format_key_findings(scans: list[dict]) -> list[str]:
-    completed = _completed_scans(scans)
+    completed = _represented_scans(scans)
     if not completed:
-        return ["No key findings are available because no completed scans are recorded."]
+        return ["No key findings are available because no completed or partial scans are recorded."]
 
     lines: list[str] = []
     for scan in completed:
@@ -184,9 +184,9 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
 
 
 def _format_assessment_history(scans: list[dict]) -> list[str]:
-    completed = _completed_scans(scans)
+    completed = _represented_scans(scans)
     if not completed:
-        return ["No completed scans are recorded yet."]
+        return ["No completed or partial scans are recorded yet."]
     return [
         (
             f"- {_format_timestamp(scan.get('completed_at') or scan.get('created_at'))}: "
@@ -198,7 +198,7 @@ def _format_assessment_history(scans: list[dict]) -> list[str]:
 
 
 def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
-    completed = _completed_scans(scans)
+    completed = _represented_scans(scans)
     if not completed:
         return [
             "- Run authorized Nmap, BBOT, and Nuclei scans for the assessment scope.",
@@ -228,8 +228,8 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
 
-def _completed_scans(scans: list[dict]) -> list[dict]:
-    return [scan for scan in scans if str(scan.get("status") or "").lower() == "completed"]
+def _represented_scans(scans: list[dict]) -> list[dict]:
+    return [scan for scan in scans if str(scan.get("status") or "").lower() in {"completed", "partial"}]
 
 
 def _scan_summary(scan: dict) -> str:

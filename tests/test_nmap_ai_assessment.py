@@ -23,7 +23,13 @@ def test_nmap_ai_prompt_includes_observed_ports_and_constraints() -> None:
     assert "Do not invent vulnerabilities." in prompt
     assert "Do not recommend exploitation." in prompt
     assert "Do not claim the target is safe or secure." in prompt
+    assert "Never contradict the supplied evidence." in prompt
+    assert "Never say no open services were observed if open ports are supplied." in prompt
+    assert "Observed Assets must include the target host or IP when supplied." in prompt
+    assert "Observed Assets must include observed services when open ports are supplied." in prompt
     assert "22/tcp ssh" in prompt
+    assert "Host: scanme.nmap.org" in prompt
+    assert "Services: 22/tcp ssh" in prompt
     assert "SSH exposed" in prompt
 
 

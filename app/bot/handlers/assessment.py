@@ -291,10 +291,13 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
             report = generate_assessment_ai_report(assessment_context)
         except Exception:
             report = FALLBACK_REPORT
+        from app.bot.handlers.reports import split_report_text
+
         if reply_text is not None:
-            await reply_text(report)
+            for chunk in split_report_text(report):
+                await reply_text(chunk)
         else:
-            await query.edit_message_text(report)
+            await query.edit_message_text(split_report_text(report)[0])
         return
 
     if action == "markdown":
