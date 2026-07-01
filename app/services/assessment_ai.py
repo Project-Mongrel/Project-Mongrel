@@ -1,4 +1,5 @@
 from app.services.ai_client import ask_ai
+from app.services.assessment_guard import SECURE_PREAMBLE, build_guard_prompt_section, is_secure_question
 
 AI_UNAVAILABLE_MESSAGES = (
     "AI integration is not configured yet.",
@@ -31,8 +32,8 @@ def answer_assessment_question(question: str, context: dict) -> str:
     answer = str(response or "").strip()
     if not answer:
         return FALLBACK_ANSWER
-    if _is_secure_question(question) and "cannot conclude" not in answer.lower():
-        answer = "Based on this assessment alone, I cannot conclude the target is secure.\n\n" + answer
+    if is_secure_question(question) and "cannot conclude" not in answer.lower():
+        answer = f"{SECURE_PREAMBLE}\n\n" + answer
     return answer
 
 
@@ -64,10 +65,12 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             '- Never say the target is "safe" or "secure".',
             "- If evidence is missing, say so.",
             "- If evidence is insufficient, recommend the next assessment step.",
-            "- For secure/safe questions, start with: Based on this assessment alone, I cannot conclude the target is secure.",
+            f"- For secure/safe questions, start with: {SECURE_PREAMBLE}",
             "- For secure/safe questions, explain observed evidence, unassessed areas, whether confirmed vulnerabilities were found, and recommended next steps.",
             "- Keep the answer concise and consultant-focused.",
             "- Do not use evidence from other assessments.",
+            "",
+            build_guard_prompt_section(context, question=question),
             "",
             "Assessment Evidence:",
             _format_assessment_context(context),
@@ -101,6 +104,8 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Base conclusions only on Nmap, BBOT, Nuclei, assessment history, artifacts, and notes in the supplied context.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
+            "",
+            build_guard_prompt_section(context),
             "",
             "Required report structure:",
             "✦ Assessment AI Report",
@@ -241,8 +246,3 @@ def _clean(value: object) -> str:
 def _is_unavailable_response(response: object) -> bool:
     text = str(response or "").strip()
     return not text or any(text.startswith(message) for message in AI_UNAVAILABLE_MESSAGES)
-
-
-def _is_secure_question(question: object) -> bool:
-    normalized = str(question or "").lower()
-    return any(term in normalized for term in ("secure", "safe"))

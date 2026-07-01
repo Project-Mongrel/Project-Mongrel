@@ -730,6 +730,11 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(ai_response)
             return
 
+    if is_assessment_chat_active(context):
+        handled = await assessment_chat_text_handler(update, context)
+        if handled:
+            return
+
     if user_id is not None and is_ai_waiting(user_id):
         logger.info("Ask Mongrel question received for user_id=%s", user_id)
         await update.message.reply_text("Analyzing...")
@@ -744,11 +749,6 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         await update.message.reply_text(ai_response)
         return
-
-    if is_assessment_chat_active(context):
-        handled = await assessment_chat_text_handler(update, context)
-        if handled:
-            return
 
     if update.message.text in MAIN_MENU_BUTTONS:
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)

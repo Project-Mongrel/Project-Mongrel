@@ -476,6 +476,37 @@ def test_assessment_ask_mongrel_answers_with_assessment_evidence() -> None:
     assert ASSESSMENT_CHAT_STATE_KEY in context.user_data
 
 
+def test_assessment_chat_followup_does_not_call_generic_ask_mongrel() -> None:
+    clear_user_findings(8136)
+    assessment = create_assessment("Assessment Chat Followup")
+    target = add_assessment_target(assessment["id"], address="scanme.nmap.org")
+    finding = add_finding(
+        user_id=8136,
+        finding={
+            "source": "nmap",
+            "target": "scanme.nmap.org",
+            "summary": "SSH observed.",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", target_id=target["id"], finding_id=finding["id"])
+    set_ai_waiting(8136)
+    context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"]}})
+    message = SimpleNamespace(text="What evidence supports that?", reply_text=AsyncMock())
+
+    with (
+        patch("app.services.assessment_ai.ask_ai", return_value="Assessment evidence shows 22/tcp ssh.") as assessment_ask_ai,
+        patch("app.bot.handlers.scan.ask_ai", side_effect=AssertionError("generic Ask Mongrel should not be called")) as generic_ask_ai,
+    ):
+        asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8136)), context))
+
+    assessment_ask_ai.assert_called_once()
+    generic_ask_ai.assert_not_called()
+    assert message.reply_text.call_args_list[0].args[0] == "Reviewing assessment evidence..."
+    assert message.reply_text.call_args_list[1].args[0] == "Assessment evidence shows 22/tcp ssh."
+    assert ASSESSMENT_CHAT_STATE_KEY in context.user_data
+
+
 def test_assessment_ask_mongrel_exit_returns_to_normal_flow() -> None:
     assessment = create_assessment("Assessment Chat Exit")
     context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"]}})
