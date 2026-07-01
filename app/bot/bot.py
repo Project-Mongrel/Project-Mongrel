@@ -5,10 +5,12 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from app.bot.handlers import (
     ask_handler,
+    assessment_callback_handler,
     cancel_handler,
     findings_callback_handler,
     findings_handler,
     home_handler,
+    new_assessment_handler,
     reports_handler,
     reports_callback_handler,
     scan_callback_handler,
@@ -35,6 +37,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("home", home_handler))
     application.add_handler(CommandHandler("cancel", cancel_handler))
     application.add_handler(MessageHandler(filters.Regex("^Home$"), home_handler))
+    application.add_handler(MessageHandler(filters.Regex("^New Assessment$"), new_assessment_handler))
     application.add_handler(MessageHandler(filters.Regex("^Scan$"), scan_handler))
     application.add_handler(MessageHandler(filters.Regex("^(Upload|Upload Findings)$"), upload_handler))
     application.add_handler(MessageHandler(filters.Regex("^Findings$"), findings_handler))
@@ -43,6 +46,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(MessageHandler(filters.Regex("^Reports$"), reports_handler))
     application.add_handler(MessageHandler(filters.Regex("^Settings$"), settings_handler))
     application.add_handler(CallbackQueryHandler(scan_callback_handler, pattern="^(scan:(nmap|nuclei|bbot)|bbot_ai:.+|ai_summary:.+|nav:home)$"))
+    application.add_handler(CallbackQueryHandler(assessment_callback_handler, pattern="^assessment:"))
     application.add_handler(CallbackQueryHandler(findings_callback_handler, pattern="^(finding:(view:.+|list|clear)|explain:finding:.+)$"))
     application.add_handler(CallbackQueryHandler(reports_callback_handler, pattern="^report:"))
     application.add_handler(CallbackQueryHandler(upload_callback_handler, pattern="^upload:explain_ai$"))

@@ -7,6 +7,15 @@ from telegram.error import TimedOut
 
 from app.bot.auth import is_admin
 from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
+from app.bot.handlers.assessment import (
+    ASSESSMENT_FLOW_STATE_KEY,
+    assessment_callback_handler,
+    build_assessment_dashboard_keyboard,
+    build_assessment_dashboard_text,
+    build_assessment_history_text,
+    build_new_assessment_name_prompt,
+    new_assessment_handler,
+)
 from app.bot.handlers.findings import (
     MAX_FINDINGS_MESSAGE_LENGTH,
     build_finding_analysis_context,
@@ -76,6 +85,14 @@ from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build
 from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edit_text
 from app.core.config import Settings
 from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
+from app.services.assessment_store import (
+    add_assessment_target,
+    create_assessment,
+    record_assessment_scan,
+    list_assessment_scans,
+    list_assessment_targets,
+    list_assessments,
+)
 from app.services.bbot_ai_assessment import FALLBACK_LINES
 from app.services.nmap_ai_assessment import FALLBACK_LINES as NMAP_AI_FALLBACK_LINES
 from app.services.nuclei_ai_assessment import FALLBACK_LINES as NUCLEI_AI_FALLBACK_LINES
@@ -153,6 +170,285 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "Send an Nmap XML or Nuclei results file to begin analysis." in build_upload_text()
     assert build_ask_text() == "Ask Mongrel anything. Cybersecurity is my specialty."
     assert "Reports" in build_reports_text([])
+    assert "Send an assessment name." in build_new_assessment_name_prompt()
+
+
+def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
+    assessment = create_assessment("Acme External Assessment")
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", elapsed_seconds=9, risk="medium")
+    dashboard = build_assessment_dashboard_text(
+        assessment,
+        [{"address": "example.com"}],
+        list_assessment_scans(assessment["id"]),
+    )
+    keyboard = build_assessment_dashboard_keyboard(assessment["id"])
+    rendered_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "Assessment Dashboard" in dashboard
+    assert "Acme External Assessment" in dashboard
+    assert "example.com" in dashboard
+    assert "Status\nActive" in dashboard
+    assert "Last Updated" in dashboard
+    assert "Nmap: Completed" in dashboard
+    assert "BBOT: Not run" in dashboard
+    assert "Nuclei: Not run" in dashboard
+    assert rendered_buttons == [
+        "Run Nmap",
+        "Run BBOT",
+        "Run Nuclei",
+        "Ask Mongrel",
+        "Generate AI Report",
+        "Markdown Report",
+        "History",
+        "Home",
+    ]
+
+
+def test_assessment_history_renders_empty_and_recorded_scans() -> None:
+    empty_assessment = create_assessment("Empty History Assessment")
+    assert "No assessment scans recorded yet." in build_assessment_history_text(empty_assessment, [])
+
+    assessment = create_assessment("History Assessment")
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", elapsed_seconds=9, risk="medium")
+    record_assessment_scan(assessment["id"], tool="nuclei", status="failed")
+    history = build_assessment_history_text(assessment, list_assessment_scans(assessment["id"]))
+
+    assert "Assessment History" in history
+    assert "History Assessment" in history
+    assert "NMAP - Completed" in history
+    assert "Risk: MEDIUM" in history
+    assert "Elapsed: 9s" in history
+    assert "NUCLEI - Failed" in history
+
+
+def test_new_assessment_flow_creates_assessment_target_and_dashboard() -> None:
+    context = SimpleNamespace(user_data={})
+    start_message = SimpleNamespace(text="New Assessment", reply_text=AsyncMock())
+    asyncio.run(new_assessment_handler(SimpleNamespace(message=start_message, effective_user=SimpleNamespace(id=8101)), context))
+
+    assert context.user_data[ASSESSMENT_FLOW_STATE_KEY]["stage"] == "awaiting_name"
+    assert "Send an assessment name." in start_message.reply_text.call_args.args[0]
+
+    name_message = SimpleNamespace(text="Mission 10.11 Assessment", reply_text=AsyncMock())
+    asyncio.run(scan_target_handler(SimpleNamespace(message=name_message, effective_user=SimpleNamespace(id=8101)), context))
+
+    assert context.user_data[ASSESSMENT_FLOW_STATE_KEY]["stage"] == "awaiting_target"
+    assert context.user_data[ASSESSMENT_FLOW_STATE_KEY]["name"] == "Mission 10.11 Assessment"
+    assert "Primary Target" in name_message.reply_text.call_args.args[0]
+
+    target_message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    asyncio.run(scan_target_handler(SimpleNamespace(message=target_message, effective_user=SimpleNamespace(id=8101)), context))
+
+    assert ASSESSMENT_FLOW_STATE_KEY not in context.user_data
+    dashboard = target_message.reply_text.call_args.args[0]
+    keyboard = target_message.reply_text.call_args.kwargs["reply_markup"]
+    assert "Assessment Dashboard" in dashboard
+    assert "Mission 10.11 Assessment" in dashboard
+    assert "example.com" in dashboard
+    assert "Nmap: Not run" in dashboard
+    assert keyboard.inline_keyboard[0][0].text == "Run Nmap"
+
+    assessment = list_assessments()[-1]
+    assert assessment["name"] == "Mission 10.11 Assessment"
+    assert list_assessment_targets(assessment["id"])[0]["address"] == "example.com"
+
+
+def test_assessment_nmap_button_records_assessment_scan() -> None:
+    clear_user_findings(8120)
+    clear_user_investigations(8120)
+    assessment = create_assessment("Assessment Nmap")
+    target = add_assessment_target(assessment["id"], address="127.0.0.1")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:run:nmap:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_nmap_scan",
+            return_value={
+                "success": True,
+                "target": "127.0.0.1",
+                "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n",
+                "error": "",
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_nmap_ai_assessment", return_value=NMAP_AI_FALLBACK_LINES),
+    ):
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8120)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    query.answer.assert_called_once()
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "nmap"
+    assert scans[0]["status"] == "completed"
+    assert scans[0]["target_id"] == target["id"]
+    assert scans[0]["finding_id"]
+    assert "Nmap: Completed" in query_message.reply_text.call_args_list[-1].args[0]
+
+
+def test_assessment_bbot_button_records_assessment_scan() -> None:
+    clear_user_findings(8121)
+    clear_user_investigations(8121)
+    clear_user_observations(8121)
+    assessment = create_assessment("Assessment BBOT")
+    target = add_assessment_target(assessment["id"], address="example.com")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:run:bbot:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": True,
+                "target": "example.com",
+                "output": "Found app.example.com",
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 4.2,
+            },
+        ),
+    ):
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8121)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "bbot"
+    assert scans[0]["status"] == "completed"
+    assert scans[0]["target_id"] == target["id"]
+    assert scans[0]["elapsed_seconds"] == 4
+    assert "BBOT: Completed" in query_message.reply_text.call_args_list[-1].args[0]
+
+
+def test_assessment_nuclei_button_records_assessment_scan() -> None:
+    clear_user_findings(8122)
+    clear_user_investigations(8122)
+    clear_active_scan(8122)
+    assessment = create_assessment("Assessment Nuclei")
+    target = add_assessment_target(assessment["id"], address="https://example.com")
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    query_message = SimpleNamespace(reply_text=AsyncMock(return_value=status_message))
+    query = SimpleNamespace(
+        data=f"assessment:run:nuclei:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    async def run_flow() -> None:
+        with (
+            patch(
+                "app.bot.handlers.scan.run_nuclei_scan",
+                return_value={"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0},
+            ),
+            patch("app.bot.handlers.scan.generate_nuclei_ai_assessment", return_value=NUCLEI_AI_FALLBACK_LINES),
+        ):
+            await assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8122)),
+                SimpleNamespace(user_data={}),
+            )
+            active_scan = get_active_scan(8122)
+            assert active_scan is not None
+            assert active_scan.task is not None
+            await active_scan.task
+
+    asyncio.run(run_flow())
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "nuclei"
+    assert scans[0]["status"] == "completed"
+    assert scans[0]["target_id"] == target["id"]
+    assert scans[0]["finding_id"]
+    assert "Nuclei: Completed" in query_message.reply_text.call_args_list[-1].args[0]
+
+
+def test_assessment_failed_scan_records_failed_status() -> None:
+    clear_user_findings(8123)
+    clear_user_investigations(8123)
+    assessment = create_assessment("Assessment Failed Nmap")
+    add_assessment_target(assessment["id"], address="127.0.0.1")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:run:nmap:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    with patch(
+        "app.bot.handlers.scan.run_nmap_scan",
+        return_value={"success": False, "target": "127.0.0.1", "output": "", "error": "nmap failed"},
+    ):
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8123)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "nmap"
+    assert scans[0]["status"] == "failed"
+    assert "Nmap: Failed" in query_message.reply_text.call_args_list[-1].args[0]
+
+
+def test_assessment_history_callback_lists_recorded_scans() -> None:
+    assessment = create_assessment("History Callback Assessment")
+    record_assessment_scan(assessment["id"], tool="bbot", status="completed", elapsed_seconds=19, risk="info")
+    query = SimpleNamespace(
+        data=f"assessment:history:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), SimpleNamespace(user_data={})))
+
+    query.answer.assert_called_once()
+    assert "Assessment History" in query.edit_message_text.call_args.args[0]
+    assert "BBOT - Completed" in query.edit_message_text.call_args.args[0]
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text == "Back to Assessment"
+
+
+def test_assessment_placeholder_actions_are_safe() -> None:
+    assessment = create_assessment("Placeholder Assessment")
+    add_assessment_target(assessment["id"], address="example.com")
+    for action, expected in [
+        ("ask", "Assessment Ask Mongrel is coming next."),
+        ("ai_report", "Assessment AI report generation is coming next."),
+        ("markdown", "Assessment Markdown report generation is coming next."),
+    ]:
+        query = SimpleNamespace(
+            data=f"assessment:{action}:{assessment['id']}",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), SimpleNamespace(user_data={})))
+
+        query.answer.assert_called_once()
+        assert expected in query.edit_message_text.call_args.args[0]
+        assert "Assessment Dashboard" in query.edit_message_text.call_args.args[0]
 
 
 def test_reports_menu_renders() -> None:

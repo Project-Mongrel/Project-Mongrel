@@ -6,6 +6,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.handlers.home import build_home_text
+from app.bot.handlers.assessment import (
+    ASSESSMENT_SCAN_CONTEXT_KEY,
+    assessment_text_handler,
+    build_assessment_dashboard_keyboard,
+    build_assessment_dashboard_text,
+    clear_assessment_flow_state,
+    is_assessment_flow_active,
+)
 from app.bot.handlers.findings import build_finding_followup_ai_prompt
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edit_text
@@ -14,6 +22,12 @@ from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observa
 from app.bot.handlers.reports import split_report_text
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
+from app.services.assessment_store import (
+    get_assessment,
+    list_assessment_scans,
+    list_assessment_targets,
+    record_assessment_scan,
+)
 from app.services.active_scan_state import (
     clear_active_scan,
     get_active_scan,
@@ -347,6 +361,95 @@ def _format_nmap_notes(notes: list[object]) -> list[str]:
     return formatted_notes
 
 
+def _pop_assessment_scan_context(context: ContextTypes.DEFAULT_TYPE, tool: str) -> dict | None:
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        return None
+    assessment_context = user_data.get(ASSESSMENT_SCAN_CONTEXT_KEY)
+    if not isinstance(assessment_context, dict):
+        return None
+    if str(assessment_context.get("tool") or "").lower() != tool:
+        return None
+    return user_data.pop(ASSESSMENT_SCAN_CONTEXT_KEY)
+
+
+def _record_assessment_scan(
+    assessment_context: dict | None,
+    *,
+    tool: str,
+    result: dict,
+    finding: dict | None = None,
+) -> dict | None:
+    if not assessment_context:
+        return None
+    status = "completed" if result.get("success") is True else "failed"
+    return record_assessment_scan(
+        assessment_id=int(assessment_context["assessment_id"]),
+        target_id=int(assessment_context["target_id"]) if assessment_context.get("target_id") is not None else None,
+        tool=tool,
+        status=status,
+        finding_id=finding.get("id") if finding else None,
+        elapsed_seconds=_scan_elapsed_seconds(result, finding),
+        risk=_scan_risk(result, finding),
+        raw_reference=_scan_raw_reference(result, finding),
+    )
+
+
+async def _send_assessment_dashboard(message: object, assessment_context: dict | None) -> None:
+    if not assessment_context:
+        return
+    assessment_id = int(assessment_context["assessment_id"])
+    assessment = get_assessment(assessment_id)
+    if assessment is None:
+        return
+    await message.reply_text(
+        build_assessment_dashboard_text(
+            assessment,
+            list_assessment_targets(assessment_id),
+            list_assessment_scans(assessment_id),
+        ),
+        reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+    )
+
+
+def _scan_elapsed_seconds(result: dict, finding: dict | None = None) -> int | None:
+    for value in (
+        result.get("elapsed_seconds"),
+        (finding or {}).get("duration"),
+        ((finding or {}).get("metadata") or {}).get("elapsed_seconds"),
+    ):
+        parsed = _parse_elapsed_seconds(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_elapsed_seconds(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    text = str(value).strip().lower()
+    if text.endswith("s"):
+        text = text[:-1]
+    try:
+        return max(0, int(float(text)))
+    except ValueError:
+        return None
+
+
+def _scan_risk(result: dict, finding: dict | None = None) -> str | None:
+    return str((finding or {}).get("risk_level") or result.get("risk_level") or "").lower() or None
+
+
+def _scan_raw_reference(result: dict, finding: dict | None = None) -> str | None:
+    if finding and finding.get("scan_run_id"):
+        return f"scan_runs/{finding['scan_run_id']}"
+    if result.get("output_dir"):
+        return str(result["output_dir"])
+    return None
+
+
 def append_change_summary(message: str, comparison: dict | None, impact: dict | None = None) -> str:
     if comparison is None:
         return message
@@ -615,7 +718,13 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if update.message.text in MAIN_MENU_BUTTONS:
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        clear_assessment_flow_state(context)
         return
+
+    if is_assessment_flow_active(context):
+        handled = await assessment_text_handler(update, context)
+        if handled:
+            return
 
     scan_request_id = context.user_data.get(PENDING_NMAP_REQUEST_KEY)
     if user_id is None or not isinstance(scan_request_id, str):
@@ -683,6 +792,8 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         summary="Nmap scan completed" if result.get("success") is True else "Nmap scan failed",
         metadata={"finding_id": finding.get("id") if finding else None},
     )
+    assessment_context = _pop_assessment_scan_context(context, "nmap")
+    _record_assessment_scan(assessment_context, tool="nmap", result=result, finding=finding)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     if result.get("success") is True:
         await progress_card.complete()
@@ -698,6 +809,7 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     if result.get("success") is True and finding:
         await _send_nmap_ai_assessment(update.message, finding)
+    await _send_assessment_dashboard(update.message, assessment_context)
 
 
 async def _send_nmap_ai_assessment(message: object, finding: dict) -> None:
@@ -821,6 +933,8 @@ async def _handle_bbot_target(
         ),
         metadata={"finding_id": finding.get("id"), "observation_count": observation_count},
     )
+    assessment_context = _pop_assessment_scan_context(context, "bbot")
+    _record_assessment_scan(assessment_context, tool="bbot", result=result, finding=finding)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     if result.get("success") is True:
         await progress_card.complete()
@@ -838,6 +952,7 @@ async def _handle_bbot_target(
     for index, chunk in enumerate(chunks):
         kwargs = {"reply_markup": keyboard} if keyboard is not None and index == len(chunks) - 1 else {}
         await update.message.reply_text(chunk, **kwargs)
+    await _send_assessment_dashboard(update.message, assessment_context)
 
 
 async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> None:
@@ -1019,6 +1134,7 @@ async def _handle_nuclei_target(
         status_message=status_message,
     )
     started_at = progress_card.started_at
+    assessment_context = _pop_assessment_scan_context(context, "nuclei")
     status_task = asyncio.create_task(_update_nuclei_status_card(user_id, status_message, display_target, started_at))
     task = asyncio.create_task(
         _run_nuclei_scan_background(
@@ -1030,6 +1146,7 @@ async def _handle_nuclei_target(
             display_target=display_target,
             started_at=started_at,
             investigation_id=investigation["id"],
+            assessment_context=assessment_context,
         )
     )
     set_active_scan_status_task(user_id, status_task)
@@ -1052,6 +1169,7 @@ async def _run_nuclei_scan_background(
     display_target: str,
     started_at: float,
     investigation_id: str,
+    assessment_context: dict | None = None,
 ) -> None:
     try:
         result = await asyncio.to_thread(run_nuclei_scan, target)
@@ -1069,6 +1187,12 @@ async def _run_nuclei_scan_background(
             summary="Nuclei scan failed",
         )
         await _send_scan_message(message, f"Invalid Nuclei target: {exc}")
+        _record_assessment_scan(
+            assessment_context,
+            tool="nuclei",
+            result={"success": False, "target": display_target, "error": str(exc)},
+        )
+        await _send_assessment_dashboard(message, assessment_context)
         return
     except asyncio.CancelledError:
         elapsed_seconds = time.monotonic() - started_at
@@ -1106,6 +1230,8 @@ async def _run_nuclei_scan_background(
             summary="Nuclei scan failed",
         )
         await _send_scan_message(message, f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
+        _record_assessment_scan(assessment_context, tool="nuclei", result=result)
+        await _send_assessment_dashboard(message, assessment_context)
         return
 
     await progress_card.complete()
@@ -1130,13 +1256,21 @@ async def _run_nuclei_scan_background(
         )
         finding.setdefault("metadata", {})
         finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
+        _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
         await _send_nuclei_ai_assessment(message, finding)
+        await _send_assessment_dashboard(message, assessment_context)
         return
 
     try:
         nuclei_findings = parse_nuclei_results(output)
     except NucleiParserError:
         await _send_scan_message(message, "Unable to parse Nuclei scan output.")
+        _record_assessment_scan(
+            assessment_context,
+            tool="nuclei",
+            result={**result, "success": False, "error": "Unable to parse Nuclei scan output."},
+        )
+        await _send_assessment_dashboard(message, assessment_context)
         return
 
     if not nuclei_findings:
@@ -1159,7 +1293,9 @@ async def _run_nuclei_scan_background(
         )
         finding.setdefault("metadata", {})
         finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
+        _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
         await _send_nuclei_ai_assessment(message, finding)
+        await _send_assessment_dashboard(message, assessment_context)
         return
 
     from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
@@ -1182,7 +1318,9 @@ async def _run_nuclei_scan_background(
         build_nuclei_import_success_text(finding, elapsed=elapsed_label),
         reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
     )
+    _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
     await _send_nuclei_ai_assessment(message, finding)
+    await _send_assessment_dashboard(message, assessment_context)
 
 
 async def _update_nuclei_status_card(user_id: int, status_message: object, target: str, started_at: float) -> None:

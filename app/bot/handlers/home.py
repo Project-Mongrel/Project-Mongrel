@@ -3,6 +3,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
+from app.bot.handlers.assessment import clear_assessment_flow_state
 from app.services.active_scan_state import cancel_active_scan, clear_active_scan
 from app.services.chat_state import clear_ai_waiting, clear_finding_analysis_context, is_finding_analysis_active
 
@@ -15,6 +16,7 @@ def build_home_text() -> str:
         "Use this assistant for authorized defensive security work only.\n\n"
         "Available actions:\n"
         "- Home: return to this control panel\n"
+        "- New Assessment: create an assessment workspace\n"
         "- Scan: prepare authorized scan workflows\n"
         "- Upload Findings: send scan output for analysis\n"
         "- Findings: review security findings\n"
@@ -32,6 +34,7 @@ async def home_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         clear_ai_waiting(update.effective_user.id)
         finding_analysis_exited = is_finding_analysis_active(update.effective_user.id)
         clear_finding_analysis_context(update.effective_user.id)
+        clear_assessment_flow_state(context)
         if finding_analysis_exited:
             logger.info("Finding analysis ended for user_id=%s", update.effective_user.id)
         cancelled_scan = cancel_active_scan(update.effective_user.id)
