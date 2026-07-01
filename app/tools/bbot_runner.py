@@ -95,17 +95,22 @@ def run_bbot_scan(target: str) -> dict[str, object]:
         _join_stream_thread(stdout_thread, "stdout")
         _join_stream_thread(stderr_thread, "stderr")
         elapsed_seconds = time.monotonic() - started_at
+        stdout = "\n".join(stdout_lines)
+        stderr = "\n".join(stderr_lines)
+        json_output, json_output_paths = _read_bbot_json_output(output_dir)
         return {
             "target": validated_target,
             "success": False,
-            "output": "\n".join(stdout_lines),
-            "error": "\n".join(stderr_lines) or "BBOT recon timed out.",
+            "output": _combine_output(stdout, json_output),
+            "error": stderr or "BBOT recon timed out.",
             "error_type": "timeout",
             "returncode": returncode,
             "elapsed_seconds": elapsed_seconds,
             "output_dir": str(output_dir),
             "command": command,
             "working_directory": str(working_directory),
+            "json_output_paths": json_output_paths,
+            "json_output_found": bool(json_output_paths),
         }
 
     logger.info("BBOT process exited normally: returncode=%s", returncode)

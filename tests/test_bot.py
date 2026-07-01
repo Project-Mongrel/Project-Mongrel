@@ -1612,6 +1612,97 @@ def test_bbot_scan_failure_creates_failed_event_and_stores_result() -> None:
     assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_failed"]
 
 
+def test_bbot_scan_nonzero_with_observations_is_partial_and_clean() -> None:
+    clear_user_findings(7205)
+    clear_user_investigations(7205)
+    clear_user_observations(7205)
+    clear_user_scan_requests(7205)
+    scan_request = create_scan_request(user_id=7205, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7205, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7205))
+    raw_output = "NOISY BBOT STDOUT\n{\"type\":\"DNS_NAME\",\"data\":\"app.example.com\"}"
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": False,
+                "target": "example.com",
+                "output": raw_output,
+                "error": "BBOT exited with code 1",
+                "returncode": 1,
+                "elapsed_seconds": 7,
+            },
+        ),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    result_text = message.reply_text.call_args_list[1].args[0]
+    assert "Status\nPartial" in result_text
+    assert "BBOT Recon Summary" in result_text
+    assert "app.example.com" in result_text
+    assert "Partial result:" in result_text
+    assert "NOISY BBOT STDOUT" not in result_text
+    assert "BBOT exited with code 1" not in result_text
+    finding = get_user_findings(7205)[0]
+    assert finding["status"] == "partial"
+    assert finding["raw_output"] == raw_output
+    assert finding["metadata"]["partial"] is True
+    assert finding["finding_count"] == 1
+    observations = get_user_observations(7205)
+    assert len(observations) == 1
+    assert observations[0]["value"] == "app.example.com"
+    investigation = get_user_investigations(7205)[0]
+    events = get_investigation_events(investigation["id"], 7205)
+    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_partial"]
+
+
+def test_assessment_bbot_partial_scan_records_partial_status() -> None:
+    clear_user_findings(8124)
+    clear_user_investigations(8124)
+    clear_user_observations(8124)
+    assessment = create_assessment("Assessment BBOT Partial")
+    target = add_assessment_target(assessment["id"], address="example.com")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:run:bbot:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": False,
+                "target": "example.com",
+                "output": '{"type":"DNS_NAME","data":"partial.example.com"}',
+                "error": "nonzero exit",
+                "returncode": 1,
+                "elapsed_seconds": 4,
+            },
+        ),
+    ):
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8124)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "bbot"
+    assert scans[0]["status"] == "partial"
+    assert scans[0]["target_id"] == target["id"]
+    assert "BBOT: Partial" in query_message.reply_text.call_args_list[-1].args[0]
+
+
 def test_bbot_scan_zero_observations_handled_cleanly() -> None:
     clear_user_findings(7206)
     clear_user_investigations(7206)
@@ -1699,17 +1790,39 @@ def test_bbot_scan_result_formatter_uses_recon_summary() -> None:
     assert "Findings\n- Observations collected:" not in text
 
 
+def test_bbot_scan_result_formatter_uses_clean_partial_summary() -> None:
+    text = build_bbot_result_text(
+        {
+            "success": False,
+            "partial": True,
+            "target": "example.com",
+            "output": "raw stdout should not show",
+            "error": "raw error should not show",
+            "elapsed_seconds": 1,
+        },
+        recon_summary="BBOT Recon Summary\n\nTarget:\nexample.com",
+    )
+
+    assert "Status\nPartial" in text
+    assert "BBOT Recon Summary" in text
+    assert "Partial result:" in text
+    assert "raw stdout should not show" not in text
+    assert "raw error should not show" not in text
+
+
 def test_bbot_scan_result_formatter_keeps_failure_output_concise() -> None:
     text = build_bbot_result_text(
         {
             "success": False,
             "target": "example.com",
+            "output": "raw stdout should not show",
             "error": "A" * 1000,
             "elapsed_seconds": 1,
         }
     )
 
     assert "Status\nFailed" in text
+    assert "raw stdout should not show" not in text
     assert "...[truncated]" in text
 
 

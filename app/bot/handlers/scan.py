@@ -217,13 +217,22 @@ def build_bbot_result_text(
     observation_counts: dict[str, int] | None = None,
     recon_summary: str | None = None,
 ) -> str:
-    if result.get("success") is True and recon_summary:
+    if (result.get("success") is True or result.get("partial") is True) and recon_summary:
+        summary = recon_summary
+        if result.get("partial") is True:
+            summary = "\n\n".join(
+                [
+                    recon_summary,
+                    "Partial result: BBOT exited before a clean completion, but useful observations were collected.",
+                ]
+            )
         return render_scan_result_card(
             tool_name="BBOT",
             target=str(result.get("target") or "unknown"),
+            status="Partial" if result.get("partial") is True else "Complete",
             elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
             risk="INFO",
-            summary=recon_summary,
+            summary=summary,
         )
 
     if result.get("error_type") == "runtime_incompatible":
@@ -235,7 +244,13 @@ def build_bbot_result_text(
         )
 
     status = "Complete" if result.get("success") is True else "Failed"
-    output = _truncate_bbot_output(str(result.get("output") or result.get("error") or "No output returned."))
+    output = _truncate_bbot_output(
+        str(
+            result.get("output")
+            if result.get("success") is True
+            else (result.get("error") or "BBOT recon failed before useful observations were collected.")
+        )
+    )
     counts = observation_counts or {}
     return render_scan_result_card(
         tool_name="BBOT",
@@ -250,10 +265,15 @@ def build_bbot_result_text(
 
 
 def store_bbot_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
-    status = "completed" if result.get("success") is True else "failed"
     observations = observations or []
     observation_counts = summarize_observations(observations)
-    if result.get("success") is True:
+    if result.get("partial") is True:
+        status = "partial"
+    elif result.get("success") is True:
+        status = "completed"
+    else:
+        status = "failed"
+    if result.get("success") is True or result.get("partial") is True:
         summary = _build_bbot_summary(observation_counts)
     else:
         summary = str(result.get("error") or "BBOT recon failed.")
@@ -279,6 +299,8 @@ def store_bbot_scan_result(user_id: int, result: dict[str, object], observations
                 "json_output_found": result.get("json_output_found"),
                 "json_output_paths": result.get("json_output_paths"),
                 "error": result.get("error"),
+                "partial": result.get("partial") is True,
+                "parser_error": result.get("parser_error"),
                 "observation_count": len(observations),
             },
         },
@@ -384,7 +406,12 @@ def _record_assessment_scan(
 ) -> dict | None:
     if not assessment_context:
         return None
-    status = "completed" if result.get("success") is True else "failed"
+    if result.get("partial") is True:
+        status = "partial"
+    elif result.get("success") is True:
+        status = "completed"
+    else:
+        status = "failed"
     return record_assessment_scan(
         assessment_id=int(assessment_context["assessment_id"]),
         target_id=int(assessment_context["target_id"]) if assessment_context.get("target_id") is not None else None,
@@ -906,21 +933,33 @@ async def _handle_bbot_target(
         result=result,
     )
     observations = []
-    if result.get("success") is True:
+    parser_error = None
+    if result.get("output"):
         await progress_card.update("Collecting observations...")
-        observations = normalize_bbot_output(
-            result.get("output"),
-            target=str(result.get("target") or display_target),
-            user_id=user_id,
-            investigation_id=investigation["id"],
-        )
-        add_observations(observations)
+        try:
+            observations = normalize_bbot_output(
+                result.get("output"),
+                target=str(result.get("target") or display_target),
+                user_id=user_id,
+                investigation_id=investigation["id"],
+            )
+        except Exception as exc:
+            parser_error = str(exc)
+            observations = []
+        if observations:
+            add_observations(observations)
     observation_counts = summarize_observations(observations)
+    if result.get("success") is not True and observations:
+        result = {**result, "partial": True, "parser_error": parser_error}
+    elif parser_error:
+        result = {**result, "parser_error": parser_error}
     finding = store_bbot_scan_result(user_id=user_id, result=result, observations=observations)
-    event_type = "bbot_scan_completed" if result.get("success") is True else "bbot_scan_failed"
+    is_partial = result.get("partial") is True
+    is_successful_or_partial = result.get("success") is True or is_partial
+    event_type = "bbot_scan_partial" if is_partial else ("bbot_scan_completed" if result.get("success") is True else "bbot_scan_failed")
     observation_count = len(observations)
     recon_summary = None
-    if result.get("success") is True:
+    if is_successful_or_partial:
         recon_summary = build_bbot_recon_summary(
             user_id=user_id,
             investigation_id=investigation["id"],
@@ -932,18 +971,22 @@ async def _handle_bbot_target(
         target=str(result["target"]),
         event_type=event_type,
         tool="bbot",
-        status="completed" if result.get("success") is True else "failed",
+        status="partial" if is_partial else ("completed" if result.get("success") is True else "failed"),
         summary=(
-            f"BBOT scan completed - Recon Summary Generated ({observation_count} observations)."
-            if result.get("success") is True
-            else "BBOT recon failed"
+            f"BBOT scan partial - Recon Summary Generated ({observation_count} observations)."
+            if is_partial
+            else (
+                f"BBOT scan completed - Recon Summary Generated ({observation_count} observations)."
+                if result.get("success") is True
+                else "BBOT recon failed"
+            )
         ),
-        metadata={"finding_id": finding.get("id"), "observation_count": observation_count},
+        metadata={"finding_id": finding.get("id"), "observation_count": observation_count, "partial": is_partial},
     )
     assessment_context = _pop_assessment_scan_context(context, "bbot")
     _record_assessment_scan(assessment_context, tool="bbot", result=result, finding=finding)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
-    if result.get("success") is True:
+    if is_successful_or_partial:
         await progress_card.complete()
     else:
         await progress_card.fail(str(result.get("error") or "Unknown error."))
@@ -954,6 +997,7 @@ async def _handle_bbot_target(
             build_bbot_ai_assessment_keyboard(investigation["id"]),
         )
         if result.get("success") is True
+        or is_partial
         else None
     )
     for index, chunk in enumerate(chunks):

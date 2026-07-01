@@ -90,6 +90,28 @@ def test_bbot_timeout_handled(tmp_path: Path) -> None:
     assert process.killed is True
 
 
+def test_bbot_timeout_harvests_json_output(tmp_path: Path) -> None:
+    json_output_dir = tmp_path / "example.com" / "scan" / "output"
+    json_output_dir.mkdir(parents=True)
+    json_file = json_output_dir / "output.jsonl"
+    json_file.write_text('{"type":"DNS_NAME","data":"partial.example.com"}\n', encoding="utf-8")
+    process = FakeBbotProcess(returncode=-9, stdout="partial stdout\n", stderr="partial error\n", timeout=True)
+
+    with (
+        patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
+        patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_bbot_scan("example.com")
+
+    assert result["success"] is False
+    assert "partial stdout" in result["output"]
+    assert '{"type":"DNS_NAME","data":"partial.example.com"}' in result["output"]
+    assert result["json_output_found"] is True
+    assert result["json_output_paths"] == [str(json_file)]
+    assert process.killed is True
+
+
 def test_bbot_missing_binary_handled(tmp_path: Path) -> None:
     with (
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
