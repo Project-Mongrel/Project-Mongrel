@@ -434,21 +434,38 @@ def test_assessment_placeholder_actions_are_safe() -> None:
     assessment = create_assessment("Placeholder Assessment")
     add_assessment_target(assessment["id"], address="example.com")
     for action, expected in [
-        ("ask", "Assessment Ask Mongrel is coming next."),
-        ("ai_report", "Assessment AI report generation is coming next."),
-        ("markdown", "Assessment Markdown report generation is coming next."),
+        ("ask", "Coming next: Ask Mongrel."),
+        ("ai_report", "Coming next: Generate AI Report."),
+        ("markdown", "Coming next: Markdown Report."),
     ]:
+        query_message = SimpleNamespace(reply_text=AsyncMock())
         query = SimpleNamespace(
             data=f"assessment:{action}:{assessment['id']}",
             answer=AsyncMock(),
             edit_message_text=AsyncMock(),
+            message=query_message,
         )
 
         asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), SimpleNamespace(user_data={})))
 
         query.answer.assert_called_once()
-        assert expected in query.edit_message_text.call_args.args[0]
-        assert "Assessment Dashboard" in query.edit_message_text.call_args.args[0]
+        query.edit_message_text.assert_not_called()
+        query_message.reply_text.assert_called_once_with(expected)
+
+
+def test_assessment_placeholder_actions_edit_when_message_missing() -> None:
+    assessment = create_assessment("Placeholder Fallback Assessment")
+    query = SimpleNamespace(
+        data=f"assessment:ask:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=None,
+    )
+
+    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), SimpleNamespace(user_data={})))
+
+    query.answer.assert_called_once()
+    query.edit_message_text.assert_called_once_with("Coming next: Ask Mongrel.")
 
 
 def test_reports_menu_renders() -> None:

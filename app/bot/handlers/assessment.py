@@ -233,24 +233,16 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 
     if action in {"ask", "ai_report", "markdown"}:
         placeholders = {
-            "ask": "Assessment Ask Mongrel is coming next.",
-            "ai_report": "Assessment AI report generation is coming next.",
-            "markdown": "Assessment Markdown report generation is coming next.",
+            "ask": "Coming next: Ask Mongrel.",
+            "ai_report": "Coming next: Generate AI Report.",
+            "markdown": "Coming next: Markdown Report.",
         }
-        await query.edit_message_text(
-            "\n".join(
-                [
-                    build_assessment_dashboard_text(
-                        assessment,
-                        list_assessment_targets(assessment_id),
-                        list_assessment_scans(assessment_id),
-                    ),
-                    "",
-                    placeholders[action],
-                ]
-            ),
-            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
-        )
+        message = getattr(query, "message", None)
+        reply_text = getattr(message, "reply_text", None)
+        if reply_text is not None:
+            await reply_text(placeholders[action])
+        else:
+            await query.edit_message_text(placeholders[action])
         return
 
     if action != "run" or len(parts) != 4:
