@@ -20,6 +20,27 @@ ASSESSMENT_SCAN_CONTEXT_KEY = "assessment_scan_context"
 ASSESSMENT_STAGE_NAME = "awaiting_name"
 ASSESSMENT_STAGE_TARGET = "awaiting_target"
 ASSESSMENT_CALLBACK_PREFIX = "assessment"
+ACTIVE_ASSESSMENT_ID_KEY = "active_assessment_id"
+
+
+def build_assessment_chat_intro(assessment: dict, targets: list[dict] | None = None) -> str:
+    targets = targets or []
+    target_address = targets[0]["address"] if targets else "Not set"
+    return "\n".join(
+        [
+            section_label("mongrel_ai", "Assessment AI"),
+            "",
+            "Assessment:",
+            assessment.get("name") or "Untitled assessment",
+            "",
+            "Target:",
+            target_address,
+            "",
+            "Ask anything about this assessment.",
+            "",
+            "I will answer only from collected evidence.",
+        ]
+    )
 
 
 def build_new_assessment_name_prompt() -> str:
@@ -152,6 +173,12 @@ def clear_assessment_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         user_data.pop(ASSESSMENT_CHAT_STATE_KEY, None)
 
 
+def clear_assessment_chat_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        user_data.pop(ASSESSMENT_CHAT_STATE_KEY, None)
+
+
 def is_assessment_chat_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_data = getattr(context, "user_data", None)
     return bool(isinstance(user_data, dict) and user_data.get(ASSESSMENT_CHAT_STATE_KEY))
@@ -209,14 +236,14 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
 
     text = str(update.message.text or "").strip()
     if text.lower() in {"home", "back", "cancel"}:
-        context.user_data.pop(ASSESSMENT_CHAT_STATE_KEY, None)
+        clear_assessment_chat_state(context)
         await update.message.reply_text("Exited assessment Ask Mongrel mode.", reply_markup=build_main_menu_keyboard())
         return True
     if not text:
         await update.message.reply_text("Please send a question about this assessment.")
         return True
 
-    assessment_id = int(state["assessment_id"])
+    assessment_id = int(state.get(ACTIVE_ASSESSMENT_ID_KEY) or state.get("assessment_id"))
     user_id = update.effective_user.id if update.effective_user is not None else 0
     await update.message.reply_text("Reviewing assessment evidence...")
     try:
@@ -253,6 +280,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     if action == "dashboard":
+        clear_assessment_chat_state(context)
         await query.edit_message_text(
             build_assessment_dashboard_text(
                 assessment,
@@ -271,10 +299,15 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     if action == "ask":
-        context.user_data[ASSESSMENT_CHAT_STATE_KEY] = {"assessment_id": assessment_id}
+        targets = list_assessment_targets(assessment_id)
+        context.user_data[ASSESSMENT_CHAT_STATE_KEY] = {
+            "assessment_chat": True,
+            ACTIVE_ASSESSMENT_ID_KEY: assessment_id,
+            "assessment_id": assessment_id,
+        }
         message = getattr(query, "message", None)
         reply_text = getattr(message, "reply_text", None)
-        prompt = "What would you like to ask about this assessment?"
+        prompt = build_assessment_chat_intro(assessment, targets)
         if reply_text is not None:
             await reply_text(prompt)
         else:

@@ -3,8 +3,15 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
-from app.bot.handlers.assessment import clear_assessment_flow_state
+from app.bot.handlers.assessment import (
+    ASSESSMENT_CHAT_STATE_KEY,
+    ACTIVE_ASSESSMENT_ID_KEY,
+    build_assessment_chat_intro,
+    clear_assessment_flow_state,
+    is_assessment_chat_active,
+)
 from app.services.active_scan_state import cancel_active_scan, clear_active_scan
+from app.services.assessment_store import get_assessment, list_assessment_targets
 from app.services.chat_state import clear_ai_waiting, clear_finding_analysis_context, is_finding_analysis_active, set_ai_waiting
 
 logger = logging.getLogger(__name__)
@@ -17,6 +24,17 @@ def build_ask_text() -> str:
 async def ask_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
+
+    if is_assessment_chat_active(context):
+        state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
+        assessment_id = int(state.get(ACTIVE_ASSESSMENT_ID_KEY) or state.get("assessment_id"))
+        assessment = get_assessment(assessment_id)
+        if assessment is not None:
+            await update.message.reply_text(
+                build_assessment_chat_intro(assessment, list_assessment_targets(assessment_id)),
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
 
     if update.effective_user is not None:
         set_ai_waiting(update.effective_user.id)

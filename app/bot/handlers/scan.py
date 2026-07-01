@@ -642,6 +642,7 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     if query.data == "nav:home":
+        clear_assessment_flow_state(context)
         await query.edit_message_text(build_home_text())
         if query.message is not None:
             await query.message.reply_text(

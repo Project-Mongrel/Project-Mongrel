@@ -10,7 +10,9 @@ from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
 from app.bot.handlers.assessment import (
     ASSESSMENT_CHAT_STATE_KEY,
     ASSESSMENT_FLOW_STATE_KEY,
+    ACTIVE_ASSESSMENT_ID_KEY,
     assessment_callback_handler,
+    build_assessment_chat_intro,
     build_assessment_dashboard_keyboard,
     build_assessment_dashboard_text,
     build_assessment_history_text,
@@ -433,6 +435,7 @@ def test_assessment_history_callback_lists_recorded_scans() -> None:
 
 def test_assessment_ask_mongrel_starts_assessment_conversation() -> None:
     assessment = create_assessment("Assessment Chat")
+    target = add_assessment_target(assessment["id"], address="scanme.nmap.org")
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
         data=f"assessment:ask:{assessment['id']}",
@@ -446,8 +449,12 @@ def test_assessment_ask_mongrel_starts_assessment_conversation() -> None:
 
     query.answer.assert_called_once()
     query.edit_message_text.assert_not_called()
-    query_message.reply_text.assert_called_once_with("What would you like to ask about this assessment?")
+    query_message.reply_text.assert_called_once_with(build_assessment_chat_intro(assessment, [target]))
+    assert "Ask Mongrel anything. Cybersecurity is my specialty." not in query_message.reply_text.call_args.args[0]
+    assert "Assessment AI" in query_message.reply_text.call_args.args[0]
     assert context.user_data[ASSESSMENT_CHAT_STATE_KEY]["assessment_id"] == assessment["id"]
+    assert context.user_data[ASSESSMENT_CHAT_STATE_KEY][ACTIVE_ASSESSMENT_ID_KEY] == assessment["id"]
+    assert context.user_data[ASSESSMENT_CHAT_STATE_KEY]["assessment_chat"] is True
 
 
 def test_assessment_ask_mongrel_answers_with_assessment_evidence() -> None:
@@ -516,6 +523,74 @@ def test_assessment_ask_mongrel_exit_returns_to_normal_flow() -> None:
 
     assert ASSESSMENT_CHAT_STATE_KEY not in context.user_data
     assert message.reply_text.call_args.args[0] == "Exited assessment Ask Mongrel mode."
+
+
+def test_assessment_chat_exit_words_clear_state() -> None:
+    for word in ("Back", "Cancel"):
+        assessment = create_assessment(f"Assessment Chat Exit {word}")
+        context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"], ACTIVE_ASSESSMENT_ID_KEY: assessment["id"]}})
+        message = SimpleNamespace(text=word, reply_text=AsyncMock())
+
+        asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8137)), context))
+
+        assert ASSESSMENT_CHAT_STATE_KEY not in context.user_data
+        assert message.reply_text.call_args.args[0] == "Exited assessment Ask Mongrel mode."
+
+
+def test_assessment_dashboard_callback_exits_assessment_chat() -> None:
+    assessment = create_assessment("Assessment Dashboard Exit")
+    query = SimpleNamespace(
+        data=f"assessment:dashboard:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"], ACTIVE_ASSESSMENT_ID_KEY: assessment["id"]}})
+
+    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), context))
+
+    assert ASSESSMENT_CHAT_STATE_KEY not in context.user_data
+    assert "Assessment Dashboard" in query.edit_message_text.call_args.args[0]
+
+
+def test_ask_handler_preserves_assessment_chat_mode() -> None:
+    clear_ai_waiting(8138)
+    assessment = create_assessment("Assessment Ask Handler")
+    target = add_assessment_target(assessment["id"], address="example.com")
+    context = SimpleNamespace(
+        user_data={
+            ASSESSMENT_CHAT_STATE_KEY: {
+                "assessment_chat": True,
+                "assessment_id": assessment["id"],
+                ACTIVE_ASSESSMENT_ID_KEY: assessment["id"],
+            }
+        }
+    )
+    message = SimpleNamespace(text="Ask Mongrel", reply_text=AsyncMock())
+
+    asyncio.run(ask_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8138)), context))
+
+    assert is_ai_waiting(8138) is False
+    assert message.reply_text.call_args.args[0] == build_assessment_chat_intro(assessment, [target])
+    assert ASSESSMENT_CHAT_STATE_KEY in context.user_data
+
+
+def test_home_exits_assessment_chat_mode() -> None:
+    assessment = create_assessment("Assessment Home Exit")
+    context = SimpleNamespace(
+        user_data={
+            ASSESSMENT_CHAT_STATE_KEY: {
+                "assessment_chat": True,
+                "assessment_id": assessment["id"],
+                ACTIVE_ASSESSMENT_ID_KEY: assessment["id"],
+            }
+        }
+    )
+    message = SimpleNamespace(text="Home", reply_text=AsyncMock())
+
+    asyncio.run(home_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8139)), context))
+
+    assert ASSESSMENT_CHAT_STATE_KEY not in context.user_data
+    assert message.reply_text.call_args.args[0] == build_home_text()
 
 
 def test_assessment_markdown_report_callback_sends_report() -> None:
