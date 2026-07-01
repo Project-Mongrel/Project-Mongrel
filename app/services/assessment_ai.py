@@ -1,0 +1,221 @@
+from app.services.ai_client import ask_ai
+
+AI_UNAVAILABLE_MESSAGES = (
+    "AI integration is not configured yet.",
+    "Unsupported AI provider.",
+    "Ollama base URL is not configured.",
+    "AI request timed out.",
+    "Unable to connect to Ollama server.",
+    "AI request failed.",
+    "Malformed Ollama response.",
+    "Empty AI response.",
+    "Mongrel generated internal reasoning but no final answer.",
+)
+
+FALLBACK_ANSWER = "Assessment AI is unavailable. Review the assessment dashboard, scan history, and stored findings for next steps."
+FALLBACK_REPORT = (
+    "Assessment AI report unavailable. Review the assessment dashboard, scan history, and stored findings for next steps."
+)
+
+
+def answer_assessment_question(question: str, context: dict) -> str:
+    prompt = build_assessment_ai_prompt(question, context)
+    try:
+        response = ask_ai(prompt)
+    except Exception:
+        return FALLBACK_ANSWER
+
+    if _is_unavailable_response(response):
+        return FALLBACK_ANSWER
+
+    return str(response or "").strip() or FALLBACK_ANSWER
+
+
+def generate_assessment_ai_report(context: dict) -> str:
+    prompt = build_assessment_ai_report_prompt(context)
+    try:
+        response = ask_ai(prompt)
+    except Exception:
+        return FALLBACK_REPORT
+
+    if _is_unavailable_response(response):
+        return FALLBACK_REPORT
+
+    return str(response or "").strip() or FALLBACK_REPORT
+
+
+def build_assessment_ai_prompt(question: str, context: dict) -> str:
+    return "\n".join(
+        [
+            "You are Mongrel.",
+            "",
+            "You are analysing ONE authorised security assessment.",
+            "",
+            "Rules:",
+            "- Answer ONLY using evidence supplied.",
+            "- Never invent findings.",
+            "- Never assume vulnerabilities.",
+            "- Never claim exploitation.",
+            "- If evidence is missing, say so.",
+            "- If evidence is insufficient, recommend the next assessment step.",
+            "- Keep the answer concise and consultant-focused.",
+            "- Do not use evidence from other assessments.",
+            "",
+            "Assessment Evidence:",
+            _format_assessment_context(context),
+            "",
+            "User question:",
+            str(question or "").strip(),
+            "",
+            "Answer:",
+        ]
+    )
+
+
+def build_assessment_ai_report_prompt(context: dict) -> str:
+    return "\n".join(
+        [
+            "You are Mongrel.",
+            "",
+            "You are preparing a professional AI Assessment Report for ONE authorised security assessment.",
+            "",
+            "Rules:",
+            "- Evidence-only.",
+            "- Answer ONLY using evidence supplied.",
+            "- Never invent vulnerabilities.",
+            "- Never invent findings.",
+            "- Never assume vulnerabilities.",
+            "- Never claim exploitation.",
+            '- Never state a target is "safe".',
+            "- If evidence is missing, explain what has not yet been assessed.",
+            "- Base conclusions only on Nmap, BBOT, Nuclei, assessment history, artifacts, and notes in the supplied context.",
+            "- Keep the report concise and consultant-focused.",
+            "- Return final answer only.",
+            "",
+            "Required report structure:",
+            "✦ Assessment AI Report",
+            "Executive Summary",
+            "Assessment Overview",
+            "Completed Activities",
+            "Observed Assets",
+            "Key Findings",
+            "Potential Risks",
+            "Recommended Next Actions",
+            "Confidence",
+            "Evidence Limitations",
+            "",
+            "Assessment Evidence:",
+            _format_assessment_context(context),
+            "",
+            "Report:",
+        ]
+    )
+
+
+def _format_assessment_context(context: dict) -> str:
+    assessment = context.get("assessment") or {}
+    lines = [
+        f"- Assessment name: {_clean(assessment.get('name') or 'unknown')}",
+        f"- Assessment status: {_clean(assessment.get('status') or 'unknown')}",
+    ]
+    if assessment.get("description"):
+        lines.append(f"- Description: {_clean(assessment['description'])}")
+
+    targets = context.get("targets") or []
+    if targets:
+        lines.append("- Targets:")
+        for target in targets[:10]:
+            lines.append(f"  - {_clean(target.get('address') or 'unknown')} type={_clean(target.get('target_type') or 'unknown')}")
+    else:
+        lines.append("- Targets: none supplied")
+
+    scans = context.get("scans") or []
+    if scans:
+        lines.append("- Scan history:")
+        for scan in scans[:20]:
+            lines.append(_format_scan(scan))
+    else:
+        lines.append("- Scan history: no scans recorded")
+
+    findings = context.get("findings") or []
+    if findings:
+        lines.append("- Stored findings:")
+        for finding in findings[:20]:
+            lines.extend(_format_finding(finding))
+    else:
+        lines.append("- Stored findings: none linked")
+
+    artifacts = context.get("artifacts") or []
+    if artifacts:
+        lines.append("- Artifacts:")
+        for artifact in artifacts[:20]:
+            lines.append(
+                f"  - {_clean(artifact.get('artifact_type') or 'artifact')} title={_clean(artifact.get('title') or 'untitled')} "
+                f"content={_clean(artifact.get('content') or '')}"
+            )
+    else:
+        lines.append("- Artifacts: none recorded")
+
+    notes = context.get("notes") or []
+    if notes:
+        lines.append("- Notes:")
+        for note in notes[:20]:
+            lines.append(f"  - {_clean(note.get('note_type') or 'manual')}: {_clean(note.get('content') or '')}")
+    else:
+        lines.append("- Notes: none recorded")
+
+    return "\n".join(lines)
+
+
+def _format_scan(scan: dict) -> str:
+    parts = [
+        f"  - tool={_clean(scan.get('tool') or 'unknown')}",
+        f"status={_clean(scan.get('status') or 'unknown')}",
+    ]
+    if scan.get("risk"):
+        parts.append(f"risk={_clean(scan['risk'])}")
+    if scan.get("elapsed_seconds") is not None:
+        parts.append(f"elapsed={scan['elapsed_seconds']}s")
+    if scan.get("finding_id"):
+        parts.append(f"finding_id={_clean(scan['finding_id'])}")
+    return " ".join(parts)
+
+
+def _format_finding(finding: dict) -> list[str]:
+    lines = [
+        f"  - tool={_clean(finding.get('source') or 'unknown')} target={_clean(finding.get('target') or 'unknown')} "
+        f"risk={_clean(finding.get('risk_level') or 'unknown')} summary={_clean(finding.get('summary') or '')}"
+    ]
+    open_ports = finding.get("open_ports") or []
+    if open_ports:
+        lines.append("    Open ports:")
+        for open_port in open_ports[:20]:
+            lines.append(
+                f"    - {_clean(open_port.get('port') or 'unknown')}/{_clean(open_port.get('protocol') or 'tcp')} "
+                f"{_clean(open_port.get('service') or 'unknown')}"
+            )
+    nuclei_findings = finding.get("nuclei_findings") or []
+    if nuclei_findings:
+        lines.append("    Nuclei findings:")
+        for item in nuclei_findings[:20]:
+            lines.append(
+                f"    - {_clean(item.get('template_id') or item.get('name') or 'finding')} "
+                f"severity={_clean(item.get('severity') or 'unknown')} "
+                f"matched={_clean(item.get('matched_at') or item.get('host') or 'unknown')}"
+            )
+    observation_counts = finding.get("observation_counts") or {}
+    if observation_counts:
+        lines.append(
+            "    Observation counts: "
+            + ", ".join(f"{_clean(key)}={int(value or 0)}" for key, value in sorted(observation_counts.items()))
+        )
+    return lines
+
+
+def _clean(value: object) -> str:
+    return str(value or "").replace("\n", " ").strip()[:700]
+
+
+def _is_unavailable_response(response: object) -> bool:
+    text = str(response or "").strip()
+    return not text or any(text.startswith(message) for message in AI_UNAVAILABLE_MESSAGES)

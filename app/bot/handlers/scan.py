@@ -8,10 +8,12 @@ from telegram.ext import ContextTypes
 from app.bot.handlers.home import build_home_text
 from app.bot.handlers.assessment import (
     ASSESSMENT_SCAN_CONTEXT_KEY,
+    assessment_chat_text_handler,
     assessment_text_handler,
     build_assessment_dashboard_keyboard,
     build_assessment_dashboard_text,
     clear_assessment_flow_state,
+    is_assessment_chat_active,
     is_assessment_flow_active,
 )
 from app.bot.handlers.findings import build_finding_followup_ai_prompt
@@ -715,6 +717,11 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         await update.message.reply_text(ai_response)
         return
+
+    if is_assessment_chat_active(context):
+        handled = await assessment_chat_text_handler(update, context)
+        if handled:
+            return
 
     if update.message.text in MAIN_MENU_BUTTONS:
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)

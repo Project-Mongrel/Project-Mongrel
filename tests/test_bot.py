@@ -8,6 +8,7 @@ from telegram.error import TimedOut
 from app.bot.auth import is_admin
 from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
 from app.bot.handlers.assessment import (
+    ASSESSMENT_CHAT_STATE_KEY,
     ASSESSMENT_FLOW_STATE_KEY,
     assessment_callback_handler,
     build_assessment_dashboard_keyboard,
@@ -430,33 +431,160 @@ def test_assessment_history_callback_lists_recorded_scans() -> None:
     assert keyboard.inline_keyboard[0][0].text == "Back to Assessment"
 
 
-def test_assessment_placeholder_actions_are_safe() -> None:
-    assessment = create_assessment("Placeholder Assessment")
-    add_assessment_target(assessment["id"], address="example.com")
-    for action, expected in [
-        ("ask", "Coming next: Ask Mongrel."),
-        ("ai_report", "Coming next: Generate AI Report."),
-        ("markdown", "Coming next: Markdown Report."),
-    ]:
-        query_message = SimpleNamespace(reply_text=AsyncMock())
-        query = SimpleNamespace(
-            data=f"assessment:{action}:{assessment['id']}",
-            answer=AsyncMock(),
-            edit_message_text=AsyncMock(),
-            message=query_message,
-        )
-
-        asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), SimpleNamespace(user_data={})))
-
-        query.answer.assert_called_once()
-        query.edit_message_text.assert_not_called()
-        query_message.reply_text.assert_called_once_with(expected)
-
-
-def test_assessment_placeholder_actions_edit_when_message_missing() -> None:
-    assessment = create_assessment("Placeholder Fallback Assessment")
+def test_assessment_ask_mongrel_starts_assessment_conversation() -> None:
+    assessment = create_assessment("Assessment Chat")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
         data=f"assessment:ask:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), context))
+
+    query.answer.assert_called_once()
+    query.edit_message_text.assert_not_called()
+    query_message.reply_text.assert_called_once_with("What would you like to ask about this assessment?")
+    assert context.user_data[ASSESSMENT_CHAT_STATE_KEY]["assessment_id"] == assessment["id"]
+
+
+def test_assessment_ask_mongrel_answers_with_assessment_evidence() -> None:
+    clear_user_findings(8130)
+    assessment = create_assessment("Assessment Chat Evidence")
+    target = add_assessment_target(assessment["id"], address="scanme.nmap.org")
+    finding = add_finding(
+        user_id=8130,
+        finding={
+            "source": "nmap",
+            "target": "scanme.nmap.org",
+            "risk_level": "medium",
+            "summary": "SSH observed.",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", target_id=target["id"], finding_id=finding["id"])
+    context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"]}})
+    message = SimpleNamespace(text="What ports are open?", reply_text=AsyncMock())
+
+    with patch("app.services.assessment_ai.ask_ai", return_value="Observed evidence shows 22/tcp ssh."):
+        asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8130)), context))
+
+    assert message.reply_text.call_args_list[0].args[0] == "Reviewing assessment evidence..."
+    assert message.reply_text.call_args_list[1].args[0] == "Observed evidence shows 22/tcp ssh."
+    assert ASSESSMENT_CHAT_STATE_KEY in context.user_data
+
+
+def test_assessment_ask_mongrel_exit_returns_to_normal_flow() -> None:
+    assessment = create_assessment("Assessment Chat Exit")
+    context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"]}})
+    message = SimpleNamespace(text="Cancel", reply_text=AsyncMock())
+
+    asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8131)), context))
+
+    assert ASSESSMENT_CHAT_STATE_KEY not in context.user_data
+    assert message.reply_text.call_args.args[0] == "Exited assessment Ask Mongrel mode."
+
+
+def test_assessment_markdown_report_callback_sends_report() -> None:
+    clear_user_findings(8134)
+    assessment = create_assessment("Markdown Assessment")
+    add_assessment_target(assessment["id"], address="example.com")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:markdown:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    asyncio.run(
+        assessment_callback_handler(
+            SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8134)),
+            SimpleNamespace(user_data={}),
+        )
+    )
+
+    query.answer.assert_called_once()
+    query.edit_message_text.assert_not_called()
+    report = query_message.reply_text.call_args.args[0]
+    assert report.startswith("# Assessment Report")
+    assert "Markdown Assessment" in report
+    assert "## Evidence Limitations" in report
+
+
+def test_assessment_ai_report_callback_sends_assessment_report() -> None:
+    clear_user_findings(8132)
+    assessment = create_assessment("Assessment AI Report")
+    target = add_assessment_target(assessment["id"], address="scanme.nmap.org")
+    finding = add_finding(
+        user_id=8132,
+        finding={
+            "source": "nmap",
+            "target": "scanme.nmap.org",
+            "risk_level": "medium",
+            "summary": "SSH observed.",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        },
+    )
+    record_assessment_scan(
+        assessment["id"],
+        tool="nmap",
+        status="completed",
+        target_id=target["id"],
+        finding_id=finding["id"],
+        risk="medium",
+    )
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:ai_report:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    response = "✦ Assessment AI Report\n\nExecutive Summary\nSSH observed."
+    with patch("app.services.assessment_ai.ask_ai", return_value=response):
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8132)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    query.answer.assert_called_once()
+    query.edit_message_text.assert_not_called()
+    query_message.reply_text.assert_called_once_with(response)
+
+
+def test_assessment_ai_report_callback_returns_fallback_when_ai_unavailable() -> None:
+    assessment = create_assessment("Assessment AI Report Fallback")
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:ai_report:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    with patch("app.services.assessment_ai.ask_ai", return_value="AI request timed out."):
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8133)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    query.answer.assert_called_once()
+    query.edit_message_text.assert_not_called()
+    assert "Assessment AI report unavailable." in query_message.reply_text.call_args.args[0]
+
+
+def test_assessment_markdown_report_callback_edits_when_message_missing() -> None:
+    assessment = create_assessment("Placeholder Fallback Assessment")
+    query = SimpleNamespace(
+        data=f"assessment:markdown:{assessment['id']}",
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
         message=None,
@@ -465,7 +593,8 @@ def test_assessment_placeholder_actions_edit_when_message_missing() -> None:
     asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), SimpleNamespace(user_data={})))
 
     query.answer.assert_called_once()
-    query.edit_message_text.assert_called_once_with("Coming next: Ask Mongrel.")
+    query.edit_message_text.assert_called_once()
+    assert query.edit_message_text.call_args.args[0].startswith("# Assessment Report")
 
 
 def test_reports_menu_renders() -> None:

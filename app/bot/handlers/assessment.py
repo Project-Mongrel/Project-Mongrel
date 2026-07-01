@@ -9,9 +9,13 @@ from app.services.assessment_store import (
     list_assessment_scans,
     list_assessment_targets,
 )
+from app.services.assessment_ai import FALLBACK_REPORT, answer_assessment_question, generate_assessment_ai_report
+from app.services.assessment_context import build_assessment_context
+from app.services.assessment_markdown_report import generate_assessment_markdown_report
 from app.services.icon_helper import icon_label, section_label
 
 ASSESSMENT_FLOW_STATE_KEY = "assessment_flow_state"
+ASSESSMENT_CHAT_STATE_KEY = "assessment_chat_state"
 ASSESSMENT_SCAN_CONTEXT_KEY = "assessment_scan_context"
 ASSESSMENT_STAGE_NAME = "awaiting_name"
 ASSESSMENT_STAGE_TARGET = "awaiting_target"
@@ -145,6 +149,12 @@ def clear_assessment_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     user_data = getattr(context, "user_data", None)
     if isinstance(user_data, dict):
         user_data.pop(ASSESSMENT_FLOW_STATE_KEY, None)
+        user_data.pop(ASSESSMENT_CHAT_STATE_KEY, None)
+
+
+def is_assessment_chat_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_data = getattr(context, "user_data", None)
+    return bool(isinstance(user_data, dict) and user_data.get(ASSESSMENT_CHAT_STATE_KEY))
 
 
 async def new_assessment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -189,6 +199,35 @@ async def assessment_text_handler(update: Update, context: ContextTypes.DEFAULT_
     return False
 
 
+async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if update.message is None:
+        return False
+
+    state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
+    if not isinstance(state, dict):
+        return False
+
+    text = str(update.message.text or "").strip()
+    if text.lower() in {"home", "back", "cancel"}:
+        context.user_data.pop(ASSESSMENT_CHAT_STATE_KEY, None)
+        await update.message.reply_text("Exited assessment Ask Mongrel mode.", reply_markup=build_main_menu_keyboard())
+        return True
+    if not text:
+        await update.message.reply_text("Please send a question about this assessment.")
+        return True
+
+    assessment_id = int(state["assessment_id"])
+    user_id = update.effective_user.id if update.effective_user is not None else 0
+    await update.message.reply_text("Reviewing assessment evidence...")
+    try:
+        assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
+        answer = answer_assessment_question(text, assessment_context)
+    except Exception:
+        answer = "Assessment AI is unavailable. Review the assessment dashboard, scan history, and stored findings for next steps."
+    await update.message.reply_text(answer)
+    return True
+
+
 async def assessment_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -231,18 +270,47 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         )
         return
 
-    if action in {"ask", "ai_report", "markdown"}:
-        placeholders = {
-            "ask": "Coming next: Ask Mongrel.",
-            "ai_report": "Coming next: Generate AI Report.",
-            "markdown": "Coming next: Markdown Report.",
-        }
+    if action == "ask":
+        context.user_data[ASSESSMENT_CHAT_STATE_KEY] = {"assessment_id": assessment_id}
         message = getattr(query, "message", None)
         reply_text = getattr(message, "reply_text", None)
+        prompt = "What would you like to ask about this assessment?"
         if reply_text is not None:
-            await reply_text(placeholders[action])
+            await reply_text(prompt)
         else:
-            await query.edit_message_text(placeholders[action])
+            await query.edit_message_text(prompt)
+        return
+
+    if action == "ai_report":
+        effective_user = getattr(update, "effective_user", None)
+        user_id = effective_user.id if effective_user is not None else 0
+        message = getattr(query, "message", None)
+        reply_text = getattr(message, "reply_text", None)
+        try:
+            assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
+            report = generate_assessment_ai_report(assessment_context)
+        except Exception:
+            report = FALLBACK_REPORT
+        if reply_text is not None:
+            await reply_text(report)
+        else:
+            await query.edit_message_text(report)
+        return
+
+    if action == "markdown":
+        effective_user = getattr(update, "effective_user", None)
+        user_id = effective_user.id if effective_user is not None else 0
+        message = getattr(query, "message", None)
+        reply_text = getattr(message, "reply_text", None)
+        assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
+        report = generate_assessment_markdown_report(assessment_context)
+        from app.bot.handlers.reports import split_report_text
+
+        if reply_text is not None:
+            for chunk in split_report_text(report):
+                await reply_text(chunk)
+        else:
+            await query.edit_message_text(split_report_text(report)[0])
         return
 
     if action != "run" or len(parts) != 4:
