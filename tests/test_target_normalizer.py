@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.target_normalizer import normalize_for_bbot, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
+from app.services.target_normalizer import normalize_for_bbot, normalize_for_httpx, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
 
 
 def test_none_or_empty_target_returns_none() -> None:
@@ -69,19 +69,31 @@ def test_normalize_for_nuclei(raw_target: str, expected_target: str) -> None:
     assert normalize_for_nuclei(raw_target) == expected_target
 
 
-@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei])
+@pytest.mark.parametrize(
+    ("raw_target", "expected_target"),
+    [
+        ("scanme.nmap.org", "https://scanme.nmap.org"),
+        ("https://scanme.nmap.org", "https://scanme.nmap.org"),
+        ("http://example.com/path?x=1", "http://example.com/path?x=1"),
+    ],
+)
+def test_normalize_for_httpx(raw_target: str, expected_target: str) -> None:
+    assert normalize_for_httpx(raw_target) == expected_target
+
+
+@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx])
 def test_unsupported_scheme_rejected(normalizer: object) -> None:
     with pytest.raises(ValueError, match="valid http or https URL or hostname"):
         normalizer("ftp://example.com")
 
 
-@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei])
+@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx])
 def test_empty_input_rejected(normalizer: object) -> None:
     with pytest.raises(ValueError, match="cannot be empty"):
         normalizer("   ")
 
 
-@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei])
+@pytest.mark.parametrize("normalizer", [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx])
 def test_malformed_input_rejected(normalizer: object) -> None:
     with pytest.raises(ValueError, match="malformed|valid http or https"):
         normalizer("https:///scanme.nmap.org")

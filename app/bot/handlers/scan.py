@@ -22,6 +22,7 @@ from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edi
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
 from app.bot.handlers.reports import split_report_text
+from app.parsers.httpx_parser import parse_httpx_output, summarize_httpx_services
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import (
@@ -59,11 +60,14 @@ from app.services.nmap_ai_assessment import FALLBACK_LINES as NMAP_AI_FALLBACK_L
 from app.services.nmap_ai_assessment import generate_nmap_ai_assessment
 from app.services.nuclei_ai_assessment import FALLBACK_LINES as NUCLEI_AI_FALLBACK_LINES
 from app.services.nuclei_ai_assessment import generate_nuclei_ai_assessment
+from app.services.httpx_ai_assessment import FALLBACK_LINES as HTTPX_AI_FALLBACK_LINES
+from app.services.httpx_ai_assessment import generate_httpx_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
-from app.services.target_normalizer import normalize_for_bbot, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
+from app.services.target_normalizer import normalize_for_bbot, normalize_for_httpx, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
+from app.tools.httpx_runner import run_httpx_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
 from app.ui.ai_summary import render_ai_summary_card
 from app.ui.scan_progress import ScanProgressCard, render_scan_loading_card
@@ -120,6 +124,18 @@ def build_bbot_target_prompt() -> str:
             "",
             "Examples:",
             "scanme.nmap.org",
+            "example.com",
+        ]
+    )
+
+
+def build_httpx_target_prompt() -> str:
+    return "\n".join(
+        [
+            "httpx fingerprint request created. Send the authorized HTTP target URL or hostname.",
+            "",
+            "Examples:",
+            "https://example.com",
             "example.com",
         ]
     )
@@ -261,6 +277,85 @@ def build_bbot_result_text(
         summary=output,
         findings=_bbot_result_findings_from_counts(counts),
         assets=_bbot_result_assets_from_counts(counts),
+    )
+
+
+def build_httpx_result_text(result: dict[str, object], services: list[dict] | None = None) -> str:
+    services = services or []
+    summary = summarize_httpx_services(services)
+    limitations = []
+    if result.get("success") is not True:
+        limitations.append(str(result.get("error") or "httpx did not complete successfully."))
+    if not services:
+        limitations.append("No structured httpx JSON observations were stored.")
+    status_codes = summary.get("status_codes") or {}
+    titles = [
+        f"{service.get('url') or service.get('host')}: {service.get('title')}"
+        for service in services
+        if service.get("title")
+    ]
+    technologies = [str(value) for value in summary.get("technologies") or []]
+    redirects = [
+        f"{service.get('url') or service.get('host')} -> {service.get('redirect_location') or service.get('final_url')}"
+        for service in services
+        if service.get("redirect_location") or service.get("final_url")
+    ]
+    findings = [
+        f"HTTP services/URLs observed: {summary.get('service_count', 0)}",
+        "Status codes: " + (", ".join(f"{code}: {count}" for code, count in sorted(status_codes.items())) if status_codes else "none"),
+    ]
+    if titles:
+        findings.append("Titles: " + "; ".join(titles[:3]))
+    if technologies:
+        findings.append("Technologies: " + ", ".join(technologies[:8]))
+    if redirects:
+        findings.append("Redirects: " + "; ".join(redirects[:3]))
+    if limitations:
+        findings.append("Limitations: " + " ".join(limitations))
+    return render_scan_result_card(
+        tool_name="httpx",
+        target=str(result.get("target") or "unknown"),
+        status="Complete" if result.get("success") is True else "Failed",
+        elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+        risk="INFO" if result.get("success") is True else None,
+        summary=f"{summary.get('service_count', 0)} HTTP service/URL observation(s) recorded.",
+        findings=findings,
+        assets=[str(service.get("url") or service.get("host")) for service in services if service.get("url") or service.get("host")],
+    )
+
+
+def store_httpx_scan_result(user_id: int, result: dict[str, object], services: list[dict] | None = None) -> dict:
+    services = services or []
+    status = "completed" if result.get("success") is True else "failed"
+    summary = summarize_httpx_services(services)
+    if result.get("success") is True:
+        finding_summary = f"httpx observed {len(services)} HTTP service/URL record(s)."
+    else:
+        finding_summary = str(result.get("error") or "httpx fingerprinting failed.")
+    target = str(result.get("target") or "")
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "httpx",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "status": status,
+            "summary": finding_summary,
+            "risk_level": "info" if result.get("success") is True else "unknown",
+            "finding_count": len(services),
+            "raw_output": str(result.get("output") or ""),
+            "httpx_services": services,
+            "httpx_summary": summary,
+            "metadata": {
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "command": result.get("command"),
+                "working_directory": result.get("working_directory"),
+                "error": result.get("error"),
+                "error_type": result.get("error_type"),
+                "parser": "jsonl",
+            },
+        },
     )
 
 
@@ -699,6 +794,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_bbot_target_prompt())
         return
 
+    if scan_type == "httpx":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_httpx_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -776,6 +877,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if scan_request.scan_type == "bbot":
         await _handle_bbot_target(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type == "httpx":
+        await _handle_httpx_target(update, context, user_id, scan_request_id)
         return
 
     if scan_request.scan_type != "nmap":
@@ -873,6 +978,101 @@ async def _send_nuclei_ai_assessment(message: object, finding: dict) -> None:
     assessment_text = render_ai_summary_card(assessment_lines, title="Nuclei AI Assessment")
     for chunk in split_report_text(assessment_text):
         await message.reply_text(chunk)
+
+
+async def _send_httpx_ai_assessment(message: object, finding: dict) -> None:
+    progress_message = await message.reply_text("Generating httpx AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_httpx_ai_assessment, finding)
+    if assessment_lines == HTTPX_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "httpx AI assessment unavailable.", context="httpx AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="httpx AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="httpx AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
+async def _handle_httpx_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    target = update.message.text or ""
+    try:
+        display_target = normalize_for_httpx(target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid httpx target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=display_target,
+        event_type="httpx_scan_started",
+        tool="httpx",
+        status="started",
+        summary="httpx fingerprinting started",
+    )
+    progress_card = ScanProgressCard(update.message, "httpx Scan", display_target)
+    await progress_card.start("Launching scan...")
+
+    try:
+        result = await asyncio.to_thread(run_httpx_scan, target)
+    except ValueError as exc:
+        await progress_card.fail(str(exc))
+        add_investigation_event(
+            investigation_id=investigation["id"],
+            user_id=user_id,
+            target=display_target,
+            event_type="httpx_scan_failed",
+            tool="httpx",
+            status="failed",
+            summary="httpx fingerprinting failed",
+        )
+        await update.message.reply_text(f"Invalid httpx target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result["target"]),
+        result=result,
+    )
+    services = parse_httpx_output(str(result.get("output") or "")) if result.get("output") else []
+    finding = store_httpx_scan_result(user_id=user_id, result=result, services=services)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=str(result["target"]),
+        event_type="httpx_scan_completed" if result.get("success") is True else "httpx_scan_failed",
+        tool="httpx",
+        status="completed" if result.get("success") is True else "failed",
+        summary="httpx fingerprinting completed" if result.get("success") is True else "httpx fingerprinting failed",
+        metadata={"finding_id": finding.get("id"), "service_count": len(services)},
+    )
+    assessment_context = _pop_assessment_scan_context(context, "httpx")
+    _record_assessment_scan(assessment_context, tool="httpx", result=result, finding=finding)
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
+    await update.message.reply_text(
+        build_httpx_result_text(result, services),
+        reply_markup=build_scan_result_actions(finding.get("id"), "httpx") if result.get("success") is True else None,
+    )
+    if result.get("success") is True:
+        await _send_httpx_ai_assessment(update.message, finding)
+    await _send_assessment_dashboard(update.message, assessment_context)
 
 
 async def _handle_bbot_target(

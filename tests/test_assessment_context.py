@@ -56,3 +56,41 @@ def test_assessment_context_collects_assessment_evidence() -> None:
     assert context["findings"][0]["open_ports"][0]["service"] == "ssh"
     assert context["artifacts"] == [artifact]
     assert context["notes"] == [note]
+
+
+def test_assessment_context_includes_httpx_evidence_when_present() -> None:
+    assessment = create_assessment("httpx Context")
+    target = add_assessment_target(assessment["id"], address="example.com", target_type="hostname")
+    finding = add_finding(
+        user_id=8101,
+        finding={
+            "source": "httpx",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "status": "completed",
+            "summary": "httpx observed one HTTP service.",
+            "httpx_services": [
+                {
+                    "url": "https://example.com",
+                    "status_code": 200,
+                    "title": "Example",
+                    "web_server": "nginx",
+                    "technologies": ["React"],
+                }
+            ],
+        },
+    )
+    record_assessment_scan(
+        assessment["id"],
+        tool="httpx",
+        status="completed",
+        target_id=target["id"],
+        finding_id=finding["id"],
+        risk="info",
+    )
+
+    context = build_assessment_context(assessment["id"], user_id=8101)
+
+    assert context["scans"][0]["tool"] == "httpx"
+    assert context["scans"][0]["finding"]["httpx_services"][0]["title"] == "Example"
+    assert context["findings"][0]["source"] == "httpx"

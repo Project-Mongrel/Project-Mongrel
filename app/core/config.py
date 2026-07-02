@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     nuclei_rate_limit: int = 25
     nuclei_request_timeout: int = 5
     nuclei_retries: int = 1
+    httpx_path: str = "httpx"
+    httpx_scan_timeout_seconds: int = 120
 
 
 @lru_cache

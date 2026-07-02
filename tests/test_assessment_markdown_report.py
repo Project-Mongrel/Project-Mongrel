@@ -160,3 +160,65 @@ def test_assessment_markdown_report_includes_partial_bbot_evidence() -> None:
     assert "Partial reconnaissance observations collected." in report
     assert "BBOT Partial - Risk: INFO" in report
     assert "- BBOT: 2 reconnaissance observation(s) recorded." in report
+
+
+def test_assessment_markdown_report_includes_httpx_section() -> None:
+    report = generate_assessment_markdown_report(
+        {
+            "assessment": {
+                "name": "httpx Assessment",
+                "status": "active",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "updated_at": datetime(2026, 1, 2, tzinfo=UTC),
+            },
+            "targets": [{"address": "example.com"}],
+            "scans": [
+                {
+                    "tool": "httpx",
+                    "status": "completed",
+                    "risk": "info",
+                    "completed_at": datetime(2026, 1, 1, 12, tzinfo=UTC),
+                    "finding": {
+                        "summary": "httpx observed two HTTP services.",
+                        "target": "https://example.com",
+                        "risk_level": "info",
+                        "httpx_services": [
+                            {
+                                "url": "https://example.com",
+                                "status_code": 301,
+                                "title": "Example",
+                                "web_server": "nginx",
+                                "technologies": ["nginx"],
+                                "redirect_location": "https://www.example.com",
+                            },
+                            {
+                                "url": "https://www.example.com",
+                                "status_code": 200,
+                                "title": "Home",
+                                "technologies": ["React"],
+                                "tls": {"probe": True},
+                            },
+                        ],
+                    },
+                }
+            ],
+            "findings": [
+                {
+                    "target": "https://example.com",
+                    "httpx_services": [
+                        {"url": "https://example.com", "status_code": 301, "title": "Example", "technologies": ["nginx"]},
+                        {"url": "https://www.example.com", "status_code": 200, "title": "Home", "technologies": ["React"]},
+                    ],
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        }
+    )
+
+    assert "### httpx" in report
+    assert "Scan status\nCompleted" in report
+    assert "https://example.com status=301 title=Example server=nginx technologies=nginx redirect=https://www.example.com" in report
+    assert "Technologies\n- nginx\n- React" in report
+    assert "- httpx: 2 HTTP service/URL observation(s) recorded." in report
+    assert "- Validate observed HTTP services, redirects, page titles, and technology fingerprints against intended exposure." in report

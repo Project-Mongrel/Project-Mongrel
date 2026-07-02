@@ -50,6 +50,8 @@ from app.bot.handlers.scan import (
     build_bbot_ai_assessment_keyboard,
     build_bbot_result_text,
     build_bbot_target_prompt,
+    build_httpx_result_text,
+    build_httpx_target_prompt,
     build_clean_nuclei_verdict_text,
     build_nuclei_status_card,
     build_nuclei_target_prompt,
@@ -62,6 +64,7 @@ from app.bot.handlers.scan import (
     scan_target_handler,
     store_clean_nuclei_scan,
     store_bbot_scan_result,
+    store_httpx_scan_result,
     store_successful_nmap_finding,
 )
 from app.bot.handlers.settings import build_settings_text
@@ -195,10 +198,12 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "Nmap: Completed" in dashboard
     assert "BBOT: Not run" in dashboard
     assert "Nuclei: Not run" in dashboard
+    assert "httpx: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
         "Run Nuclei",
+        "Run httpx",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",
@@ -1389,6 +1394,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "Nmap Scan" in rendered_buttons
     assert "Nuclei Scan" in rendered_buttons
     assert "BBOT Recon" in rendered_buttons
+    assert "httpx Fingerprint" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -1413,6 +1419,58 @@ def test_bbot_scan_callback_prompts_for_target() -> None:
 
     assert query.edit_message_text.call_args.args[0] == build_bbot_target_prompt()
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_httpx_scan_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7203)
+    query = SimpleNamespace(data="scan:httpx", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7203))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_httpx_target_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
+    result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": '{"url":"raw"}'}
+    services = [
+        {
+            "url": "https://example.com",
+            "status_code": 301,
+            "title": "Example",
+            "technologies": ["nginx"],
+            "redirect_location": "https://www.example.com",
+        },
+        {"url": "https://www.example.com", "status_code": 200, "title": "Home", "technologies": ["React"]},
+    ]
+
+    card = build_httpx_result_text(result, services)
+
+    assert "httpx Scan Complete" in card
+    assert "HTTP services/URLs observed: 2" in card
+    assert "Status codes: 200: 1, 301: 1" in card
+    assert "Titles: https://example.com: Example" in card
+    assert "Technologies: nginx, React" in card
+    assert "Redirects: https://example.com -> https://www.example.com" in card
+    assert '{"url":"raw"}' not in card
+
+
+def test_store_httpx_scan_result_persists_structured_evidence() -> None:
+    clear_user_findings(7204)
+    services = [{"url": "https://example.com", "status_code": 200, "title": "Example", "technologies": ["nginx"]}]
+
+    finding = store_httpx_scan_result(
+        user_id=7204,
+        result={"success": True, "target": "https://example.com", "output": "{}", "elapsed_seconds": 1, "returncode": 0},
+        services=services,
+    )
+
+    stored = get_user_findings(7204)[0]
+    assert finding["source"] == "httpx"
+    assert stored["httpx_services"] == services
+    assert stored["httpx_summary"]["status_codes"] == {"200": 1}
 
 
 def test_successful_bbot_scan_creates_events_and_stores_result() -> None:

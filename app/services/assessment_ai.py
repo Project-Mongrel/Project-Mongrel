@@ -101,7 +101,7 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Never imply a clean Nuclei scan means the target is secure.",
             "- If evidence is missing, explain what has not yet been assessed.",
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
-            "- Base conclusions only on Nmap, BBOT, Nuclei, assessment history, artifacts, and notes in the supplied context.",
+            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, assessment history, artifacts, and notes in the supplied context.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
             "",
@@ -156,7 +156,7 @@ def _format_assessment_context(context: dict) -> str:
                 if str(scan.get("status") or "").lower() in {"completed", "partial"}
             }
         )
-        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei") if tool not in represented_tools]
+        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx") if tool not in represented_tools]
         lines.append("- Represented tools:")
         lines.append("  - " + (", ".join(represented_tools) if represented_tools else "none"))
         lines.append("- Missing or not represented:")
@@ -236,6 +236,23 @@ def _format_finding(finding: dict) -> list[str]:
             "    Observation counts: "
             + ", ".join(f"{_clean(key)}={int(value or 0)}" for key, value in sorted(observation_counts.items()))
         )
+    httpx_services = finding.get("httpx_services") or []
+    if httpx_services:
+        lines.append("    httpx services:")
+        for service in httpx_services[:20]:
+            parts = [
+                f"url={_clean(service.get('url') or service.get('host') or 'unknown')}",
+                f"status={_clean(service.get('status_code') or 'unknown')}",
+            ]
+            if service.get("title"):
+                parts.append(f"title={_clean(service.get('title'))}")
+            if service.get("web_server"):
+                parts.append(f"server={_clean(service.get('web_server'))}")
+            if service.get("technologies"):
+                parts.append("tech=" + ", ".join(_clean(value) for value in service.get("technologies")[:8]))
+            if service.get("redirect_location") or service.get("final_url"):
+                parts.append(f"redirect={_clean(service.get('redirect_location') or service.get('final_url'))}")
+            lines.append("    - " + " ".join(parts))
     return lines
 
 

@@ -117,7 +117,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
-    for tool in ("nmap", "bbot", "nuclei"):
+    for tool in ("nmap", "bbot", "nuclei", "httpx"):
         tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
         if not tool_scans:
             continue
@@ -126,6 +126,9 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         lines.extend(
             [
                 f"### {_tool_label(tool)}",
+                "",
+                "Scan status",
+                str(latest.get("status") or "unknown").title(),
                 "",
                 "Summary",
                 _scan_summary(latest),
@@ -170,11 +173,14 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         open_ports = finding.get("open_ports") or []
         nuclei_findings = finding.get("nuclei_findings") or []
         observation_counts = finding.get("observation_counts") or {}
+        httpx_services = finding.get("httpx_services") or {}
 
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
         elif nuclei_findings:
             lines.append(f"- {tool}: {len(nuclei_findings)} matched finding(s) observed.")
+        elif httpx_services:
+            lines.append(f"- {tool}: {len(httpx_services)} HTTP service/URL observation(s) recorded.")
         elif observation_counts:
             total = sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
@@ -211,6 +217,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     services = {str(port.get("service") or "").lower() for port in open_ports}
     nuclei_findings = [item for finding in findings for item in (finding.get("nuclei_findings") or [])]
     observation_counts = [finding.get("observation_counts") or {} for finding in findings]
+    httpx_services = [service for finding in findings for service in (finding.get("httpx_services") or [])]
 
     if open_ports:
         actions.append("- Validate externally exposed services and confirm each service is authorized.")
@@ -224,6 +231,8 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
         actions.append("- Review discovered domains and URLs for unexpected internet-facing exposure.")
     if any(counts.get("technology") for counts in observation_counts):
         actions.append("- Review detected technologies and versions against current advisories.")
+    if httpx_services:
+        actions.append("- Validate observed HTTP services, redirects, page titles, and technology fingerprints against intended exposure.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -248,6 +257,9 @@ def _scan_summary(scan: dict) -> str:
     if tool == "nmap":
         open_ports = finding.get("open_ports") or []
         return f"{len(open_ports)} open service(s) observed." if open_ports else "No open TCP services were observed by this scan."
+    if tool == "httpx":
+        services = finding.get("httpx_services") or []
+        return f"{len(services)} HTTP service/URL observation(s) recorded." if services else "httpx completed with no structured HTTP observations."
     return "Completed scan evidence recorded."
 
 
@@ -270,6 +282,22 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
     counts = finding.get("observation_counts") or {}
     if counts:
         return [f"- {_count_label(key)}: {int(value or 0)}" for key, value in sorted(counts.items()) if int(value or 0) > 0]
+
+    httpx_services = finding.get("httpx_services") or []
+    if httpx_services:
+        lines = []
+        for service in httpx_services[:10]:
+            detail = f"- {_clean(service.get('url') or service.get('host') or 'unknown')} status={_clean(service.get('status_code') or 'unknown')}"
+            if service.get("title"):
+                detail = f"{detail} title={_clean(service.get('title'))}"
+            if service.get("web_server"):
+                detail = f"{detail} server={_clean(service.get('web_server'))}"
+            if service.get("technologies"):
+                detail = f"{detail} technologies={', '.join(_clean(value) for value in service.get('technologies')[:5])}"
+            if service.get("redirect_location") or service.get("final_url"):
+                detail = f"{detail} redirect={_clean(service.get('redirect_location') or service.get('final_url'))}"
+            lines.append(detail)
+        return lines
 
     if str(scan.get("tool") or "").lower() == "nuclei":
         return ["- No matching findings were observed with the selected template/profile."]
@@ -311,6 +339,18 @@ def _collect_assets(targets: list[dict], findings: list[dict]) -> dict[str, list
             for technology in _as_list(item.get("technology")) + _as_list(item.get("technologies")):
                 assets["technologies"].append(_clean(technology))
 
+        for service in finding.get("httpx_services") or []:
+            value = _clean(service.get("url") or service.get("host") or "")
+            if value:
+                assets["urls" if _looks_like_url(value) else "hosts"].append(value)
+            if service.get("web_server"):
+                assets["services"].append(_clean(service.get("web_server")))
+            status_code = service.get("status_code")
+            if status_code is not None:
+                assets["services"].append(f"HTTP {status_code}")
+            for technology in service.get("technologies") or []:
+                assets["technologies"].append(_clean(technology))
+
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -339,7 +379,7 @@ def _risk_suffix(scan: dict) -> str:
 
 
 def _tool_label(tool: object) -> str:
-    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei"}
+    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx"}
     return labels.get(str(tool or "").lower(), _clean(tool or "Unknown"))
 
 

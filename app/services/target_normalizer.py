@@ -34,11 +34,19 @@ def normalize_for_bbot(raw_target: str) -> str:
 
 
 def normalize_for_nuclei(raw_target: str) -> str:
-    stripped_target = _strip_and_validate(raw_target, tool_name="Nuclei")
+    return _normalize_http_url_target(raw_target, tool_name="Nuclei")
+
+
+def normalize_for_httpx(raw_target: str) -> str:
+    return _normalize_http_url_target(raw_target, tool_name="httpx")
+
+
+def _normalize_http_url_target(raw_target: str, *, tool_name: str) -> str:
+    stripped_target = _strip_and_validate(raw_target, tool_name=tool_name)
     parsed_target = urlparse(stripped_target)
     if parsed_target.scheme:
         if parsed_target.scheme.lower() not in {"http", "https"} or not parsed_target.hostname:
-            raise ValueError("Nuclei target must be a valid http or https URL or hostname.")
+            raise ValueError(f"{tool_name} target must be a valid http or https URL or hostname.")
 
         netloc = _normalize_netloc(parsed_target)
         return urlunparse(
@@ -53,9 +61,9 @@ def normalize_for_nuclei(raw_target: str) -> str:
         )
 
     if "://" in stripped_target:
-        raise ValueError("Nuclei target must be a valid http or https URL or hostname.")
+        raise ValueError(f"{tool_name} target must be a valid http or https URL or hostname.")
 
-    _validate_bare_host_or_ip(stripped_target, tool_name="Nuclei")
+    _validate_bare_host_or_ip(stripped_target, tool_name=tool_name)
     return f"https://{stripped_target.lower()}"
 
 

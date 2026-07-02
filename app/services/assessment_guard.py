@@ -1,6 +1,5 @@
-CORE_TOOLS = ("nmap", "bbot", "nuclei")
+CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx")
 LOCKED_TOOL_LIMITATIONS = (
-    "httpx not run",
     "Katana not run",
     "Playwright not run",
     "ffuf not run",
@@ -108,6 +107,17 @@ def collect_observed_assets(context: dict) -> dict[str, list[str] | str]:
                 value = str(item.get(key) or "").strip()
                 if value:
                     urls.append(value)
+        for service in finding.get("httpx_services") or []:
+            value = str(service.get("url") or service.get("host") or "").strip()
+            if value:
+                urls.append(value)
+            status_code = service.get("status_code")
+            if status_code is not None:
+                services.append(f"http {status_code}")
+            for technology in service.get("technologies") or []:
+                cleaned = str(technology or "").strip()
+                if cleaned:
+                    services.append(f"technology: {cleaned}")
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
