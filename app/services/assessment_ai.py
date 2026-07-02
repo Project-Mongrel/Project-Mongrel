@@ -101,7 +101,7 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Never imply a clean Nuclei scan means the target is secure.",
             "- If evidence is missing, explain what has not yet been assessed.",
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
-            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, assessment history, artifacts, and notes in the supplied context.",
+            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, assessment history, artifacts, and notes in the supplied context.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
             "",
@@ -156,7 +156,7 @@ def _format_assessment_context(context: dict) -> str:
                 if str(scan.get("status") or "").lower() in {"completed", "partial"}
             }
         )
-        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx") if tool not in represented_tools]
+        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx", "katana") if tool not in represented_tools]
         lines.append("- Represented tools:")
         lines.append("  - " + (", ".join(represented_tools) if represented_tools else "none"))
         lines.append("- Missing or not represented:")
@@ -252,6 +252,27 @@ def _format_finding(finding: dict) -> list[str]:
                 parts.append("tech=" + ", ".join(_clean(value) for value in service.get("technologies")[:8]))
             if service.get("redirect_location") or service.get("final_url"):
                 parts.append(f"redirect={_clean(service.get('redirect_location') or service.get('final_url'))}")
+            lines.append("    - " + " ".join(parts))
+    katana_observations = finding.get("katana_observations") or []
+    if katana_observations:
+        lines.append("    Katana observations:")
+        for observation in katana_observations[:20]:
+            parts = [
+                f"url={_clean(observation.get('url') or 'unknown')}",
+                f"type={_clean(observation.get('endpoint_type') or 'url')}",
+            ]
+            if observation.get("method"):
+                parts.append(f"method={_clean(observation.get('method'))}")
+            if observation.get("status_code"):
+                parts.append(f"status={_clean(observation.get('status_code'))}")
+            if observation.get("depth") is not None:
+                parts.append(f"depth={_clean(observation.get('depth'))}")
+            if observation.get("source"):
+                parts.append(f"source={_clean(observation.get('source'))}")
+            if observation.get("query_parameters"):
+                parts.append("params=" + ", ".join(_clean(value) for value in observation.get("query_parameters")[:8]))
+            if observation.get("forms"):
+                parts.append(f"forms={len(observation.get('forms') or [])}")
             lines.append("    - " + " ".join(parts))
     return lines
 

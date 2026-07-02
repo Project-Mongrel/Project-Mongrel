@@ -41,6 +41,10 @@ def normalize_for_httpx(raw_target: str) -> str:
     return _normalize_http_url_target(raw_target, tool_name="httpx")
 
 
+def normalize_for_katana(raw_target: str) -> str:
+    return _normalize_http_url_target(raw_target, tool_name="Katana")
+
+
 def _normalize_http_url_target(raw_target: str, *, tool_name: str) -> str:
     stripped_target = _strip_and_validate(raw_target, tool_name=tool_name)
     parsed_target = urlparse(stripped_target)
@@ -48,7 +52,7 @@ def _normalize_http_url_target(raw_target: str, *, tool_name: str) -> str:
         if parsed_target.scheme.lower() not in {"http", "https"} or not parsed_target.hostname:
             raise ValueError(f"{tool_name} target must be a valid http or https URL or hostname.")
 
-        netloc = _normalize_netloc(parsed_target)
+        netloc = _normalize_netloc(parsed_target, tool_name=tool_name)
         return urlunparse(
             (
                 parsed_target.scheme.lower(),
@@ -109,12 +113,12 @@ def _validate_bare_host_or_ip(target: str, *, tool_name: str) -> None:
         raise ValueError(f"{tool_name} target is malformed.")
 
 
-def _normalize_netloc(parsed_target: object) -> str:
+def _normalize_netloc(parsed_target: object, *, tool_name: str) -> str:
     hostname = str(parsed_target.hostname or "").lower()
     try:
         port = parsed_target.port
     except ValueError as exc:
-        raise ValueError("Nuclei target is malformed.") from exc
+        raise ValueError(f"{tool_name} target is malformed.") from exc
 
     if port is not None:
         hostname = f"{hostname}:{port}"

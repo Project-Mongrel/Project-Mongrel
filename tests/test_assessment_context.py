@@ -94,3 +94,42 @@ def test_assessment_context_includes_httpx_evidence_when_present() -> None:
     assert context["scans"][0]["tool"] == "httpx"
     assert context["scans"][0]["finding"]["httpx_services"][0]["title"] == "Example"
     assert context["findings"][0]["source"] == "httpx"
+
+
+def test_assessment_context_includes_katana_evidence_when_present() -> None:
+    assessment = create_assessment("Katana Context")
+    target = add_assessment_target(assessment["id"], address="example.com", target_type="hostname")
+    finding = add_finding(
+        user_id=8102,
+        finding={
+            "source": "katana",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "status": "completed",
+            "summary": "Katana observed one endpoint.",
+            "katana_observations": [
+                {
+                    "url": "https://example.com/search?q=test",
+                    "host": "example.com",
+                    "path": "/search",
+                    "endpoint_type": "parameterized_url",
+                    "query_parameters": ["q"],
+                    "depth": 2,
+                }
+            ],
+        },
+    )
+    record_assessment_scan(
+        assessment["id"],
+        tool="katana",
+        status="completed",
+        target_id=target["id"],
+        finding_id=finding["id"],
+        risk="info",
+    )
+
+    context = build_assessment_context(assessment["id"], user_id=8102)
+
+    assert context["scans"][0]["tool"] == "katana"
+    assert context["scans"][0]["finding"]["katana_observations"][0]["query_parameters"] == ["q"]
+    assert context["findings"][0]["source"] == "katana"

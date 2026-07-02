@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     nuclei_retries: int = 1
     httpx_path: str = "httpx"
     httpx_scan_timeout_seconds: int = 120
+    katana_path: str = "katana"
+    katana_scan_timeout_seconds: int = 180
+    katana_crawl_depth: int = 2
 
 
 @lru_cache

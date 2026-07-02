@@ -222,3 +222,89 @@ def test_assessment_markdown_report_includes_httpx_section() -> None:
     assert "Technologies\n- nginx\n- React" in report
     assert "- httpx: 2 HTTP service/URL observation(s) recorded." in report
     assert "- Validate observed HTTP services, redirects, page titles, and technology fingerprints against intended exposure." in report
+
+
+def test_assessment_markdown_report_includes_katana_section() -> None:
+    report = generate_assessment_markdown_report(
+        {
+            "assessment": {
+                "name": "Katana Assessment",
+                "status": "active",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "updated_at": datetime(2026, 1, 2, tzinfo=UTC),
+            },
+            "targets": [{"address": "example.com"}],
+            "scans": [
+                {
+                    "tool": "katana",
+                    "status": "completed",
+                    "risk": "info",
+                    "completed_at": datetime(2026, 1, 1, 12, tzinfo=UTC),
+                    "finding": {
+                        "summary": "Katana observed three endpoints.",
+                        "target": "https://example.com",
+                        "risk_level": "info",
+                        "katana_summary": {
+                            "host_count": 1,
+                            "javascript_count": 1,
+                            "query_parameter_count": 1,
+                            "form_count": 1,
+                            "max_depth": 2,
+                        },
+                        "katana_observations": [
+                            {
+                                "url": "https://example.com/",
+                                "host": "example.com",
+                                "endpoint_type": "url",
+                                "depth": 0,
+                            },
+                            {
+                                "url": "https://example.com/app.js",
+                                "host": "example.com",
+                                "endpoint_type": "javascript",
+                                "depth": 1,
+                            },
+                            {
+                                "url": "https://example.com/search?q=test",
+                                "host": "example.com",
+                                "endpoint_type": "parameterized_url",
+                                "query_parameters": ["q"],
+                                "forms": [{"action": "/login", "method": "POST"}],
+                                "depth": 2,
+                            },
+                        ],
+                    },
+                }
+            ],
+            "findings": [
+                {
+                    "target": "https://example.com",
+                    "katana_observations": [
+                        {"url": "https://example.com/app.js", "host": "example.com", "endpoint_type": "javascript", "depth": 1},
+                        {
+                            "url": "https://example.com/search?q=test",
+                            "host": "example.com",
+                            "endpoint_type": "parameterized_url",
+                            "query_parameters": ["q"],
+                            "forms": [{"action": "/login"}],
+                            "depth": 2,
+                        },
+                    ],
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        }
+    )
+
+    assert "### Katana" in report
+    assert "Scan status\nCompleted" in report
+    assert "- URLs/endpoints: 3" in report
+    assert "- Unique hosts: 1" in report
+    assert "- JavaScript files: 1" in report
+    assert "- Query parameters: 1" in report
+    assert "- Forms/actions: 1" in report
+    assert "- Max observed crawl depth: 2" in report
+    assert "https://example.com/search?q=test type=parameterized_url depth=2 params=q forms=1" in report
+    assert "- Katana: 3 crawled URL/endpoint observation(s) recorded." in report
+    assert "- Review crawled URLs, JavaScript files, forms, and query parameters to prioritize manual web testing." in report

@@ -117,7 +117,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
-    for tool in ("nmap", "bbot", "nuclei", "httpx"):
+    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana"):
         tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
         if not tool_scans:
             continue
@@ -174,6 +174,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         nuclei_findings = finding.get("nuclei_findings") or []
         observation_counts = finding.get("observation_counts") or {}
         httpx_services = finding.get("httpx_services") or {}
+        katana_observations = finding.get("katana_observations") or {}
 
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
@@ -181,6 +182,8 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
             lines.append(f"- {tool}: {len(nuclei_findings)} matched finding(s) observed.")
         elif httpx_services:
             lines.append(f"- {tool}: {len(httpx_services)} HTTP service/URL observation(s) recorded.")
+        elif katana_observations:
+            lines.append(f"- {tool}: {len(katana_observations)} crawled URL/endpoint observation(s) recorded.")
         elif observation_counts:
             total = sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
@@ -207,7 +210,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     completed = _represented_scans(scans)
     if not completed:
         return [
-            "- Run authorized Nmap, BBOT, and Nuclei scans for the assessment scope.",
+            "- Run authorized Nmap, BBOT, Nuclei, httpx, and Katana scans for the assessment scope.",
             "- Add notes or artifacts that define scope and testing constraints.",
         ]
 
@@ -218,6 +221,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     nuclei_findings = [item for finding in findings for item in (finding.get("nuclei_findings") or [])]
     observation_counts = [finding.get("observation_counts") or {} for finding in findings]
     httpx_services = [service for finding in findings for service in (finding.get("httpx_services") or [])]
+    katana_observations = [observation for finding in findings for observation in (finding.get("katana_observations") or [])]
 
     if open_ports:
         actions.append("- Validate externally exposed services and confirm each service is authorized.")
@@ -233,6 +237,8 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
         actions.append("- Review detected technologies and versions against current advisories.")
     if httpx_services:
         actions.append("- Validate observed HTTP services, redirects, page titles, and technology fingerprints against intended exposure.")
+    if katana_observations:
+        actions.append("- Review crawled URLs, JavaScript files, forms, and query parameters to prioritize manual web testing.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -260,6 +266,9 @@ def _scan_summary(scan: dict) -> str:
     if tool == "httpx":
         services = finding.get("httpx_services") or []
         return f"{len(services)} HTTP service/URL observation(s) recorded." if services else "httpx completed with no structured HTTP observations."
+    if tool == "katana":
+        observations = finding.get("katana_observations") or []
+        return f"{len(observations)} crawled URL/endpoint observation(s) recorded." if observations else "Katana completed with no structured crawl observations."
     return "Completed scan evidence recorded."
 
 
@@ -296,6 +305,32 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
                 detail = f"{detail} technologies={', '.join(_clean(value) for value in service.get('technologies')[:5])}"
             if service.get("redirect_location") or service.get("final_url"):
                 detail = f"{detail} redirect={_clean(service.get('redirect_location') or service.get('final_url'))}"
+            lines.append(detail)
+        return lines
+
+    katana_observations = finding.get("katana_observations") or []
+    if katana_observations:
+        summary = finding.get("katana_summary") or {}
+        lines = [
+            f"- URLs/endpoints: {len(katana_observations)}",
+            f"- Unique hosts: {int(summary.get('host_count') or len(_unique([_clean(item.get('host') or '') for item in katana_observations])))}",
+            f"- JavaScript files: {int(summary.get('javascript_count') or len([item for item in katana_observations if item.get('endpoint_type') == 'javascript']))}",
+            f"- Query parameters: {int(summary.get('query_parameter_count') or len(_unique([_clean(parameter) for item in katana_observations for parameter in (item.get('query_parameters') or [])])))}",
+            f"- Forms/actions: {int(summary.get('form_count') or sum(len(item.get('forms') or []) for item in katana_observations))}",
+            f"- Max observed crawl depth: {int(summary.get('max_depth') or max([int(item.get('depth') or 0) for item in katana_observations] or [0]))}",
+        ]
+        for observation in katana_observations[:10]:
+            detail = f"- {_clean(observation.get('url') or 'unknown')} type={_clean(observation.get('endpoint_type') or 'url')}"
+            if observation.get("method"):
+                detail = f"{detail} method={_clean(observation.get('method'))}"
+            if observation.get("status_code"):
+                detail = f"{detail} status={_clean(observation.get('status_code'))}"
+            if observation.get("depth") is not None:
+                detail = f"{detail} depth={_clean(observation.get('depth'))}"
+            if observation.get("query_parameters"):
+                detail = f"{detail} params={', '.join(_clean(value) for value in observation.get('query_parameters')[:5])}"
+            if observation.get("forms"):
+                detail = f"{detail} forms={len(observation.get('forms') or [])}"
             lines.append(detail)
         return lines
 
@@ -351,6 +386,22 @@ def _collect_assets(targets: list[dict], findings: list[dict]) -> dict[str, list
             for technology in service.get("technologies") or []:
                 assets["technologies"].append(_clean(technology))
 
+        for observation in finding.get("katana_observations") or []:
+            value = _clean(observation.get("url") or observation.get("host") or "")
+            if value:
+                assets["urls" if _looks_like_url(value) else "hosts"].append(value)
+            endpoint_type = _clean(observation.get("endpoint_type") or "")
+            if endpoint_type:
+                assets["services"].append(f"Katana {endpoint_type}")
+            if observation.get("endpoint_type") == "javascript" and value:
+                assets["other"].append(f"JavaScript: {value}")
+            for parameter in observation.get("query_parameters") or []:
+                assets["other"].append(f"Query parameter: {_clean(parameter)}")
+            for form in observation.get("forms") or []:
+                action = _clean(form.get("action") or "")
+                if action:
+                    assets["other"].append(f"Form action: {action}")
+
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -379,7 +430,7 @@ def _risk_suffix(scan: dict) -> str:
 
 
 def _tool_label(tool: object) -> str:
-    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx"}
+    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana"}
     return labels.get(str(tool or "").lower(), _clean(tool or "Unknown"))
 
 

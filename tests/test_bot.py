@@ -52,6 +52,8 @@ from app.bot.handlers.scan import (
     build_bbot_target_prompt,
     build_httpx_result_text,
     build_httpx_target_prompt,
+    build_katana_result_text,
+    build_katana_target_prompt,
     build_clean_nuclei_verdict_text,
     build_nuclei_status_card,
     build_nuclei_target_prompt,
@@ -65,6 +67,7 @@ from app.bot.handlers.scan import (
     store_clean_nuclei_scan,
     store_bbot_scan_result,
     store_httpx_scan_result,
+    store_katana_scan_result,
     store_successful_nmap_finding,
 )
 from app.bot.handlers.settings import build_settings_text
@@ -199,11 +202,13 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "BBOT: Not run" in dashboard
     assert "Nuclei: Not run" in dashboard
     assert "httpx: Not run" in dashboard
+    assert "Katana: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
         "Run Nuclei",
         "Run httpx",
+        "Run Katana",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",
@@ -1395,6 +1400,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "Nuclei Scan" in rendered_buttons
     assert "BBOT Recon" in rendered_buttons
     assert "httpx Fingerprint" in rendered_buttons
+    assert "Katana Crawl" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -1433,6 +1439,18 @@ def test_httpx_scan_callback_prompts_for_target() -> None:
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 
+def test_katana_scan_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7205)
+    query = SimpleNamespace(data="scan:katana", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7205))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_katana_target_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
 def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": '{"url":"raw"}'}
     services = [
@@ -1457,6 +1475,39 @@ def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     assert '{"url":"raw"}' not in card
 
 
+def test_katana_result_card_summarizes_observations_without_raw_json() -> None:
+    result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": '{"url":"raw"}'}
+    observations = [
+        {
+            "url": "https://example.com/app.js",
+            "host": "example.com",
+            "endpoint_type": "javascript",
+            "depth": 1,
+        },
+        {
+            "url": "https://example.com/search?q=test",
+            "host": "example.com",
+            "endpoint_type": "parameterized_url",
+            "query_parameters": ["q"],
+            "depth": 2,
+            "forms": [{"action": "/login", "method": "POST"}],
+        },
+    ]
+
+    card = build_katana_result_text(result, observations)
+
+    assert "Katana Scan Complete" in card
+    assert "URLs/endpoints discovered: 2" in card
+    assert "Unique hosts: 1" in card
+    assert "JavaScript files: 1" in card
+    assert "Query parameters: 1" in card
+    assert "Forms/actions: 1" in card
+    assert "Max observed crawl depth: 2" in card
+    assert "Observed parameters: q" in card
+    assert "JavaScript: https://example.com/app.js" in card
+    assert '{"url":"raw"}' not in card
+
+
 def test_store_httpx_scan_result_persists_structured_evidence() -> None:
     clear_user_findings(7204)
     services = [{"url": "https://example.com", "status_code": 200, "title": "Example", "technologies": ["nginx"]}]
@@ -1471,6 +1522,29 @@ def test_store_httpx_scan_result_persists_structured_evidence() -> None:
     assert finding["source"] == "httpx"
     assert stored["httpx_services"] == services
     assert stored["httpx_summary"]["status_codes"] == {"200": 1}
+
+
+def test_store_katana_scan_result_persists_structured_evidence() -> None:
+    clear_user_findings(7206)
+    observations = [{"url": "https://example.com/search?q=test", "host": "example.com", "query_parameters": ["q"], "depth": 2}]
+
+    finding = store_katana_scan_result(
+        user_id=7206,
+        result={
+            "success": True,
+            "target": "https://example.com",
+            "output": "{}",
+            "elapsed_seconds": 1,
+            "returncode": 0,
+            "command": ["katana", "-u", "https://example.com", "-d", "2"],
+        },
+        observations=observations,
+    )
+
+    stored = get_user_findings(7206)[0]
+    assert finding["source"] == "katana"
+    assert stored["katana_observations"] == observations
+    assert stored["katana_summary"]["query_parameters"] == ["q"]
 
 
 def test_successful_bbot_scan_creates_events_and_stores_result() -> None:

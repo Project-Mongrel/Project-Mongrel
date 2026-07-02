@@ -23,6 +23,7 @@ from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
 from app.bot.handlers.reports import split_report_text
 from app.parsers.httpx_parser import parse_httpx_output, summarize_httpx_services
+from app.parsers.katana_parser import parse_katana_output, summarize_katana_observations
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import (
@@ -62,12 +63,15 @@ from app.services.nuclei_ai_assessment import FALLBACK_LINES as NUCLEI_AI_FALLBA
 from app.services.nuclei_ai_assessment import generate_nuclei_ai_assessment
 from app.services.httpx_ai_assessment import FALLBACK_LINES as HTTPX_AI_FALLBACK_LINES
 from app.services.httpx_ai_assessment import generate_httpx_ai_assessment
+from app.services.katana_ai_assessment import FALLBACK_LINES as KATANA_AI_FALLBACK_LINES
+from app.services.katana_ai_assessment import generate_katana_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
-from app.services.target_normalizer import normalize_for_bbot, normalize_for_httpx, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
+from app.services.target_normalizer import normalize_for_bbot, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
 from app.tools.httpx_runner import run_httpx_scan
+from app.tools.katana_runner import run_katana_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
 from app.ui.ai_summary import render_ai_summary_card
 from app.ui.scan_progress import ScanProgressCard, render_scan_loading_card
@@ -133,6 +137,18 @@ def build_httpx_target_prompt() -> str:
     return "\n".join(
         [
             "httpx fingerprint request created. Send the authorized HTTP target URL or hostname.",
+            "",
+            "Examples:",
+            "https://example.com",
+            "example.com",
+        ]
+    )
+
+
+def build_katana_target_prompt() -> str:
+    return "\n".join(
+        [
+            "Katana crawl request created. Send the authorized HTTP target URL or hostname.",
             "",
             "Examples:",
             "https://example.com",
@@ -354,6 +370,92 @@ def store_httpx_scan_result(user_id: int, result: dict[str, object], services: l
                 "error": result.get("error"),
                 "error_type": result.get("error_type"),
                 "parser": "jsonl",
+            },
+        },
+    )
+
+
+def build_katana_result_text(result: dict[str, object], observations: list[dict] | None = None) -> str:
+    observations = observations or []
+    summary = summarize_katana_observations(observations)
+    limitations = []
+    if result.get("success") is not True:
+        limitations.append(str(result.get("error") or "Katana did not complete successfully."))
+    if not observations:
+        limitations.append("No structured Katana JSON observations were stored.")
+    findings = [
+        f"URLs/endpoints discovered: {summary.get('url_count', 0)}",
+        f"Unique hosts: {summary.get('host_count', 0)}",
+        f"JavaScript files: {summary.get('javascript_count', 0)}",
+        f"Query parameters: {summary.get('query_parameter_count', 0)}",
+        f"Forms/actions: {summary.get('form_count', 0)}",
+        f"Max observed crawl depth: {summary.get('max_depth', 0)}",
+    ]
+    parameters = [str(value) for value in summary.get("query_parameters") or []]
+    if parameters:
+        findings.append("Observed parameters: " + ", ".join(parameters[:10]))
+    js_files = [str(value) for value in summary.get("javascript_files") or []]
+    if js_files:
+        findings.append("JavaScript: " + "; ".join(js_files[:3]))
+    forms = [
+        f"{observation.get('url') or 'unknown'} -> {form.get('action') or 'unknown'}"
+        for observation in observations
+        for form in (observation.get("forms") or [])
+    ]
+    if forms:
+        findings.append("Forms/actions: " + "; ".join(forms[:3]))
+    if limitations:
+        findings.append("Limitations: " + " ".join(limitations))
+    findings_text = "\n".join(f"- {finding}" for finding in findings)
+    return render_scan_result_card(
+        tool_name="Katana",
+        target=str(result.get("target") or "unknown"),
+        status="Complete" if result.get("success") is True else "Failed",
+        elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+        risk="INFO" if result.get("success") is True else None,
+        summary=f"{summary.get('url_count', 0)} URL/endpoint observation(s) recorded.",
+        findings=findings_text,
+        assets=[str(observation.get("url")) for observation in observations if observation.get("url")],
+    )
+
+
+def store_katana_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
+    observations = observations or []
+    status = "completed" if result.get("success") is True else "failed"
+    summary = summarize_katana_observations(observations)
+    if result.get("success") is True:
+        finding_summary = f"Katana observed {len(observations)} URL/endpoint record(s)."
+    else:
+        finding_summary = str(result.get("error") or "Katana crawl failed.")
+    target = str(result.get("target") or "")
+    command = result.get("command") or []
+    crawl_depth = None
+    if isinstance(command, list) and "-d" in command:
+        depth_index = command.index("-d") + 1
+        if depth_index < len(command):
+            crawl_depth = command[depth_index]
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "katana",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "status": status,
+            "summary": finding_summary,
+            "risk_level": "info" if result.get("success") is True else "unknown",
+            "finding_count": len(observations),
+            "raw_output": str(result.get("output") or ""),
+            "katana_observations": observations,
+            "katana_summary": summary,
+            "metadata": {
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "command": result.get("command"),
+                "working_directory": result.get("working_directory"),
+                "error": result.get("error"),
+                "error_type": result.get("error_type"),
+                "parser": "jsonl",
+                "crawl_depth": crawl_depth,
             },
         },
     )
@@ -800,6 +902,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_httpx_target_prompt())
         return
 
+    if scan_type == "katana":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_katana_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -881,6 +989,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if scan_request.scan_type == "httpx":
         await _handle_httpx_target(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type == "katana":
+        await _handle_katana_target(update, context, user_id, scan_request_id)
         return
 
     if scan_request.scan_type != "nmap":
@@ -992,6 +1104,101 @@ async def _send_httpx_ai_assessment(message: object, finding: dict) -> None:
     assessment_text = render_ai_summary_card(assessment_lines, title="httpx AI Assessment")
     for chunk in split_report_text(assessment_text):
         await message.reply_text(chunk)
+
+
+async def _send_katana_ai_assessment(message: object, finding: dict) -> None:
+    progress_message = await message.reply_text("Generating Katana AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_katana_ai_assessment, finding)
+    if assessment_lines == KATANA_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "Katana AI assessment unavailable.", context="Katana AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="Katana AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="Katana AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
+async def _handle_katana_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    target = update.message.text or ""
+    try:
+        display_target = normalize_for_katana(target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid Katana target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=display_target,
+        event_type="katana_scan_started",
+        tool="katana",
+        status="started",
+        summary="Katana crawl started",
+    )
+    progress_card = ScanProgressCard(update.message, "Katana Crawl", display_target)
+    await progress_card.start("Launching crawl...")
+
+    try:
+        result = await asyncio.to_thread(run_katana_scan, target)
+    except ValueError as exc:
+        await progress_card.fail(str(exc))
+        add_investigation_event(
+            investigation_id=investigation["id"],
+            user_id=user_id,
+            target=display_target,
+            event_type="katana_scan_failed",
+            tool="katana",
+            status="failed",
+            summary="Katana crawl failed",
+        )
+        await update.message.reply_text(f"Invalid Katana target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result["target"]),
+        result=result,
+    )
+    observations = parse_katana_output(str(result.get("output") or "")) if result.get("output") else []
+    finding = store_katana_scan_result(user_id=user_id, result=result, observations=observations)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=str(result["target"]),
+        event_type="katana_scan_completed" if result.get("success") is True else "katana_scan_failed",
+        tool="katana",
+        status="completed" if result.get("success") is True else "failed",
+        summary="Katana crawl completed" if result.get("success") is True else "Katana crawl failed",
+        metadata={"finding_id": finding.get("id"), "url_count": len(observations)},
+    )
+    assessment_context = _pop_assessment_scan_context(context, "katana")
+    _record_assessment_scan(assessment_context, tool="katana", result=result, finding=finding)
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
+    await update.message.reply_text(
+        build_katana_result_text(result, observations),
+        reply_markup=build_scan_result_actions(finding.get("id"), "katana") if result.get("success") is True else None,
+    )
+    if result.get("success") is True:
+        await _send_katana_ai_assessment(update.message, finding)
+    await _send_assessment_dashboard(update.message, assessment_context)
 
 
 async def _handle_httpx_target(

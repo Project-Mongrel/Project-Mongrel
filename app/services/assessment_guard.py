@@ -1,6 +1,5 @@
-CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx")
+CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx", "katana")
 LOCKED_TOOL_LIMITATIONS = (
-    "Katana not run",
     "Playwright not run",
     "ffuf not run",
     "testssl.sh not run",
@@ -118,6 +117,17 @@ def collect_observed_assets(context: dict) -> dict[str, list[str] | str]:
                 cleaned = str(technology or "").strip()
                 if cleaned:
                     services.append(f"technology: {cleaned}")
+        for observation in finding.get("katana_observations") or []:
+            value = str(observation.get("url") or observation.get("host") or "").strip()
+            if value:
+                urls.append(value)
+            endpoint_type = str(observation.get("endpoint_type") or "").strip()
+            if endpoint_type:
+                services.append(f"katana {endpoint_type}")
+            for parameter in observation.get("query_parameters") or []:
+                cleaned = str(parameter or "").strip()
+                if cleaned:
+                    services.append(f"query parameter: {cleaned}")
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
