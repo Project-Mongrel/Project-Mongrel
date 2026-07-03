@@ -17,6 +17,7 @@ def test_assessment_guard_identifies_missing_locked_tool_coverage() -> None:
                 {"tool": "nuclei", "status": "failed"},
                 {"tool": "httpx", "status": "completed"},
                 {"tool": "katana", "status": "completed"},
+                {"tool": "playwright", "status": "completed"},
             ],
             "findings": [
                 {
@@ -29,10 +30,10 @@ def test_assessment_guard_identifies_missing_locked_tool_coverage() -> None:
         question="Is this secure?",
     )
 
-    assert guard["completed_tools"] == ["httpx", "katana", "nmap"]
+    assert guard["completed_tools"] == ["httpx", "katana", "nmap", "playwright"]
     assert guard["partial_tools"] == ["bbot"]
     assert guard["failed_tools"] == ["nuclei"]
-    assert guard["represented_tools"] == ["bbot", "httpx", "katana", "nmap"]
+    assert guard["represented_tools"] == ["bbot", "httpx", "katana", "nmap", "playwright"]
     assert guard["missing_core_tools"] == []
     assert guard["is_complete"] is False
     assert guard["is_secure_question"] is True
@@ -42,6 +43,7 @@ def test_assessment_guard_identifies_missing_locked_tool_coverage() -> None:
     assert "subdomain: 1" in guard["observed_assets"]["services"]
     assert "httpx not run" not in guard["locked_tool_limitations"]
     assert "Katana not run" not in guard["locked_tool_limitations"]
+    assert "Playwright not run" not in guard["locked_tool_limitations"]
     assert "Metasploit validation not run" in guard["locked_tool_limitations"]
     assert set(LOCKED_TOOL_LIMITATIONS).issubset(set(guard["locked_tool_limitations"]))
 
@@ -57,9 +59,10 @@ def test_guard_prompt_section_lists_limitations_and_partial_evidence() -> None:
     )
 
     assert "Partial tools: bbot" in prompt_section
-    assert "Missing core tools: nmap, nuclei, httpx, katana" in prompt_section
+    assert "Missing core tools: nmap, nuclei, httpx, katana, playwright" in prompt_section
     assert "httpx not run" not in prompt_section
     assert "Katana not run" not in prompt_section
+    assert "Playwright not run" not in prompt_section
     assert "TShark not run" in prompt_section
     assert "Observed hosts/targets: example.com" in prompt_section
     assert "Observed services: subdomain: 1" in prompt_section

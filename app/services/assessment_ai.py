@@ -101,7 +101,7 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Never imply a clean Nuclei scan means the target is secure.",
             "- If evidence is missing, explain what has not yet been assessed.",
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
-            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, assessment history, artifacts, and notes in the supplied context.",
+            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, assessment history, artifacts, and notes in the supplied context.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
             "",
@@ -156,7 +156,7 @@ def _format_assessment_context(context: dict) -> str:
                 if str(scan.get("status") or "").lower() in {"completed", "partial"}
             }
         )
-        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx", "katana") if tool not in represented_tools]
+        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright") if tool not in represented_tools]
         lines.append("- Represented tools:")
         lines.append("  - " + (", ".join(represented_tools) if represented_tools else "none"))
         lines.append("- Missing or not represented:")
@@ -274,6 +274,24 @@ def _format_finding(finding: dict) -> list[str]:
             if observation.get("forms"):
                 parts.append(f"forms={len(observation.get('forms') or [])}")
             lines.append("    - " + " ".join(parts))
+    playwright_observation = finding.get("playwright_observation") or {}
+    if playwright_observation:
+        lines.append("    Playwright observation:")
+        parts = [
+            f"requested={_clean(playwright_observation.get('requested_url') or 'unknown')}",
+            f"final={_clean(playwright_observation.get('final_url') or 'unknown')}",
+            f"load={_clean(playwright_observation.get('load_status') or 'unknown')}",
+        ]
+        if playwright_observation.get("status_code"):
+            parts.append(f"status={_clean(playwright_observation.get('status_code'))}")
+        if playwright_observation.get("title"):
+            parts.append(f"title={_clean(playwright_observation.get('title'))}")
+        parts.append(f"forms={int(playwright_observation.get('forms_count') or 0)}")
+        parts.append(f"inputs={int(playwright_observation.get('inputs_count') or 0)}")
+        parts.append(f"links={int(playwright_observation.get('links_count') or 0)}")
+        parts.append(f"console_issues={int(playwright_observation.get('console_issue_count') or 0)}")
+        parts.append(f"network_issues={int(playwright_observation.get('network_issue_count') or 0)}")
+        lines.append("    - " + " ".join(parts))
     return lines
 
 

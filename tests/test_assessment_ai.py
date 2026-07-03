@@ -113,7 +113,7 @@ def test_assessment_ai_report_prompt_includes_required_sections_and_limitations(
     assert "Completed tools: nmap" in prompt
     assert "Partial tools: bbot" in prompt
     assert "Failed tools: nuclei" in prompt
-    assert "Core tools not run: httpx, katana" in prompt
+    assert "Core tools not run: httpx, katana, playwright" in prompt
     assert "Gitleaks not run" in prompt
     assert "Absence of findings is not evidence of security." in prompt
     assert "explain what has not yet been assessed" in prompt
@@ -126,7 +126,7 @@ def test_assessment_ai_report_prompt_includes_required_sections_and_limitations(
     assert "Represented tools:" in prompt
     assert "bbot, nmap" in prompt
     assert "Missing or not represented:" in prompt
-    assert "nuclei, httpx, katana" in prompt
+    assert "nuclei, httpx, katana, playwright" in prompt
     assert "SSH observed." in prompt
 
 

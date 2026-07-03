@@ -308,3 +308,74 @@ def test_assessment_markdown_report_includes_katana_section() -> None:
     assert "https://example.com/search?q=test type=parameterized_url depth=2 params=q forms=1" in report
     assert "- Katana: 3 crawled URL/endpoint observation(s) recorded." in report
     assert "- Review crawled URLs, JavaScript files, forms, and query parameters to prioritize manual web testing." in report
+
+
+def test_assessment_markdown_report_includes_playwright_section() -> None:
+    report = generate_assessment_markdown_report(
+        {
+            "assessment": {
+                "name": "Playwright Assessment",
+                "status": "active",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "updated_at": datetime(2026, 1, 2, tzinfo=UTC),
+            },
+            "targets": [{"address": "example.com"}],
+            "scans": [
+                {
+                    "tool": "playwright",
+                    "status": "completed",
+                    "risk": "info",
+                    "completed_at": datetime(2026, 1, 1, 12, tzinfo=UTC),
+                    "finding": {
+                        "summary": "Playwright passive browser observation completed.",
+                        "target": "https://example.com",
+                        "risk_level": "info",
+                        "playwright_observation": {
+                            "requested_url": "https://example.com",
+                            "final_url": "https://www.example.com",
+                            "title": "Example",
+                            "load_status": "loaded",
+                            "status_code": 200,
+                            "forms_count": 1,
+                            "inputs_count": 4,
+                            "links_count": 12,
+                            "console_issue_count": 2,
+                            "network_issue_count": 1,
+                            "page_error_count": 0,
+                            "link_samples": ["https://www.example.com/about"],
+                            "limitations": ["Passive browser observation only."],
+                        },
+                    },
+                }
+            ],
+            "findings": [
+                {
+                    "target": "https://example.com",
+                    "playwright_observation": {
+                        "requested_url": "https://example.com",
+                        "final_url": "https://www.example.com",
+                        "title": "Example",
+                        "load_status": "loaded",
+                        "forms_count": 1,
+                        "inputs_count": 4,
+                        "links_count": 12,
+                    },
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        }
+    )
+
+    assert "### Playwright" in report
+    assert "Scan status\nCompleted" in report
+    assert "- Requested URL: https://example.com" in report
+    assert "- Final URL: https://www.example.com" in report
+    assert "- Title: Example" in report
+    assert "- Load status: loaded" in report
+    assert "- Forms/inputs: 1 forms / 4 inputs" in report
+    assert "- Links: 12" in report
+    assert "- Console/network summary: 2 console / 1 network / 0 page errors" in report
+    assert "- Screenshot/artifact metadata: not captured" in report
+    assert "- Playwright: passive browser observation recorded for https://www.example.com." in report
+    assert "- Review browser-observed forms, links, console issues, and network failures before deeper manual testing." in report

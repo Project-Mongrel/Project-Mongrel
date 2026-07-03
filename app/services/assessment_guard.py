@@ -1,6 +1,5 @@
-CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx", "katana")
+CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright")
 LOCKED_TOOL_LIMITATIONS = (
-    "Playwright not run",
     "ffuf not run",
     "testssl.sh not run",
     "Gitleaks not run",
@@ -128,6 +127,18 @@ def collect_observed_assets(context: dict) -> dict[str, list[str] | str]:
                 cleaned = str(parameter or "").strip()
                 if cleaned:
                     services.append(f"query parameter: {cleaned}")
+        playwright_observation = finding.get("playwright_observation") or {}
+        for key in ("requested_url", "final_url"):
+            value = str(playwright_observation.get(key) or "").strip()
+            if value:
+                urls.append(value)
+        title = str(playwright_observation.get("title") or "").strip()
+        if title:
+            services.append("playwright title observed")
+        if int(playwright_observation.get("forms_count") or 0) > 0:
+            services.append(f"forms: {int(playwright_observation.get('forms_count') or 0)}")
+        if int(playwright_observation.get("links_count") or 0) > 0:
+            services.append(f"links: {int(playwright_observation.get('links_count') or 0)}")
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:

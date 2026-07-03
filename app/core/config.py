@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     katana_path: str = "katana"
     katana_scan_timeout_seconds: int = 180
     katana_crawl_depth: int = 2
+    playwright_scan_timeout_seconds: int = 45
 
 
 @lru_cache

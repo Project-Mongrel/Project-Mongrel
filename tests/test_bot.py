@@ -54,6 +54,8 @@ from app.bot.handlers.scan import (
     build_httpx_target_prompt,
     build_katana_result_text,
     build_katana_target_prompt,
+    build_playwright_result_text,
+    build_playwright_target_prompt,
     build_clean_nuclei_verdict_text,
     build_nuclei_status_card,
     build_nuclei_target_prompt,
@@ -68,6 +70,7 @@ from app.bot.handlers.scan import (
     store_bbot_scan_result,
     store_httpx_scan_result,
     store_katana_scan_result,
+    store_playwright_scan_result,
     store_successful_nmap_finding,
 )
 from app.bot.handlers.settings import build_settings_text
@@ -203,12 +206,14 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "Nuclei: Not run" in dashboard
     assert "httpx: Not run" in dashboard
     assert "Katana: Not run" in dashboard
+    assert "Playwright: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
         "Run Nuclei",
         "Run httpx",
         "Run Katana",
+        "Run Playwright",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",
@@ -1401,6 +1406,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "BBOT Recon" in rendered_buttons
     assert "httpx Fingerprint" in rendered_buttons
     assert "Katana Crawl" in rendered_buttons
+    assert "Playwright Observe" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -1451,6 +1457,18 @@ def test_katana_scan_callback_prompts_for_target() -> None:
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 
+def test_playwright_scan_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7207)
+    query = SimpleNamespace(data="scan:playwright", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7207))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_playwright_target_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
 def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": '{"url":"raw"}'}
     services = [
@@ -1473,6 +1491,39 @@ def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     assert "Technologies: nginx, React" in card
     assert "Redirects: https://example.com -> https://www.example.com" in card
     assert '{"url":"raw"}' not in card
+
+
+def test_playwright_result_card_summarizes_observation_without_raw_details() -> None:
+    result = {"success": True, "target": "https://example.com", "elapsed_seconds": 3, "output": {"raw": "not shown"}}
+    observation = {
+        "requested_url": "https://example.com",
+        "final_url": "https://www.example.com",
+        "title": "Example",
+        "load_status": "loaded",
+        "status_code": 200,
+        "forms_count": 1,
+        "inputs_count": 4,
+        "links_count": 12,
+        "console_issue_count": 2,
+        "network_issue_count": 1,
+        "page_error_count": 0,
+        "link_samples": ["https://www.example.com/about"],
+        "limitations": ["Passive browser observation only."],
+    }
+
+    card = build_playwright_result_text(result, observation)
+
+    assert "Playwright Scan Complete" in card
+    assert "Final URL: https://www.example.com" in card
+    assert "Title: Example" in card
+    assert "Load status: loaded" in card
+    assert "Status code: 200" in card
+    assert "Forms/inputs: 1 forms / 4 inputs" in card
+    assert "Links: 12" in card
+    assert "Console/network issues: 2 console / 1 network / 0 page errors" in card
+    assert "Screenshot/artifact: not captured" in card
+    assert "Passive browser observation only." in card
+    assert "raw" not in card
 
 
 def test_katana_result_card_summarizes_observations_without_raw_json() -> None:
@@ -1545,6 +1596,30 @@ def test_store_katana_scan_result_persists_structured_evidence() -> None:
     assert finding["source"] == "katana"
     assert stored["katana_observations"] == observations
     assert stored["katana_summary"]["query_parameters"] == ["q"]
+
+
+def test_store_playwright_scan_result_persists_structured_evidence() -> None:
+    clear_user_findings(7208)
+    observation = {
+        "requested_url": "https://example.com",
+        "final_url": "https://www.example.com",
+        "title": "Example",
+        "load_status": "loaded",
+        "forms_count": 1,
+        "inputs_count": 3,
+        "links_count": 8,
+    }
+
+    finding = store_playwright_scan_result(
+        user_id=7208,
+        result={"success": True, "target": "https://example.com", "output": observation, "elapsed_seconds": 1},
+        observation=observation,
+    )
+
+    stored = get_user_findings(7208)[0]
+    assert finding["source"] == "playwright"
+    assert stored["playwright_observation"]["title"] == "Example"
+    assert stored["playwright_summary"]["links_count"] == 8
 
 
 def test_successful_bbot_scan_creates_events_and_stores_result() -> None:

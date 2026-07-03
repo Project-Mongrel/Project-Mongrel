@@ -25,6 +25,7 @@ from app.bot.handlers.reports import split_report_text
 from app.parsers.httpx_parser import parse_httpx_output, summarize_httpx_services
 from app.parsers.katana_parser import parse_katana_output, summarize_katana_observations
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
+from app.parsers.playwright_parser import normalize_playwright_observation, summarize_playwright_observation
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import (
     get_assessment,
@@ -65,13 +66,16 @@ from app.services.httpx_ai_assessment import FALLBACK_LINES as HTTPX_AI_FALLBACK
 from app.services.httpx_ai_assessment import generate_httpx_ai_assessment
 from app.services.katana_ai_assessment import FALLBACK_LINES as KATANA_AI_FALLBACK_LINES
 from app.services.katana_ai_assessment import generate_katana_ai_assessment
+from app.services.playwright_ai_assessment import FALLBACK_LINES as PLAYWRIGHT_AI_FALLBACK_LINES
+from app.services.playwright_ai_assessment import generate_playwright_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
-from app.services.target_normalizer import normalize_for_bbot, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_target_key
+from app.services.target_normalizer import normalize_for_bbot, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_for_playwright, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
+from app.tools.playwright_runner import run_playwright_observation
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
 from app.ui.ai_summary import render_ai_summary_card
 from app.ui.scan_progress import ScanProgressCard, render_scan_loading_card
@@ -149,6 +153,20 @@ def build_katana_target_prompt() -> str:
     return "\n".join(
         [
             "Katana crawl request created. Send the authorized HTTP target URL or hostname.",
+            "",
+            "Examples:",
+            "https://example.com",
+            "example.com",
+        ]
+    )
+
+
+def build_playwright_target_prompt() -> str:
+    return "\n".join(
+        [
+            "Playwright observation request created. Send the authorized HTTP target URL or hostname.",
+            "",
+            "Passive browser observation only.",
             "",
             "Examples:",
             "https://example.com",
@@ -456,6 +474,73 @@ def store_katana_scan_result(user_id: int, result: dict[str, object], observatio
                 "error_type": result.get("error_type"),
                 "parser": "jsonl",
                 "crawl_depth": crawl_depth,
+            },
+        },
+    )
+
+
+def build_playwright_result_text(result: dict[str, object], observation: dict | None = None) -> str:
+    observation = normalize_playwright_observation(observation or {})
+    summary = summarize_playwright_observation(observation)
+    limitations = list(observation.get("limitations") or [])
+    if result.get("success") is not True:
+        limitations.append(str(result.get("error") or "Playwright observation did not complete successfully."))
+    if not observation:
+        limitations.append("No structured Playwright browser observation was stored.")
+    screenshot_status = "present" if summary.get("screenshot_present") else "not captured"
+    findings = [
+        f"Final URL: {summary.get('final_url') or 'unknown'}",
+        f"Title: {summary.get('title') or 'not observed'}",
+        f"Load status: {summary.get('load_status') or 'unknown'}",
+        f"Status code: {summary.get('status_code') or 'not observed'}",
+        f"Forms/inputs: {summary.get('forms_count', 0)} forms / {summary.get('inputs_count', 0)} inputs",
+        f"Links: {summary.get('links_count', 0)}",
+        f"Console/network issues: {summary.get('console_issue_count', 0)} console / {summary.get('network_issue_count', 0)} network / {summary.get('page_error_count', 0)} page errors",
+        f"Screenshot/artifact: {screenshot_status}",
+    ]
+    if limitations:
+        findings.append("Limitations: " + " ".join(str(limitation) for limitation in limitations[:3]))
+    findings_text = "\n".join(f"- {finding}" for finding in findings)
+    return render_scan_result_card(
+        tool_name="Playwright",
+        target=str(result.get("target") or observation.get("requested_url") or "unknown"),
+        status="Complete" if result.get("success") is True else "Failed",
+        elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+        risk="INFO" if result.get("success") is True else None,
+        summary="Passive browser observation recorded." if result.get("success") is True else str(result.get("error") or "Playwright observation failed."),
+        findings=findings_text,
+        assets=[str(value) for value in [observation.get("requested_url"), observation.get("final_url"), *(observation.get("link_samples") or [])] if value],
+    )
+
+
+def store_playwright_scan_result(user_id: int, result: dict[str, object], observation: dict | None = None) -> dict:
+    observation = normalize_playwright_observation(observation or {})
+    summary = summarize_playwright_observation(observation)
+    status = "completed" if result.get("success") is True else "failed"
+    if result.get("success") is True:
+        finding_summary = "Playwright passive browser observation completed."
+    else:
+        finding_summary = str(result.get("error") or "Playwright observation failed.")
+    target = str(result.get("target") or observation.get("requested_url") or "")
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "playwright",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "status": status,
+            "summary": finding_summary,
+            "risk_level": "info" if result.get("success") is True else "unknown",
+            "finding_count": 1 if observation else 0,
+            "raw_output": "",
+            "playwright_observation": observation,
+            "playwright_summary": summary,
+            "metadata": {
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "error": result.get("error"),
+                "error_type": result.get("error_type"),
+                "mode": "passive_browser_observation",
+                "screenshot_present": bool(summary.get("screenshot_present")),
             },
         },
     )
@@ -908,6 +993,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_katana_target_prompt())
         return
 
+    if scan_type == "playwright":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_playwright_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -993,6 +1084,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if scan_request.scan_type == "katana":
         await _handle_katana_target(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type == "playwright":
+        await _handle_playwright_target(update, context, user_id, scan_request_id)
         return
 
     if scan_request.scan_type != "nmap":
@@ -1118,6 +1213,101 @@ async def _send_katana_ai_assessment(message: object, finding: dict) -> None:
     assessment_text = render_ai_summary_card(assessment_lines, title="Katana AI Assessment")
     for chunk in split_report_text(assessment_text):
         await message.reply_text(chunk)
+
+
+async def _send_playwright_ai_assessment(message: object, finding: dict) -> None:
+    progress_message = await message.reply_text("Generating Playwright AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_playwright_ai_assessment, finding)
+    if assessment_lines == PLAYWRIGHT_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "Playwright AI assessment unavailable.", context="Playwright AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="Playwright AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="Playwright AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
+async def _handle_playwright_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    target = update.message.text or ""
+    try:
+        display_target = normalize_for_playwright(target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid Playwright target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=display_target,
+        event_type="playwright_observation_started",
+        tool="playwright",
+        status="started",
+        summary="Playwright passive browser observation started",
+    )
+    progress_card = ScanProgressCard(update.message, "Playwright Observation", display_target)
+    await progress_card.start("Launching browser observation...")
+
+    try:
+        result = await asyncio.to_thread(run_playwright_observation, target)
+    except ValueError as exc:
+        await progress_card.fail(str(exc))
+        add_investigation_event(
+            investigation_id=investigation["id"],
+            user_id=user_id,
+            target=display_target,
+            event_type="playwright_observation_failed",
+            tool="playwright",
+            status="failed",
+            summary="Playwright passive browser observation failed",
+        )
+        await update.message.reply_text(f"Invalid Playwright target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result["target"]),
+        result=result,
+    )
+    observation = normalize_playwright_observation(result.get("output") or {}) if result.get("output") else {}
+    finding = store_playwright_scan_result(user_id=user_id, result=result, observation=observation)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=str(result["target"]),
+        event_type="playwright_observation_completed" if result.get("success") is True else "playwright_observation_failed",
+        tool="playwright",
+        status="completed" if result.get("success") is True else "failed",
+        summary="Playwright passive browser observation completed" if result.get("success") is True else "Playwright passive browser observation failed",
+        metadata={"finding_id": finding.get("id"), "final_url": observation.get("final_url")},
+    )
+    assessment_context = _pop_assessment_scan_context(context, "playwright")
+    _record_assessment_scan(assessment_context, tool="playwright", result=result, finding=finding)
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
+    await update.message.reply_text(
+        build_playwright_result_text(result, observation),
+        reply_markup=build_scan_result_actions(finding.get("id"), "playwright") if result.get("success") is True else None,
+    )
+    if result.get("success") is True:
+        await _send_playwright_ai_assessment(update.message, finding)
+    await _send_assessment_dashboard(update.message, assessment_context)
 
 
 async def _handle_katana_target(

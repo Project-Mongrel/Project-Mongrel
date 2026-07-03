@@ -117,7 +117,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
-    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana"):
+    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright"):
         tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
         if not tool_scans:
             continue
@@ -175,6 +175,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         observation_counts = finding.get("observation_counts") or {}
         httpx_services = finding.get("httpx_services") or {}
         katana_observations = finding.get("katana_observations") or {}
+        playwright_observation = finding.get("playwright_observation") or {}
 
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
@@ -184,6 +185,8 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
             lines.append(f"- {tool}: {len(httpx_services)} HTTP service/URL observation(s) recorded.")
         elif katana_observations:
             lines.append(f"- {tool}: {len(katana_observations)} crawled URL/endpoint observation(s) recorded.")
+        elif playwright_observation:
+            lines.append(f"- {tool}: passive browser observation recorded for {playwright_observation.get('final_url') or playwright_observation.get('requested_url') or 'target'}.")
         elif observation_counts:
             total = sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
@@ -210,7 +213,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     completed = _represented_scans(scans)
     if not completed:
         return [
-            "- Run authorized Nmap, BBOT, Nuclei, httpx, and Katana scans for the assessment scope.",
+            "- Run authorized Nmap, BBOT, Nuclei, httpx, Katana, and Playwright scans for the assessment scope.",
             "- Add notes or artifacts that define scope and testing constraints.",
         ]
 
@@ -222,6 +225,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     observation_counts = [finding.get("observation_counts") or {} for finding in findings]
     httpx_services = [service for finding in findings for service in (finding.get("httpx_services") or [])]
     katana_observations = [observation for finding in findings for observation in (finding.get("katana_observations") or [])]
+    playwright_observations = [finding.get("playwright_observation") for finding in findings if finding.get("playwright_observation")]
 
     if open_ports:
         actions.append("- Validate externally exposed services and confirm each service is authorized.")
@@ -239,6 +243,8 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
         actions.append("- Validate observed HTTP services, redirects, page titles, and technology fingerprints against intended exposure.")
     if katana_observations:
         actions.append("- Review crawled URLs, JavaScript files, forms, and query parameters to prioritize manual web testing.")
+    if playwright_observations:
+        actions.append("- Review browser-observed forms, links, console issues, and network failures before deeper manual testing.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -269,6 +275,9 @@ def _scan_summary(scan: dict) -> str:
     if tool == "katana":
         observations = finding.get("katana_observations") or []
         return f"{len(observations)} crawled URL/endpoint observation(s) recorded." if observations else "Katana completed with no structured crawl observations."
+    if tool == "playwright":
+        observation = finding.get("playwright_observation") or {}
+        return "Passive browser observation recorded." if observation else "Playwright completed with no structured browser observation."
     return "Completed scan evidence recorded."
 
 
@@ -332,6 +341,27 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             if observation.get("forms"):
                 detail = f"{detail} forms={len(observation.get('forms') or [])}"
             lines.append(detail)
+        return lines
+
+    playwright_observation = finding.get("playwright_observation") or {}
+    if playwright_observation:
+        lines = [
+            f"- Requested URL: {_clean(playwright_observation.get('requested_url') or 'unknown')}",
+            f"- Final URL: {_clean(playwright_observation.get('final_url') or 'unknown')}",
+            f"- Title: {_clean(playwright_observation.get('title') or 'not observed')}",
+            f"- Load status: {_clean(playwright_observation.get('load_status') or 'unknown')}",
+            f"- Status code: {_clean(playwright_observation.get('status_code') or 'not observed')}",
+            f"- Forms/inputs: {int(playwright_observation.get('forms_count') or 0)} forms / {int(playwright_observation.get('inputs_count') or 0)} inputs",
+            f"- Links: {int(playwright_observation.get('links_count') or 0)}",
+            (
+                f"- Console/network summary: {int(playwright_observation.get('console_issue_count') or 0)} console / "
+                f"{int(playwright_observation.get('network_issue_count') or 0)} network / "
+                f"{int(playwright_observation.get('page_error_count') or 0)} page errors"
+            ),
+            f"- Screenshot/artifact metadata: {'present' if playwright_observation.get('screenshot') else 'not captured'}",
+        ]
+        for limitation in playwright_observation.get("limitations") or []:
+            lines.append(f"- Limitation: {_clean(limitation)}")
         return lines
 
     if str(scan.get("tool") or "").lower() == "nuclei":
@@ -402,6 +432,18 @@ def _collect_assets(targets: list[dict], findings: list[dict]) -> dict[str, list
                 if action:
                     assets["other"].append(f"Form action: {action}")
 
+        playwright_observation = finding.get("playwright_observation") or {}
+        for key in ("requested_url", "final_url"):
+            value = _clean(playwright_observation.get(key) or "")
+            if value:
+                assets["urls"].append(value)
+        for link in playwright_observation.get("link_samples") or []:
+            assets["urls"].append(_clean(link))
+        if playwright_observation.get("title"):
+            assets["other"].append(f"Page title: {_clean(playwright_observation.get('title'))}")
+        if int(playwright_observation.get("forms_count") or 0) > 0:
+            assets["other"].append(f"Forms: {int(playwright_observation.get('forms_count') or 0)}")
+
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -430,7 +472,7 @@ def _risk_suffix(scan: dict) -> str:
 
 
 def _tool_label(tool: object) -> str:
-    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana"}
+    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright"}
     return labels.get(str(tool or "").lower(), _clean(tool or "Unknown"))
 
 

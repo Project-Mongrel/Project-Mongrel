@@ -133,3 +133,41 @@ def test_assessment_context_includes_katana_evidence_when_present() -> None:
     assert context["scans"][0]["tool"] == "katana"
     assert context["scans"][0]["finding"]["katana_observations"][0]["query_parameters"] == ["q"]
     assert context["findings"][0]["source"] == "katana"
+
+
+def test_assessment_context_includes_playwright_evidence_when_present() -> None:
+    assessment = create_assessment("Playwright Context")
+    target = add_assessment_target(assessment["id"], address="example.com", target_type="hostname")
+    finding = add_finding(
+        user_id=8103,
+        finding={
+            "source": "playwright",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "status": "completed",
+            "summary": "Playwright passive browser observation completed.",
+            "playwright_observation": {
+                "requested_url": "https://example.com",
+                "final_url": "https://www.example.com",
+                "title": "Example",
+                "load_status": "loaded",
+                "forms_count": 1,
+                "inputs_count": 3,
+                "links_count": 8,
+            },
+        },
+    )
+    record_assessment_scan(
+        assessment["id"],
+        tool="playwright",
+        status="completed",
+        target_id=target["id"],
+        finding_id=finding["id"],
+        risk="info",
+    )
+
+    context = build_assessment_context(assessment["id"], user_id=8103)
+
+    assert context["scans"][0]["tool"] == "playwright"
+    assert context["scans"][0]["finding"]["playwright_observation"]["title"] == "Example"
+    assert context["findings"][0]["source"] == "playwright"
