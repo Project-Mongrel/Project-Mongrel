@@ -103,6 +103,7 @@ def build_assessment_dashboard_text(assessment: dict, targets: list[dict] | None
             f"Katana: {scan_status['katana']}",
             f"Playwright: {scan_status['playwright']}",
             f"ffuf: {scan_status['ffuf']}",
+            f"testssl.sh: {scan_status['testssl']}",
         ]
     )
 
@@ -119,6 +120,7 @@ def build_assessment_dashboard_keyboard(assessment_id: int) -> InlineKeyboardMar
             [InlineKeyboardButton("Run Katana", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:katana:{assessment_id}")],
             [InlineKeyboardButton("Run Playwright", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:playwright:{assessment_id}")],
             [InlineKeyboardButton("Run ffuf", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:ffuf:{assessment_id}")],
+            [InlineKeyboardButton("Run testssl.sh", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:testssl:{assessment_id}")],
             [
                 InlineKeyboardButton("Ask Mongrel", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ask:{assessment_id}"),
                 InlineKeyboardButton("Generate AI Report", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ai_report:{assessment_id}"),
@@ -405,7 +407,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 
 
 def _scan_statuses(scans: list[dict]) -> dict[str, str]:
-    statuses = {"nmap": "Not run", "bbot": "Not run", "nuclei": "Not run", "httpx": "Not run", "katana": "Not run", "playwright": "Not run", "ffuf": "Not run"}
+    statuses = {"nmap": "Not run", "bbot": "Not run", "nuclei": "Not run", "httpx": "Not run", "katana": "Not run", "playwright": "Not run", "ffuf": "Not run", "testssl": "Not run"}
     for scan in scans:
         tool = str(scan.get("tool") or "").lower()
         if tool in statuses:

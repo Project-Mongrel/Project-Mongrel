@@ -25,7 +25,7 @@ def build_assessment_guard(context: dict, question: object | None = None) -> dic
         "failed_tools": failed_tools,
         "represented_tools": represented_tools,
         "missing_core_tools": missing_core_tools,
-        "locked_tool_limitations": list(LOCKED_TOOL_LIMITATIONS),
+        "locked_tool_limitations": _locked_tool_limitations(status_by_tool),
         "observed_assets": observed_assets,
         "is_secure_question": is_secure_question(question),
         "secure_preamble": SECURE_PREAMBLE,
@@ -148,6 +148,23 @@ def collect_observed_assets(context: dict) -> dict[str, list[str] | str]:
             classification = str(result.get("classification") or "").strip()
             if classification:
                 services.append(f"ffuf {classification}")
+        testssl_evidence = finding.get("testssl_evidence") or {}
+        if testssl_evidence:
+            host = str(testssl_evidence.get("host") or "").strip()
+            if host:
+                hosts.append(host)
+            port = testssl_evidence.get("port")
+            if port:
+                services.append(f"tls/{port}")
+            for protocol in testssl_evidence.get("protocols") or []:
+                name = str(protocol.get("name") or "").strip()
+                if name:
+                    services.append(f"TLS protocol: {name}")
+            for item in testssl_evidence.get("weak_protocols") or []:
+                services.append(f"weak TLS: {item}")
+            for item in testssl_evidence.get("vulnerabilities") or []:
+                item_id = str(item.get("id") or "testssl finding").strip()
+                services.append(f"testssl: {item_id}")
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -184,6 +201,13 @@ def _status_by_tool(scans: list[dict]) -> dict[str, set[str]]:
 
 def _tools_with_status(status_by_tool: dict[str, set[str]], status: str) -> list[str]:
     return sorted(tool for tool, statuses in status_by_tool.items() if status in statuses)
+
+
+def _locked_tool_limitations(status_by_tool: dict[str, set[str]]) -> list[str]:
+    limitations = list(LOCKED_TOOL_LIMITATIONS)
+    if "testssl" in status_by_tool:
+        limitations = [limitation for limitation in limitations if limitation != "testssl.sh not run"]
+    return limitations
 
 
 def _join_or_none(values: list[str]) -> str:

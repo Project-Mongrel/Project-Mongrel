@@ -13,6 +13,7 @@ def build_scan_type_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Katana Crawl", callback_data="scan:katana")],
             [InlineKeyboardButton("Playwright Observe", callback_data="scan:playwright")],
             [InlineKeyboardButton("ffuf Discovery", callback_data="scan:ffuf")],
+            [InlineKeyboardButton("testssl.sh TLS", callback_data="scan:testssl")],
             [InlineKeyboardButton("Back", callback_data="nav:home")],
         ]
     )

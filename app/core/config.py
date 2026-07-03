@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     ffuf_wordlist_path: Path = Path("app/resources/wordlists/ffuf_default.txt")
     ffuf_threads: int = 5
     ffuf_rate_limit: int = 25
+    testssl_path: str = "testssl.sh"
+    testssl_scan_timeout_seconds: int = 180
 
 
 @lru_cache

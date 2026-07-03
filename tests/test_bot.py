@@ -212,6 +212,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "Katana: Not run" in dashboard
     assert "Playwright: Not run" in dashboard
     assert "ffuf: Not run" in dashboard
+    assert "testssl.sh: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
@@ -220,6 +221,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
         "Run Katana",
         "Run Playwright",
         "Run ffuf",
+        "Run testssl.sh",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",

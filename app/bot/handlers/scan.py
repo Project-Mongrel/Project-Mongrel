@@ -27,6 +27,7 @@ from app.parsers.httpx_parser import parse_httpx_output, summarize_httpx_service
 from app.parsers.katana_parser import parse_katana_output, summarize_katana_observations
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.parsers.playwright_parser import normalize_playwright_observation, summarize_playwright_observation
+from app.parsers.testssl_parser import TestsslParserError, normalize_testssl_output, summarize_testssl_evidence
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import (
     get_assessment,
@@ -80,6 +81,7 @@ from app.tools.ffuf_runner import run_ffuf_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
 from app.tools.playwright_runner import run_playwright_observation
+from app.tools.testssl_runner import run_testssl_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
 from app.ui.ai_summary import render_ai_summary_card
 from app.ui.scan_progress import ScanProgressCard, render_scan_loading_card
@@ -189,6 +191,21 @@ def build_ffuf_target_prompt() -> str:
             "Examples:",
             "https://example.com",
             "example.com",
+        ]
+    )
+
+
+def build_testssl_target_prompt() -> str:
+    return "\n".join(
+        [
+            "testssl.sh TLS assessment request created. Send the authorized TLS target URL or hostname.",
+            "",
+            "Conservative TLS configuration evidence only.",
+            "",
+            "Examples:",
+            "https://example.com",
+            "example.com",
+            "example.com:443",
         ]
     )
 
@@ -643,6 +660,92 @@ def store_ffuf_scan_result(user_id: int, result: dict[str, object], observations
             },
         },
     )
+
+
+def build_testssl_result_text(result: dict[str, object], evidence: dict | None = None) -> str:
+    evidence = evidence or {}
+    summary = summarize_testssl_evidence(evidence) if evidence else {}
+    limitations = list(evidence.get("limitations") or [])
+    if result.get("success") is not True:
+        limitations.append(str(result.get("error") or "testssl.sh did not complete successfully."))
+    protocols = summary.get("supported_protocols") or [item.get("name") for item in evidence.get("protocols") or [] if item.get("name")]
+    vulnerabilities = evidence.get("vulnerabilities") or []
+    notable = [
+        item
+        for item in vulnerabilities + (evidence.get("notable_findings") or []) + (evidence.get("cipher_findings") or [])
+        if _is_notable_testssl_item(item)
+    ]
+    findings = [
+        "Certificate: " + str(summary.get("certificate_summary") or "No certificate metadata extracted."),
+        "Protocols: " + (", ".join(str(value) for value in protocols[:8]) if protocols else "none extracted"),
+    ]
+    weak = evidence.get("weak_protocols") or []
+    if weak:
+        findings.append("Weak/deprecated: " + "; ".join(str(value) for value in weak[:5]))
+    findings.extend(
+        [
+            "Notable TLS findings: " + (str(len(notable)) if notable else "none recorded"),
+            "Limitation: TLS configuration evidence only; not an overall site security verdict.",
+        ]
+    )
+    for item in notable[:5]:
+        findings.append(f"{item.get('id')}: {item.get('finding') or item.get('severity') or 'reported'}")
+    if limitations:
+        findings.append("Limitations: " + " ".join(limitations[:3]))
+    return render_scan_result_card(
+        tool_name="testssl.sh",
+        target=str(result.get("target") or evidence.get("target") or "unknown"),
+        status="Complete" if result.get("success") is True else "Failed",
+        elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+        risk="INFO" if result.get("success") is True else None,
+        summary="TLS configuration evidence recorded. TLS configuration evidence only." if evidence else "No structured testssl.sh evidence was stored.",
+        findings=findings,
+        assets=[str(evidence.get("host") or result.get("target") or "")],
+    )
+
+
+def store_testssl_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
+    evidence = evidence or {}
+    status = "completed" if result.get("success") is True else "failed"
+    summary = summarize_testssl_evidence(evidence) if evidence else {}
+    notable_count = int(summary.get("notable_count") or 0) + int(summary.get("weak_protocol_count") or 0)
+    target = str(result.get("target") or evidence.get("target") or "")
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "testssl",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "status": status,
+            "summary": (
+                f"testssl.sh recorded TLS evidence for {evidence.get('host') or target}."
+                if result.get("success") is True
+                else str(result.get("error") or "testssl.sh TLS assessment failed.")
+            ),
+            "risk_level": "info" if result.get("success") is True else "unknown",
+            "finding_count": notable_count,
+            "raw_output": "",
+            "testssl_evidence": evidence,
+            "testssl_summary": summary,
+            "metadata": {
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "command": result.get("command"),
+                "working_directory": result.get("working_directory"),
+                "error": result.get("error"),
+                "error_type": result.get("error_type"),
+                "parser": "testssl-json",
+            },
+        },
+    )
+
+
+def _is_notable_testssl_item(item: dict) -> bool:
+    severity = str(item.get("severity") or "").upper()
+    finding = str(item.get("finding") or "").lower()
+    if severity in {"HIGH", "CRITICAL", "MEDIUM", "LOW", "WARN", "WARNING"}:
+        return True
+    return not any(term in finding for term in ("not vulnerable", "not offered", "not supported", "no vulnerability"))
 
 
 def store_bbot_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
@@ -1104,6 +1207,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_ffuf_target_prompt())
         return
 
+    if scan_type == "testssl":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_testssl_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -1197,6 +1306,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if scan_request.scan_type == "ffuf":
         await _handle_ffuf_target(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type == "testssl":
+        await _handle_testssl_target(update, context, user_id, scan_request_id)
         return
 
     if scan_request.scan_type != "nmap":
@@ -1431,6 +1544,90 @@ async def _handle_ffuf_target(
     if result.get("success") is True:
         await _send_ffuf_ai_assessment(update.message, finding)
     await _send_assessment_dashboard(update.message, assessment_context)
+
+
+async def _handle_testssl_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    target = update.message.text or ""
+    try:
+        display_target = normalize_for_httpx(target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid testssl.sh target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=display_target,
+        event_type="testssl_scan_started",
+        tool="testssl",
+        status="started",
+        summary="testssl.sh TLS assessment started",
+    )
+    progress_card = ScanProgressCard(update.message, "testssl.sh TLS", display_target)
+    await progress_card.start("Launching scan...")
+    assessment_context = _pop_assessment_scan_context(context, "testssl")
+
+    try:
+        result = await asyncio.to_thread(run_testssl_scan, target)
+    except ValueError as exc:
+        await progress_card.fail(str(exc))
+        await update.message.reply_text(f"Invalid testssl.sh target: {exc}")
+        _record_assessment_scan(
+            assessment_context,
+            tool="testssl",
+            result={"success": False, "target": display_target, "error": str(exc)},
+        )
+        await _send_assessment_dashboard(update.message, assessment_context)
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result.get("target") or display_target),
+        result=result,
+    )
+    evidence = {}
+    parser_error = None
+    if result.get("success") is True:
+        try:
+            evidence = normalize_testssl_output(str(result.get("json_output") or ""), target=str(result.get("target") or display_target))
+        except TestsslParserError as exc:
+            parser_error = str(exc)
+            result = {**result, "success": False, "error": parser_error, "error_type": "parser_error"}
+
+    finding = store_testssl_scan_result(user_id=user_id, result=result, evidence=evidence)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=str(result.get("target") or display_target),
+        event_type="testssl_scan_completed" if result.get("success") is True else "testssl_scan_failed",
+        tool="testssl",
+        status="completed" if result.get("success") is True else "failed",
+        summary="testssl.sh TLS assessment completed" if result.get("success") is True else "testssl.sh TLS assessment failed",
+        metadata={"finding_id": finding.get("id"), "parser_error": parser_error},
+    )
+    _record_assessment_scan(assessment_context, tool="testssl", result=result, finding=finding)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
+    await update.message.reply_text(
+        build_testssl_result_text(result, evidence),
+        reply_markup=build_scan_result_actions(finding.get("id"), "testssl") if result.get("success") is True else None,
+    )
+    await _send_assessment_dashboard(update.message, assessment_context)
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
 
 
 async def _handle_playwright_target(

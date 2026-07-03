@@ -1,0 +1,127 @@
+import subprocess
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from app.core.config import Settings
+from app.parsers.testssl_parser import normalize_testssl_output, summarize_testssl_evidence
+from app.tools.testssl_runner import _build_testssl_command, _resolve_testssl_executable, run_testssl_scan
+
+
+TESTSSL_JSON = """
+[
+  {"id":"cert_commonName","severity":"INFO","finding":"example.com"},
+  {"id":"cert_issuer","severity":"INFO","finding":"Example CA"},
+  {"id":"cert_notAfter","severity":"INFO","finding":"2030-01-01 00:00 +0000"},
+  {"id":"cert_subjectAltName","severity":"INFO","finding":"DNS:example.com, DNS:www.example.com"},
+  {"id":"TLS1","severity":"LOW","finding":"offered"},
+  {"id":"TLS1_2","severity":"OK","finding":"offered"},
+  {"id":"TLS1_3","severity":"OK","finding":"offered"},
+  {"id":"heartbleed","severity":"OK","finding":"not vulnerable"},
+  {"id":"cipherlist_NULL","severity":"HIGH","finding":"NULL ciphers not offered"},
+  {"id":"HSTS","severity":"INFO","finding":"max-age=31536000"}
+]
+"""
+
+
+def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=["testssl.sh"], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_testssl_runner_success_uses_safe_subprocess_args() -> None:
+    settings = Settings(_env_file=None, testssl_scan_timeout_seconds=19)
+
+    def run_side_effect(command, **kwargs):
+        Path(command[2]).write_text(TESTSSL_JSON, encoding="utf-8")
+        return _completed(stdout="human output")
+
+    with (
+        patch("app.tools.testssl_runner.get_settings", return_value=settings),
+        patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
+        patch("app.tools.testssl_runner.subprocess.run", side_effect=run_side_effect) as run_mock,
+    ):
+        result = run_testssl_scan("https://example.com")
+
+    command = run_mock.call_args.args[0]
+    assert command[0] == "testssl.sh"
+    assert command[1] == "--jsonfile-pretty"
+    assert command[-1] == "example.com:443"
+    assert run_mock.call_args.kwargs["shell"] is False
+    assert run_mock.call_args.kwargs["check"] is False
+    assert run_mock.call_args.kwargs["timeout"] == 19
+    assert result["success"] is True
+    assert result["target"] == "example.com:443"
+    assert result["json_output"].strip().startswith("[")
+
+
+def test_testssl_missing_binary_is_clean_failure() -> None:
+    with (
+        patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.testssl_runner.shutil.which", return_value=None),
+        patch("app.tools.testssl_runner.Path.is_file", return_value=False),
+        patch("app.tools.testssl_runner.subprocess.run") as run_mock,
+    ):
+        result = run_testssl_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "missing_binary"
+    assert result["command"] is None
+    run_mock.assert_not_called()
+
+
+def test_testssl_timeout_is_clean_failure() -> None:
+    with (
+        patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None, testssl_scan_timeout_seconds=1)),
+        patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
+        patch("app.tools.testssl_runner.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="testssl.sh", timeout=1, output="", stderr="slow")),
+    ):
+        result = run_testssl_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "timeout"
+    assert result["error"] == "slow"
+
+
+@pytest.mark.parametrize("target", ["example.com;whoami", "example.com && whoami", "example.com|whoami"])
+def test_dangerous_testssl_target_rejected(target: str) -> None:
+    with pytest.raises(ValueError, match="shell characters"):
+        run_testssl_scan(target)
+
+
+def test_testssl_path_discovery() -> None:
+    with patch("app.tools.testssl_runner.shutil.which", return_value="/opt/bin/testssl.sh"):
+        assert _resolve_testssl_executable() == "/opt/bin/testssl.sh"
+
+
+def test_build_testssl_command_uses_explicit_argv() -> None:
+    command = _build_testssl_command("testssl.sh", "example.com:443", Path("out.json"))
+
+    assert command == [
+        "testssl.sh",
+        "--jsonfile-pretty",
+        "out.json",
+        "--warnings",
+        "batch",
+        "--openssl-timeout",
+        "5",
+        "--connect-timeout",
+        "5",
+        "--quiet",
+        "example.com:443",
+    ]
+
+
+def test_testssl_json_normalization_extracts_tls_evidence() -> None:
+    evidence = normalize_testssl_output(TESTSSL_JSON, target="example.com:443")
+    summary = summarize_testssl_evidence(evidence)
+
+    assert evidence["host"] == "example.com"
+    assert evidence["port"] == 443
+    assert evidence["certificate"]["issuer"] == "Example CA"
+    assert evidence["certificate"]["subject_alt_names"] == "DNS:example.com, DNS:www.example.com"
+    assert "TLS 1.0: offered" in evidence["weak_protocols"]
+    assert evidence["vulnerabilities"][0]["id"] == "heartbleed"
+    assert evidence["cipher_findings"][0]["id"] == "cipherlist_NULL"
+    assert evidence["security_headers"][0]["id"] == "HSTS"
+    assert summary["supported_protocols"] == ["TLS 1.0", "TLS 1.2", "TLS 1.3"]

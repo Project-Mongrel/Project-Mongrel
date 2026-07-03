@@ -117,7 +117,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
-    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf"):
+    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl"):
         tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
         if not tool_scans:
             continue
@@ -177,6 +177,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         katana_observations = finding.get("katana_observations") or {}
         playwright_observation = finding.get("playwright_observation") or {}
         ffuf_results = finding.get("ffuf_results") or {}
+        testssl_evidence = finding.get("testssl_evidence") or {}
 
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
@@ -190,6 +191,9 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
             lines.append(f"- {tool}: passive browser observation recorded for {playwright_observation.get('final_url') or playwright_observation.get('requested_url') or 'target'}.")
         elif ffuf_results:
             lines.append(f"- {tool}: {len(ffuf_results)} hidden-content path observation(s) recorded.")
+        elif testssl_evidence:
+            notable = _notable_testssl_items(testssl_evidence)
+            lines.append(f"- {tool}: TLS configuration evidence recorded with {len(notable)} notable finding(s).")
         elif observation_counts:
             total = sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
@@ -216,7 +220,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     completed = _represented_scans(scans)
     if not completed:
         return [
-            "- Run authorized Nmap, BBOT, Nuclei, httpx, Katana, Playwright, and ffuf scans for the assessment scope.",
+            "- Run authorized Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, and testssl.sh scans for the assessment scope.",
             "- Add notes or artifacts that define scope and testing constraints.",
         ]
 
@@ -230,6 +234,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     katana_observations = [observation for finding in findings for observation in (finding.get("katana_observations") or [])]
     playwright_observations = [finding.get("playwright_observation") for finding in findings if finding.get("playwright_observation")]
     ffuf_results = [result for finding in findings for result in (finding.get("ffuf_results") or [])]
+    testssl_evidence = [finding.get("testssl_evidence") for finding in findings if finding.get("testssl_evidence")]
 
     if open_ports:
         actions.append("- Validate externally exposed services and confirm each service is authorized.")
@@ -251,6 +256,8 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
         actions.append("- Review browser-observed forms, links, console issues, and network failures before deeper manual testing.")
     if ffuf_results:
         actions.append("- Review discovered hidden-content paths and status codes as follow-up candidates before manual validation.")
+    if testssl_evidence:
+        actions.append("- Review TLS protocols, certificate expiry, cipher observations, and testssl.sh-reported misconfigurations with the service owner.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -287,6 +294,9 @@ def _scan_summary(scan: dict) -> str:
     if tool == "ffuf":
         results = finding.get("ffuf_results") or []
         return f"{len(results)} hidden-content path observation(s) recorded." if results else "ffuf completed with no structured hidden-content observations."
+    if tool == "testssl":
+        evidence = finding.get("testssl_evidence") or {}
+        return "TLS configuration evidence recorded." if evidence else "testssl.sh completed with no structured TLS evidence."
     return "Completed scan evidence recorded."
 
 
@@ -401,6 +411,28 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             lines.append(detail)
         return lines
 
+    testssl_evidence = finding.get("testssl_evidence") or {}
+    if testssl_evidence:
+        cert = testssl_evidence.get("certificate") or {}
+        protocols = testssl_evidence.get("protocols") or []
+        notable = _notable_testssl_items(testssl_evidence)
+        lines = [
+            f"- Status: {_clean(testssl_evidence.get('scan_status') or 'completed').title()}",
+            f"- Certificate subject/CN: {_clean(cert.get('subject') or cert.get('common_name') or 'not extracted')}",
+            f"- Certificate issuer: {_clean(cert.get('issuer') or 'not extracted')}",
+            f"- Certificate expiry: {_clean(cert.get('not_after') or (testssl_evidence.get('expiry') or {}).get('not_after') or 'not extracted')}",
+            "- Protocols: " + (", ".join(_clean(item.get("name") or item.get("id")) for item in protocols[:10]) if protocols else "none extracted"),
+            "- Weak/deprecated items: " + ("; ".join(_clean(item) for item in (testssl_evidence.get("weak_protocols") or [])[:10]) if testssl_evidence.get("weak_protocols") else "none recorded"),
+            f"- Notable TLS findings: {len(notable)}",
+            "- Limitation: TLS configuration evidence only; this does not establish overall site security.",
+        ]
+        for item in notable[:10]:
+            lines.append(f"- {_clean(item.get('id') or 'finding')} severity={_clean(item.get('severity') or 'info')} finding={_clean(item.get('finding') or '')}")
+        headers = testssl_evidence.get("security_headers") or []
+        if headers:
+            lines.append("- Security header evidence: " + "; ".join(_clean(item.get("id") or item.get("finding")) for item in headers[:8]))
+        return lines
+
     if str(scan.get("tool") or "").lower() == "nuclei":
         return ["- No matching findings were observed with the selected template/profile."]
     return ["- No additional structured observations are linked to this scan."]
@@ -492,6 +524,24 @@ def _collect_assets(targets: list[dict], findings: list[dict]) -> dict[str, list
             if classification:
                 assets["other"].append(f"ffuf {classification}: {_clean(result.get('path') or value)}")
 
+        testssl_evidence = finding.get("testssl_evidence") or {}
+        if testssl_evidence:
+            host = _clean(testssl_evidence.get("host") or "")
+            if host:
+                assets["hosts"].append(host)
+            port = testssl_evidence.get("port")
+            if port:
+                assets["services"].append(f"TLS {port}")
+            for protocol in testssl_evidence.get("protocols") or []:
+                name = _clean(protocol.get("name") or protocol.get("id") or "")
+                if name:
+                    assets["services"].append(f"TLS protocol: {name}")
+            cert = testssl_evidence.get("certificate") or {}
+            if cert.get("issuer"):
+                assets["other"].append(f"Certificate issuer: {_clean(cert.get('issuer'))}")
+            if cert.get("not_after"):
+                assets["other"].append(f"Certificate expiry: {_clean(cert.get('not_after'))}")
+
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -520,7 +570,7 @@ def _risk_suffix(scan: dict) -> str:
 
 
 def _tool_label(tool: object) -> str:
-    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf"}
+    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh"}
     return labels.get(str(tool or "").lower(), _clean(tool or "Unknown"))
 
 
@@ -586,3 +636,16 @@ def _strip_trailing_blank(lines: list[str]) -> list[str]:
     while lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+def _notable_testssl_items(evidence: dict) -> list[dict]:
+    items = (evidence.get("vulnerabilities") or []) + (evidence.get("notable_findings") or []) + (evidence.get("cipher_findings") or [])
+    return [item for item in items if _is_notable_testssl_item(item)]
+
+
+def _is_notable_testssl_item(item: dict) -> bool:
+    severity = str(item.get("severity") or "").upper()
+    finding = str(item.get("finding") or "").lower()
+    if severity in {"HIGH", "CRITICAL", "MEDIUM", "LOW", "WARN", "WARNING"}:
+        return True
+    return not any(term in finding for term in ("not vulnerable", "not offered", "not supported", "no vulnerability"))

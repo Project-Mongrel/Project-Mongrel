@@ -63,6 +63,8 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             "- Never assume vulnerabilities.",
             "- Never claim exploitation.",
             '- Never say the target is "safe" or "secure".',
+            "- Treat testssl.sh results as TLS configuration evidence only.",
+            "- Do not invent TLS vulnerabilities or claim overall site security from TLS evidence alone.",
             "- If evidence is missing, say so.",
             "- If evidence is insufficient, recommend the next assessment step.",
             f"- For secure/safe questions, start with: {SECURE_PREAMBLE}",
@@ -101,7 +103,8 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Never imply a clean Nuclei scan means the target is secure.",
             "- If evidence is missing, explain what has not yet been assessed.",
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
-            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, assessment history, artifacts, and notes in the supplied context.",
+            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, assessment history, artifacts, and notes in the supplied context.",
+            "- testssl.sh evidence supports TLS configuration assessment only; do not claim overall site security from TLS evidence alone.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
             "",
@@ -156,7 +159,7 @@ def _format_assessment_context(context: dict) -> str:
                 if str(scan.get("status") or "").lower() in {"completed", "partial"}
             }
         )
-        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf") if tool not in represented_tools]
+        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl") if tool not in represented_tools]
         lines.append("- Represented tools:")
         lines.append("  - " + (", ".join(represented_tools) if represented_tools else "none"))
         lines.append("- Missing or not represented:")
@@ -312,6 +315,35 @@ def _format_finding(finding: dict) -> list[str]:
             if result.get("input_word"):
                 parts.append(f"word={_clean(result.get('input_word'))}")
             lines.append("    - " + " ".join(parts))
+    testssl_evidence = finding.get("testssl_evidence") or {}
+    if testssl_evidence:
+        lines.append("    testssl.sh TLS evidence:")
+        cert = testssl_evidence.get("certificate") or {}
+        if cert:
+            lines.append(
+                "    - certificate "
+                f"subject={_clean(cert.get('subject') or cert.get('common_name') or 'unknown')} "
+                f"issuer={_clean(cert.get('issuer') or 'unknown')} "
+                f"expires={_clean(cert.get('not_after') or 'unknown')} "
+                f"san={_clean(cert.get('subject_alt_names') or 'unknown')}"
+            )
+        protocols = testssl_evidence.get("protocols") or []
+        if protocols:
+            lines.append("    - protocols: " + ", ".join(_clean(item.get("name") or item.get("id")) for item in protocols[:10]))
+        weak_protocols = testssl_evidence.get("weak_protocols") or []
+        if weak_protocols:
+            lines.append("    - weak/deprecated protocols: " + "; ".join(_clean(item) for item in weak_protocols[:10]))
+        for label, key in (("vulnerabilities", "vulnerabilities"), ("cipher findings", "cipher_findings"), ("security headers", "security_headers")):
+            values = testssl_evidence.get(key) or []
+            if values:
+                lines.append(f"    - {label}:")
+                for item in values[:10]:
+                    lines.append(
+                        f"      - {_clean(item.get('id') or 'finding')} severity={_clean(item.get('severity') or 'info')} "
+                        f"finding={_clean(item.get('finding') or '')}"
+                    )
+        for limitation in testssl_evidence.get("limitations") or []:
+            lines.append(f"    - limitation: {_clean(limitation)}")
     return lines
 
 
