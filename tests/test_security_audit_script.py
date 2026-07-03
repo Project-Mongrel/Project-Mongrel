@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 from scripts import security_audit
 
@@ -90,6 +91,8 @@ def test_subprocess_uses_list_args_and_shell_false() -> None:
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"
     assert kwargs["timeout"] == 10
+    assert kwargs["cwd"] == str(security_audit.PROJECT_ROOT)
+    assert isinstance(kwargs["env"], dict)
 
 
 def test_pytest_command_uses_project_local_basetemp() -> None:
@@ -97,7 +100,23 @@ def test_pytest_command_uses_project_local_basetemp() -> None:
 
     assert "--basetemp" in tests_check.command
     assert security_audit.PYTEST_BASETEMP in tests_check.command
+    basetemp = Path(security_audit.PYTEST_BASETEMP)
+    assert basetemp.parent == security_audit.PYTEST_AUDIT_TEMP_ROOT
+    assert basetemp.name.startswith("run-")
     assert tests_check.timeout_seconds == 180
+
+
+def test_pytest_check_uses_audit_temp_root_environment() -> None:
+    calls = []
+
+    def runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    tests_check = next(check for check in security_audit.DEFAULT_CHECKS if check.name == "Tests")
+    security_audit.run_check(tests_check, installed=lambda check: True, runner=runner)
+
+    assert calls[0][1]["env"][security_audit.PYTEST_TEMP_ROOT_ENV] == str(security_audit.PYTEST_AUDIT_TEMP_ROOT)
 
 
 def test_bandit_command_does_not_scan_tests() -> None:

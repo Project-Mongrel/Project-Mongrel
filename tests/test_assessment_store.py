@@ -83,6 +83,7 @@ def test_record_nmap_bbot_and_nuclei_style_scans() -> None:
     httpx_scan = record_assessment_scan(assessment["id"], tool="httpx", status="completed", elapsed_seconds=4, risk="info")
     katana_scan = record_assessment_scan(assessment["id"], tool="katana", status="completed", elapsed_seconds=11, risk="info")
     playwright_scan = record_assessment_scan(assessment["id"], tool="playwright", status="completed", elapsed_seconds=6, risk="info")
+    ffuf_scan = record_assessment_scan(assessment["id"], tool="ffuf", status="completed", elapsed_seconds=8, risk="info")
 
     assert nmap_scan["target_id"] == target["id"]
     assert nmap_scan["tool"] == "nmap"
@@ -94,7 +95,8 @@ def test_record_nmap_bbot_and_nuclei_style_scans() -> None:
     assert httpx_scan["tool"] == "httpx"
     assert katana_scan["tool"] == "katana"
     assert playwright_scan["tool"] == "playwright"
-    assert [scan["tool"] for scan in list_assessment_scans(assessment["id"])] == ["nmap", "bbot", "nuclei", "httpx", "katana", "playwright"]
+    assert ffuf_scan["tool"] == "ffuf"
+    assert [scan["tool"] for scan in list_assessment_scans(assessment["id"])] == ["nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf"]
 
 
 def test_add_and_list_assessment_artifacts() -> None:

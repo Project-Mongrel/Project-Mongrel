@@ -22,6 +22,7 @@ from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edi
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
 from app.bot.handlers.reports import split_report_text
+from app.parsers.ffuf_parser import parse_ffuf_output, summarize_ffuf_results
 from app.parsers.httpx_parser import parse_httpx_output, summarize_httpx_services
 from app.parsers.katana_parser import parse_katana_output, summarize_katana_observations
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
@@ -62,6 +63,8 @@ from app.services.nmap_ai_assessment import FALLBACK_LINES as NMAP_AI_FALLBACK_L
 from app.services.nmap_ai_assessment import generate_nmap_ai_assessment
 from app.services.nuclei_ai_assessment import FALLBACK_LINES as NUCLEI_AI_FALLBACK_LINES
 from app.services.nuclei_ai_assessment import generate_nuclei_ai_assessment
+from app.services.ffuf_ai_assessment import FALLBACK_LINES as FFUF_AI_FALLBACK_LINES
+from app.services.ffuf_ai_assessment import generate_ffuf_ai_assessment
 from app.services.httpx_ai_assessment import FALLBACK_LINES as HTTPX_AI_FALLBACK_LINES
 from app.services.httpx_ai_assessment import generate_httpx_ai_assessment
 from app.services.katana_ai_assessment import FALLBACK_LINES as KATANA_AI_FALLBACK_LINES
@@ -69,10 +72,11 @@ from app.services.katana_ai_assessment import generate_katana_ai_assessment
 from app.services.playwright_ai_assessment import FALLBACK_LINES as PLAYWRIGHT_AI_FALLBACK_LINES
 from app.services.playwright_ai_assessment import generate_playwright_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
-from app.services.target_normalizer import normalize_for_bbot, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_for_playwright, normalize_target_key
+from app.services.target_normalizer import normalize_for_bbot, normalize_for_ffuf, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_for_playwright, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
+from app.tools.ffuf_runner import run_ffuf_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
 from app.tools.playwright_runner import run_playwright_observation
@@ -167,6 +171,20 @@ def build_playwright_target_prompt() -> str:
             "Playwright observation request created. Send the authorized HTTP target URL or hostname.",
             "",
             "Passive browser observation only.",
+            "",
+            "Examples:",
+            "https://example.com",
+            "example.com",
+        ]
+    )
+
+
+def build_ffuf_target_prompt() -> str:
+    return "\n".join(
+        [
+            "ffuf discovery request created. Send the authorized HTTP target URL or hostname.",
+            "",
+            "Conservative hidden-content discovery only.",
             "",
             "Examples:",
             "https://example.com",
@@ -541,6 +559,87 @@ def store_playwright_scan_result(user_id: int, result: dict[str, object], observ
                 "error_type": result.get("error_type"),
                 "mode": "passive_browser_observation",
                 "screenshot_present": bool(summary.get("screenshot_present")),
+            },
+        },
+    )
+
+
+def build_ffuf_result_text(result: dict[str, object], observations: list[dict] | None = None) -> str:
+    observations = observations or []
+    summary = summarize_ffuf_results(observations)
+    limitations = []
+    if result.get("success") is not True:
+        limitations.append(str(result.get("error") or "ffuf did not complete successfully."))
+    if not observations:
+        limitations.append("No structured ffuf JSON observations were stored.")
+    status_codes = summary.get("status_codes") or {}
+    interesting_paths = [str(value) for value in summary.get("interesting_paths") or []]
+    redirects = [
+        f"{observation.get('path') or observation.get('url')} -> {observation.get('redirect_location')}"
+        for observation in observations
+        if observation.get("redirect_location")
+    ]
+    findings = [
+        f"Wordlist entries: {int(result.get('wordlist_count') or 0)}",
+        f"Discovered paths: {summary.get('result_count', 0)}",
+        "Status codes: " + (", ".join(f"{code}: {count}" for code, count in sorted(status_codes.items())) if status_codes else "none"),
+        f"Forbidden/auth-gated responses: {summary.get('forbidden_count', 0)}",
+        f"Server-error responses: {summary.get('server_error_count', 0)}",
+    ]
+    if interesting_paths:
+        findings.append("Interesting paths: " + "; ".join(interesting_paths[:8]))
+    if redirects:
+        findings.append("Redirects: " + "; ".join(redirects[:5]))
+    if result.get("wordlist_path"):
+        findings.append(f"Wordlist used: {str(result.get('wordlist_path')).split('/')[-1].split(chr(92))[-1]}")
+    if limitations:
+        findings.append("Limitations: " + " ".join(limitations))
+    findings_text = "\n".join(f"- {finding}" for finding in findings)
+    return render_scan_result_card(
+        tool_name="ffuf",
+        target=str(result.get("target") or "unknown"),
+        status="Complete" if result.get("success") is True else "Failed",
+        elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+        risk="INFO" if result.get("success") is True else None,
+        summary=f"{summary.get('result_count', 0)} hidden-content observation(s) recorded.",
+        findings=findings_text,
+        assets=[str(observation.get("url")) for observation in observations if observation.get("url")],
+    )
+
+
+def store_ffuf_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
+    observations = observations or []
+    status = "completed" if result.get("success") is True else "failed"
+    summary = summarize_ffuf_results(observations)
+    if result.get("success") is True:
+        finding_summary = f"ffuf observed {len(observations)} hidden-content path record(s)."
+    else:
+        finding_summary = str(result.get("error") or "ffuf hidden-content discovery failed.")
+    target = str(result.get("target") or "")
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "ffuf",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "status": status,
+            "summary": finding_summary,
+            "risk_level": "info" if result.get("success") is True else "unknown",
+            "finding_count": len(observations),
+            "raw_output": str(result.get("output") or ""),
+            "ffuf_results": observations,
+            "ffuf_summary": summary,
+            "metadata": {
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "command": result.get("command"),
+                "working_directory": result.get("working_directory"),
+                "error": result.get("error"),
+                "error_type": result.get("error_type"),
+                "parser": "json",
+                "wordlist_path": result.get("wordlist_path"),
+                "wordlist_count": result.get("wordlist_count"),
+                "fuzz_url": result.get("fuzz_url"),
             },
         },
     )
@@ -999,6 +1098,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_playwright_target_prompt())
         return
 
+    if scan_type == "ffuf":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_ffuf_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -1088,6 +1193,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if scan_request.scan_type == "playwright":
         await _handle_playwright_target(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type == "ffuf":
+        await _handle_ffuf_target(update, context, user_id, scan_request_id)
         return
 
     if scan_request.scan_type != "nmap":
@@ -1227,6 +1336,101 @@ async def _send_playwright_ai_assessment(message: object, finding: dict) -> None
     assessment_text = render_ai_summary_card(assessment_lines, title="Playwright AI Assessment")
     for chunk in split_report_text(assessment_text):
         await message.reply_text(chunk)
+
+
+async def _send_ffuf_ai_assessment(message: object, finding: dict) -> None:
+    progress_message = await message.reply_text("Generating ffuf AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_ffuf_ai_assessment, finding)
+    if assessment_lines == FFUF_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "ffuf AI assessment unavailable.", context="ffuf AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="ffuf AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="ffuf AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
+async def _handle_ffuf_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    target = update.message.text or ""
+    try:
+        display_target = normalize_for_ffuf(target)
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid ffuf target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=display_target,
+        event_type="ffuf_scan_started",
+        tool="ffuf",
+        status="started",
+        summary="ffuf hidden-content discovery started",
+    )
+    progress_card = ScanProgressCard(update.message, "ffuf Discovery", display_target)
+    await progress_card.start("Launching discovery...")
+
+    try:
+        result = await asyncio.to_thread(run_ffuf_scan, target)
+    except ValueError as exc:
+        await progress_card.fail(str(exc))
+        add_investigation_event(
+            investigation_id=investigation["id"],
+            user_id=user_id,
+            target=display_target,
+            event_type="ffuf_scan_failed",
+            tool="ffuf",
+            status="failed",
+            summary="ffuf hidden-content discovery failed",
+        )
+        await update.message.reply_text(f"Invalid ffuf target: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result["target"]),
+        result=result,
+    )
+    observations = parse_ffuf_output(str(result.get("output") or "")) if result.get("output") else []
+    finding = store_ffuf_scan_result(user_id=user_id, result=result, observations=observations)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=str(result["target"]),
+        event_type="ffuf_scan_completed" if result.get("success") is True else "ffuf_scan_failed",
+        tool="ffuf",
+        status="completed" if result.get("success") is True else "failed",
+        summary="ffuf hidden-content discovery completed" if result.get("success") is True else "ffuf hidden-content discovery failed",
+        metadata={"finding_id": finding.get("id"), "result_count": len(observations)},
+    )
+    assessment_context = _pop_assessment_scan_context(context, "ffuf")
+    _record_assessment_scan(assessment_context, tool="ffuf", result=result, finding=finding)
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
+    await update.message.reply_text(
+        build_ffuf_result_text(result, observations),
+        reply_markup=build_scan_result_actions(finding.get("id"), "ffuf") if result.get("success") is True else None,
+    )
+    if result.get("success") is True:
+        await _send_ffuf_ai_assessment(update.message, finding)
+    await _send_assessment_dashboard(update.message, assessment_context)
 
 
 async def _handle_playwright_target(

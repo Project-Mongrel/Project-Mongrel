@@ -8,15 +8,21 @@ import shutil
 # Required to run local audit tools with explicit arg lists.
 import subprocess  # nosec B404
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable, Sequence
+from uuid import uuid4
 
 
 # Audit status label, not a password.
 STATUS_PASS = "PASS"  # nosec B105
 STATUS_FAIL = "FAIL"
 STATUS_SKIPPED = "SKIPPED"
-PYTEST_BASETEMP = f".pytest_tmp_security_audit_{os.getpid()}"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PYTEST_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp"
+PYTEST_AUDIT_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp_audit"
+PYTEST_BASETEMP = str(PYTEST_AUDIT_TEMP_ROOT / f"run-{os.getpid()}-{time.time_ns()}-{uuid4().hex[:8]}")
+PYTEST_TEMP_ROOT_ENV = "MONGREL_PYTEST_TEMP_ROOT"
 
 
 @dataclass(frozen=True)
@@ -91,7 +97,7 @@ def is_tool_installed(check: AuditCheck) -> bool:
 
 def prepare_check(check: AuditCheck) -> None:
     if check.name == "Tests":
-        Path(PYTEST_BASETEMP).mkdir(exist_ok=True)
+        PYTEST_AUDIT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def run_check(
@@ -105,6 +111,9 @@ def run_check(
     prepare_check(check)
 
     try:
+        env = os.environ.copy()
+        if check.name == "Tests":
+            env[PYTEST_TEMP_ROOT_ENV] = str(PYTEST_AUDIT_TEMP_ROOT)
         completed = runner(
             check.command,
             capture_output=True,
@@ -112,6 +121,8 @@ def run_check(
             encoding="utf-8",
             errors="replace",
             timeout=check.timeout_seconds,
+            cwd=str(PROJECT_ROOT),
+            env=env,
             check=False,
             shell=False,
         )

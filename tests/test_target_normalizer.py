@@ -2,6 +2,7 @@ import pytest
 
 from app.services.target_normalizer import (
     normalize_for_bbot,
+    normalize_for_ffuf,
     normalize_for_httpx,
     normalize_for_katana,
     normalize_for_nmap,
@@ -114,8 +115,20 @@ def test_normalize_for_playwright(raw_target: str, expected_target: str) -> None
 
 
 @pytest.mark.parametrize(
+    ("raw_target", "expected_target"),
+    [
+        ("scanme.nmap.org", "https://scanme.nmap.org"),
+        ("https://scanme.nmap.org", "https://scanme.nmap.org"),
+        ("http://example.com/path?x=1", "http://example.com/path?x=1"),
+    ],
+)
+def test_normalize_for_ffuf(raw_target: str, expected_target: str) -> None:
+    assert normalize_for_ffuf(raw_target) == expected_target
+
+
+@pytest.mark.parametrize(
     "normalizer",
-    [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx, normalize_for_katana, normalize_for_playwright],
+    [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx, normalize_for_katana, normalize_for_playwright, normalize_for_ffuf],
 )
 def test_unsupported_scheme_rejected(normalizer: object) -> None:
     with pytest.raises(ValueError, match="valid http or https URL or hostname"):
@@ -124,7 +137,7 @@ def test_unsupported_scheme_rejected(normalizer: object) -> None:
 
 @pytest.mark.parametrize(
     "normalizer",
-    [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx, normalize_for_katana, normalize_for_playwright],
+    [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx, normalize_for_katana, normalize_for_playwright, normalize_for_ffuf],
 )
 def test_empty_input_rejected(normalizer: object) -> None:
     with pytest.raises(ValueError, match="cannot be empty"):
@@ -133,7 +146,7 @@ def test_empty_input_rejected(normalizer: object) -> None:
 
 @pytest.mark.parametrize(
     "normalizer",
-    [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx, normalize_for_katana, normalize_for_playwright],
+    [normalize_for_nmap, normalize_for_bbot, normalize_for_nuclei, normalize_for_httpx, normalize_for_katana, normalize_for_playwright, normalize_for_ffuf],
 )
 def test_malformed_input_rejected(normalizer: object) -> None:
     with pytest.raises(ValueError, match="malformed|valid http or https"):

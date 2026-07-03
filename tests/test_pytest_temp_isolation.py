@@ -1,4 +1,7 @@
+import subprocess
+import sys
 from pathlib import Path
+from uuid import uuid4
 
 import conftest
 
@@ -7,25 +10,61 @@ def test_unique_basetemp_is_under_repo_local_pytest_tmp() -> None:
     first = conftest.build_unique_basetemp()
     second = conftest.build_unique_basetemp()
 
-    assert first.parent == Path(".pytest_tmp")
-    assert second.parent == Path(".pytest_tmp")
+    assert first.parent == conftest.current_pytest_temp_root()
+    assert second.parent == conftest.current_pytest_temp_root()
+    assert first.is_absolute()
     assert first != second
     assert first.name.startswith("run-")
 
 
 def test_pytest_temp_plugin_preserves_explicit_basetemp() -> None:
-    args = ["--basetemp", "custom-temp"]
+    config = conftest.config_stub("custom-temp")
 
-    conftest.pytest_load_initial_conftests(None, None, args)
+    applied = conftest.configure_pytest_basetemp(config)
 
-    assert args == ["--basetemp", "custom-temp"]
+    assert applied is None
+    assert config.option.basetemp == "custom-temp"
 
 
 def test_pytest_temp_plugin_adds_unique_basetemp_when_missing() -> None:
-    args = ["-q"]
+    config = conftest.config_stub()
 
-    conftest.pytest_load_initial_conftests(None, None, args)
+    applied = conftest.configure_pytest_basetemp(config)
 
-    assert args[:1] == ["-q"]
-    assert args[1] == "--basetemp"
-    assert args[2].startswith(str(Path(".pytest_tmp") / "run-"))
+    assert applied == Path(config.option.basetemp)
+    assert Path(config.option.basetemp).parent == conftest.current_pytest_temp_root()
+    assert Path(config.option.basetemp).name.startswith("run-")
+
+
+def test_normal_pytest_startup_uses_repo_local_basetemp(tmp_path: Path) -> None:
+    probe_dir = tmp_path / "probe-tests" / uuid4().hex
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    probe_file = probe_dir / "test_probe_basetemp.py"
+    probe_file.write_text(
+        "\n".join(
+            [
+                "def test_probe_basetemp(tmp_path_factory):",
+                "    print('BASE=' + str(tmp_path_factory.getbasetemp()))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", str(probe_file), "-q", "-s"],
+        cwd=conftest.REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+        shell=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    base_lines = [line for line in completed.stdout.splitlines() if line.startswith("BASE=")]
+    assert base_lines, completed.stdout
+    basetemp = Path(base_lines[-1].removeprefix("BASE=")).resolve()
+    assert basetemp.parent == conftest.current_pytest_temp_root()
+    assert basetemp.name.startswith("run-")

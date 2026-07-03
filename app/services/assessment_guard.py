@@ -1,6 +1,5 @@
-CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright")
+CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf")
 LOCKED_TOOL_LIMITATIONS = (
-    "ffuf not run",
     "testssl.sh not run",
     "Gitleaks not run",
     "ScoutSuite/Prowler not run",
@@ -139,6 +138,16 @@ def collect_observed_assets(context: dict) -> dict[str, list[str] | str]:
             services.append(f"forms: {int(playwright_observation.get('forms_count') or 0)}")
         if int(playwright_observation.get("links_count") or 0) > 0:
             services.append(f"links: {int(playwright_observation.get('links_count') or 0)}")
+        for result in finding.get("ffuf_results") or []:
+            value = str(result.get("url") or "").strip()
+            if value:
+                urls.append(value)
+            status_code = result.get("status_code")
+            if status_code is not None:
+                services.append(f"ffuf HTTP {status_code}")
+            classification = str(result.get("classification") or "").strip()
+            if classification:
+                services.append(f"ffuf {classification}")
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:

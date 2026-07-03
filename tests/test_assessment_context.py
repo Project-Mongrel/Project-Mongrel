@@ -171,3 +171,44 @@ def test_assessment_context_includes_playwright_evidence_when_present() -> None:
     assert context["scans"][0]["tool"] == "playwright"
     assert context["scans"][0]["finding"]["playwright_observation"]["title"] == "Example"
     assert context["findings"][0]["source"] == "playwright"
+
+
+def test_assessment_context_includes_ffuf_evidence_when_present() -> None:
+    assessment = create_assessment("ffuf Context")
+    target = add_assessment_target(assessment["id"], address="example.com", target_type="hostname")
+    finding = add_finding(
+        user_id=8104,
+        finding={
+            "source": "ffuf",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "status": "completed",
+            "summary": "ffuf observed one hidden-content path.",
+            "ffuf_results": [
+                {
+                    "url": "https://example.com/admin",
+                    "path": "/admin",
+                    "status_code": 200,
+                    "content_length": 120,
+                    "words": 10,
+                    "lines": 3,
+                    "classification": "public",
+                    "input_word": "admin",
+                }
+            ],
+        },
+    )
+    record_assessment_scan(
+        assessment["id"],
+        tool="ffuf",
+        status="completed",
+        target_id=target["id"],
+        finding_id=finding["id"],
+        risk="info",
+    )
+
+    context = build_assessment_context(assessment["id"], user_id=8104)
+
+    assert context["scans"][0]["tool"] == "ffuf"
+    assert context["scans"][0]["finding"]["ffuf_results"][0]["path"] == "/admin"
+    assert context["findings"][0]["source"] == "ffuf"

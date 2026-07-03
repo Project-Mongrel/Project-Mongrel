@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     katana_scan_timeout_seconds: int = 180
     katana_crawl_depth: int = 2
     playwright_scan_timeout_seconds: int = 45
+    ffuf_path: str = "ffuf"
+    ffuf_scan_timeout_seconds: int = 120
+    ffuf_wordlist_path: Path = Path("app/resources/wordlists/ffuf_default.txt")
+    ffuf_threads: int = 5
+    ffuf_rate_limit: int = 25
 
 
 @lru_cache

@@ -50,6 +50,8 @@ from app.bot.handlers.scan import (
     build_bbot_ai_assessment_keyboard,
     build_bbot_result_text,
     build_bbot_target_prompt,
+    build_ffuf_result_text,
+    build_ffuf_target_prompt,
     build_httpx_result_text,
     build_httpx_target_prompt,
     build_katana_result_text,
@@ -68,6 +70,7 @@ from app.bot.handlers.scan import (
     scan_target_handler,
     store_clean_nuclei_scan,
     store_bbot_scan_result,
+    store_ffuf_scan_result,
     store_httpx_scan_result,
     store_katana_scan_result,
     store_playwright_scan_result,
@@ -176,6 +179,7 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "Choose a scan workflow" in build_scan_text()
     assert "pending" in build_scan_created_text("nmap")
     assert "authorized target" in build_nmap_target_prompt()
+    assert "ffuf discovery request created" in build_ffuf_target_prompt()
     assert "Nmap XML" in build_upload_text()
     assert "- Nuclei JSON (supported)" in build_upload_text()
     assert "- Nuclei JSONL (supported)" in build_upload_text()
@@ -207,6 +211,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "httpx: Not run" in dashboard
     assert "Katana: Not run" in dashboard
     assert "Playwright: Not run" in dashboard
+    assert "ffuf: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
@@ -214,6 +219,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
         "Run httpx",
         "Run Katana",
         "Run Playwright",
+        "Run ffuf",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",
@@ -1407,6 +1413,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "httpx Fingerprint" in rendered_buttons
     assert "Katana Crawl" in rendered_buttons
     assert "Playwright Observe" in rendered_buttons
+    assert "ffuf Discovery" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -1466,6 +1473,18 @@ def test_playwright_scan_callback_prompts_for_target() -> None:
     asyncio.run(scan_callback_handler(update, context))
 
     assert query.edit_message_text.call_args.args[0] == build_playwright_target_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_ffuf_scan_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7209)
+    query = SimpleNamespace(data="scan:ffuf", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7209))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_ffuf_target_prompt()
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 
@@ -1559,6 +1578,39 @@ def test_katana_result_card_summarizes_observations_without_raw_json() -> None:
     assert '{"url":"raw"}' not in card
 
 
+def test_ffuf_result_card_summarizes_observations_without_raw_json() -> None:
+    result = {
+        "success": True,
+        "target": "https://example.com",
+        "elapsed_seconds": 2,
+        "output": '{"results":[{"url":"raw"}]}',
+        "wordlist_count": 19,
+        "wordlist_path": "app/resources/wordlists/ffuf_default.txt",
+    }
+    observations = [
+        {"url": "https://example.com/admin", "path": "/admin", "status_code": 200, "classification": "public"},
+        {
+            "url": "https://example.com/login",
+            "path": "/login",
+            "status_code": 302,
+            "redirect_location": "https://example.com/sso",
+            "classification": "redirect",
+        },
+        {"url": "https://example.com/config", "path": "/config", "status_code": 403, "classification": "forbidden"},
+    ]
+
+    card = build_ffuf_result_text(result, observations)
+
+    assert "ffuf Scan Complete" in card
+    assert "Wordlist entries: 19" in card
+    assert "Discovered paths: 3" in card
+    assert "Status codes: 200: 1, 302: 1, 403: 1" in card
+    assert "Interesting paths: /admin; /login; /config" in card
+    assert "Redirects: /login -> https://example.com/sso" in card
+    assert "Forbidden/auth-gated responses: 1" in card
+    assert '{"results"' not in card
+
+
 def test_store_httpx_scan_result_persists_structured_evidence() -> None:
     clear_user_findings(7204)
     services = [{"url": "https://example.com", "status_code": 200, "title": "Example", "technologies": ["nginx"]}]
@@ -1620,6 +1672,33 @@ def test_store_playwright_scan_result_persists_structured_evidence() -> None:
     assert finding["source"] == "playwright"
     assert stored["playwright_observation"]["title"] == "Example"
     assert stored["playwright_summary"]["links_count"] == 8
+
+
+def test_store_ffuf_scan_result_persists_structured_evidence() -> None:
+    clear_user_findings(7209)
+    observations = [{"url": "https://example.com/admin", "path": "/admin", "status_code": 200, "classification": "public"}]
+
+    finding = store_ffuf_scan_result(
+        user_id=7209,
+        result={
+            "success": True,
+            "target": "https://example.com",
+            "output": "{}",
+            "elapsed_seconds": 1,
+            "returncode": 0,
+            "command": ["ffuf", "-u", "https://example.com/FUZZ"],
+            "wordlist_count": 19,
+            "wordlist_path": "app/resources/wordlists/ffuf_default.txt",
+            "fuzz_url": "https://example.com/FUZZ",
+        },
+        observations=observations,
+    )
+
+    stored = get_user_findings(7209)[0]
+    assert finding["source"] == "ffuf"
+    assert stored["ffuf_results"] == observations
+    assert stored["ffuf_summary"]["status_codes"] == {"200": 1}
+    assert stored["metadata"]["wordlist_count"] == 19
 
 
 def test_successful_bbot_scan_creates_events_and_stores_result() -> None:

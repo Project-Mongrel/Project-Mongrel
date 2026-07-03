@@ -18,22 +18,24 @@ def test_assessment_guard_identifies_missing_locked_tool_coverage() -> None:
                 {"tool": "httpx", "status": "completed"},
                 {"tool": "katana", "status": "completed"},
                 {"tool": "playwright", "status": "completed"},
+                {"tool": "ffuf", "status": "completed"},
             ],
             "findings": [
                 {
                     "target": "example.com",
                     "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
                     "observation_counts": {"subdomain": 1},
+                    "ffuf_results": [{"url": "https://example.com/admin", "status_code": 200, "classification": "public"}],
                 }
             ],
         },
         question="Is this secure?",
     )
 
-    assert guard["completed_tools"] == ["httpx", "katana", "nmap", "playwright"]
+    assert guard["completed_tools"] == ["ffuf", "httpx", "katana", "nmap", "playwright"]
     assert guard["partial_tools"] == ["bbot"]
     assert guard["failed_tools"] == ["nuclei"]
-    assert guard["represented_tools"] == ["bbot", "httpx", "katana", "nmap", "playwright"]
+    assert guard["represented_tools"] == ["bbot", "ffuf", "httpx", "katana", "nmap", "playwright"]
     assert guard["missing_core_tools"] == []
     assert guard["is_complete"] is False
     assert guard["is_secure_question"] is True
@@ -41,9 +43,12 @@ def test_assessment_guard_identifies_missing_locked_tool_coverage() -> None:
     assert guard["observed_assets"]["hosts"] == ["example.com"]
     assert "22/tcp ssh" in guard["observed_assets"]["services"]
     assert "subdomain: 1" in guard["observed_assets"]["services"]
+    assert "https://example.com/admin" in guard["observed_assets"]["urls"]
+    assert "ffuf HTTP 200" in guard["observed_assets"]["services"]
     assert "httpx not run" not in guard["locked_tool_limitations"]
     assert "Katana not run" not in guard["locked_tool_limitations"]
     assert "Playwright not run" not in guard["locked_tool_limitations"]
+    assert "ffuf not run" not in guard["locked_tool_limitations"]
     assert "Metasploit validation not run" in guard["locked_tool_limitations"]
     assert set(LOCKED_TOOL_LIMITATIONS).issubset(set(guard["locked_tool_limitations"]))
 
@@ -59,7 +64,7 @@ def test_guard_prompt_section_lists_limitations_and_partial_evidence() -> None:
     )
 
     assert "Partial tools: bbot" in prompt_section
-    assert "Missing core tools: nmap, nuclei, httpx, katana, playwright" in prompt_section
+    assert "Missing core tools: nmap, nuclei, httpx, katana, playwright, ffuf" in prompt_section
     assert "httpx not run" not in prompt_section
     assert "Katana not run" not in prompt_section
     assert "Playwright not run" not in prompt_section

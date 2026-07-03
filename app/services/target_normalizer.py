@@ -49,6 +49,10 @@ def normalize_for_playwright(raw_target: str) -> str:
     return _normalize_http_url_target(raw_target, tool_name="Playwright")
 
 
+def normalize_for_ffuf(raw_target: str) -> str:
+    return _normalize_http_url_target(raw_target, tool_name="ffuf")
+
+
 def _normalize_http_url_target(raw_target: str, *, tool_name: str) -> str:
     stripped_target = _strip_and_validate(raw_target, tool_name=tool_name)
     parsed_target = urlparse(stripped_target)

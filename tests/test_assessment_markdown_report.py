@@ -379,3 +379,81 @@ def test_assessment_markdown_report_includes_playwright_section() -> None:
     assert "- Screenshot/artifact metadata: not captured" in report
     assert "- Playwright: passive browser observation recorded for https://www.example.com." in report
     assert "- Review browser-observed forms, links, console issues, and network failures before deeper manual testing." in report
+
+
+def test_assessment_markdown_report_includes_ffuf_section() -> None:
+    report = generate_assessment_markdown_report(
+        {
+            "assessment": {
+                "name": "ffuf Assessment",
+                "status": "active",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "updated_at": datetime(2026, 1, 2, tzinfo=UTC),
+            },
+            "targets": [{"address": "example.com"}],
+            "scans": [
+                {
+                    "tool": "ffuf",
+                    "status": "completed",
+                    "risk": "info",
+                    "completed_at": datetime(2026, 1, 1, 12, tzinfo=UTC),
+                    "finding": {
+                        "summary": "ffuf observed hidden-content paths.",
+                        "target": "https://example.com",
+                        "risk_level": "info",
+                        "ffuf_summary": {
+                            "status_codes": {"200": 1, "302": 1, "403": 1},
+                            "redirect_count": 1,
+                            "forbidden_count": 1,
+                            "server_error_count": 0,
+                        },
+                        "ffuf_results": [
+                            {
+                                "url": "https://example.com/admin",
+                                "path": "/admin",
+                                "status_code": 200,
+                                "content_length": 120,
+                                "words": 10,
+                                "lines": 3,
+                                "classification": "public",
+                            },
+                            {
+                                "url": "https://example.com/login",
+                                "path": "/login",
+                                "status_code": 302,
+                                "redirect_location": "https://example.com/sso",
+                                "classification": "redirect",
+                            },
+                            {
+                                "url": "https://example.com/config",
+                                "path": "/config",
+                                "status_code": 403,
+                                "classification": "forbidden",
+                            },
+                        ],
+                    },
+                }
+            ],
+            "findings": [
+                {
+                    "target": "https://example.com",
+                    "ffuf_results": [
+                        {"url": "https://example.com/admin", "path": "/admin", "status_code": 200, "classification": "public"},
+                        {"url": "https://example.com/config", "path": "/config", "status_code": 403, "classification": "forbidden"},
+                    ],
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        }
+    )
+
+    assert "### ffuf" in report
+    assert "Scan status\nCompleted" in report
+    assert "- Target/base URL: https://example.com" in report
+    assert "- Discovered paths: 3" in report
+    assert "- Status codes: 200=1, 302=1, 403=1" in report
+    assert "- Redirects: 1" in report
+    assert "https://example.com/login status=302 classification=redirect redirect=https://example.com/sso" in report
+    assert "- ffuf: 3 hidden-content path observation(s) recorded." in report
+    assert "- Review discovered hidden-content paths and status codes as follow-up candidates before manual validation." in report
