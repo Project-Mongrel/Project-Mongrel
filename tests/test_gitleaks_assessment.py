@@ -1,7 +1,8 @@
 import pytest
+from cryptography.fernet import Fernet
 
 from app.bot.handlers.assessment import build_assessment_dashboard_keyboard, build_assessment_dashboard_text
-from app.bot.handlers.scan import build_gitleaks_result_text, store_gitleaks_scan_result
+from app.bot.handlers.scan import build_gitleaks_result_text, redact_gitleaks_result_for_public_state, store_gitleaks_scan_result, store_gitleaks_secret_vault_records
 from app.parsers.gitleaks_parser import contains_unredacted_secret, normalize_gitleaks_output
 from app.services.assessment_ai import build_assessment_ai_prompt
 from app.services.assessment_context import build_assessment_context
@@ -9,6 +10,7 @@ from app.services.assessment_guard import build_assessment_guard
 from app.services.assessment_markdown_report import generate_assessment_markdown_report
 from app.services.assessment_store import add_assessment_target, create_assessment, list_assessment_scans, record_assessment_scan
 from app.services.findings_store import close_findings_database, configure_findings_database
+from app.services.evidence_vault import EvidenceVaultUnavailable, close_evidence_vault, configure_evidence_vault, reveal_secret_evidence
 
 RAW_SECRET = "ghp_1234567890abcdefghijklmnopqrstuv"
 GITLEAKS_JSON = f"""
@@ -29,9 +31,12 @@ GITLEAKS_JSON = f"""
 @pytest.fixture(autouse=True)
 def sqlite_gitleaks_store(tmp_path):
     configure_findings_database(tmp_path / "mongrel.db")
+    configure_evidence_vault(tmp_path / "vault.db", Fernet.generate_key().decode("utf-8"))
     yield
     close_findings_database()
+    close_evidence_vault()
     configure_findings_database(None)
+    configure_evidence_vault(None, None)
 
 
 def _stored_context() -> dict:
@@ -112,3 +117,35 @@ def test_assessment_ai_prompt_includes_redacted_gitleaks_constraints() -> None:
     assert "Gitleaks redacted secret-exposure evidence" in prompt
     assert "<REDACTED>" in prompt
     assert RAW_SECRET not in prompt
+
+
+def test_gitleaks_vault_records_attach_public_evidence_id() -> None:
+    evidence = normalize_gitleaks_output(GITLEAKS_JSON, scan_root="/tmp/artifact")
+    evidence = store_gitleaks_secret_vault_records(GITLEAKS_JSON, evidence, assessment_id=99)
+    finding = evidence["findings"][0]
+
+    revealed = reveal_secret_evidence(finding["evidence_id"])
+
+    assert finding["evidence_id"]
+    assert finding["secret_hash"]
+    assert not contains_unredacted_secret(evidence, RAW_SECRET)
+    assert revealed["assessment_id"] == "99"
+    assert revealed["secret_payload"]["secret"] == RAW_SECRET
+
+
+def test_gitleaks_vault_missing_key_prevents_public_evidence_storage(tmp_path) -> None:
+    configure_evidence_vault(tmp_path / "vault.db", None)
+    evidence = normalize_gitleaks_output(GITLEAKS_JSON, scan_root="/tmp/artifact")
+
+    with pytest.raises(EvidenceVaultUnavailable):
+        store_gitleaks_secret_vault_records(GITLEAKS_JSON, evidence, assessment_id=None)
+
+
+def test_gitleaks_public_scan_result_does_not_keep_raw_json() -> None:
+    public_result = redact_gitleaks_result_for_public_state(
+        {"success": True, "target": "/tmp/artifact", "json_output": GITLEAKS_JSON, "json_len": len(GITLEAKS_JSON)}
+    )
+
+    assert public_result["json_output"] == ""
+    assert public_result["json_redacted"] is True
+    assert RAW_SECRET not in str(public_result)

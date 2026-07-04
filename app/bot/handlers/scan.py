@@ -23,7 +23,7 @@ from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
 from app.bot.handlers.reports import split_report_text
 from app.parsers.ffuf_parser import parse_ffuf_output, summarize_ffuf_results
-from app.parsers.gitleaks_parser import GitleaksParserError, normalize_gitleaks_output, summarize_gitleaks_evidence
+from app.parsers.gitleaks_parser import GitleaksParserError, extract_gitleaks_vault_payloads, normalize_gitleaks_output, summarize_gitleaks_evidence
 from app.parsers.httpx_parser import parse_httpx_output, summarize_httpx_services
 from app.parsers.katana_parser import parse_katana_output, summarize_katana_observations
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
@@ -49,6 +49,7 @@ from app.services.chat_state import clear_finding_analysis_context, get_finding_
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.findings_store import get_user_finding
+from app.services.evidence_vault import EvidenceVaultUnavailable, store_secret_evidence
 from app.services.icon_helper import section_label
 from app.services.impact_engine import assess_change_impact
 from app.services.investigation_store import add_investigation_event, get_investigation, get_or_create_latest_open_investigation
@@ -842,6 +843,34 @@ def store_gitleaks_scan_result(user_id: int, result: dict[str, object], evidence
             },
         },
     )
+
+
+def store_gitleaks_secret_vault_records(raw_output: str, evidence: dict, assessment_id: str | int | None = None) -> dict:
+    finding_count = int(evidence.get("finding_count") or 0)
+    if finding_count <= 0:
+        return evidence
+    payloads = extract_gitleaks_vault_payloads(raw_output, scan_root=str(evidence.get("scan_root") or ""))
+    if not payloads:
+        raise EvidenceVaultUnavailable("Gitleaks produced findings without vault-storable secret payloads.")
+
+    updated_findings = [dict(finding) for finding in evidence.get("findings") or []]
+    for index, payload in enumerate(payloads):
+        vault_record = store_secret_evidence(
+            assessment_id=str(assessment_id) if assessment_id is not None else None,
+            finding_reference=payload["finding_reference"],
+            secret_payload=payload["secret_payload"],
+        )
+        if index < len(updated_findings):
+            updated_findings[index]["evidence_id"] = vault_record["evidence_id"]
+    return {**evidence, "findings": updated_findings}
+
+
+def redact_gitleaks_result_for_public_state(result: dict[str, object]) -> dict[str, object]:
+    public_result = dict(result)
+    if public_result.get("json_output"):
+        public_result["json_output"] = ""
+        public_result["json_redacted"] = True
+    return public_result
 
 
 def _format_count_summary(counts: dict) -> str:
@@ -1823,20 +1852,31 @@ async def _handle_gitleaks_target(
     finally:
         await progress_card.stop_auto_refresh()
 
-    complete_scan_request(
-        user_id=user_id,
-        scan_request_id=scan_request_id,
-        target=str(result.get("target") or scope),
-        result=result,
-    )
     evidence = {}
     parser_error = None
     if result.get("success") is True:
         try:
             evidence = normalize_gitleaks_output(str(result.get("json_output") or "[]"), scan_root=str(result.get("target") or scope))
+            evidence = store_gitleaks_secret_vault_records(
+                str(result.get("json_output") or "[]"),
+                evidence,
+                assessment_id=assessment_context.get("assessment_id") if assessment_context else None,
+            )
         except GitleaksParserError as exc:
             parser_error = str(exc)
             result = {**result, "success": False, "error": parser_error, "error_type": "parser_error"}
+            evidence = {}
+        except EvidenceVaultUnavailable as exc:
+            parser_error = str(exc)
+            result = {**result, "success": False, "error": parser_error, "error_type": "evidence_vault_unavailable"}
+            evidence = {}
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result.get("target") or scope),
+        result=redact_gitleaks_result_for_public_state(result),
+    )
 
     finding = store_gitleaks_scan_result(user_id=user_id, result=result, evidence=evidence)
     add_investigation_event(

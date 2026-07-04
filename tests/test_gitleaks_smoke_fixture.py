@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,23 @@ def _stored_context(smoke_fixture: GitleaksSmokeFixture) -> dict:
 def test_gitleaks_smoke_fixture_path_is_allowed(smoke_fixture: GitleaksSmokeFixture) -> None:
     assert smoke_fixture.path.exists()
     assert _validate_scan_scope(str(smoke_fixture.path)) == smoke_fixture.path.resolve()
+
+
+def test_gitleaks_smoke_fixture_generated_file_is_ignored(smoke_fixture: GitleaksSmokeFixture) -> None:
+    generated_file = smoke_fixture.path / "fake_secrets.env"
+
+    result = subprocess.run(
+        ["git", "check-ignore", str(generated_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        check=False,
+    )
+
+    normalized_stdout = result.stdout.replace("\\", "/").replace("//", "/").strip('" \n')
+    assert result.returncode == 0
+    assert normalized_stdout.endswith("data/gitleaks_smoke_fixture/fake_secrets.env")
 
 
 def test_gitleaks_smoke_fixture_detections_are_redacted(smoke_fixture: GitleaksSmokeFixture) -> None:

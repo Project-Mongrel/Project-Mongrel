@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from app.core.config import Settings
-from app.parsers.gitleaks_parser import REDACTION_MARKER, contains_unredacted_secret, normalize_gitleaks_output
+from app.parsers.gitleaks_parser import REDACTION_MARKER, contains_unredacted_secret, extract_gitleaks_vault_payloads, normalize_gitleaks_output
 from app.tools.gitleaks_runner import _build_gitleaks_command, _resolve_gitleaks_executable, _validate_scan_scope, run_gitleaks_scan
 
 RAW_SECRET = "ghp_1234567890abcdefghijklmnopqrstuv"
@@ -37,7 +37,7 @@ def test_gitleaks_runner_success_uses_safe_subprocess_args(tmp_path) -> None:
     settings = Settings(_env_file=None, gitleaks_scan_timeout_seconds=13)
 
     def run_side_effect(command, **kwargs):
-        Path(command[7]).write_text(GITLEAKS_JSON, encoding="utf-8")
+        Path(command[6]).write_text(GITLEAKS_JSON, encoding="utf-8")
         return _completed(returncode=1)
 
     with (
@@ -49,10 +49,9 @@ def test_gitleaks_runner_success_uses_safe_subprocess_args(tmp_path) -> None:
 
     command = run_mock.call_args.args[0]
     assert command[0] == "gitleaks"
-    assert command[1] == "detect"
-    assert command[2] == "--source"
-    assert command[3] == str(scope.resolve())
-    assert "--redact" in command
+    assert command[1] == "dir"
+    assert command[2] == str(scope.resolve())
+    assert "--redact" not in command
     assert run_mock.call_args.kwargs["shell"] is False
     assert run_mock.call_args.kwargs["timeout"] == 13
     assert result["success"] is True
@@ -111,14 +110,12 @@ def test_build_gitleaks_command_uses_explicit_argv(tmp_path) -> None:
 
     assert command == [
         "gitleaks",
-        "detect",
-        "--source",
+        "dir",
         str(tmp_path),
         "--report-format",
         "json",
         "--report-path",
         "out.json",
-        "--redact",
         "--no-banner",
     ]
 
@@ -139,4 +136,39 @@ def test_gitleaks_normalization_redacts_secret_values() -> None:
     assert finding["line_number"] == 12
     assert finding["provider"] == "github"
     assert finding["redacted_secret_preview"].startswith(REDACTION_MARKER)
+    assert finding["secret_hash"]
     assert not contains_unredacted_secret(evidence, RAW_SECRET)
+
+
+def test_gitleaks_normalization_filters_results_outside_existing_scope(tmp_path) -> None:
+    scope = tmp_path / "gitleaks_smoke_fixture"
+    scope.mkdir()
+    fixture_file = scope / "fake_secrets.env"
+    fixture_file.write_text("placeholder", encoding="utf-8")
+    output = f"""
+    [
+      {{"RuleID": "github-pat", "File": "fake_secrets.env", "StartLine": 1, "Secret": "{RAW_SECRET}"}},
+      {{"RuleID": "github-pat", "File": "../tests/test_gitleaks_runner.py", "StartLine": 1, "Secret": "{RAW_SECRET}"}},
+      {{"RuleID": "github-pat", "File": "tests/test_gitleaks_assessment.py", "StartLine": 1, "Secret": "{RAW_SECRET}"}}
+    ]
+    """
+
+    evidence = normalize_gitleaks_output(output, scan_root=str(scope))
+
+    assert evidence["finding_count"] == 1
+    assert evidence["dropped_out_of_scope_count"] == 2
+    assert evidence["findings"][0]["file_path"] == "fake_secrets.env"
+    assert "test_gitleaks_runner.py" not in str(evidence)
+
+
+def test_gitleaks_vault_payload_extraction_keeps_raw_value_separate(tmp_path) -> None:
+    scope = tmp_path / "artifact"
+    nested = scope / "src"
+    nested.mkdir(parents=True)
+    (nested / "config.py").write_text("placeholder", encoding="utf-8")
+
+    evidence = normalize_gitleaks_output(GITLEAKS_JSON, scan_root=str(scope))
+    payloads = extract_gitleaks_vault_payloads(GITLEAKS_JSON, scan_root=str(scope))
+
+    assert not contains_unredacted_secret(evidence, RAW_SECRET)
+    assert payloads[0]["secret_payload"]["secret"] == RAW_SECRET

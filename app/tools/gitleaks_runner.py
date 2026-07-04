@@ -171,14 +171,12 @@ def _gitleaks_executable_candidates() -> tuple[Path, Path, Path, Path]:
 def _build_gitleaks_command(executable: str, scan_path: Path, json_path: Path) -> list[str]:
     return [
         executable,
-        "detect",
-        "--source",
+        "dir",
         str(scan_path),
         "--report-format",
         "json",
         "--report-path",
         str(json_path),
-        "--redact",
         "--no-banner",
     ]
 

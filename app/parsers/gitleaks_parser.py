@@ -1,5 +1,6 @@
 import json
 import re
+from hashlib import sha256
 from pathlib import Path
 
 REDACTION_MARKER = "<REDACTED>"
@@ -12,23 +13,66 @@ class GitleaksParserError(ValueError):
 
 def normalize_gitleaks_output(output: str | list | dict, scan_root: str | None = None) -> dict:
     records = _decode_records(output)
-    findings = [_normalize_finding(record, scan_root=scan_root) for record in records if isinstance(record, dict)]
-    findings = [finding for finding in findings if finding]
+    accepted_records: list[dict] = []
+    findings: list[dict] = []
+    dropped_out_of_scope_count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        finding = _normalize_finding(record, scan_root=scan_root)
+        if not finding:
+            dropped_out_of_scope_count += 1
+            continue
+        accepted_records.append(record)
+        findings.append(finding)
     return {
         "scan_root": str(scan_root or ""),
         "finding_count": len(findings),
         "affected_files_count": len({finding.get("file_path") for finding in findings if finding.get("file_path")}),
+        "dropped_out_of_scope_count": dropped_out_of_scope_count,
         "rule_summary": _count_values(finding.get("rule_id") for finding in findings),
         "provider_summary": _count_values(finding.get("provider") for finding in findings),
         "severity_summary": _count_values(finding.get("severity") for finding in findings),
         "findings": findings,
-        "raw_json": redact_gitleaks_value(records),
+        "raw_json": redact_gitleaks_value(accepted_records),
         "limitations": [
             "Gitleaks detections are secret-exposure evidence only.",
             "Detected secrets were not validated or used.",
             "Secret values are redacted before storage, prompts, reports, and Telegram output.",
         ],
     }
+
+
+def extract_gitleaks_vault_payloads(output: str | list | dict, scan_root: str | None = None) -> list[dict]:
+    payloads: list[dict] = []
+    for record in _decode_records(output):
+        if not isinstance(record, dict):
+            continue
+        finding = _normalize_finding(record, scan_root=scan_root)
+        if not finding:
+            continue
+        raw_value = str(_first(record, "Secret", "secret", "Match", "match") or "")
+        if not raw_value:
+            continue
+        payloads.append(
+            {
+                "finding_reference": {
+                    "rule_id": finding.get("rule_id"),
+                    "file_path": finding.get("file_path"),
+                    "line_number": finding.get("line_number"),
+                    "fingerprint": finding.get("fingerprint"),
+                    "secret_hash": finding.get("secret_hash"),
+                },
+                "secret_payload": {
+                    "secret": raw_value,
+                    "rule_id": finding.get("rule_id"),
+                    "file_path": finding.get("file_path"),
+                    "line_number": finding.get("line_number"),
+                    "fingerprint": finding.get("fingerprint"),
+                },
+            }
+        )
+    return payloads
 
 
 def summarize_gitleaks_evidence(evidence: dict) -> dict:
@@ -74,10 +118,12 @@ def _decode_records(output: str | list | dict) -> list[dict]:
     return _decode_records(decoded)
 
 
-def _normalize_finding(record: dict, scan_root: str | None = None) -> dict:
+def _normalize_finding(record: dict, scan_root: str | None = None) -> dict | None:
     rule_id = _first(record, "RuleID", "Rule", "rule_id", "rule")
     description = _first(record, "Description", "description")
     file_path = _safe_relative_path(_first(record, "File", "file", "Path", "path"), scan_root)
+    if file_path is None:
+        return None
     line = _first(record, "StartLine", "Line", "line", "start_line")
     entropy = _first(record, "Entropy", "entropy")
     fingerprint = _first(record, "Fingerprint", "fingerprint")
@@ -93,6 +139,8 @@ def _normalize_finding(record: dict, scan_root: str | None = None) -> dict:
         "entropy": _to_float(entropy),
         "severity": severity,
         "fingerprint": str(fingerprint or ""),
+        "secret_hash": _stable_secret_hash(secret),
+        "evidence_id": "",
         "provider": provider,
         "redacted_secret_preview": _redacted_preview(secret),
         "commit": _safe_text(_first(record, "Commit", "commit")),
@@ -118,23 +166,40 @@ def _as_list(value: object) -> list[object]:
     return [value]
 
 
-def _safe_relative_path(value: object, scan_root: str | None) -> str:
+def _safe_relative_path(value: object, scan_root: str | None) -> str | None:
     path_text = str(value or "").replace("\\", "/").strip()
     if not path_text:
         return ""
+    if not scan_root:
+        return path_text.lstrip("./")[:500]
+    root = Path(scan_root).resolve()
+    if not root.exists():
+        return path_text.lstrip("./")[:500]
     try:
         path = Path(path_text)
-        if path.is_absolute() and scan_root:
-            return str(path.resolve().relative_to(Path(scan_root).resolve())).replace("\\", "/")
+        candidates = [path.resolve()] if path.is_absolute() else [(root / path).resolve(), (Path.cwd().resolve() / path).resolve()]
+        for candidate in candidates:
+            try:
+                relative = candidate.relative_to(root)
+            except ValueError:
+                continue
+            if candidate.exists() and candidate.is_file():
+                return str(relative).replace("\\", "/")[:500]
+        return None
     except (OSError, ValueError):
-        pass
-    return path_text.lstrip("./")[:500]
+        return None
 
 
 def _redacted_preview(secret: str) -> str:
     if not secret:
         return REDACTION_MARKER
     return f"{REDACTION_MARKER} len={len(secret)}"
+
+
+def _stable_secret_hash(secret: str) -> str:
+    if not secret:
+        return ""
+    return sha256(secret.encode("utf-8")).hexdigest()
 
 
 def _infer_provider(rule_id: object, tags: list[object], description: object) -> str:
