@@ -10,6 +10,8 @@ from app.bot.handlers.assessment import build_assessment_dashboard_keyboard, bui
 from app.bot.handlers.assessment import ASSESSMENT_SCAN_CONTEXT_KEY
 from app.bot.handlers.scan import (
     _handle_gitleaks_evidence_vault_callback,
+    _gitleaks_evidence_action_tokens,
+    _store_gitleaks_evidence_action_token,
     PENDING_NMAP_REQUEST_KEY,
     build_gitleaks_evidence_warning_text,
     build_gitleaks_result_actions,
@@ -55,11 +57,13 @@ GITLEAKS_JSON = f"""
 def sqlite_gitleaks_store(tmp_path):
     configure_findings_database(tmp_path / "mongrel.db")
     configure_evidence_vault(tmp_path / "vault.db", Fernet.generate_key().decode("utf-8"))
+    _gitleaks_evidence_action_tokens.clear()
     yield
     close_findings_database()
     close_evidence_vault()
     configure_findings_database(None)
     configure_evidence_vault(None, None)
+    _gitleaks_evidence_action_tokens.clear()
 
 
 def _stored_context() -> dict:
@@ -98,9 +102,16 @@ def _vaulted_gitleaks_assessment(user_id: int = 9200) -> tuple[dict, dict, dict]
 
 
 def _vault_query(action: str, assessment_id: int | str, finding_id: str, evidence_id: str, reply_value: object | None = None) -> SimpleNamespace:
+    token = _store_gitleaks_evidence_action_token(
+        user_id=9200,
+        assessment_id=str(assessment_id),
+        finding_id=str(finding_id),
+        evidence_id=str(evidence_id),
+    )
+    prefixes = {"view": "glev", "reveal": "glrv", "cancel": "glcx"}
     message = SimpleNamespace(reply_text=AsyncMock(return_value=reply_value or SimpleNamespace(delete=AsyncMock())))
     return SimpleNamespace(
-        data=f"vault:{action}:{assessment_id}:{finding_id}:{evidence_id}",
+        data=f"{prefixes[action]}:{token}",
         edit_message_text=AsyncMock(),
         message=message,
     )
@@ -254,11 +265,18 @@ def test_gitleaks_view_evidence_button_uses_only_opaque_references() -> None:
     assessment, finding, evidence = _vaulted_gitleaks_assessment()
     evidence_id = evidence["findings"][0]["evidence_id"]
 
-    keyboard = build_gitleaks_result_actions(finding, {"assessment_id": assessment["id"]})
+    keyboard = build_gitleaks_result_actions(finding, {"assessment_id": assessment["id"]}, user_id=9200)
     callback_data = keyboard.inline_keyboard[1][0].callback_data
+    token = callback_data.split(":", 1)[1]
 
-    assert callback_data == f"vault:view:{assessment['id']}:{finding['id']}:{evidence_id}"
+    assert callback_data.startswith("glev:")
+    assert len(callback_data.encode("utf-8")) <= 64
     assert RAW_SECRET not in callback_data
+    assert finding["id"] not in callback_data
+    assert evidence_id not in callback_data
+    assert _gitleaks_evidence_action_tokens[token]["finding_id"] == finding["id"]
+    assert _gitleaks_evidence_action_tokens[token]["evidence_id"] == evidence_id
+    assert _gitleaks_evidence_action_tokens[token]["assessment_id"] == str(assessment["id"])
 
 
 def test_live_style_gitleaks_completion_renders_view_evidence_for_standalone_scan() -> None:
@@ -285,8 +303,17 @@ def test_live_style_gitleaks_completion_renders_view_evidence_for_standalone_sca
     finding = get_user_findings(user_id)[0]
     evidence_id = finding["gitleaks_evidence"]["findings"][0]["evidence_id"]
 
-    assert view_button.callback_data == f"vault:view:standalone:{finding['id']}:{evidence_id}"
+    token = view_button.callback_data.split(":", 1)[1]
+    assert view_button.callback_data.startswith("glev:")
+    assert len(view_button.callback_data.encode("utf-8")) <= 64
     assert RAW_SECRET not in view_button.callback_data
+    assert "fake_secrets.env" not in view_button.callback_data
+    assert "live-fixture-github" not in view_button.callback_data
+    assert finding["id"] not in view_button.callback_data
+    assert evidence_id not in view_button.callback_data
+    assert _gitleaks_evidence_action_tokens[token]["assessment_id"] == "standalone"
+    assert _gitleaks_evidence_action_tokens[token]["finding_id"] == finding["id"]
+    assert _gitleaks_evidence_action_tokens[token]["evidence_id"] == evidence_id
     assert any("Gitleaks AI Assessment" in str(call.args[0]) for call in message.reply_text.call_args_list)
     assert result_call.kwargs["reply_markup"] is keyboard
 
@@ -309,12 +336,17 @@ def test_live_style_standalone_gitleaks_reveal_uses_vaulted_value() -> None:
     message, _ = _live_style_gitleaks_scan(user_id=user_id, json_output=output)
     result_call = _result_card_call(message)
     view_button = [button for row in result_call.kwargs["reply_markup"].inline_keyboard for button in row if button.text == "View Evidence"][0]
-    _, _, assessment_ref, finding_id, evidence_id = view_button.callback_data.split(":", 4)
-    reveal_query = _vault_query("reveal", assessment_ref, finding_id, evidence_id)
+    token = view_button.callback_data.split(":", 1)[1]
+    payload = _gitleaks_evidence_action_tokens[token]
+    reveal_query = SimpleNamespace(
+        data=f"glrv:{token}",
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock()))),
+    )
 
     asyncio.run(_handle_gitleaks_evidence_vault_callback(reveal_query, user_id=user_id))
 
-    assert assessment_ref == "standalone"
+    assert payload["assessment_id"] == "standalone"
     assert RAW_SECRET not in view_button.callback_data
     assert RAW_SECRET in reveal_query.message.reply_text.call_args.args[0]
 
@@ -349,7 +381,12 @@ def test_live_style_gitleaks_completion_preserves_assessment_linkage_in_view_evi
     finding = get_user_findings(user_id)[0]
     evidence_id = finding["gitleaks_evidence"]["findings"][0]["evidence_id"]
 
-    assert view_button.callback_data == f"vault:view:{assessment['id']}:{finding['id']}:{evidence_id}"
+    token = view_button.callback_data.split(":", 1)[1]
+    assert view_button.callback_data.startswith("glev:")
+    assert len(view_button.callback_data.encode("utf-8")) <= 64
+    assert _gitleaks_evidence_action_tokens[token]["assessment_id"] == str(assessment["id"])
+    assert _gitleaks_evidence_action_tokens[token]["finding_id"] == finding["id"]
+    assert _gitleaks_evidence_action_tokens[token]["evidence_id"] == evidence_id
     assert list_assessment_scans(assessment["id"])[0]["finding_id"] == finding["id"]
     assert RAW_SECRET not in view_button.callback_data
 
@@ -402,8 +439,11 @@ def test_live_style_gitleaks_multiple_findings_map_to_distinct_evidence_callback
 
     assert [button.text for button in view_buttons] == ["View Evidence #1", "View Evidence #2"]
     assert len(set(callbacks)) == 2
+    assert all(callback.startswith("glev:") for callback in callbacks)
+    assert all(len(callback.encode("utf-8")) <= 64 for callback in callbacks)
+    token_payloads = [_gitleaks_evidence_action_tokens[callback.split(":", 1)[1]] for callback in callbacks]
     for evidence_id in evidence_ids:
-        assert any(callback.endswith(f":{evidence_id}") for callback in callbacks)
+        assert any(payload["evidence_id"] == evidence_id for payload in token_payloads)
     assert RAW_SECRET not in str(callbacks)
     assert second_raw_value not in str(callbacks)
 
@@ -413,13 +453,38 @@ def test_gitleaks_view_evidence_warning_shows_no_raw_secret_before_confirmation(
     evidence_id = evidence["findings"][0]["evidence_id"]
 
     warning = build_gitleaks_evidence_warning_text(finding, evidence_id)
-    keyboard = build_gitleaks_result_actions(finding, {"assessment_id": 1})
+    keyboard = build_gitleaks_result_actions(finding, {"assessment_id": 1}, user_id=9200)
 
     assert "Sensitive Evidence Warning" in warning
     assert "github-pat" in warning
     assert "<REDACTED>" in warning
     assert RAW_SECRET not in warning
     assert RAW_SECRET not in str(keyboard.to_dict())
+
+
+def test_gitleaks_warning_step_resolves_short_token_without_raw_secret() -> None:
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    token = _store_gitleaks_evidence_action_token(
+        user_id=9200,
+        assessment_id=str(assessment["id"]),
+        finding_id=finding["id"],
+        evidence_id=evidence_id,
+    )
+    query = SimpleNamespace(data=f"glev:{token}", edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    warning_text = query.edit_message_text.call_args.args[0]
+    warning_keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    callbacks = [button.callback_data for row in warning_keyboard.inline_keyboard for button in row]
+    assert "Sensitive Evidence Warning" in warning_text
+    assert RAW_SECRET not in warning_text
+    assert callbacks == [f"glrv:{token}", f"glcx:{token}"]
+    assert all(len(callback.encode("utf-8")) <= 64 for callback in callbacks)
+    assert RAW_SECRET not in str(callbacks)
+    assert finding["id"] not in str(callbacks)
+    assert evidence_id not in str(callbacks)
 
 
 def test_gitleaks_authorized_reveal_returns_exact_vaulted_value() -> None:
@@ -475,6 +540,24 @@ def test_gitleaks_missing_evidence_is_denied() -> None:
     assert query.edit_message_text.call_args.args[0] == "Evidence access denied."
     assert not query.message.reply_text.called
     assert list_reveal_audit_events("missing-evidence")[-1]["outcome"] == "denied"
+
+
+def test_gitleaks_expired_token_is_denied() -> None:
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    token = _store_gitleaks_evidence_action_token(
+        user_id=9200,
+        assessment_id=str(assessment["id"]),
+        finding_id=finding["id"],
+        evidence_id=evidence_id,
+    )
+    _gitleaks_evidence_action_tokens[token]["expires_at"] = 0
+    query = SimpleNamespace(data=f"glrv:{token}", edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    assert query.edit_message_text.call_args.args[0] == "Evidence access denied."
+    assert not query.message.reply_text.called
 
 
 def test_gitleaks_missing_vault_config_fails_closed(tmp_path) -> None:
