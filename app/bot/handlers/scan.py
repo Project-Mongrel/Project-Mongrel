@@ -828,20 +828,23 @@ def build_gitleaks_result_text(result: dict[str, object], evidence: dict | None 
 
 
 def build_gitleaks_result_actions(finding: dict | None, assessment_context: dict | None) -> InlineKeyboardMarkup | None:
-    if not finding or not assessment_context:
+    if not finding:
         return build_scan_result_actions(finding.get("id") if finding else None, "gitleaks")
-    evidence_item = _first_gitleaks_vaulted_finding(finding)
-    evidence_id = str(evidence_item.get("evidence_id") or "") if evidence_item else ""
-    assessment_id = str(assessment_context.get("assessment_id") or "")
     finding_id = str(finding.get("id") or "")
     base_actions = build_scan_result_actions(finding_id, "gitleaks")
     buttons = list(base_actions.inline_keyboard) if base_actions else []
-    if evidence_id and assessment_id and finding_id:
+    assessment_ref = _gitleaks_assessment_reference(assessment_context)
+    evidence_items = _gitleaks_vaulted_findings(finding)
+    for index, evidence_item in enumerate(evidence_items, start=1):
+        evidence_id = str(evidence_item.get("evidence_id") or "")
+        if not evidence_id or not finding_id:
+            continue
+        label = "View Evidence" if len(evidence_items) == 1 else f"View Evidence #{index}"
         buttons.append(
             [
                 InlineKeyboardButton(
-                    "View Evidence",
-                    callback_data=f"{EVIDENCE_VAULT_CALLBACK_PREFIX}:view:{assessment_id}:{finding_id}:{evidence_id}",
+                    label,
+                    callback_data=f"{EVIDENCE_VAULT_CALLBACK_PREFIX}:view:{assessment_ref}:{finding_id}:{evidence_id}",
                 )
             ]
         )
@@ -966,11 +969,18 @@ def redact_gitleaks_result_for_public_state(result: dict[str, object]) -> dict[s
     return public_result
 
 
-def _first_gitleaks_vaulted_finding(finding: dict) -> dict | None:
-    for item in ((finding.get("gitleaks_evidence") or {}).get("findings") or []):
-        if isinstance(item, dict) and str(item.get("evidence_id") or "").strip():
-            return item
-    return None
+def _gitleaks_assessment_reference(assessment_context: dict | None) -> str:
+    if assessment_context and assessment_context.get("assessment_id") is not None:
+        return str(assessment_context.get("assessment_id"))
+    return "standalone"
+
+
+def _gitleaks_vaulted_findings(finding: dict) -> list[dict]:
+    return [
+        item
+        for item in ((finding.get("gitleaks_evidence") or {}).get("findings") or [])
+        if isinstance(item, dict) and str(item.get("evidence_id") or "").strip()
+    ]
 
 
 def _find_gitleaks_evidence_item(finding: dict, evidence_id: str) -> dict | None:
@@ -2604,6 +2614,13 @@ def _authorize_gitleaks_evidence_access(
         return None, "wrong_tool"
     if _find_gitleaks_evidence_item(finding, evidence_id) is None:
         return None, "evidence_not_in_finding"
+    metadata = get_secret_evidence_metadata(evidence_id)
+    if metadata is None:
+        return None, "missing_evidence"
+    if assessment_id == "standalone":
+        if str(metadata.get("assessment_id") or "") != "":
+            return None, "vault_assessment_mismatch"
+        return finding, ""
     try:
         scan_assessment_id = int(assessment_id)
     except ValueError:
@@ -2613,9 +2630,6 @@ def _authorize_gitleaks_evidence_access(
         for scan in list_assessment_scans(scan_assessment_id)
     ):
         return None, "wrong_assessment"
-    metadata = get_secret_evidence_metadata(evidence_id)
-    if metadata is None:
-        return None, "missing_evidence"
     if str(metadata.get("assessment_id") or "") != str(assessment_id):
         return None, "vault_assessment_mismatch"
     return finding, ""

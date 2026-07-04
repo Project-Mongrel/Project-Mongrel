@@ -1,18 +1,21 @@
 import asyncio
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from cryptography.fernet import Fernet
 
 from app.bot.handlers.assessment import build_assessment_dashboard_keyboard, build_assessment_dashboard_text
+from app.bot.handlers.assessment import ASSESSMENT_SCAN_CONTEXT_KEY
 from app.bot.handlers.scan import (
     _handle_gitleaks_evidence_vault_callback,
+    PENDING_NMAP_REQUEST_KEY,
     build_gitleaks_evidence_warning_text,
     build_gitleaks_result_actions,
     build_gitleaks_result_text,
     redact_gitleaks_result_for_public_state,
+    scan_target_handler,
     store_gitleaks_scan_result,
     store_gitleaks_secret_vault_records,
 )
@@ -22,7 +25,8 @@ from app.services.assessment_context import build_assessment_context
 from app.services.assessment_guard import build_assessment_guard
 from app.services.assessment_markdown_report import generate_assessment_markdown_report
 from app.services.assessment_store import add_assessment_target, create_assessment, list_assessment_scans, record_assessment_scan
-from app.services.findings_store import close_findings_database, configure_findings_database
+from app.services.findings_store import close_findings_database, configure_findings_database, get_user_findings
+from app.services.scan_manager import clear_user_scan_requests, create_scan_request, mark_scan_request_awaiting_target
 from app.services.evidence_vault import (
     EvidenceVaultUnavailable,
     close_evidence_vault,
@@ -100,6 +104,55 @@ def _vault_query(action: str, assessment_id: int | str, finding_id: str, evidenc
         edit_message_text=AsyncMock(),
         message=message,
     )
+
+
+def _gitleaks_json(records: list[dict]) -> str:
+    import json
+
+    return json.dumps(records)
+
+
+def _live_style_gitleaks_scan(
+    *,
+    user_id: int,
+    json_output: str,
+    assessment_context: dict | None = None,
+) -> tuple[SimpleNamespace, dict | None]:
+    clear_user_scan_requests(user_id)
+    scan_request = create_scan_request(user_id=user_id, scan_type="gitleaks")
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    if assessment_context:
+        context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY] = assessment_context
+    message = SimpleNamespace(text="/home/mongrel/Project-Mongrel/data/gitleaks_smoke_fixture", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id))
+    result = {
+        "success": True,
+        "target": "/home/mongrel/Project-Mongrel/data/gitleaks_smoke_fixture",
+        "json_output": json_output,
+        "elapsed_seconds": 2,
+        "returncode": 1,
+        "command": ["gitleaks", "dir"],
+    }
+
+    with (
+        patch("app.bot.handlers.scan.run_gitleaks_scan", return_value=result),
+        patch("app.bot.handlers.scan.generate_gitleaks_ai_assessment", return_value=["Gitleaks AI assessment ready."]),
+        patch("app.bot.handlers.scan.ScanProgressCard.start", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.complete", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    return message, assessment_context
+
+
+def _result_card_call(message: SimpleNamespace):
+    for call in message.reply_text.call_args_list:
+        if call.args and "Gitleaks Scan Complete" in str(call.args[0]):
+            return call
+    raise AssertionError("Gitleaks result card was not sent.")
 
 
 def test_assessment_context_includes_redacted_gitleaks_evidence() -> None:
@@ -206,6 +259,153 @@ def test_gitleaks_view_evidence_button_uses_only_opaque_references() -> None:
 
     assert callback_data == f"vault:view:{assessment['id']}:{finding['id']}:{evidence_id}"
     assert RAW_SECRET not in callback_data
+
+
+def test_live_style_gitleaks_completion_renders_view_evidence_for_standalone_scan() -> None:
+    user_id = 9310
+    output = _gitleaks_json(
+        [
+            {
+                "RuleID": "github-pat",
+                "Description": "GitHub Personal Access Token",
+                "File": "fake_secrets.env",
+                "StartLine": 5,
+                "Secret": RAW_SECRET,
+                "Entropy": 4.9,
+                "Fingerprint": "live-fixture-github",
+            }
+        ]
+    )
+
+    message, _ = _live_style_gitleaks_scan(user_id=user_id, json_output=output)
+    result_call = _result_card_call(message)
+    keyboard = result_call.kwargs["reply_markup"]
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    view_button = [button for button in buttons if button.text == "View Evidence"][0]
+    finding = get_user_findings(user_id)[0]
+    evidence_id = finding["gitleaks_evidence"]["findings"][0]["evidence_id"]
+
+    assert view_button.callback_data == f"vault:view:standalone:{finding['id']}:{evidence_id}"
+    assert RAW_SECRET not in view_button.callback_data
+    assert any("Gitleaks AI Assessment" in str(call.args[0]) for call in message.reply_text.call_args_list)
+    assert result_call.kwargs["reply_markup"] is keyboard
+
+
+def test_live_style_standalone_gitleaks_reveal_uses_vaulted_value() -> None:
+    user_id = 9314
+    output = _gitleaks_json(
+        [
+            {
+                "RuleID": "github-pat",
+                "Description": "GitHub Personal Access Token",
+                "File": "fake_secrets.env",
+                "StartLine": 5,
+                "Secret": RAW_SECRET,
+                "Entropy": 4.9,
+                "Fingerprint": "live-fixture-github",
+            }
+        ]
+    )
+    message, _ = _live_style_gitleaks_scan(user_id=user_id, json_output=output)
+    result_call = _result_card_call(message)
+    view_button = [button for row in result_call.kwargs["reply_markup"].inline_keyboard for button in row if button.text == "View Evidence"][0]
+    _, _, assessment_ref, finding_id, evidence_id = view_button.callback_data.split(":", 4)
+    reveal_query = _vault_query("reveal", assessment_ref, finding_id, evidence_id)
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(reveal_query, user_id=user_id))
+
+    assert assessment_ref == "standalone"
+    assert RAW_SECRET not in view_button.callback_data
+    assert RAW_SECRET in reveal_query.message.reply_text.call_args.args[0]
+
+
+def test_live_style_gitleaks_completion_preserves_assessment_linkage_in_view_evidence() -> None:
+    user_id = 9311
+    assessment = create_assessment("Live Gitleaks Assessment")
+    target = add_assessment_target(assessment["id"], address="/home/mongrel/Project-Mongrel/data/gitleaks_smoke_fixture", target_type="artifact_dir")
+    output = _gitleaks_json(
+        [
+            {
+                "RuleID": "github-pat",
+                "Description": "GitHub Personal Access Token",
+                "File": "fake_secrets.env",
+                "StartLine": 5,
+                "Secret": RAW_SECRET,
+                "Entropy": 4.9,
+                "Fingerprint": "live-fixture-github",
+            }
+        ]
+    )
+
+    message, _ = _live_style_gitleaks_scan(
+        user_id=user_id,
+        json_output=output,
+        assessment_context={"assessment_id": assessment["id"], "target_id": target["id"], "tool": "gitleaks"},
+    )
+    result_call = _result_card_call(message)
+    keyboard = result_call.kwargs["reply_markup"]
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    view_button = [button for button in buttons if button.text == "View Evidence"][0]
+    finding = get_user_findings(user_id)[0]
+    evidence_id = finding["gitleaks_evidence"]["findings"][0]["evidence_id"]
+
+    assert view_button.callback_data == f"vault:view:{assessment['id']}:{finding['id']}:{evidence_id}"
+    assert list_assessment_scans(assessment["id"])[0]["finding_id"] == finding["id"]
+    assert RAW_SECRET not in view_button.callback_data
+
+
+def test_live_style_gitleaks_completion_without_vaulted_evidence_has_no_view_evidence() -> None:
+    user_id = 9312
+
+    message, _ = _live_style_gitleaks_scan(user_id=user_id, json_output="[]")
+    result_call = _result_card_call(message)
+    keyboard = result_call.kwargs["reply_markup"]
+    button_texts = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "AI Summary" in button_texts
+    assert "View Evidence" not in button_texts
+
+
+def test_live_style_gitleaks_multiple_findings_map_to_distinct_evidence_callbacks() -> None:
+    user_id = 9313
+    second_raw_value = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    output = _gitleaks_json(
+        [
+            {
+                "RuleID": "github-pat",
+                "Description": "GitHub Personal Access Token",
+                "File": "fake_secrets.env",
+                "StartLine": 5,
+                "Secret": RAW_SECRET,
+                "Entropy": 4.9,
+                "Fingerprint": "first-fingerprint",
+            },
+            {
+                "RuleID": "github-pat",
+                "Description": "GitHub Personal Access Token",
+                "File": "fake_secrets.env",
+                "StartLine": 6,
+                "Secret": second_raw_value,
+                "Entropy": 4.8,
+                "Fingerprint": "second-fingerprint",
+            },
+        ]
+    )
+
+    message, _ = _live_style_gitleaks_scan(user_id=user_id, json_output=output)
+    result_call = _result_card_call(message)
+    keyboard = result_call.kwargs["reply_markup"]
+    view_buttons = [button for row in keyboard.inline_keyboard for button in row if button.text.startswith("View Evidence")]
+    finding = get_user_findings(user_id)[0]
+    evidence_ids = [item["evidence_id"] for item in finding["gitleaks_evidence"]["findings"]]
+    callbacks = [button.callback_data for button in view_buttons]
+
+    assert [button.text for button in view_buttons] == ["View Evidence #1", "View Evidence #2"]
+    assert len(set(callbacks)) == 2
+    for evidence_id in evidence_ids:
+        assert any(callback.endswith(f":{evidence_id}") for callback in callbacks)
+    assert RAW_SECRET not in str(callbacks)
+    assert second_raw_value not in str(callbacks)
 
 
 def test_gitleaks_view_evidence_warning_shows_no_raw_secret_before_confirmation() -> None:
