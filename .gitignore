@@ -21,6 +21,7 @@ logs/
 
 # Runtime data
 data/
+data/gitleaks_smoke_fixture/
 
 # Coverage & testing
 .coverage
