@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     evidence_vault_path: Path = Path("data/evidence_vault.db")
     evidence_vault_key: str | None = None
     evidence_reveal_ttl_seconds: int = 60
+    prowler_enabled: bool = False
+    prowler_binary: str = "prowler"
+    prowler_timeout_seconds: int = 900
 
 
 @lru_cache
