@@ -220,13 +220,22 @@ def build_testssl_target_prompt() -> str:
 def build_gitleaks_target_prompt() -> str:
     return "\n".join(
         [
-            "Gitleaks secret scan request created. Send an authorized local artifact/project directory.",
+            "Gitleaks secret scan request created.",
             "",
-            "Detection only. Secrets are redacted before storage and display.",
+            "Send an authorized local directory path on the Mongrel VPS.",
             "",
-            "Examples:",
-            "C:\\dev\\Project-Mongrel\\artifacts\\assessment-1",
-            ".\\data\\artifacts\\assessment-1",
+            "Detection only:",
+            "- Secrets are redacted in Telegram, AI, and reports.",
+            "- Raw secrets are stored only in the encrypted Evidence Vault when configured.",
+            "- No credential validation or use is performed.",
+            "",
+            "Demo smoke-test path:",
+            "/home/mongrel/Project-Mongrel/data/gitleaks_smoke_fixture",
+            "",
+            "Assessment artifact example:",
+            "/home/mongrel/Project-Mongrel/data/artifacts/<assessment-id>",
+            "",
+            "The demo smoke-test path contains generated fake test data only.",
         ]
     )
 

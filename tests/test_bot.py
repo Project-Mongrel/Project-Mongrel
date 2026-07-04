@@ -1522,6 +1522,20 @@ def test_gitleaks_scan_callback_prompts_for_target() -> None:
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 
+def test_gitleaks_target_prompt_uses_vps_local_scope_guidance() -> None:
+    prompt = build_gitleaks_target_prompt()
+
+    assert "Send an authorized local directory path on the Mongrel VPS." in prompt
+    assert "- Secrets are redacted in Telegram, AI, and reports." in prompt
+    assert "- Raw secrets are stored only in the encrypted Evidence Vault when configured." in prompt
+    assert "- No credential validation or use is performed." in prompt
+    assert "/home/mongrel/Project-Mongrel/data/gitleaks_smoke_fixture" in prompt
+    assert "/home/mongrel/Project-Mongrel/data/artifacts/<assessment-id>" in prompt
+    assert "generated fake test data only" in prompt
+    assert "C:\\dev" not in prompt
+    assert ".\\data" not in prompt
+
+
 def test_scan_callback_pattern_routes_testssl_button() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:testssl")
 
