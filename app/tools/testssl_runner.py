@@ -164,8 +164,6 @@ def _build_testssl_command(executable: str, target: str, json_path: Path) -> lis
         "batch",
         "--openssl-timeout",
         "5",
-        "--connect-timeout",
-        "5",
         "--quiet",
         target,
     ]

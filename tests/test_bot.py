@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -6,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 from telegram.error import TimedOut
 
 from app.bot.auth import is_admin
+from app.bot.bot import SCAN_CALLBACK_PATTERN
 from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
 from app.bot.handlers.assessment import (
     ASSESSMENT_CHAT_STATE_KEY,
@@ -58,6 +60,7 @@ from app.bot.handlers.scan import (
     build_katana_target_prompt,
     build_playwright_result_text,
     build_playwright_target_prompt,
+    build_testssl_target_prompt,
     build_clean_nuclei_verdict_text,
     build_nuclei_status_card,
     build_nuclei_target_prompt,
@@ -1416,6 +1419,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "Katana Crawl" in rendered_buttons
     assert "Playwright Observe" in rendered_buttons
     assert "ffuf Discovery" in rendered_buttons
+    assert "testssl.sh TLS" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -1488,6 +1492,22 @@ def test_ffuf_scan_callback_prompts_for_target() -> None:
 
     assert query.edit_message_text.call_args.args[0] == build_ffuf_target_prompt()
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_testssl_scan_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7211)
+    query = SimpleNamespace(data="scan:testssl", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7211))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_testssl_target_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_scan_callback_pattern_routes_testssl_button() -> None:
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:testssl")
 
 
 def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:

@@ -105,8 +105,6 @@ def test_build_testssl_command_uses_explicit_argv() -> None:
         "batch",
         "--openssl-timeout",
         "5",
-        "--connect-timeout",
-        "5",
         "--quiet",
         "example.com:443",
     ]
