@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     ffuf_rate_limit: int = 25
     testssl_path: str = "testssl.sh"
     testssl_scan_timeout_seconds: int = 180
+    gitleaks_path: str = "gitleaks"
+    gitleaks_scan_timeout_seconds: int = 120
 
 
 @lru_cache

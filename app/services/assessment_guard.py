@@ -165,6 +165,17 @@ def collect_observed_assets(context: dict) -> dict[str, list[str] | str]:
             for item in testssl_evidence.get("vulnerabilities") or []:
                 item_id = str(item.get("id") or "testssl finding").strip()
                 services.append(f"testssl: {item_id}")
+        gitleaks_evidence = finding.get("gitleaks_evidence") or {}
+        if gitleaks_evidence:
+            scan_root = str(gitleaks_evidence.get("scan_root") or "").strip()
+            if scan_root:
+                hosts.append(scan_root)
+            count = int(gitleaks_evidence.get("finding_count") or 0)
+            services.append(f"gitleaks secret findings: {count}")
+            for item in gitleaks_evidence.get("findings") or []:
+                rule_id = str(item.get("rule_id") or "secret").strip()
+                file_path = str(item.get("file_path") or "unknown").strip()
+                services.append(f"gitleaks {rule_id} in {file_path}")
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -207,6 +218,8 @@ def _locked_tool_limitations(status_by_tool: dict[str, set[str]]) -> list[str]:
     limitations = list(LOCKED_TOOL_LIMITATIONS)
     if "testssl" in status_by_tool:
         limitations = [limitation for limitation in limitations if limitation != "testssl.sh not run"]
+    if "gitleaks" in status_by_tool:
+        limitations = [limitation for limitation in limitations if limitation != "Gitleaks not run"]
     return limitations
 
 

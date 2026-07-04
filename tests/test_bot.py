@@ -54,6 +54,7 @@ from app.bot.handlers.scan import (
     build_bbot_target_prompt,
     build_ffuf_result_text,
     build_ffuf_target_prompt,
+    build_gitleaks_target_prompt,
     build_httpx_result_text,
     build_httpx_target_prompt,
     build_katana_result_text,
@@ -216,6 +217,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "Playwright: Not run" in dashboard
     assert "ffuf: Not run" in dashboard
     assert "testssl.sh: Not run" in dashboard
+    assert "Gitleaks: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
@@ -225,6 +227,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
         "Run Playwright",
         "Run ffuf",
         "Run testssl.sh",
+        "Run Gitleaks",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",
@@ -1420,6 +1423,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "Playwright Observe" in rendered_buttons
     assert "ffuf Discovery" in rendered_buttons
     assert "testssl.sh TLS" in rendered_buttons
+    assert "Gitleaks Secrets" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -1506,8 +1510,24 @@ def test_testssl_scan_callback_prompts_for_target() -> None:
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 
+def test_gitleaks_scan_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7213)
+    query = SimpleNamespace(data="scan:gitleaks", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7213))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_gitleaks_target_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
 def test_scan_callback_pattern_routes_testssl_button() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:testssl")
+
+
+def test_scan_callback_pattern_routes_gitleaks_button() -> None:
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:gitleaks")
 
 
 def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> None:

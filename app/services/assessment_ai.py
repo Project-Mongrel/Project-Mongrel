@@ -65,6 +65,8 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             '- Never say the target is "safe" or "secure".',
             "- Treat testssl.sh results as TLS configuration evidence only.",
             "- Do not invent TLS vulnerabilities or claim overall site security from TLS evidence alone.",
+            "- Treat Gitleaks detections as redacted secret-exposure evidence only.",
+            "- Never include raw secret values or infer hidden secret values.",
             "- If evidence is missing, say so.",
             "- If evidence is insufficient, recommend the next assessment step.",
             f"- For secure/safe questions, start with: {SECURE_PREAMBLE}",
@@ -103,7 +105,7 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Never imply a clean Nuclei scan means the target is secure.",
             "- If evidence is missing, explain what has not yet been assessed.",
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
-            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, assessment history, artifacts, and notes in the supplied context.",
+            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, Gitleaks, assessment history, artifacts, and notes in the supplied context.",
             "- testssl.sh evidence supports TLS configuration assessment only; do not claim overall site security from TLS evidence alone.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
@@ -159,7 +161,7 @@ def _format_assessment_context(context: dict) -> str:
                 if str(scan.get("status") or "").lower() in {"completed", "partial"}
             }
         )
-        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl") if tool not in represented_tools]
+        missing_tools = [tool for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks") if tool not in represented_tools]
         lines.append("- Represented tools:")
         lines.append("  - " + (", ".join(represented_tools) if represented_tools else "none"))
         lines.append("- Missing or not represented:")
@@ -343,6 +345,19 @@ def _format_finding(finding: dict) -> list[str]:
                         f"finding={_clean(item.get('finding') or '')}"
                     )
         for limitation in testssl_evidence.get("limitations") or []:
+            lines.append(f"    - limitation: {_clean(limitation)}")
+    gitleaks_evidence = finding.get("gitleaks_evidence") or {}
+    if gitleaks_evidence:
+        lines.append("    Gitleaks redacted secret-exposure evidence:")
+        lines.append(f"    - scan_root={_clean(gitleaks_evidence.get('scan_root') or finding.get('target') or 'unknown')}")
+        lines.append(f"    - findings={int(gitleaks_evidence.get('finding_count') or 0)} affected_files={int(gitleaks_evidence.get('affected_files_count') or 0)}")
+        for item in (gitleaks_evidence.get("findings") or [])[:20]:
+            lines.append(
+                f"    - rule={_clean(item.get('rule_id') or 'unknown')} file={_clean(item.get('file_path') or 'unknown')} "
+                f"line={_clean(item.get('line_number') or 'unknown')} provider={_clean(item.get('provider') or 'unknown')} "
+                f"severity={_clean(item.get('severity') or 'unknown')} secret={_clean(item.get('redacted_secret_preview') or '<REDACTED>')}"
+            )
+        for limitation in gitleaks_evidence.get("limitations") or []:
             lines.append(f"    - limitation: {_clean(limitation)}")
     return lines
 

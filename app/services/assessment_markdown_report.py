@@ -117,7 +117,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
-    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl"):
+    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks"):
         tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
         if not tool_scans:
             continue
@@ -178,6 +178,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         playwright_observation = finding.get("playwright_observation") or {}
         ffuf_results = finding.get("ffuf_results") or {}
         testssl_evidence = finding.get("testssl_evidence") or {}
+        gitleaks_evidence = finding.get("gitleaks_evidence") or {}
 
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
@@ -194,6 +195,8 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         elif testssl_evidence:
             notable = _notable_testssl_items(testssl_evidence)
             lines.append(f"- {tool}: TLS configuration evidence recorded with {len(notable)} notable finding(s).")
+        elif gitleaks_evidence:
+            lines.append(f"- {tool}: {int(gitleaks_evidence.get('finding_count') or 0)} redacted secret-exposure finding(s) recorded.")
         elif observation_counts:
             total = sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
@@ -220,7 +223,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     completed = _represented_scans(scans)
     if not completed:
         return [
-            "- Run authorized Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, and testssl.sh scans for the assessment scope.",
+            "- Run authorized Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, and Gitleaks scans for the assessment scope.",
             "- Add notes or artifacts that define scope and testing constraints.",
         ]
 
@@ -235,6 +238,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     playwright_observations = [finding.get("playwright_observation") for finding in findings if finding.get("playwright_observation")]
     ffuf_results = [result for finding in findings for result in (finding.get("ffuf_results") or [])]
     testssl_evidence = [finding.get("testssl_evidence") for finding in findings if finding.get("testssl_evidence")]
+    gitleaks_evidence = [finding.get("gitleaks_evidence") for finding in findings if finding.get("gitleaks_evidence")]
 
     if open_ports:
         actions.append("- Validate externally exposed services and confirm each service is authorized.")
@@ -258,6 +262,8 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
         actions.append("- Review discovered hidden-content paths and status codes as follow-up candidates before manual validation.")
     if testssl_evidence:
         actions.append("- Review TLS protocols, certificate expiry, cipher observations, and testssl.sh-reported misconfigurations with the service owner.")
+    if gitleaks_evidence:
+        actions.append("- Rotate or revoke detected secrets, remove them from repositories/artifacts, and review commit history for exposure.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -297,6 +303,9 @@ def _scan_summary(scan: dict) -> str:
     if tool == "testssl":
         evidence = finding.get("testssl_evidence") or {}
         return "TLS configuration evidence recorded." if evidence else "testssl.sh completed with no structured TLS evidence."
+    if tool == "gitleaks":
+        evidence = finding.get("gitleaks_evidence") or {}
+        return f"{int(evidence.get('finding_count') or 0)} redacted secret-exposure finding(s) recorded." if evidence else "Gitleaks completed with no structured secret findings."
     return "Completed scan evidence recorded."
 
 
@@ -433,6 +442,26 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             lines.append("- Security header evidence: " + "; ".join(_clean(item.get("id") or item.get("finding")) for item in headers[:8]))
         return lines
 
+    gitleaks_evidence = finding.get("gitleaks_evidence") or {}
+    if gitleaks_evidence:
+        summary = finding.get("gitleaks_summary") or {}
+        lines = [
+            f"- Scope: {_clean(gitleaks_evidence.get('scan_root') or finding.get('target') or 'unknown')}",
+            f"- Secret findings: {int(summary.get('finding_count') or gitleaks_evidence.get('finding_count') or 0)}",
+            f"- Affected files: {int(summary.get('affected_files_count') or gitleaks_evidence.get('affected_files_count') or 0)}",
+            "- Rules: " + _format_count_summary(summary.get("rule_summary") or gitleaks_evidence.get("rule_summary") or {}),
+            "- Providers: " + _format_count_summary(summary.get("provider_summary") or gitleaks_evidence.get("provider_summary") or {}),
+            "- Severity: " + _format_count_summary(summary.get("severity_summary") or gitleaks_evidence.get("severity_summary") or {}),
+            "- Limitation: Secret values are redacted. Detections are not proof of compromise.",
+        ]
+        for item in (gitleaks_evidence.get("findings") or [])[:10]:
+            lines.append(
+                f"- {_clean(item.get('rule_id') or 'unknown')} file={_clean(item.get('file_path') or 'unknown')} "
+                f"line={_clean(item.get('line_number') or 'unknown')} provider={_clean(item.get('provider') or 'unknown')} "
+                f"secret={_clean(item.get('redacted_secret_preview') or '<REDACTED>')}"
+            )
+        return lines
+
     if str(scan.get("tool") or "").lower() == "nuclei":
         return ["- No matching findings were observed with the selected template/profile."]
     return ["- No additional structured observations are linked to this scan."]
@@ -542,6 +571,17 @@ def _collect_assets(targets: list[dict], findings: list[dict]) -> dict[str, list
             if cert.get("not_after"):
                 assets["other"].append(f"Certificate expiry: {_clean(cert.get('not_after'))}")
 
+        gitleaks_evidence = finding.get("gitleaks_evidence") or {}
+        if gitleaks_evidence:
+            scan_root = _clean(gitleaks_evidence.get("scan_root") or finding.get("target") or "")
+            if scan_root:
+                assets["other"].append(f"Gitleaks scope: {scan_root}")
+            for item in gitleaks_evidence.get("findings") or []:
+                file_path = _clean(item.get("file_path") or "")
+                rule_id = _clean(item.get("rule_id") or "secret")
+                if file_path:
+                    assets["other"].append(f"Gitleaks {rule_id}: {file_path}")
+
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -570,7 +610,7 @@ def _risk_suffix(scan: dict) -> str:
 
 
 def _tool_label(tool: object) -> str:
-    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh"}
+    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh", "gitleaks": "Gitleaks"}
     return labels.get(str(tool or "").lower(), _clean(tool or "Unknown"))
 
 
@@ -649,3 +689,7 @@ def _is_notable_testssl_item(item: dict) -> bool:
     if severity in {"HIGH", "CRITICAL", "MEDIUM", "LOW", "WARN", "WARNING"}:
         return True
     return not any(term in finding for term in ("not vulnerable", "not offered", "not supported", "no vulnerability"))
+
+
+def _format_count_summary(counts: dict) -> str:
+    return ", ".join(f"{_clean(key)}={int(value or 0)}" for key, value in sorted(counts.items())) if counts else "none"

@@ -23,6 +23,7 @@ from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
 from app.bot.handlers.reports import split_report_text
 from app.parsers.ffuf_parser import parse_ffuf_output, summarize_ffuf_results
+from app.parsers.gitleaks_parser import GitleaksParserError, normalize_gitleaks_output, summarize_gitleaks_evidence
 from app.parsers.httpx_parser import parse_httpx_output, summarize_httpx_services
 from app.parsers.katana_parser import parse_katana_output, summarize_katana_observations
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
@@ -66,6 +67,8 @@ from app.services.nuclei_ai_assessment import FALLBACK_LINES as NUCLEI_AI_FALLBA
 from app.services.nuclei_ai_assessment import generate_nuclei_ai_assessment
 from app.services.ffuf_ai_assessment import FALLBACK_LINES as FFUF_AI_FALLBACK_LINES
 from app.services.ffuf_ai_assessment import generate_ffuf_ai_assessment
+from app.services.gitleaks_ai_assessment import FALLBACK_LINES as GITLEAKS_AI_FALLBACK_LINES
+from app.services.gitleaks_ai_assessment import generate_gitleaks_ai_assessment
 from app.services.httpx_ai_assessment import FALLBACK_LINES as HTTPX_AI_FALLBACK_LINES
 from app.services.httpx_ai_assessment import generate_httpx_ai_assessment
 from app.services.katana_ai_assessment import FALLBACK_LINES as KATANA_AI_FALLBACK_LINES
@@ -80,6 +83,7 @@ from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
 from app.tools.ffuf_runner import run_ffuf_scan
+from app.tools.gitleaks_runner import run_gitleaks_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
 from app.tools.playwright_runner import run_playwright_observation
@@ -208,6 +212,20 @@ def build_testssl_target_prompt() -> str:
             "https://example.com",
             "example.com",
             "example.com:443",
+        ]
+    )
+
+
+def build_gitleaks_target_prompt() -> str:
+    return "\n".join(
+        [
+            "Gitleaks secret scan request created. Send an authorized local artifact/project directory.",
+            "",
+            "Detection only. Secrets are redacted before storage and display.",
+            "",
+            "Examples:",
+            "C:\\dev\\Project-Mongrel\\artifacts\\assessment-1",
+            ".\\data\\artifacts\\assessment-1",
         ]
     )
 
@@ -750,6 +768,86 @@ def _is_notable_testssl_item(item: dict) -> bool:
     return not any(term in finding for term in ("not vulnerable", "not offered", "not supported", "no vulnerability"))
 
 
+def build_gitleaks_result_text(result: dict[str, object], evidence: dict | None = None) -> str:
+    evidence = evidence or {}
+    summary = summarize_gitleaks_evidence(evidence) if evidence else {}
+    finding_count = int(summary.get("finding_count") or 0)
+    affected_files = int(summary.get("affected_files_count") or 0)
+    limitations = list(evidence.get("limitations") or [])
+    if result.get("success") is not True:
+        limitations.append(str(result.get("error") or "Gitleaks did not complete successfully."))
+    findings = [
+        f"Secret findings: {finding_count}",
+        f"Affected files: {affected_files}",
+    ]
+    for item in (evidence.get("findings") or [])[:5]:
+        findings.append(
+            f"{item.get('rule_id') or 'unknown'} in {item.get('file_path') or 'unknown'}:"
+            f"{item.get('line_number') or '?'} ({item.get('redacted_secret_preview') or '<REDACTED>'})"
+        )
+        break
+    findings.extend(
+        [
+            "Rules: " + _format_count_summary(summary.get("rule_summary") or {}),
+            "Providers: " + _format_count_summary(summary.get("provider_summary") or {}),
+            "Severity: " + _format_count_summary(summary.get("severity_summary") or {}),
+        ]
+    )
+    findings.append("Limitation: Detection only; secrets were not validated or used.")
+    if limitations:
+        findings.append("Limitations: " + " ".join(str(value) for value in limitations[:3]))
+    return render_scan_result_card(
+        tool_name="Gitleaks",
+        target=str(result.get("target") or evidence.get("scan_root") or "unknown"),
+        status="Complete" if result.get("success") is True else "Failed",
+        elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+        risk="HIGH" if finding_count else ("INFO" if result.get("success") is True else None),
+        summary=f"{finding_count} redacted secret-exposure finding(s) recorded.",
+        findings=findings,
+        assets=[str(evidence.get("scan_root") or result.get("target") or "")],
+    )
+
+
+def store_gitleaks_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
+    evidence = evidence or {}
+    summary = summarize_gitleaks_evidence(evidence) if evidence else {}
+    finding_count = int(summary.get("finding_count") or 0)
+    status = "completed" if result.get("success") is True else "failed"
+    target = str(result.get("target") or evidence.get("scan_root") or "")
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "gitleaks",
+            "target": target,
+            "target_key": normalize_target_key(target),
+            "status": status,
+            "summary": (
+                f"Gitleaks recorded {finding_count} redacted secret-exposure finding(s)."
+                if result.get("success") is True
+                else str(result.get("error") or "Gitleaks secret scan failed.")
+            ),
+            "risk_level": "high" if finding_count else ("info" if result.get("success") is True else "unknown"),
+            "finding_count": finding_count,
+            "raw_output": "",
+            "gitleaks_evidence": evidence,
+            "gitleaks_summary": summary,
+            "metadata": {
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "command": result.get("command"),
+                "working_directory": result.get("working_directory"),
+                "error": result.get("error"),
+                "error_type": result.get("error_type"),
+                "parser": "gitleaks-json",
+            },
+        },
+    )
+
+
+def _format_count_summary(counts: dict) -> str:
+    return ", ".join(f"{key}: {count}" for key, count in sorted(counts.items())) if counts else "none"
+
+
 def store_bbot_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
     observations = observations or []
     observation_counts = summarize_observations(observations)
@@ -1215,6 +1313,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_testssl_target_prompt())
         return
 
+    if scan_type == "gitleaks":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_gitleaks_target_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -1312,6 +1416,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if scan_request.scan_type == "testssl":
         await _handle_testssl_target(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type == "gitleaks":
+        await _handle_gitleaks_target(update, context, user_id, scan_request_id)
         return
 
     if scan_request.scan_type != "nmap":
@@ -1477,6 +1585,20 @@ async def _send_testssl_ai_assessment(message: object, finding: dict) -> None:
 
     await safe_edit_text(progress_message, "AI assessment ready.", context="testssl.sh AI assessment status")
     assessment_text = render_ai_summary_card(assessment_lines, title="testssl.sh AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
+async def _send_gitleaks_ai_assessment(message: object, finding: dict) -> None:
+    progress_message = await message.reply_text("Generating Gitleaks AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_gitleaks_ai_assessment, finding)
+    if assessment_lines == GITLEAKS_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "Gitleaks AI assessment unavailable.", context="Gitleaks AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="Gitleaks AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="Gitleaks AI Assessment")
     for chunk in split_report_text(assessment_text):
         await message.reply_text(chunk)
 
@@ -1647,6 +1769,97 @@ async def _handle_testssl_target(
     )
     if result.get("success") is True:
         await _send_testssl_ai_assessment(update.message, finding)
+    await _send_assessment_dashboard(update.message, assessment_context)
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+
+
+async def _handle_gitleaks_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    scope = update.message.text or ""
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=scope)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=scope,
+        event_type="gitleaks_scan_started",
+        tool="gitleaks",
+        status="started",
+        summary="Gitleaks secret scan started",
+    )
+    progress_card = ScanProgressCard(update.message, "Gitleaks Secrets", scope)
+    await progress_card.start("Launching scan...")
+    await progress_card.start_auto_refresh("Running scan...", interval_seconds=5)
+    assessment_context = _pop_assessment_scan_context(context, "gitleaks")
+
+    try:
+        result = await asyncio.to_thread(run_gitleaks_scan, scope)
+    except ValueError as exc:
+        await progress_card.fail(str(exc))
+        add_investigation_event(
+            investigation_id=investigation["id"],
+            user_id=user_id,
+            target=scope,
+            event_type="gitleaks_scan_failed",
+            tool="gitleaks",
+            status="failed",
+            summary="Gitleaks secret scan failed",
+        )
+        await update.message.reply_text(f"Invalid Gitleaks scope: {exc}")
+        _record_assessment_scan(
+            assessment_context,
+            tool="gitleaks",
+            result={"success": False, "target": scope, "error": str(exc)},
+        )
+        await _send_assessment_dashboard(update.message, assessment_context)
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+    finally:
+        await progress_card.stop_auto_refresh()
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=str(result.get("target") or scope),
+        result=result,
+    )
+    evidence = {}
+    parser_error = None
+    if result.get("success") is True:
+        try:
+            evidence = normalize_gitleaks_output(str(result.get("json_output") or "[]"), scan_root=str(result.get("target") or scope))
+        except GitleaksParserError as exc:
+            parser_error = str(exc)
+            result = {**result, "success": False, "error": parser_error, "error_type": "parser_error"}
+
+    finding = store_gitleaks_scan_result(user_id=user_id, result=result, evidence=evidence)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=str(result.get("target") or scope),
+        event_type="gitleaks_scan_completed" if result.get("success") is True else "gitleaks_scan_failed",
+        tool="gitleaks",
+        status="completed" if result.get("success") is True else "failed",
+        summary="Gitleaks secret scan completed" if result.get("success") is True else "Gitleaks secret scan failed",
+        metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count"), "parser_error": parser_error},
+    )
+    _record_assessment_scan(assessment_context, tool="gitleaks", result=result, finding=finding)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
+    await update.message.reply_text(
+        build_gitleaks_result_text(result, evidence),
+        reply_markup=build_scan_result_actions(finding.get("id"), "gitleaks") if result.get("success") is True else None,
+    )
+    if result.get("success") is True:
+        await _send_gitleaks_ai_assessment(update.message, finding)
     await _send_assessment_dashboard(update.message, assessment_context)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
 
