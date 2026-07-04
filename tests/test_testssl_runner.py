@@ -123,3 +123,35 @@ def test_testssl_json_normalization_extracts_tls_evidence() -> None:
     assert evidence["cipher_findings"][0]["id"] == "cipherlist_NULL"
     assert evidence["security_headers"][0]["id"] == "HSTS"
     assert summary["supported_protocols"] == ["TLS 1.0", "TLS 1.2", "TLS 1.3"]
+
+
+def test_testssl_json_normalization_handles_nested_scan_result_shape() -> None:
+    output = {
+        "scanResult": [
+            {
+                "targetHost": "example.com",
+                "serverDefaults": [
+                    {"id": "cert_commonName", "severity": "INFO", "finding": "example.com"},
+                    {"id": "cert_issuer", "severity": "INFO", "finding": "Example CA"},
+                    {"id": "cert_notAfter_local", "severity": "INFO", "finding": "2030-01-01"},
+                ],
+                "scanResult": [
+                    {"id": "TLS 1.2", "severity": "OK", "finding": "offered"},
+                    {"id": "TLS 1.3", "severity": "OK", "finding": "offered"},
+                    {"id": "cert_subjectAltName", "severity": "INFO", "finding": ["DNS:example.com", "DNS:www.example.com"]},
+                    {"id": "heartbleed", "severity": "OK", "finding": "not vulnerable"},
+                    {"id": "HSTS", "severity": "INFO", "finding": "not offered"},
+                ],
+            }
+        ]
+    }
+
+    evidence = normalize_testssl_output(output, target="example.com:443")
+    summary = summarize_testssl_evidence(evidence)
+
+    assert evidence["certificate"]["common_name"] == "example.com"
+    assert evidence["certificate"]["issuer"] == "Example CA"
+    assert evidence["certificate"]["not_after"] == "2030-01-01"
+    assert evidence["certificate"]["subject_alt_names"] == "DNS:example.com, DNS:www.example.com"
+    assert summary["supported_protocols"] == ["TLS 1.2", "TLS 1.3"]
+    assert evidence["vulnerabilities"][0]["id"] == "heartbleed"

@@ -72,6 +72,8 @@ from app.services.katana_ai_assessment import FALLBACK_LINES as KATANA_AI_FALLBA
 from app.services.katana_ai_assessment import generate_katana_ai_assessment
 from app.services.playwright_ai_assessment import FALLBACK_LINES as PLAYWRIGHT_AI_FALLBACK_LINES
 from app.services.playwright_ai_assessment import generate_playwright_ai_assessment
+from app.services.testssl_ai_assessment import FALLBACK_LINES as TESTSSL_AI_FALLBACK_LINES
+from app.services.testssl_ai_assessment import generate_testssl_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
 from app.services.target_normalizer import normalize_for_bbot, normalize_for_ffuf, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_for_playwright, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
@@ -1465,6 +1467,20 @@ async def _send_ffuf_ai_assessment(message: object, finding: dict) -> None:
         await message.reply_text(chunk)
 
 
+async def _send_testssl_ai_assessment(message: object, finding: dict) -> None:
+    progress_message = await message.reply_text("Generating testssl.sh AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_testssl_ai_assessment, finding)
+    if assessment_lines == TESTSSL_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "testssl.sh AI assessment unavailable.", context="testssl.sh AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="testssl.sh AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="testssl.sh AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
 async def _handle_ffuf_target(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1575,6 +1591,7 @@ async def _handle_testssl_target(
     )
     progress_card = ScanProgressCard(update.message, "testssl.sh TLS", display_target)
     await progress_card.start("Launching scan...")
+    await progress_card.start_auto_refresh("Running scan...", interval_seconds=5)
     assessment_context = _pop_assessment_scan_context(context, "testssl")
 
     try:
@@ -1590,6 +1607,8 @@ async def _handle_testssl_target(
         await _send_assessment_dashboard(update.message, assessment_context)
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
+    finally:
+        await progress_card.stop_auto_refresh()
 
     complete_scan_request(
         user_id=user_id,
@@ -1626,6 +1645,8 @@ async def _handle_testssl_target(
         build_testssl_result_text(result, evidence),
         reply_markup=build_scan_result_actions(finding.get("id"), "testssl") if result.get("success") is True else None,
     )
+    if result.get("success") is True:
+        await _send_testssl_ai_assessment(update.message, finding)
     await _send_assessment_dashboard(update.message, assessment_context)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
 

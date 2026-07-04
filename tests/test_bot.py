@@ -1510,6 +1510,64 @@ def test_scan_callback_pattern_routes_testssl_button() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:testssl")
 
 
+def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> None:
+    clear_user_findings(7212)
+    clear_user_investigations(7212)
+    clear_user_scan_requests(7212)
+    scan_request = create_scan_request(user_id=7212, scan_type="testssl")
+    mark_scan_request_awaiting_target(user_id=7212, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7212))
+    json_output = """
+    {
+      "scanResult": [
+        {
+          "serverDefaults": [
+            {"id":"cert_commonName","severity":"INFO","finding":"example.com"},
+            {"id":"cert_issuer","severity":"INFO","finding":"Example CA"}
+          ],
+          "scanResult": [
+            {"id":"TLS 1.2","severity":"OK","finding":"offered"},
+            {"id":"TLS 1.3","severity":"OK","finding":"offered"}
+          ]
+        }
+      ]
+    }
+    """
+    assessment_lines = ["Executive Summary", "- TLS evidence reviewed.", "Confidence", "Medium"]
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_testssl_scan",
+            return_value={
+                "success": True,
+                "target": "example.com:443",
+                "output": "noisy stdout",
+                "json_output": json_output,
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 6,
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_testssl_ai_assessment", return_value=assessment_lines),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock) as start_auto_refresh,
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock) as stop_auto_refresh,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    start_auto_refresh.assert_awaited_once_with("Running scan...", interval_seconds=5)
+    assert stop_auto_refresh.await_count >= 1
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert any("testssl.sh Scan Complete" in text for text in sent_messages)
+    assert any("Generating testssl.sh AI assessment..." in text for text in sent_messages)
+    assert any("testssl.sh AI Assessment" in text for text in sent_messages)
+    finding = get_user_findings(7212)[0]
+    assert finding["source"] == "testssl"
+    assert finding["testssl_evidence"]["certificate"]["issuer"] == "Example CA"
+    assert finding["testssl_summary"]["supported_protocols"] == ["TLS 1.2", "TLS 1.3"]
+
+
 def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": '{"url":"raw"}'}
     services = [
