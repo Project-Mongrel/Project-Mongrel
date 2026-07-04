@@ -49,7 +49,14 @@ from app.services.chat_state import clear_finding_analysis_context, get_finding_
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.findings_store import get_user_finding
-from app.services.evidence_vault import EvidenceVaultUnavailable, store_secret_evidence
+from app.services.evidence_vault import (
+    EvidenceVaultDecryptError,
+    EvidenceVaultUnavailable,
+    get_secret_evidence_metadata,
+    record_reveal_audit_event,
+    reveal_secret_evidence,
+    store_secret_evidence,
+)
 from app.services.icon_helper import section_label
 from app.services.impact_engine import assess_change_impact
 from app.services.investigation_store import add_investigation_event, get_investigation, get_or_create_latest_open_investigation
@@ -90,6 +97,7 @@ from app.tools.katana_runner import run_katana_scan
 from app.tools.playwright_runner import run_playwright_observation
 from app.tools.testssl_runner import run_testssl_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
+from app.core.config import get_settings
 from app.ui.ai_summary import render_ai_summary_card
 from app.ui.scan_progress import ScanProgressCard, render_scan_loading_card
 from app.ui.scan_actions import AI_SUMMARY_CALLBACK_PREFIX, build_scan_result_actions
@@ -98,6 +106,7 @@ from app.ui.result_cards import render_scan_result_card, render_section
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
 NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS = 15
 BBOT_AI_ASSESSMENT_CALLBACK_PREFIX = "bbot_ai"
+EVIDENCE_VAULT_CALLBACK_PREFIX = "vault"
 logger = logging.getLogger(__name__)
 
 
@@ -818,6 +827,81 @@ def build_gitleaks_result_text(result: dict[str, object], evidence: dict | None 
     )
 
 
+def build_gitleaks_result_actions(finding: dict | None, assessment_context: dict | None) -> InlineKeyboardMarkup | None:
+    if not finding or not assessment_context:
+        return build_scan_result_actions(finding.get("id") if finding else None, "gitleaks")
+    evidence_item = _first_gitleaks_vaulted_finding(finding)
+    evidence_id = str(evidence_item.get("evidence_id") or "") if evidence_item else ""
+    assessment_id = str(assessment_context.get("assessment_id") or "")
+    finding_id = str(finding.get("id") or "")
+    base_actions = build_scan_result_actions(finding_id, "gitleaks")
+    buttons = list(base_actions.inline_keyboard) if base_actions else []
+    if evidence_id and assessment_id and finding_id:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "View Evidence",
+                    callback_data=f"{EVIDENCE_VAULT_CALLBACK_PREFIX}:view:{assessment_id}:{finding_id}:{evidence_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def build_gitleaks_evidence_warning_text(finding: dict, evidence_id: str) -> str:
+    evidence_item = _find_gitleaks_evidence_item(finding, evidence_id) or {}
+    return "\n".join(
+        [
+            "Sensitive Evidence Warning",
+            "",
+            f"Evidence ID: {evidence_id}",
+            f"Provider: {evidence_item.get('provider') or 'unknown'}",
+            f"Rule: {evidence_item.get('rule_id') or 'unknown'}",
+            f"File: {evidence_item.get('file_path') or 'unknown'}",
+            f"Line: {evidence_item.get('line_number') or '?'}",
+            f"Preview: {evidence_item.get('redacted_secret_preview') or '<REDACTED>'}",
+            f"Fingerprint: {evidence_item.get('fingerprint') or evidence_item.get('secret_hash') or 'not available'}",
+            "",
+            "This action reveals sensitive evidence from the encrypted Evidence Vault.",
+            "Use it only for explicitly authorized assessments.",
+        ]
+    )
+
+
+def build_gitleaks_evidence_warning_keyboard(assessment_id: str | int, finding_id: str, evidence_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Reveal Full Secret",
+                    callback_data=f"{EVIDENCE_VAULT_CALLBACK_PREFIX}:reveal:{assessment_id}:{finding_id}:{evidence_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Cancel",
+                    callback_data=f"{EVIDENCE_VAULT_CALLBACK_PREFIX}:cancel:{assessment_id}:{finding_id}:{evidence_id}",
+                )
+            ],
+        ]
+    )
+
+
+def build_gitleaks_sensitive_secret_text(evidence_id: str, secret_value: str, ttl_seconds: int) -> str:
+    return "\n".join(
+        [
+            "Sensitive Evidence Revealed",
+            "",
+            f"Evidence ID: {evidence_id}",
+            "",
+            secret_value,
+            "",
+            f"This message is intended to be short-lived and may be deleted after {ttl_seconds}s.",
+            "Do not copy it into reports, AI prompts, logs, or normal evidence.",
+        ]
+    )
+
+
 def store_gitleaks_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
     evidence = evidence or {}
     summary = summarize_gitleaks_evidence(evidence) if evidence else {}
@@ -880,6 +964,20 @@ def redact_gitleaks_result_for_public_state(result: dict[str, object]) -> dict[s
         public_result["json_output"] = ""
         public_result["json_redacted"] = True
     return public_result
+
+
+def _first_gitleaks_vaulted_finding(finding: dict) -> dict | None:
+    for item in ((finding.get("gitleaks_evidence") or {}).get("findings") or []):
+        if isinstance(item, dict) and str(item.get("evidence_id") or "").strip():
+            return item
+    return None
+
+
+def _find_gitleaks_evidence_item(finding: dict, evidence_id: str) -> dict | None:
+    for item in ((finding.get("gitleaks_evidence") or {}).get("findings") or []):
+        if isinstance(item, dict) and str(item.get("evidence_id") or "") == str(evidence_id):
+            return item
+    return None
 
 
 def _format_count_summary(counts: dict) -> str:
@@ -1287,6 +1385,14 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("Unable to identify Telegram user.")
             return
         await _handle_scan_ai_summary_callback(query, user_id)
+        return
+
+    if query.data and query.data.startswith(f"{EVIDENCE_VAULT_CALLBACK_PREFIX}:"):
+        user_id = update.effective_user.id if update.effective_user is not None else None
+        if user_id is None:
+            await query.edit_message_text("Unable to identify Telegram user.")
+            return
+        await _handle_gitleaks_evidence_vault_callback(query, user_id)
         return
 
     if query.data is None or not query.data.startswith("scan:"):
@@ -1905,7 +2011,7 @@ async def _handle_gitleaks_target(
         await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         build_gitleaks_result_text(result, evidence),
-        reply_markup=build_scan_result_actions(finding.get("id"), "gitleaks") if result.get("success") is True else None,
+        reply_markup=build_gitleaks_result_actions(finding, assessment_context) if result.get("success") is True else None,
     )
     if result.get("success") is True:
         await _send_gitleaks_ai_assessment(update.message, finding)
@@ -2393,6 +2499,156 @@ async def _handle_scan_ai_summary_callback(query: object, user_id: int) -> None:
         await message.reply_text(chunk)
 
     logger.info("Scan AI summary generated for user_id=%s tool=%s finding_id=%s", user_id, tool, finding_id)
+
+
+async def _handle_gitleaks_evidence_vault_callback(query: object, user_id: int) -> None:
+    parsed = _parse_evidence_vault_callback(str(getattr(query, "data", "") or ""))
+    if parsed is None:
+        await query.edit_message_text("Invalid evidence vault request.")
+        return
+
+    action, assessment_id, finding_id, evidence_id = parsed
+    if action == "cancel":
+        _record_reveal_attempt(evidence_id=evidence_id, user_id=user_id, assessment_id=assessment_id, outcome="cancelled")
+        await query.edit_message_text("Evidence reveal cancelled.")
+        return
+
+    _record_reveal_attempt(evidence_id=evidence_id, user_id=user_id, assessment_id=assessment_id, outcome="attempted")
+    finding, denial_reason = _authorize_gitleaks_evidence_access(
+        user_id=user_id,
+        assessment_id=assessment_id,
+        finding_id=finding_id,
+        evidence_id=evidence_id,
+    )
+    if finding is None:
+        _record_reveal_attempt(
+            evidence_id=evidence_id,
+            user_id=user_id,
+            assessment_id=assessment_id,
+            outcome="denied",
+            reason=denial_reason,
+        )
+        await query.edit_message_text("Evidence access denied.")
+        return
+
+    if action == "view":
+        await query.edit_message_text(
+            build_gitleaks_evidence_warning_text(finding, evidence_id),
+            reply_markup=build_gitleaks_evidence_warning_keyboard(assessment_id, finding_id, evidence_id),
+        )
+        return
+
+    if action != "reveal":
+        await query.edit_message_text("Invalid evidence vault action.")
+        return
+
+    try:
+        revealed = reveal_secret_evidence(
+            evidence_id,
+            reveal_metadata={"user_id": user_id, "assessment_id": assessment_id, "finding_id": finding_id},
+        )
+    except KeyError:
+        _record_reveal_attempt(evidence_id=evidence_id, user_id=user_id, assessment_id=assessment_id, outcome="failed", reason="missing_evidence")
+        await query.edit_message_text("Evidence access denied.")
+        return
+    except EvidenceVaultUnavailable:
+        _record_reveal_attempt(evidence_id=evidence_id, user_id=user_id, assessment_id=assessment_id, outcome="failed", reason="vault_unavailable")
+        await query.edit_message_text("Evidence vault is unavailable.")
+        return
+    except EvidenceVaultDecryptError:
+        _record_reveal_attempt(evidence_id=evidence_id, user_id=user_id, assessment_id=assessment_id, outcome="failed", reason="decrypt_failed")
+        await query.edit_message_text("Evidence vault decrypt failed.")
+        return
+
+    secret_value = str((revealed.get("secret_payload") or {}).get("secret") or "")
+    if not secret_value:
+        _record_reveal_attempt(evidence_id=evidence_id, user_id=user_id, assessment_id=assessment_id, outcome="failed", reason="empty_payload")
+        await query.edit_message_text("Evidence vault payload was empty.")
+        return
+
+    _record_reveal_attempt(evidence_id=evidence_id, user_id=user_id, assessment_id=assessment_id, outcome="success")
+    settings = get_settings()
+    ttl_seconds = max(1, int(settings.evidence_reveal_ttl_seconds or 60))
+    message = getattr(query, "message", None)
+    if message is None:
+        await query.edit_message_text("Evidence vault reveal is unavailable in this chat context.")
+        return
+    await query.edit_message_text("Sensitive evidence revealed in a short-lived message.")
+    reveal_message = await message.reply_text(build_gitleaks_sensitive_secret_text(evidence_id, secret_value, ttl_seconds))
+    _schedule_sensitive_message_delete(reveal_message, ttl_seconds)
+
+
+def _parse_evidence_vault_callback(data: str) -> tuple[str, str, str, str] | None:
+    parts = data.split(":", 4)
+    if len(parts) != 5 or parts[0] != EVIDENCE_VAULT_CALLBACK_PREFIX:
+        return None
+    _, action, assessment_id, finding_id, evidence_id = parts
+    if action not in {"view", "reveal", "cancel"}:
+        return None
+    if not assessment_id or not finding_id or not evidence_id:
+        return None
+    return action, assessment_id, finding_id, evidence_id
+
+
+def _authorize_gitleaks_evidence_access(
+    *,
+    user_id: int,
+    assessment_id: str,
+    finding_id: str,
+    evidence_id: str,
+) -> tuple[dict | None, str]:
+    finding = get_user_finding(user_id=user_id, finding_id=finding_id)
+    if finding is None:
+        return None, "wrong_user_or_missing_finding"
+    if finding.get("source") != "gitleaks":
+        return None, "wrong_tool"
+    if _find_gitleaks_evidence_item(finding, evidence_id) is None:
+        return None, "evidence_not_in_finding"
+    try:
+        scan_assessment_id = int(assessment_id)
+    except ValueError:
+        return None, "invalid_assessment"
+    if not any(
+        str(scan.get("finding_id") or "") == finding_id and str(scan.get("tool") or "") == "gitleaks"
+        for scan in list_assessment_scans(scan_assessment_id)
+    ):
+        return None, "wrong_assessment"
+    metadata = get_secret_evidence_metadata(evidence_id)
+    if metadata is None:
+        return None, "missing_evidence"
+    if str(metadata.get("assessment_id") or "") != str(assessment_id):
+        return None, "vault_assessment_mismatch"
+    return finding, ""
+
+
+def _record_reveal_attempt(*, evidence_id: str, user_id: int, assessment_id: str, outcome: str, reason: str = "") -> None:
+    try:
+        record_reveal_audit_event(
+            evidence_id=evidence_id,
+            user_id=user_id,
+            assessment_id=assessment_id,
+            outcome=outcome,
+            reason=reason,
+        )
+    except Exception:
+        logger.exception("Evidence reveal audit write failed: evidence_id=%s outcome=%s", evidence_id, outcome)
+
+
+def _schedule_sensitive_message_delete(message: object, ttl_seconds: int) -> None:
+    if not hasattr(message, "delete"):
+        return
+    try:
+        asyncio.create_task(_delete_sensitive_message_later(message, ttl_seconds))
+    except RuntimeError:
+        logger.info("Sensitive evidence auto-delete could not be scheduled.")
+
+
+async def _delete_sensitive_message_later(message: object, ttl_seconds: int) -> None:
+    await asyncio.sleep(ttl_seconds)
+    try:
+        await message.delete()
+    except Exception:
+        logger.info("Sensitive evidence auto-delete failed.")
 
 
 def _is_finding_analysis_exit_message(text: str) -> bool:

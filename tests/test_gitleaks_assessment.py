@@ -1,8 +1,21 @@
+import asyncio
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 from cryptography.fernet import Fernet
 
 from app.bot.handlers.assessment import build_assessment_dashboard_keyboard, build_assessment_dashboard_text
-from app.bot.handlers.scan import build_gitleaks_result_text, redact_gitleaks_result_for_public_state, store_gitleaks_scan_result, store_gitleaks_secret_vault_records
+from app.bot.handlers.scan import (
+    _handle_gitleaks_evidence_vault_callback,
+    build_gitleaks_evidence_warning_text,
+    build_gitleaks_result_actions,
+    build_gitleaks_result_text,
+    redact_gitleaks_result_for_public_state,
+    store_gitleaks_scan_result,
+    store_gitleaks_secret_vault_records,
+)
 from app.parsers.gitleaks_parser import contains_unredacted_secret, normalize_gitleaks_output
 from app.services.assessment_ai import build_assessment_ai_prompt
 from app.services.assessment_context import build_assessment_context
@@ -10,7 +23,13 @@ from app.services.assessment_guard import build_assessment_guard
 from app.services.assessment_markdown_report import generate_assessment_markdown_report
 from app.services.assessment_store import add_assessment_target, create_assessment, list_assessment_scans, record_assessment_scan
 from app.services.findings_store import close_findings_database, configure_findings_database
-from app.services.evidence_vault import EvidenceVaultUnavailable, close_evidence_vault, configure_evidence_vault, reveal_secret_evidence
+from app.services.evidence_vault import (
+    EvidenceVaultUnavailable,
+    close_evidence_vault,
+    configure_evidence_vault,
+    list_reveal_audit_events,
+    reveal_secret_evidence,
+)
 
 RAW_SECRET = "ghp_1234567890abcdefghijklmnopqrstuv"
 GITLEAKS_JSON = f"""
@@ -54,6 +73,33 @@ def _stored_context() -> dict:
         risk="high",
     )
     return build_assessment_context(assessment["id"], user_id=9200)
+
+
+def _vaulted_gitleaks_assessment(user_id: int = 9200) -> tuple[dict, dict, dict]:
+    assessment = create_assessment("Vaulted Secrets Assessment")
+    target = add_assessment_target(assessment["id"], address="/tmp/artifact", target_type="artifact_dir")
+    evidence = normalize_gitleaks_output(GITLEAKS_JSON, scan_root="/tmp/artifact")
+    evidence = store_gitleaks_secret_vault_records(GITLEAKS_JSON, evidence, assessment_id=assessment["id"])
+    result = {"success": True, "target": "/tmp/artifact", "elapsed_seconds": 2, "returncode": 1, "command": ["gitleaks"]}
+    finding = store_gitleaks_scan_result(user_id=user_id, result=result, evidence=evidence)
+    record_assessment_scan(
+        assessment["id"],
+        tool="gitleaks",
+        status="completed",
+        target_id=target["id"],
+        finding_id=finding["id"],
+        risk="high",
+    )
+    return assessment, finding, evidence
+
+
+def _vault_query(action: str, assessment_id: int | str, finding_id: str, evidence_id: str, reply_value: object | None = None) -> SimpleNamespace:
+    message = SimpleNamespace(reply_text=AsyncMock(return_value=reply_value or SimpleNamespace(delete=AsyncMock())))
+    return SimpleNamespace(
+        data=f"vault:{action}:{assessment_id}:{finding_id}:{evidence_id}",
+        edit_message_text=AsyncMock(),
+        message=message,
+    )
 
 
 def test_assessment_context_includes_redacted_gitleaks_evidence() -> None:
@@ -149,3 +195,147 @@ def test_gitleaks_public_scan_result_does_not_keep_raw_json() -> None:
     assert public_result["json_output"] == ""
     assert public_result["json_redacted"] is True
     assert RAW_SECRET not in str(public_result)
+
+
+def test_gitleaks_view_evidence_button_uses_only_opaque_references() -> None:
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+
+    keyboard = build_gitleaks_result_actions(finding, {"assessment_id": assessment["id"]})
+    callback_data = keyboard.inline_keyboard[1][0].callback_data
+
+    assert callback_data == f"vault:view:{assessment['id']}:{finding['id']}:{evidence_id}"
+    assert RAW_SECRET not in callback_data
+
+
+def test_gitleaks_view_evidence_warning_shows_no_raw_secret_before_confirmation() -> None:
+    _, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+
+    warning = build_gitleaks_evidence_warning_text(finding, evidence_id)
+    keyboard = build_gitleaks_result_actions(finding, {"assessment_id": 1})
+
+    assert "Sensitive Evidence Warning" in warning
+    assert "github-pat" in warning
+    assert "<REDACTED>" in warning
+    assert RAW_SECRET not in warning
+    assert RAW_SECRET not in str(keyboard.to_dict())
+
+
+def test_gitleaks_authorized_reveal_returns_exact_vaulted_value() -> None:
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    query = _vault_query("reveal", assessment["id"], finding["id"], evidence_id)
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    revealed_text = query.message.reply_text.call_args.args[0]
+    assert RAW_SECRET in revealed_text
+    assert query.edit_message_text.call_args.args[0] == "Sensitive evidence revealed in a short-lived message."
+    audit_events = list_reveal_audit_events(evidence_id)
+    assert any(event["outcome"] == "success" for event in audit_events)
+    assert RAW_SECRET not in str(audit_events)
+
+
+def test_gitleaks_wrong_telegram_user_is_denied() -> None:
+    assessment, finding, evidence = _vaulted_gitleaks_assessment(user_id=9200)
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    query = _vault_query("reveal", assessment["id"], finding["id"], evidence_id)
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9999))
+
+    assert query.edit_message_text.call_args.args[0] == "Evidence access denied."
+    assert not query.message.reply_text.called
+    audit_events = list_reveal_audit_events(evidence_id)
+    assert audit_events[-1]["outcome"] == "denied"
+    assert audit_events[-1]["reason"] == "wrong_user_or_missing_finding"
+    assert RAW_SECRET not in str(audit_events)
+
+
+def test_gitleaks_wrong_assessment_is_denied() -> None:
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    other_assessment = create_assessment("Other Assessment")
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    query = _vault_query("reveal", other_assessment["id"], finding["id"], evidence_id)
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    assert assessment["id"] != other_assessment["id"]
+    assert query.edit_message_text.call_args.args[0] == "Evidence access denied."
+    assert not query.message.reply_text.called
+    assert list_reveal_audit_events(evidence_id)[-1]["reason"] == "wrong_assessment"
+
+
+def test_gitleaks_missing_evidence_is_denied() -> None:
+    assessment, finding, _ = _vaulted_gitleaks_assessment()
+    query = _vault_query("reveal", assessment["id"], finding["id"], "missing-evidence")
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    assert query.edit_message_text.call_args.args[0] == "Evidence access denied."
+    assert not query.message.reply_text.called
+    assert list_reveal_audit_events("missing-evidence")[-1]["outcome"] == "denied"
+
+
+def test_gitleaks_missing_vault_config_fails_closed(tmp_path) -> None:
+    vault_path = tmp_path / "closed-vault.db"
+    configure_evidence_vault(vault_path, Fernet.generate_key().decode("utf-8"))
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    configure_evidence_vault(vault_path, None)
+    query = _vault_query("reveal", assessment["id"], finding["id"], evidence_id)
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    assert query.edit_message_text.call_args.args[0] == "Evidence vault is unavailable."
+    assert not query.message.reply_text.called
+
+
+def test_gitleaks_decryption_failure_fails_closed(tmp_path) -> None:
+    vault_path = tmp_path / "wrong-key-vault.db"
+    configure_evidence_vault(vault_path, Fernet.generate_key().decode("utf-8"))
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    configure_evidence_vault(vault_path, Fernet.generate_key().decode("utf-8"))
+    query = _vault_query("reveal", assessment["id"], finding["id"], evidence_id)
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    assert query.edit_message_text.call_args.args[0] == "Evidence vault decrypt failed."
+    assert not query.message.reply_text.called
+
+
+def test_gitleaks_cancel_path_reveals_nothing() -> None:
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    query = _vault_query("cancel", assessment["id"], finding["id"], evidence_id)
+
+    asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    assert query.edit_message_text.call_args.args[0] == "Evidence reveal cancelled."
+    assert not query.message.reply_text.called
+    audit_events = list_reveal_audit_events(evidence_id)
+    assert audit_events[-1]["outcome"] == "cancelled"
+    assert RAW_SECRET not in str(audit_events)
+
+
+def test_gitleaks_reveal_does_not_log_raw_secret(caplog) -> None:
+    assessment, finding, evidence = _vaulted_gitleaks_assessment()
+    evidence_id = evidence["findings"][0]["evidence_id"]
+    query = _vault_query("reveal", assessment["id"], finding["id"], evidence_id)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(_handle_gitleaks_evidence_vault_callback(query, user_id=9200))
+
+    assert RAW_SECRET not in caplog.text
+
+
+def test_gitleaks_vaulted_context_reports_and_ai_remain_redacted() -> None:
+    assessment, _, _ = _vaulted_gitleaks_assessment()
+    context = build_assessment_context(assessment["id"], user_id=9200)
+    prompt = build_assessment_ai_prompt("Review vaulted Gitleaks evidence.", context)
+    report = generate_assessment_markdown_report(context)
+
+    combined_public_output = "\n".join([prompt, report, str(context)])
+    assert "<REDACTED>" in combined_public_output
+    assert RAW_SECRET not in combined_public_output

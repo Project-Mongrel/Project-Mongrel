@@ -1544,6 +1544,11 @@ def test_scan_callback_pattern_routes_gitleaks_button() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:gitleaks")
 
 
+def test_scan_callback_pattern_routes_evidence_vault_actions() -> None:
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "vault:view:1:finding-id:evidence-id")
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "vault:reveal:1:finding-id:evidence-id")
+
+
 def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> None:
     clear_user_findings(7212)
     clear_user_investigations(7212)

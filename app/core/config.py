@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     gitleaks_scan_timeout_seconds: int = 120
     evidence_vault_path: Path = Path("data/evidence_vault.db")
     evidence_vault_key: str | None = None
+    evidence_reveal_ttl_seconds: int = 60
 
 
 @lru_cache

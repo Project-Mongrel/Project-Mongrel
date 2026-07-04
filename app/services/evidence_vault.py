@@ -80,6 +80,91 @@ def store_secret_evidence(
     return record
 
 
+def record_reveal_audit_event(
+    *,
+    evidence_id: str,
+    user_id: int | str | None,
+    assessment_id: str | int | None,
+    outcome: str,
+    reason: str = "",
+) -> dict:
+    created_at = _format_datetime(datetime.now(UTC))
+    event_id = str(uuid4())
+    event = {
+        "id": event_id,
+        "evidence_id": evidence_id,
+        "user_id": str(user_id or ""),
+        "assessment_id": str(assessment_id or ""),
+        "outcome": str(outcome or "attempted"),
+        "reason": str(reason or "")[:120],
+        "created_at": created_at,
+    }
+    with _get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO evidence_reveal_audit (
+                id, evidence_id, user_id, assessment_id, outcome, reason, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["id"],
+                event["evidence_id"],
+                event["user_id"],
+                event["assessment_id"],
+                event["outcome"],
+                event["reason"],
+                event["created_at"],
+            ),
+        )
+    return event
+
+
+def list_reveal_audit_events(evidence_id: str | None = None) -> list[dict]:
+    connection = _get_connection()
+    if evidence_id:
+        rows = connection.execute(
+            """
+            SELECT id, evidence_id, user_id, assessment_id, outcome, reason, created_at
+            FROM evidence_reveal_audit
+            WHERE evidence_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (evidence_id,),
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            """
+            SELECT id, evidence_id, user_id, assessment_id, outcome, reason, created_at
+            FROM evidence_reveal_audit
+            ORDER BY created_at ASC, rowid ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_secret_evidence_metadata(evidence_id: str) -> dict | None:
+    row = _get_connection().execute(
+        """
+        SELECT evidence_id, assessment_id, finding_reference_json, encrypted_secret_payload,
+               created_at, reveal_audit_json
+        FROM secret_evidence_vault
+        WHERE evidence_id = ?
+        """,
+        (evidence_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "evidence_id": row["evidence_id"],
+        "assessment_id": row["assessment_id"],
+        "finding_reference": _from_json(row["finding_reference_json"]) or {},
+        "encrypted_secret_payload": row["encrypted_secret_payload"],
+        "created_at": row["created_at"],
+        "reveal_audit": _from_json(row["reveal_audit_json"]) or [],
+    }
+
+
 def reveal_secret_evidence(evidence_id: str, reveal_metadata: dict | None = None) -> dict:
     fernet = _get_fernet()
     row = _get_connection().execute(
@@ -161,6 +246,19 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             encrypted_secret_payload TEXT NOT NULL,
             created_at TEXT NOT NULL,
             reveal_audit_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_reveal_audit (
+            id TEXT PRIMARY KEY,
+            evidence_id TEXT NOT NULL,
+            user_id TEXT,
+            assessment_id TEXT,
+            outcome TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL
         )
         """
     )
