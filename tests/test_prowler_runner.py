@@ -116,6 +116,7 @@ def test_prowler_failure_redacts_credential_like_output(tmp_path) -> None:
 
 
 def test_prowler_no_credentials_failure_uses_concise_safe_reason(tmp_path) -> None:
+    stdout = "[1;92m                         _\n\x1b[1;92m  ____  Prowler banner"
     stderr = "\n".join(
         [
             "[File: aws_provider.py:1347]",
@@ -127,25 +128,30 @@ def test_prowler_no_credentials_failure_uses_concise_safe_reason(tmp_path) -> No
     with (
         patch("app.tools.prowler_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.prowler_runner.shutil.which", return_value="prowler"),
-        patch("app.tools.prowler_runner.subprocess.run", return_value=_completed(stderr=stderr, returncode=2)),
+        patch("app.tools.prowler_runner.subprocess.run", return_value=_completed(stdout=stdout, stderr=stderr, returncode=2)),
     ):
         result = run_prowler_scan("aws", tmp_path, "mongrel-prowler")
 
     assert result["success"] is False
     assert result["error_type"] == "missing_credentials"
     assert result["error"] == "Cloud credentials were not available for AWS on the Mongrel VPS."
+    assert "[1;92m" not in str(result)
+    assert "____" not in str(result)
     assert "[File:" not in result["error"]
     assert "[Module:" not in result["error"]
     assert "not-a-real-test-value" not in str(result)
 
 
-def test_prowler_other_failure_is_safely_summarized() -> None:
+def test_prowler_other_failure_ignores_banner_and_is_safely_summarized() -> None:
     summary = summarize_prowler_failure(
         "aws",
+        stdout="[1;92m                         _\n\x1b[1;92m  ____  Prowler banner",
         stderr="[File: x.py:1]\n[Module: x]\nCRITICAL: Prowler execution failed for an expected test reason",
     )
 
     assert summary == "CRITICAL: Prowler execution failed for an expected test reason"
+    assert "[1;92m" not in summary
+    assert "____" not in summary
     assert "[File:" not in summary
     assert "[Module:" not in summary
 

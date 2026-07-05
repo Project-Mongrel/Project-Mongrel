@@ -21,6 +21,9 @@ _CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)(aws_secret_access_key|secret_access_key|access_token|refresh_token|client_secret|password)\s*[:=]\s*[^,\s]+"),
     re.compile(r"(?i)(authorization:\s*bearer\s+)[a-z0-9._\-]+"),
 )
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_BARE_ANSI_CODE_PATTERN = re.compile(r"\[[0-9;]{1,12}m")
+_CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def run_prowler_scan(provider: str, output_dir: str | Path, output_filename: str = "mongrel-prowler") -> dict[str, object]:
@@ -149,10 +152,10 @@ def normalize_prowler_provider(provider: str) -> str:
 
 
 def redact_prowler_text(text: str) -> str:
-    redacted = str(text or "")
+    redacted = _strip_prowler_terminal_noise(str(text or ""))
     for pattern in _CREDENTIAL_PATTERNS:
         redacted = pattern.sub(lambda match: f"{match.group(1)}<REDACTED>" if match.groups() else "<REDACTED>", redacted)
-    return redacted
+    return _remove_prowler_banner_lines(redacted)
 
 
 def summarize_prowler_failure(provider: str, *, stdout: str = "", stderr: str = "") -> str:
@@ -190,6 +193,32 @@ def _is_internal_diagnostic_line(line: str) -> bool:
         or normalized.startswith("file \"")
         or normalized.startswith("traceback ")
     )
+
+
+def _strip_prowler_terminal_noise(text: str) -> str:
+    stripped = _ANSI_ESCAPE_PATTERN.sub("", text)
+    stripped = _BARE_ANSI_CODE_PATTERN.sub("", stripped)
+    return _CONTROL_CHARACTER_PATTERN.sub("", stripped)
+
+
+def _remove_prowler_banner_lines(text: str) -> str:
+    return "\n".join(line for line in str(text or "").splitlines() if not _is_prowler_banner_line(line))
+
+
+def _is_prowler_banner_line(line: str) -> bool:
+    cleaned = line.strip()
+    if not cleaned:
+        return False
+    lower = cleaned.lower()
+    if "prowler" in lower and not any(term in lower for term in ("error", "failed", "credential", "critical", "warning", "exception")):
+        return True
+    if cleaned in {"_", "__", "___"}:
+        return True
+    if len(cleaned) <= 120 and not re.search(r"[A-Za-z0-9]", cleaned):
+        return True
+    if len(cleaned) <= 120 and re.fullmatch(r"[_/\\|`'\".,:;~^*+=<>()\[\]{}\-\s]+", cleaned):
+        return True
+    return False
 
 
 def _validate_output_directory(output_dir: str | Path) -> Path:

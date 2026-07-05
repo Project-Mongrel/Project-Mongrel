@@ -1819,6 +1819,7 @@ def test_prowler_no_credentials_stderr_is_sanitized_in_telegram() -> None:
         "provider": "aws",
         "cloud_context": "standalone-aws",
         "elapsed_seconds": 2,
+        "output": "[1;92m                         _\n\x1b[1;92m  ____  Prowler banner",
         "error": "[File: aws_provider.py:1347]\n[Module: aws_provider]\nCRITICAL: NoCredentialsError: Unable to locate credentials\nauthorization: Bearer fake-token-for-test",
         "error_type": "execution_failed",
     }
@@ -1837,10 +1838,17 @@ def test_prowler_no_credentials_stderr_is_sanitized_in_telegram() -> None:
     assert "Cloud credentials were not available for AWS on the Mongrel VPS." in combined
     assert "Provider: AWS" in combined
     assert "Context: standalone-aws" in combined
+    assert "Total checks/findings parsed: 0" in combined
     assert "Failed" in combined
+    assert "[1;92m" not in combined
+    assert "____" not in combined
     assert "[File:" not in combined
     assert "[Module:" not in combined
     assert "fake-token-for-test" not in combined
+    stored = get_user_findings(7224)[0]
+    assert stored["finding_count"] == 0
+    assert "[1;92m" not in str(stored)
+    assert "____" not in str(stored)
 
 
 def test_prowler_missing_output_file_is_handled_safely(tmp_path) -> None:
