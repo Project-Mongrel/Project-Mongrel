@@ -1806,6 +1806,43 @@ def test_prowler_runner_failure_is_safe_message() -> None:
     assert get_user_findings(7218)[0]["status"] == "failed"
 
 
+def test_prowler_no_credentials_stderr_is_sanitized_in_telegram() -> None:
+    clear_user_findings(7224)
+    clear_user_scan_requests(7224)
+    scan_request = create_scan_request(user_id=7224, scan_type="prowler")
+    mark_scan_request_awaiting_target(user_id=7224, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="aws", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7224))
+    result = {
+        "success": False,
+        "provider": "aws",
+        "cloud_context": "standalone-aws",
+        "elapsed_seconds": 2,
+        "error": "[File: aws_provider.py:1347]\n[Module: aws_provider]\nCRITICAL: NoCredentialsError: Unable to locate credentials\nauthorization: Bearer fake-token-for-test",
+        "error_type": "execution_failed",
+    }
+
+    with (
+        patch("app.bot.handlers.scan.run_prowler_scan", return_value=result),
+        patch("app.bot.handlers.scan.ScanProgressCard.start", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.fail", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    combined = "\n".join(sent_messages)
+    assert "Cloud credentials were not available for AWS on the Mongrel VPS." in combined
+    assert "Provider: AWS" in combined
+    assert "Context: standalone-aws" in combined
+    assert "Failed" in combined
+    assert "[File:" not in combined
+    assert "[Module:" not in combined
+    assert "fake-token-for-test" not in combined
+
+
 def test_prowler_missing_output_file_is_handled_safely(tmp_path) -> None:
     clear_user_findings(7219)
     clear_user_scan_requests(7219)

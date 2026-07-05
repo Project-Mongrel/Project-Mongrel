@@ -10,6 +10,7 @@ from app.tools.prowler_runner import (
     normalize_prowler_provider,
     redact_prowler_text,
     run_prowler_scan,
+    summarize_prowler_failure,
 )
 
 
@@ -112,6 +113,41 @@ def test_prowler_failure_redacts_credential_like_output(tmp_path) -> None:
     assert result["success"] is False
     assert "fake-token-for-test" not in str(result)
     assert "<REDACTED>" in result["error"]
+
+
+def test_prowler_no_credentials_failure_uses_concise_safe_reason(tmp_path) -> None:
+    stderr = "\n".join(
+        [
+            "[File: aws_provider.py:1347]",
+            "[Module: aws_provider]",
+            "CRITICAL: NoCredentialsError: Unable to locate credentials",
+            "aws_secret_access_key=not-a-real-test-value",
+        ]
+    )
+    with (
+        patch("app.tools.prowler_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.prowler_runner.shutil.which", return_value="prowler"),
+        patch("app.tools.prowler_runner.subprocess.run", return_value=_completed(stderr=stderr, returncode=2)),
+    ):
+        result = run_prowler_scan("aws", tmp_path, "mongrel-prowler")
+
+    assert result["success"] is False
+    assert result["error_type"] == "missing_credentials"
+    assert result["error"] == "Cloud credentials were not available for AWS on the Mongrel VPS."
+    assert "[File:" not in result["error"]
+    assert "[Module:" not in result["error"]
+    assert "not-a-real-test-value" not in str(result)
+
+
+def test_prowler_other_failure_is_safely_summarized() -> None:
+    summary = summarize_prowler_failure(
+        "aws",
+        stderr="[File: x.py:1]\n[Module: x]\nCRITICAL: Prowler execution failed for an expected test reason",
+    )
+
+    assert summary == "CRITICAL: Prowler execution failed for an expected test reason"
+    assert "[File:" not in summary
+    assert "[Module:" not in summary
 
 
 def test_redact_prowler_text_removes_likely_access_key() -> None:

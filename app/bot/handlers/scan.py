@@ -100,7 +100,7 @@ from app.tools.gitleaks_runner import run_gitleaks_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
 from app.tools.playwright_runner import run_playwright_observation
-from app.tools.prowler_runner import normalize_prowler_provider, run_prowler_scan
+from app.tools.prowler_runner import normalize_prowler_provider, run_prowler_scan, summarize_prowler_failure
 from app.tools.testssl_runner import run_testssl_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
 from app.core.config import get_settings
@@ -962,12 +962,18 @@ def build_prowler_result_text(result: dict[str, object], evidence: dict | None =
     findings = [
         f"Provider: {provider}",
         f"Context: {cloud_context}",
-        f"Total checks/findings parsed: {int(summary.get('finding_count') or 0)}",
-        f"Failed checks: {int(summary.get('failed_count') or 0)}",
-        f"Passed checks: {int(summary.get('passed_count') or 0)}",
-        f"Highest scanner-reported severity: {summary.get('highest_severity') or 'none'}",
-        "Top failed services: " + (", ".join(summary.get("top_failed_services") or []) or "none"),
     ]
+    if result.get("success") is not True:
+        findings.append(_safe_prowler_failure_text(result, provider))
+    findings.extend(
+        [
+            f"Total checks/findings parsed: {int(summary.get('finding_count') or 0)}",
+            f"Failed checks: {int(summary.get('failed_count') or 0)}",
+            f"Passed checks: {int(summary.get('passed_count') or 0)}",
+            f"Highest scanner-reported severity: {summary.get('highest_severity') or 'none'}",
+            "Top failed services: " + (", ".join(summary.get("top_failed_services") or []) or "none"),
+        ]
+    )
     if output_files:
         findings.append(f"Output artifact: {Path(str(output_files[0])).name}")
     top_failed = [
@@ -980,8 +986,6 @@ def build_prowler_result_text(result: dict[str, object], evidence: dict | None =
             f"{finding.get('check_id') or 'check'}: {finding.get('service') or 'unknown'} "
             f"{finding.get('region') or 'unknown'} ({finding.get('severity') or 'unknown'})"
         )
-    if result.get("success") is not True:
-        findings.append(str(result.get("error") or "Prowler scan failed."))
     return render_scan_result_card(
         tool_name="Prowler Cloud Posture",
         target=cloud_context,
@@ -992,6 +996,14 @@ def build_prowler_result_text(result: dict[str, object], evidence: dict | None =
         findings=findings,
         assets=[f"Provider: {provider}", f"Context: {cloud_context}"],
     )
+
+
+def _safe_prowler_failure_text(result: dict[str, object], provider: str) -> str:
+    error = str(result.get("error") or "")
+    output = str(result.get("output") or "")
+    if error or output:
+        return summarize_prowler_failure(provider.lower(), stdout=output, stderr=error)
+    return "Prowler scan failed."
 
 
 def store_prowler_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:

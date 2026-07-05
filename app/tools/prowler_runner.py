@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 ALLOWED_PROWLER_PROVIDERS = frozenset({"aws", "azure", "gcp"})
 PROWLER_NOT_AVAILABLE_ERROR = "Prowler executable was not found."
 PROWLER_TIMEOUT_ERROR = "Prowler scan timed out."
+PROWLER_GENERIC_FAILURE_ERROR = "Prowler did not complete successfully. Review sanitized logs and VPS cloud credential configuration."
 
 _CREDENTIAL_PATTERNS = (
     re.compile(r"AKIA[0-9A-Z]{16}"),
@@ -104,12 +105,17 @@ def run_prowler_scan(provider: str, output_dir: str | Path, output_filename: str
     elapsed_seconds = time.monotonic() - start_time
     stdout = redact_prowler_text(completed.stdout or "")
     stderr = redact_prowler_text(completed.stderr or "")
+    error = ""
+    error_type = None
+    if completed.returncode != 0:
+        error = summarize_prowler_failure(normalized_provider, stdout=stdout, stderr=stderr)
+        error_type = "missing_credentials" if _is_no_credentials_failure(f"{stdout}\n{stderr}") else "execution_failed"
     return _result(
         provider=normalized_provider,
         success=completed.returncode == 0,
         output=stdout,
-        error=stderr if completed.returncode == 0 else (stderr or "Prowler did not complete successfully."),
-        error_type=None if completed.returncode == 0 else "execution_failed",
+        error=stderr if completed.returncode == 0 else error,
+        error_type=error_type,
         returncode=completed.returncode,
         elapsed_seconds=elapsed_seconds,
         command=command,
@@ -147,6 +153,43 @@ def redact_prowler_text(text: str) -> str:
     for pattern in _CREDENTIAL_PATTERNS:
         redacted = pattern.sub(lambda match: f"{match.group(1)}<REDACTED>" if match.groups() else "<REDACTED>", redacted)
     return redacted
+
+
+def summarize_prowler_failure(provider: str, *, stdout: str = "", stderr: str = "") -> str:
+    text = redact_prowler_text(f"{stdout}\n{stderr}")
+    if _is_no_credentials_failure(text):
+        return f"Cloud credentials were not available for {normalize_prowler_provider(provider).upper()} on the Mongrel VPS."
+
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if not cleaned or _is_internal_diagnostic_line(cleaned):
+            continue
+        return cleaned[:500]
+    return PROWLER_GENERIC_FAILURE_ERROR
+
+
+def _is_no_credentials_failure(text: str) -> bool:
+    normalized = str(text or "").lower()
+    indicators = (
+        "nocredentialserror",
+        "no credentials",
+        "unable to locate credentials",
+        "could not locate credentials",
+        "credentials were not found",
+        "credential configuration was not found",
+        "missing credentials",
+    )
+    return any(indicator in normalized for indicator in indicators)
+
+
+def _is_internal_diagnostic_line(line: str) -> bool:
+    normalized = line.strip().lower()
+    return (
+        normalized.startswith("[file:")
+        or normalized.startswith("[module:")
+        or normalized.startswith("file \"")
+        or normalized.startswith("traceback ")
+    )
 
 
 def _validate_output_directory(output_dir: str | Path) -> Path:
