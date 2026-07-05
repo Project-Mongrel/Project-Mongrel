@@ -963,17 +963,21 @@ def build_prowler_result_text(result: dict[str, object], evidence: dict | None =
         f"Provider: {provider}",
         f"Context: {cloud_context}",
     ]
-    if result.get("success") is not True:
-        findings.append(_safe_prowler_failure_text(result, provider))
+    finding_count = int(summary.get("finding_count") or 0)
     findings.extend(
         [
-            f"Total checks/findings parsed: {int(summary.get('finding_count') or 0)}",
+            f"Total checks/findings parsed: {finding_count}",
             f"Failed checks: {int(summary.get('failed_count') or 0)}",
             f"Passed checks: {int(summary.get('passed_count') or 0)}",
-            f"Highest scanner-reported severity: {summary.get('highest_severity') or 'none'}",
-            "Top failed services: " + (", ".join(summary.get("top_failed_services") or []) or "none"),
         ]
     )
+    if result.get("success") is True or finding_count:
+        findings.extend(
+            [
+                f"Highest scanner-reported severity: {summary.get('highest_severity') or 'none'}",
+                "Top failed services: " + (", ".join(summary.get("top_failed_services") or []) or "none"),
+            ]
+        )
     if output_files:
         findings.append(f"Output artifact: {Path(str(output_files[0])).name}")
     top_failed = [
@@ -992,7 +996,7 @@ def build_prowler_result_text(result: dict[str, object], evidence: dict | None =
         status="Complete" if result.get("success") is True else "Failed",
         elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
         risk="INFO" if result.get("success") is True else None,
-        summary=f"{provider} cloud posture evidence collected for {cloud_context}." if result.get("success") is True else "Prowler scan failed.",
+        summary=f"{provider} cloud posture evidence collected for {cloud_context}." if result.get("success") is True else f"Prowler scan failed. {_safe_prowler_failure_text(result, provider)}",
         findings=findings,
         assets=[f"Provider: {provider}", f"Context: {cloud_context}"],
     )
@@ -1000,9 +1004,8 @@ def build_prowler_result_text(result: dict[str, object], evidence: dict | None =
 
 def _safe_prowler_failure_text(result: dict[str, object], provider: str) -> str:
     error = str(result.get("error") or "")
-    output = str(result.get("output") or "")
-    if error or output:
-        return summarize_prowler_failure(provider.lower(), stdout=output, stderr=error)
+    if error:
+        return summarize_prowler_failure(provider.lower(), stderr=error)
     return "Prowler scan failed."
 
 
@@ -1024,7 +1027,7 @@ def store_prowler_scan_result(user_id: int, result: dict[str, object], evidence:
             "summary": (
                 f"Prowler recorded {int(summary.get('finding_count') or 0)} scanner-reported cloud posture finding(s) for {provider.upper()} context {cloud_context}."
                 if result.get("success") is True
-                else str(result.get("error") or "Prowler cloud posture scan failed.")
+                else _safe_prowler_failure_text(result, provider or "unknown")
             ),
             "risk_level": "info" if result.get("success") is True else "unknown",
             "finding_count": int(summary.get("finding_count") or 0),

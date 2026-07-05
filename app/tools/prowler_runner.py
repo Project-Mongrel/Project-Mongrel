@@ -210,7 +210,7 @@ def _is_prowler_banner_line(line: str) -> bool:
     if not cleaned:
         return False
     lower = cleaned.lower()
-    if "prowler" in lower and not any(term in lower for term in ("error", "failed", "credential", "critical", "warning", "exception")):
+    if "prowler banner" in lower:
         return True
     if cleaned in {"_", "__", "___"}:
         return True
@@ -218,6 +218,12 @@ def _is_prowler_banner_line(line: str) -> bool:
         return True
     if len(cleaned) <= 120 and re.fullmatch(r"[_/\\|`'\".,:;~^*+=<>()\[\]{}\-\s]+", cleaned):
         return True
+    compact = cleaned.replace(" ", "")
+    if len(cleaned) <= 120 and compact:
+        punctuation_count = len(re.findall(r"[_/\\|`'\".,:;~^*+=<>()\[\]{}\-\s]", cleaned))
+        alnum_count = len(re.findall(r"[A-Za-z0-9]", cleaned))
+        if punctuation_count >= max(6, alnum_count * 2):
+            return True
     return False
 
 

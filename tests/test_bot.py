@@ -1819,7 +1819,7 @@ def test_prowler_no_credentials_stderr_is_sanitized_in_telegram() -> None:
         "provider": "aws",
         "cloud_context": "standalone-aws",
         "elapsed_seconds": 2,
-        "output": "[1;92m                         _\n\x1b[1;92m  ____  Prowler banner",
+        "output": "[1;92m                         _\n\x1b[1;92m  ____  Prowler banner\n| |_) | | | (_) \\ V  V /| |  __/ |",
         "error": "[File: aws_provider.py:1347]\n[Module: aws_provider]\nCRITICAL: NoCredentialsError: Unable to locate credentials\nauthorization: Bearer fake-token-for-test",
         "error_type": "execution_failed",
     }
@@ -1842,13 +1842,21 @@ def test_prowler_no_credentials_stderr_is_sanitized_in_telegram() -> None:
     assert "Failed" in combined
     assert "[1;92m" not in combined
     assert "____" not in combined
+    assert "| |_) | | | (_) \\ V  V /| |  __/ |" not in combined
     assert "[File:" not in combined
     assert "[Module:" not in combined
     assert "fake-token-for-test" not in combined
+    result_card = next(text for text in sent_messages if "Prowler Cloud Posture Scan Complete" in text)
+    findings_text = result_card.split("Findings", 1)[1].split("Observed Assets", 1)[0]
+    assert "Cloud credentials were not available" not in findings_text
+    assert "Highest scanner-reported severity" not in findings_text
+    assert "Top failed services" not in findings_text
+    assert findings_text.count("- ") == 5
     stored = get_user_findings(7224)[0]
     assert stored["finding_count"] == 0
     assert "[1;92m" not in str(stored)
     assert "____" not in str(stored)
+    assert "| |_) | | | (_) \\ V  V /| |  __/ |" not in str(stored)
 
 
 def test_prowler_missing_output_file_is_handled_safely(tmp_path) -> None:
