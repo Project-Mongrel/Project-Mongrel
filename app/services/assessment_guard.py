@@ -176,6 +176,18 @@ def collect_observed_assets(context: dict) -> dict[str, list[str] | str]:
                 rule_id = str(item.get("rule_id") or "secret").strip()
                 file_path = str(item.get("file_path") or "unknown").strip()
                 services.append(f"gitleaks {rule_id} in {file_path}")
+        prowler_evidence = finding.get("prowler_evidence") or {}
+        if prowler_evidence:
+            provider = str(prowler_evidence.get("provider") or finding.get("target") or "").strip()
+            if provider:
+                hosts.append(provider)
+            count = int(prowler_evidence.get("finding_count") or 0)
+            services.append(f"prowler cloud posture findings: {count}")
+            for item in prowler_evidence.get("findings") or []:
+                check_id = str(item.get("check_id") or "check").strip()
+                status = str(item.get("status") or "unknown").strip()
+                service = str(item.get("service") or "unknown").strip()
+                services.append(f"prowler {status} {check_id} {service}")
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -220,6 +232,8 @@ def _locked_tool_limitations(status_by_tool: dict[str, set[str]]) -> list[str]:
         limitations = [limitation for limitation in limitations if limitation != "testssl.sh not run"]
     if "gitleaks" in status_by_tool:
         limitations = [limitation for limitation in limitations if limitation != "Gitleaks not run"]
+    if "prowler" in status_by_tool:
+        limitations = [limitation for limitation in limitations if limitation != "ScoutSuite/Prowler not run"]
     return limitations
 
 
