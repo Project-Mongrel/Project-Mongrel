@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import time
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
 from app.bot.handlers.assessment import (
     ASSESSMENT_CHAT_STATE_KEY,
     ASSESSMENT_FLOW_STATE_KEY,
+    ASSESSMENT_SCAN_CONTEXT_KEY,
     ACTIVE_ASSESSMENT_ID_KEY,
     assessment_callback_handler,
     build_assessment_chat_intro,
@@ -61,6 +63,8 @@ from app.bot.handlers.scan import (
     build_katana_target_prompt,
     build_playwright_result_text,
     build_playwright_target_prompt,
+    build_prowler_provider_prompt,
+    build_prowler_result_text,
     build_testssl_target_prompt,
     build_clean_nuclei_verdict_text,
     build_nuclei_status_card,
@@ -218,6 +222,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "ffuf: Not run" in dashboard
     assert "testssl.sh: Not run" in dashboard
     assert "Gitleaks: Not run" in dashboard
+    assert "Prowler: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
@@ -228,6 +233,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
         "Run ffuf",
         "Run testssl.sh",
         "Run Gitleaks",
+        "Run Prowler",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",
@@ -1424,6 +1430,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "ffuf Discovery" in rendered_buttons
     assert "testssl.sh TLS" in rendered_buttons
     assert "Gitleaks Secrets" in rendered_buttons
+    assert "Prowler Cloud" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -1522,6 +1529,23 @@ def test_gitleaks_scan_callback_prompts_for_target() -> None:
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 
+def test_prowler_scan_callback_prompts_for_provider_only() -> None:
+    clear_user_scan_requests(7215)
+    query = SimpleNamespace(data="scan:prowler", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7215))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    prompt = query.edit_message_text.call_args.args[0]
+    assert prompt == build_prowler_provider_prompt()
+    assert "aws" in prompt
+    assert "azure" in prompt
+    assert "gcp" in prompt
+    assert "access key" not in prompt.lower()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
 def test_gitleaks_target_prompt_uses_vps_local_scope_guidance() -> None:
     prompt = build_gitleaks_target_prompt()
 
@@ -1542,6 +1566,10 @@ def test_scan_callback_pattern_routes_testssl_button() -> None:
 
 def test_scan_callback_pattern_routes_gitleaks_button() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:gitleaks")
+
+
+def test_scan_callback_pattern_routes_prowler_button() -> None:
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:prowler")
 
 
 def test_scan_callback_pattern_routes_evidence_vault_actions() -> None:
@@ -1606,6 +1634,239 @@ def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> 
     assert finding["source"] == "testssl"
     assert finding["testssl_evidence"]["certificate"]["issuer"] == "Example CA"
     assert finding["testssl_summary"]["supported_protocols"] == ["TLS 1.2", "TLS 1.3"]
+
+
+def _prowler_fixture(records: list[dict]) -> str:
+    return json.dumps(records)
+
+
+def _prowler_record(status: str = "FAIL", severity: str = "medium", service: str = "iam", check_id: str = "iam_check") -> dict:
+    return {
+        "metadata": {"event_code": check_id, "product": {"feature": {"name": service}}},
+        "cloud": {"provider": "aws", "region": "global"},
+        "finding_info": {"uid": f"{check_id}-finding", "title": f"{check_id} title", "desc": "Synthetic Prowler check."},
+        "status_code": status,
+        "severity": severity,
+        "resources": [{"uid": f"{check_id}-resource", "name": "synthetic-resource", "region": "global", "group": {"name": service}}],
+        "risk_details": "Scanner-reported posture risk.",
+        "remediation": {"desc": "Review configuration.", "references": ["https://docs.example.invalid/prowler"]},
+    }
+
+
+def test_prowler_scan_provider_success_stores_normalized_evidence(tmp_path) -> None:
+    clear_user_findings(7216)
+    clear_user_investigations(7216)
+    clear_user_scan_requests(7216)
+    output_file = tmp_path / "mongrel-prowler-aws.ocsf.json"
+    output_file.write_text(_prowler_fixture([_prowler_record("FAIL", "Medium", "iam"), _prowler_record("PASS", "informational", "s3", "s3_check")]), encoding="utf-8")
+    scan_request = create_scan_request(user_id=7216, scan_type="prowler")
+    mark_scan_request_awaiting_target(user_id=7216, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="aws", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7216))
+    result = {
+        "success": True,
+        "provider": "aws",
+        "elapsed_seconds": 4,
+        "returncode": 0,
+        "command": ["prowler", "aws"],
+        "output_files": [str(output_file)],
+        "output_dir": str(tmp_path),
+    }
+
+    with (
+        patch("app.bot.handlers.scan.run_prowler_scan", return_value=result) as run_mock,
+        patch("app.bot.handlers.scan.generate_prowler_ai_assessment", return_value=["Executive Summary", "- Prowler evidence reviewed."]) as ai_mock,
+        patch("app.bot.handlers.scan.ScanProgressCard.start", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.complete", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    run_args = run_mock.call_args.args
+    assert run_args[0] == "aws"
+    assert str(run_args[1]).replace("\\", "/").startswith("data/prowler/aws-")
+    assert run_args[2] == "mongrel-prowler-aws"
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert any("Prowler Cloud Posture Scan Complete" in text for text in sent_messages)
+    assert any("Provider: AWS" in text and "Context: standalone-aws" in text for text in sent_messages)
+    assert any("Prowler AI Assessment" in text for text in sent_messages)
+    assert not any("Synthetic Prowler check." * 20 in text for text in sent_messages)
+    finding = get_user_findings(7216)[0]
+    assert finding["source"] == "prowler"
+    assert finding["provider"] == "aws"
+    assert finding["cloud_context"] == "standalone-aws"
+    assert finding["target"] == "standalone-aws"
+    assert finding["prowler_evidence"]["findings"][0]["status"] == "FAIL"
+    assert finding["prowler_evidence"]["findings"][0]["status_interpretation"] == "scanner_reported_failed_check"
+    assert finding["prowler_evidence"]["findings"][1]["status"] == "PASS"
+    assert finding["prowler_evidence"]["findings"][0]["severity"] == "Medium"
+    ai_mock.assert_called_once()
+
+
+def test_prowler_provider_input_rejects_unsupported_and_flag_injection() -> None:
+    clear_user_scan_requests(7217)
+    scan_request = create_scan_request(user_id=7217, scan_type="prowler")
+    mark_scan_request_awaiting_target(user_id=7217, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="aws --fix", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7217))
+
+    with patch("app.bot.handlers.scan.run_prowler_scan") as run_mock:
+        asyncio.run(scan_target_handler(update, context))
+
+    run_mock.assert_not_called()
+    assert "Invalid Prowler provider" in message.reply_text.call_args.args[0]
+
+
+def test_prowler_assessment_mode_rejects_host_target_with_explicit_limitation() -> None:
+    clear_user_scan_requests(7223)
+    scan_request = create_scan_request(user_id=7223, scan_type="prowler")
+    mark_scan_request_awaiting_target(user_id=7223, scan_request_id=scan_request.id)
+    context = SimpleNamespace(
+        user_data={
+            PENDING_NMAP_REQUEST_KEY: scan_request.id,
+            ASSESSMENT_SCAN_CONTEXT_KEY: {"assessment_id": 1, "target_id": 1, "tool": "prowler"},
+        }
+    )
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7223))
+
+    with (
+        patch("app.bot.handlers.scan.run_prowler_scan") as run_mock,
+        patch("app.bot.handlers.scan._record_assessment_scan") as record_mock,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    run_mock.assert_not_called()
+    record_mock.assert_called_once()
+    text = message.reply_text.call_args.args[0]
+    assert "Assessment-mode Prowler currently accepts only aws, azure, or gcp" in text
+    assert "richer cloud environment labels need a later UX pass" in text
+
+
+def test_prowler_success_with_no_parsed_checks_does_not_invent_ai_findings(tmp_path) -> None:
+    clear_user_findings(7222)
+    clear_user_investigations(7222)
+    clear_user_scan_requests(7222)
+    output_file = tmp_path / "mongrel-prowler-aws.ocsf.json"
+    output_file.write_text("[]", encoding="utf-8")
+    scan_request = create_scan_request(user_id=7222, scan_type="prowler")
+    mark_scan_request_awaiting_target(user_id=7222, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="aws", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7222))
+    result = {
+        "success": True,
+        "provider": "aws",
+        "elapsed_seconds": 1,
+        "output_files": [str(output_file)],
+        "returncode": 0,
+    }
+
+    with (
+        patch("app.bot.handlers.scan.run_prowler_scan", return_value=result),
+        patch("app.bot.handlers.scan.generate_prowler_ai_assessment") as ai_mock,
+        patch("app.bot.handlers.scan.ScanProgressCard.start", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.complete", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    ai_mock.assert_not_called()
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert any("No parsed Prowler checks were available from this run." in text for text in sent_messages)
+    assert not any("confirmed exploitable" in text.lower() for text in sent_messages)
+
+
+def test_prowler_runner_failure_is_safe_message() -> None:
+    clear_user_findings(7218)
+    clear_user_scan_requests(7218)
+    scan_request = create_scan_request(user_id=7218, scan_type="prowler")
+    mark_scan_request_awaiting_target(user_id=7218, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="aws", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7218))
+    result = {"success": False, "provider": "aws", "elapsed_seconds": 1, "error": "Prowler failed with <REDACTED>", "error_type": "execution_failed"}
+
+    with (
+        patch("app.bot.handlers.scan.run_prowler_scan", return_value=result),
+        patch("app.bot.handlers.scan.ScanProgressCard.start", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.fail", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert any("Prowler Cloud Posture" in text and "Failed" in text for text in sent_messages)
+    assert "fake-token" not in str(sent_messages)
+    assert get_user_findings(7218)[0]["status"] == "failed"
+
+
+def test_prowler_missing_output_file_is_handled_safely(tmp_path) -> None:
+    clear_user_findings(7219)
+    clear_user_scan_requests(7219)
+    scan_request = create_scan_request(user_id=7219, scan_type="prowler")
+    mark_scan_request_awaiting_target(user_id=7219, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="aws", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7219))
+    result = {"success": True, "provider": "aws", "elapsed_seconds": 1, "output_files": [str(tmp_path / "missing.json")], "returncode": 0}
+
+    with (
+        patch("app.bot.handlers.scan.run_prowler_scan", return_value=result),
+        patch("app.bot.handlers.scan.ScanProgressCard.start", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.fail", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    assert get_user_findings(7219)[0]["status"] == "failed"
+    assert "output artifact was not found" in get_user_findings(7219)[0]["summary"]
+
+
+def test_prowler_malformed_output_is_handled_safely(tmp_path) -> None:
+    clear_user_findings(7221)
+    clear_user_scan_requests(7221)
+    output_file = tmp_path / "prowler.json"
+    output_file.write_text("{not json", encoding="utf-8")
+    scan_request = create_scan_request(user_id=7221, scan_type="prowler")
+    mark_scan_request_awaiting_target(user_id=7221, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="aws", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7221))
+    result = {"success": True, "provider": "aws", "elapsed_seconds": 1, "output_files": [str(output_file)], "returncode": 0}
+
+    with (
+        patch("app.bot.handlers.scan.run_prowler_scan", return_value=result),
+        patch("app.bot.handlers.scan.ScanProgressCard.start", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.fail", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    assert get_user_findings(7221)[0]["status"] == "failed"
+    assert "Unable to parse Prowler JSON output" in get_user_findings(7221)[0]["summary"]
+
+
+def test_prowler_result_card_does_not_dump_huge_raw_output() -> None:
+    evidence = {
+        "provider": "aws",
+        "finding_count": 100,
+        "findings": [_prowler_record("FAIL", "high", "iam", f"check_{index}") for index in range(20)],
+    }
+    result = {"success": True, "provider": "aws", "elapsed_seconds": 2, "output": "RAW" * 1000}
+
+    card = build_prowler_result_text(result, evidence)
+
+    assert "Prowler Cloud Posture Scan Complete" in card
+    assert "RAWRAWRAW" not in card
+    assert card.count("check_") <= 3
 
 
 def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:

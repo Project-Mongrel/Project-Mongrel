@@ -117,7 +117,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
-    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks"):
+    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks", "prowler"):
         tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
         if not tool_scans:
             continue
@@ -179,6 +179,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         ffuf_results = finding.get("ffuf_results") or {}
         testssl_evidence = finding.get("testssl_evidence") or {}
         gitleaks_evidence = finding.get("gitleaks_evidence") or {}
+        prowler_evidence = finding.get("prowler_evidence") or {}
 
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
@@ -197,6 +198,8 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
             lines.append(f"- {tool}: TLS configuration evidence recorded with {len(notable)} notable finding(s).")
         elif gitleaks_evidence:
             lines.append(f"- {tool}: {int(gitleaks_evidence.get('finding_count') or 0)} redacted secret-exposure finding(s) recorded.")
+        elif prowler_evidence:
+            lines.append(f"- {tool}: {int(prowler_evidence.get('finding_count') or 0)} scanner-reported cloud posture check(s) recorded.")
         elif observation_counts:
             total = sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
@@ -239,6 +242,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     ffuf_results = [result for finding in findings for result in (finding.get("ffuf_results") or [])]
     testssl_evidence = [finding.get("testssl_evidence") for finding in findings if finding.get("testssl_evidence")]
     gitleaks_evidence = [finding.get("gitleaks_evidence") for finding in findings if finding.get("gitleaks_evidence")]
+    prowler_evidence = [finding.get("prowler_evidence") for finding in findings if finding.get("prowler_evidence")]
 
     if open_ports:
         actions.append("- Validate externally exposed services and confirm each service is authorized.")
@@ -264,6 +268,8 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
         actions.append("- Review TLS protocols, certificate expiry, cipher observations, and testssl.sh-reported misconfigurations with the service owner.")
     if gitleaks_evidence:
         actions.append("- Rotate or revoke detected secrets, remove them from repositories/artifacts, and review commit history for exposure.")
+    if prowler_evidence:
+        actions.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -306,6 +312,9 @@ def _scan_summary(scan: dict) -> str:
     if tool == "gitleaks":
         evidence = finding.get("gitleaks_evidence") or {}
         return f"{int(evidence.get('finding_count') or 0)} redacted secret-exposure finding(s) recorded." if evidence else "Gitleaks completed with no structured secret findings."
+    if tool == "prowler":
+        evidence = finding.get("prowler_evidence") or {}
+        return f"{int(evidence.get('finding_count') or 0)} scanner-reported cloud posture check(s) recorded." if evidence else "Prowler completed with no structured cloud posture evidence."
     return "Completed scan evidence recorded."
 
 
@@ -462,6 +471,31 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             )
         return lines
 
+    prowler_evidence = finding.get("prowler_evidence") or {}
+    if prowler_evidence:
+        summary = finding.get("prowler_summary") or {}
+        provider = _clean(finding.get("provider") or prowler_evidence.get("provider") or "unknown").upper()
+        cloud_context = _clean(finding.get("cloud_context") or prowler_evidence.get("cloud_context") or finding.get("target") or "unknown")
+        checks = prowler_evidence.get("findings") or []
+        failed = [item for item in checks if str(item.get("status") or "").upper() == "FAIL"]
+        lines = [
+            f"- Provider: {provider}",
+            f"- Context: {cloud_context}",
+            f"- Total checks/findings parsed: {int(summary.get('finding_count') or prowler_evidence.get('finding_count') or len(checks))}",
+            f"- Failed checks: {int(summary.get('failed_count') or len(failed))}",
+            f"- Passed checks: {int(summary.get('passed_count') or 0)}",
+            f"- Highest scanner-reported severity: {_clean(summary.get('highest_severity') or 'none')}",
+            "- Top failed services: " + (", ".join(_clean(value) for value in (summary.get("top_failed_services") or [])[:10]) or "none"),
+            "- Limitation: FAIL results are scanner-reported failed checks, not confirmed exploitability or compromise.",
+        ]
+        for item in failed[:10]:
+            lines.append(
+                f"- {_clean(item.get('status') or 'unknown')} {_clean(item.get('check_id') or 'check')} "
+                f"severity={_clean(item.get('severity') or 'unknown')} service={_clean(item.get('service') or 'unknown')} "
+                f"region={_clean(item.get('region') or 'unknown')} title={_clean(item.get('check_title') or 'unknown')}"
+            )
+        return lines
+
     if str(scan.get("tool") or "").lower() == "nuclei":
         return ["- No matching findings were observed with the selected template/profile."]
     return ["- No additional structured observations are linked to this scan."]
@@ -582,6 +616,21 @@ def _collect_assets(targets: list[dict], findings: list[dict]) -> dict[str, list
                 if file_path:
                     assets["other"].append(f"Gitleaks {rule_id}: {file_path}")
 
+        prowler_evidence = finding.get("prowler_evidence") or {}
+        if prowler_evidence:
+            provider = _clean(finding.get("provider") or prowler_evidence.get("provider") or "")
+            cloud_context = _clean(finding.get("cloud_context") or prowler_evidence.get("cloud_context") or finding.get("target") or "")
+            if provider:
+                assets["other"].append(f"Prowler provider: {provider.upper()}")
+            if cloud_context:
+                assets["other"].append(f"Prowler context: {cloud_context}")
+            for item in prowler_evidence.get("findings") or []:
+                service = _clean(item.get("service") or "")
+                status = _clean(item.get("status") or "")
+                check_id = _clean(item.get("check_id") or "check")
+                if service:
+                    assets["services"].append(f"Prowler {status} {check_id} {service}")
+
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -610,7 +659,7 @@ def _risk_suffix(scan: dict) -> str:
 
 
 def _tool_label(tool: object) -> str:
-    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh", "gitleaks": "Gitleaks"}
+    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh", "gitleaks": "Gitleaks", "prowler": "Prowler"}
     return labels.get(str(tool or "").lower(), _clean(tool or "Unknown"))
 
 

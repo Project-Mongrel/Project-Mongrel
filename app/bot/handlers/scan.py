@@ -2,6 +2,7 @@ import asyncio
 import logging
 import secrets
 import time
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -29,6 +30,7 @@ from app.parsers.httpx_parser import parse_httpx_output, summarize_httpx_service
 from app.parsers.katana_parser import parse_katana_output, summarize_katana_observations
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.parsers.playwright_parser import normalize_playwright_observation, summarize_playwright_observation
+from app.parsers.prowler_parser import ProwlerParserError, normalize_prowler_output
 from app.parsers.testssl_parser import TestsslParserError, normalize_testssl_output, summarize_testssl_evidence
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import (
@@ -84,6 +86,8 @@ from app.services.katana_ai_assessment import FALLBACK_LINES as KATANA_AI_FALLBA
 from app.services.katana_ai_assessment import generate_katana_ai_assessment
 from app.services.playwright_ai_assessment import FALLBACK_LINES as PLAYWRIGHT_AI_FALLBACK_LINES
 from app.services.playwright_ai_assessment import generate_playwright_ai_assessment
+from app.services.prowler_ai_assessment import FALLBACK_LINES as PROWLER_AI_FALLBACK_LINES
+from app.services.prowler_ai_assessment import generate_prowler_ai_assessment
 from app.services.testssl_ai_assessment import FALLBACK_LINES as TESTSSL_AI_FALLBACK_LINES
 from app.services.testssl_ai_assessment import generate_testssl_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
@@ -96,6 +100,7 @@ from app.tools.gitleaks_runner import run_gitleaks_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
 from app.tools.playwright_runner import run_playwright_observation
+from app.tools.prowler_runner import normalize_prowler_provider, run_prowler_scan
 from app.tools.testssl_runner import run_testssl_scan
 from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
 from app.core.config import get_settings
@@ -250,6 +255,25 @@ def build_gitleaks_target_prompt() -> str:
             "/home/mongrel/Project-Mongrel/data/artifacts/<assessment-id>",
             "",
             "The demo smoke-test path contains generated fake test data only.",
+        ]
+    )
+
+
+def build_prowler_provider_prompt() -> str:
+    return "\n".join(
+        [
+            "Prowler cloud posture scan request created.",
+            "",
+            "Send the authorized provider to assess:",
+            "aws",
+            "azure",
+            "gcp",
+            "",
+            "Requirements:",
+            "- The Mongrel VPS must already have authorized read-only cloud credentials available for that provider.",
+            "- Mongrel does not create credentials.",
+            "- Mongrel does not modify cloud resources.",
+            "- No remediation or validation actions are performed.",
         ]
     )
 
@@ -916,6 +940,102 @@ def build_gitleaks_sensitive_secret_text(evidence_id: str, secret_value: str, tt
     )
 
 
+def summarize_prowler_evidence(evidence: dict) -> dict:
+    findings = evidence.get("findings") or []
+    failed = [finding for finding in findings if str(finding.get("status") or "").upper() == "FAIL"]
+    passed = [finding for finding in findings if str(finding.get("status") or "").upper() == "PASS"]
+    return {
+        "finding_count": int(evidence.get("finding_count") or len(findings)),
+        "failed_count": len(failed),
+        "passed_count": len(passed),
+        "highest_severity": _highest_prowler_severity(finding.get("severity") for finding in findings),
+        "top_failed_services": _top_failed_prowler_services(failed),
+    }
+
+
+def build_prowler_result_text(result: dict[str, object], evidence: dict | None = None) -> str:
+    evidence = evidence or {}
+    summary = summarize_prowler_evidence(evidence) if evidence else {}
+    provider = str(result.get("provider") or evidence.get("provider") or "unknown").upper()
+    cloud_context = str(result.get("cloud_context") or evidence.get("cloud_context") or f"standalone-{provider.lower()}")
+    output_files = result.get("output_files") or []
+    findings = [
+        f"Provider: {provider}",
+        f"Context: {cloud_context}",
+        f"Total checks/findings parsed: {int(summary.get('finding_count') or 0)}",
+        f"Failed checks: {int(summary.get('failed_count') or 0)}",
+        f"Passed checks: {int(summary.get('passed_count') or 0)}",
+        f"Highest scanner-reported severity: {summary.get('highest_severity') or 'none'}",
+        "Top failed services: " + (", ".join(summary.get("top_failed_services") or []) or "none"),
+    ]
+    if output_files:
+        findings.append(f"Output artifact: {Path(str(output_files[0])).name}")
+    top_failed = [
+        finding
+        for finding in evidence.get("findings") or []
+        if str(finding.get("status") or "").upper() == "FAIL"
+    ][:3]
+    for finding in top_failed:
+        findings.append(
+            f"{finding.get('check_id') or 'check'}: {finding.get('service') or 'unknown'} "
+            f"{finding.get('region') or 'unknown'} ({finding.get('severity') or 'unknown'})"
+        )
+    if result.get("success") is not True:
+        findings.append(str(result.get("error") or "Prowler scan failed."))
+    return render_scan_result_card(
+        tool_name="Prowler Cloud Posture",
+        target=cloud_context,
+        status="Complete" if result.get("success") is True else "Failed",
+        elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
+        risk="INFO" if result.get("success") is True else None,
+        summary=f"{provider} cloud posture evidence collected for {cloud_context}." if result.get("success") is True else "Prowler scan failed.",
+        findings=findings,
+        assets=[f"Provider: {provider}", f"Context: {cloud_context}"],
+    )
+
+
+def store_prowler_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
+    evidence = evidence or {}
+    summary = summarize_prowler_evidence(evidence) if evidence else {}
+    status = "completed" if result.get("success") is True else "failed"
+    provider = str(result.get("provider") or evidence.get("provider") or "")
+    cloud_context = str(result.get("cloud_context") or evidence.get("cloud_context") or f"standalone-{provider}") if provider else "unknown-cloud-context"
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "prowler",
+            "target": cloud_context,
+            "target_key": normalize_target_key(cloud_context),
+            "provider": provider,
+            "cloud_context": cloud_context,
+            "status": status,
+            "summary": (
+                f"Prowler recorded {int(summary.get('finding_count') or 0)} scanner-reported cloud posture finding(s) for {provider.upper()} context {cloud_context}."
+                if result.get("success") is True
+                else str(result.get("error") or "Prowler cloud posture scan failed.")
+            ),
+            "risk_level": "info" if result.get("success") is True else "unknown",
+            "finding_count": int(summary.get("finding_count") or 0),
+            "raw_output": "",
+            "prowler_evidence": evidence,
+            "prowler_summary": summary,
+            "metadata": {
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "command": result.get("command"),
+                "working_directory": result.get("working_directory"),
+                "output_dir": result.get("output_dir"),
+                "output_files": result.get("output_files"),
+                "provider": provider,
+                "cloud_context": cloud_context,
+                "error": result.get("error"),
+                "error_type": result.get("error_type"),
+                "parser": "prowler-json-ocsf",
+            },
+        },
+    )
+
+
 def store_gitleaks_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
     evidence = evidence or {}
     summary = summarize_gitleaks_evidence(evidence) if evidence else {}
@@ -1003,6 +1123,58 @@ def _find_gitleaks_evidence_item(finding: dict, evidence_id: str) -> dict | None
 
 def _format_count_summary(counts: dict) -> str:
     return ", ".join(f"{key}: {count}" for key, count in sorted(counts.items())) if counts else "none"
+
+
+def _highest_prowler_severity(values: object) -> str:
+    order = {"critical": 5, "high": 4, "medium": 3, "low": 2, "informational": 1, "info": 1}
+    highest = ""
+    highest_score = -1
+    for value in values:
+        text = str(value or "").strip()
+        score = order.get(text.lower(), 0 if text else -1)
+        if score > highest_score:
+            highest = text
+            highest_score = score
+    return highest
+
+
+def _top_failed_prowler_services(failed_findings: list[dict], limit: int = 3) -> list[str]:
+    counts: dict[str, int] = {}
+    for finding in failed_findings:
+        service = str(finding.get("service") or "unknown").strip() or "unknown"
+        counts[service] = counts.get(service, 0) + 1
+    return [f"{service}: {count}" for service, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
+def _prowler_output_directory(provider: str) -> Path:
+    return Path("data") / "prowler" / f"{provider}-{int(time.time())}"
+
+
+def _load_prowler_evidence(result: dict[str, object], provider: str) -> dict:
+    output_files = [Path(str(path)) for path in result.get("output_files") or [] if str(path).strip()]
+    if not output_files:
+        raise ProwlerParserError("Prowler JSON-OCSF output artifact was not found.")
+    output_file = output_files[0]
+    if not output_file.exists() or not output_file.is_file():
+        raise ProwlerParserError("Prowler JSON-OCSF output artifact was not found.")
+    return normalize_prowler_output(output_file.read_text(encoding="utf-8"), provider=provider)
+
+
+def _prowler_cloud_context(provider: str, assessment_context: dict | None = None) -> str:
+    if assessment_context:
+        context_label = str(assessment_context.get("cloud_context") or "").strip()
+        if context_label and context_label.lower() != provider:
+            return context_label
+        return f"assessment-{provider}"
+    return f"standalone-{provider}"
+
+
+def _prowler_assessment_provider_limitation(error: object) -> str:
+    return (
+        f"Invalid Prowler provider: {error}\n\n"
+        "Assessment-mode Prowler currently accepts only aws, azure, or gcp as the assessment target value. "
+        "Use a cloud-provider assessment target for this mission; richer cloud environment labels need a later UX pass."
+    )
 
 
 def store_bbot_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
@@ -1484,6 +1656,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(build_gitleaks_target_prompt())
         return
 
+    if scan_type == "prowler":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_prowler_provider_prompt())
+        return
+
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
@@ -1585,6 +1763,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if scan_request.scan_type == "gitleaks":
         await _handle_gitleaks_target(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type == "prowler":
+        await _handle_prowler_provider(update, context, user_id, scan_request_id)
         return
 
     if scan_request.scan_type != "nmap":
@@ -1764,6 +1946,25 @@ async def _send_gitleaks_ai_assessment(message: object, finding: dict) -> None:
 
     await safe_edit_text(progress_message, "AI assessment ready.", context="Gitleaks AI assessment status")
     assessment_text = render_ai_summary_card(assessment_lines, title="Gitleaks AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
+async def _send_prowler_ai_assessment(message: object, finding: dict) -> None:
+    evidence = finding.get("prowler_evidence") or {}
+    if not evidence.get("findings"):
+        await message.reply_text("No parsed Prowler checks were available from this run.")
+        return
+
+    progress_message = await message.reply_text("Generating Prowler AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_prowler_ai_assessment, finding)
+    if assessment_lines == PROWLER_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "Prowler AI assessment unavailable.", context="Prowler AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="Prowler AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="Prowler AI Assessment")
     for chunk in split_report_text(assessment_text):
         await message.reply_text(chunk)
 
@@ -2036,6 +2237,97 @@ async def _handle_gitleaks_target(
     )
     if result.get("success") is True:
         await _send_gitleaks_ai_assessment(update.message, finding)
+    await _send_assessment_dashboard(update.message, assessment_context)
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+
+
+async def _handle_prowler_provider(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+
+    provider_input = update.message.text or ""
+    try:
+        provider = normalize_prowler_provider(provider_input)
+    except ValueError as exc:
+        assessment_context = _pop_assessment_scan_context(context, "prowler")
+        error_text = _prowler_assessment_provider_limitation(exc) if assessment_context else f"Invalid Prowler provider: {exc}"
+        await update.message.reply_text(error_text)
+        _record_assessment_scan(
+            assessment_context,
+            tool="prowler",
+            result={"success": False, "target": provider_input, "provider": provider_input, "error": str(exc)},
+        )
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    assessment_context = _pop_assessment_scan_context(context, "prowler")
+    cloud_context = _prowler_cloud_context(provider, assessment_context)
+    investigation = get_or_create_latest_open_investigation(user_id=user_id, target=cloud_context)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=cloud_context,
+        event_type="prowler_scan_started",
+        tool="prowler",
+        status="started",
+        summary=f"Prowler cloud posture scan started for {provider.upper()} context {cloud_context}",
+        metadata={"provider": provider, "cloud_context": cloud_context},
+    )
+    progress_card = ScanProgressCard(update.message, "Prowler Cloud Posture", cloud_context)
+    await progress_card.start("Launching scan...")
+    await progress_card.start_auto_refresh("Running scan...", interval_seconds=10)
+
+    output_dir = _prowler_output_directory(provider)
+    output_filename = f"mongrel-prowler-{provider}"
+    try:
+        result = await asyncio.to_thread(run_prowler_scan, provider, output_dir, output_filename)
+        result = {**result, "provider": provider, "cloud_context": cloud_context}
+    finally:
+        await progress_card.stop_auto_refresh()
+
+    evidence = {}
+    parser_error = None
+    if result.get("success") is True:
+        try:
+            evidence = _load_prowler_evidence(result, provider)
+            evidence["cloud_context"] = cloud_context
+        except ProwlerParserError as exc:
+            parser_error = str(exc)
+            result = {**result, "success": False, "error": parser_error, "error_type": "parser_error"}
+
+    complete_scan_request(
+        user_id=user_id,
+        scan_request_id=scan_request_id,
+        target=cloud_context,
+        result=result,
+    )
+    finding = store_prowler_scan_result(user_id=user_id, result=result, evidence=evidence)
+    add_investigation_event(
+        investigation_id=investigation["id"],
+        user_id=user_id,
+        target=cloud_context,
+        event_type="prowler_scan_completed" if result.get("success") is True else "prowler_scan_failed",
+        tool="prowler",
+        status="completed" if result.get("success") is True else "failed",
+        summary=f"Prowler cloud posture scan completed for {provider.upper()} context {cloud_context}" if result.get("success") is True else "Prowler cloud posture scan failed",
+        metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count"), "parser_error": parser_error, "provider": provider, "cloud_context": cloud_context},
+    )
+    _record_assessment_scan(assessment_context, tool="prowler", result=result, finding=finding)
+    if result.get("success") is True:
+        await progress_card.complete()
+    else:
+        await progress_card.fail(str(result.get("error") or "Unknown error."))
+    await update.message.reply_text(
+        build_prowler_result_text(result, evidence),
+        reply_markup=build_scan_result_actions(finding.get("id"), "prowler") if result.get("success") is True else None,
+    )
+    if result.get("success") is True:
+        await _send_prowler_ai_assessment(update.message, finding)
     await _send_assessment_dashboard(update.message, assessment_context)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
 

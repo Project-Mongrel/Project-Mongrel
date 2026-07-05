@@ -317,3 +317,57 @@ def test_report_appendix_groups_history_by_tool() -> None:
     assert "Nmap History" in report
     assert "Nuclei History" in report
     assert report.index("Nmap History") < report.index("Nuclei History")
+
+
+def test_report_generation_includes_prowler_provider_context_counts_and_failed_checks() -> None:
+    add_finding(
+        user_id=9017,
+        finding={
+            "source": "prowler",
+            "target": "standalone-aws",
+            "target_key": "standalone-aws",
+            "provider": "aws",
+            "cloud_context": "standalone-aws",
+            "risk_level": "info",
+            "finding_count": 2,
+            "status": "completed",
+            "summary": "Prowler recorded 2 scanner-reported cloud posture finding(s) for AWS context standalone-aws.",
+            "prowler_summary": {
+                "finding_count": 2,
+                "failed_count": 1,
+                "passed_count": 1,
+                "highest_severity": "Critical",
+                "top_failed_services": ["iam: 1"],
+            },
+            "prowler_evidence": {
+                "provider": "aws",
+                "cloud_context": "standalone-aws",
+                "finding_count": 2,
+                "findings": [
+                    {
+                        "status": "FAIL",
+                        "severity": "Critical",
+                        "check_id": "iam_root_mfa",
+                        "check_title": "Root MFA check",
+                        "service": "iam",
+                        "region": "global",
+                        "resource_identifier": "AKIAABCDEFGHIJKLMNOP",
+                    },
+                    {"status": "PASS", "severity": "informational", "check_id": "s3_public_block", "service": "s3"},
+                ],
+            },
+        },
+    )
+
+    report = generate_markdown_report(user_id=9017, target="standalone-aws")
+
+    assert "- Prowler" in report
+    assert "Provider: AWS" in report
+    assert "Context: standalone-aws" in report
+    assert "Total checks/findings parsed: 2" in report
+    assert "Failed checks: 1" in report
+    assert "Passed checks: 1" in report
+    assert "Highest scanner-reported severity: Critical" in report
+    assert "FAIL iam_root_mfa severity=Critical service=iam" in report
+    assert "AKIAABCDEFGHIJKLMNOP" not in report
+    assert "{\"" not in report

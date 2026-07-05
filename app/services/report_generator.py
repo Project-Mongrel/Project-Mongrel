@@ -207,6 +207,26 @@ def _format_scan_run_for_ai_prompt(index: int, scan_run: dict) -> list[str]:
             )
         if not nuclei_findings:
             lines.append("   - none")
+    if scan_run.get("source") == "prowler":
+        evidence = scan_run.get("prowler_evidence") or {}
+        summary = scan_run.get("prowler_summary") or {}
+        lines.extend(
+            [
+                f"   Provider: {scan_run.get('provider') or evidence.get('provider') or 'unknown'}",
+                f"   Context: {scan_run.get('cloud_context') or evidence.get('cloud_context') or scan_run.get('target') or 'unknown'}",
+                f"   Failed Checks: {int(summary.get('failed_count') or 0)}",
+                f"   Passed Checks: {int(summary.get('passed_count') or 0)}",
+                f"   Highest Scanner-Reported Severity: {summary.get('highest_severity') or 'none'}",
+                "   Prowler Checks:",
+            ]
+        )
+        for finding in (evidence.get("findings") or [])[:20]:
+            lines.append(
+                f"   - {finding.get('status') or 'unknown'} {finding.get('check_id') or 'check'} "
+                f"severity={finding.get('severity') or 'unknown'} service={finding.get('service') or 'unknown'}"
+            )
+        if not evidence.get("findings"):
+            lines.append("   - none")
 
     return lines
 
@@ -291,6 +311,8 @@ def _format_technical_findings(scan_runs: list[dict]) -> list[str]:
             continue
         elif source == "nuclei":
             finding_lines.extend(_format_nuclei_findings(scan_run))
+        elif source == "prowler":
+            finding_lines.extend(_format_prowler_findings(scan_run))
         else:
             finding_lines.append(f"- {_source_label(source)} finding for {scan_run.get('target') or 'unknown target'}.")
 
@@ -344,6 +366,38 @@ def _format_nuclei_findings(scan_run: dict) -> list[str]:
     return lines
 
 
+def _format_prowler_findings(scan_run: dict) -> list[str]:
+    evidence = scan_run.get("prowler_evidence") or {}
+    summary = scan_run.get("prowler_summary") or {}
+    provider = str(scan_run.get("provider") or evidence.get("provider") or "unknown").upper()
+    cloud_context = scan_run.get("cloud_context") or evidence.get("cloud_context") or scan_run.get("target") or "unknown"
+    findings = evidence.get("findings") or []
+    failed = [finding for finding in findings if str(finding.get("status") or "").upper() == "FAIL"]
+    lines = [
+        f"- Prowler cloud posture summary:",
+        f"  - Provider: {provider}",
+        f"  - Context: {cloud_context}",
+        f"  - Total checks/findings parsed: {int(summary.get('finding_count') or evidence.get('finding_count') or len(findings))}",
+        f"  - Failed checks: {int(summary.get('failed_count') or len(failed))}",
+        f"  - Passed checks: {int(summary.get('passed_count') or 0)}",
+        f"  - Highest scanner-reported severity: {summary.get('highest_severity') or 'none'}",
+        "  - Top failed services: " + (", ".join(summary.get("top_failed_services") or []) or "none"),
+        "  - Failed-check evidence:",
+    ]
+    if not failed:
+        lines.append("    - None recorded.")
+        return lines
+    for finding in failed[:10]:
+        lines.append(
+            f"    - {finding.get('status') or 'unknown'} {finding.get('check_id') or 'check'} "
+            f"severity={finding.get('severity') or 'unknown'} service={finding.get('service') or 'unknown'} "
+            f"region={finding.get('region') or 'unknown'} title={finding.get('check_title') or 'unknown'}"
+        )
+    if len(failed) > 10:
+        lines.append(f"    - ...and {len(failed) - 10} more failed check(s).")
+    return lines
+
+
 def _format_clean_scan_notes(scan_runs: list[dict]) -> list[str]:
     clean_scans = [scan_run for scan_run in scan_runs if _is_clean_scan(scan_run)]
     if not clean_scans:
@@ -366,6 +420,8 @@ def _format_recommendations(scan_runs: list[dict]) -> list[str]:
         recommendations.append("- Review exposed services and restrict administrative ports to trusted networks.")
     if "nuclei" in sources:
         recommendations.append("- Patch or reconfigure affected services identified by Nuclei.")
+    if "prowler" in sources:
+        recommendations.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
         recommendations.append("- Treat clean scans as point-in-time evidence, not proof that no vulnerabilities exist.")
     recommendations.extend(_format_finding_aware_recommendations(scan_runs))
@@ -524,6 +580,8 @@ def _format_finding_aware_recommendations(scan_runs: list[dict]) -> list[str]:
         recommendations.append("- Databases: restrict network access, require authentication, and keep database services patched.")
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
         recommendations.append("- Clean Nuclei: treat the result as point-in-time evidence, not proof that no issues exist.")
+    if any(scan_run.get("source") == "prowler" for scan_run in scan_runs):
+        recommendations.append("- Prowler: treat FAIL results as scanner-reported failed checks requiring cloud-context validation.")
 
     return recommendations
 
@@ -568,6 +626,8 @@ def _is_clean_scan(scan_run: dict) -> bool:
 def _finding_count(scan_run: dict) -> int:
     if scan_run.get("finding_count") is not None:
         return int(scan_run.get("finding_count") or 0)
+    if isinstance(scan_run.get("prowler_evidence"), dict):
+        return int((scan_run.get("prowler_evidence") or {}).get("finding_count") or len((scan_run.get("prowler_evidence") or {}).get("findings") or []))
     if isinstance(scan_run.get("nuclei_findings"), list):
         return len(scan_run.get("nuclei_findings") or [])
     if isinstance(scan_run.get("open_ports"), list):
@@ -581,6 +641,7 @@ def _source_label(source: object) -> str:
         "nmap_xml": "Nmap XML Upload",
         "nuclei": "Nuclei",
         "bbot": "BBOT",
+        "prowler": "Prowler",
     }
     return labels.get(str(source), str(source or "Unknown"))
 
@@ -597,4 +658,6 @@ def _source_icon_key(source_label: str) -> str:
         return "nuclei"
     if normalized.startswith("bbot"):
         return "bbot"
+    if normalized.startswith("prowler"):
+        return "observation"
     return "observation"

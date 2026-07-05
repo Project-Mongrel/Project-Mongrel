@@ -105,6 +105,7 @@ def build_assessment_dashboard_text(assessment: dict, targets: list[dict] | None
             f"ffuf: {scan_status['ffuf']}",
             f"testssl.sh: {scan_status['testssl']}",
             f"Gitleaks: {scan_status['gitleaks']}",
+            f"Prowler: {scan_status['prowler']}",
         ]
     )
 
@@ -123,6 +124,7 @@ def build_assessment_dashboard_keyboard(assessment_id: int) -> InlineKeyboardMar
             [InlineKeyboardButton("Run ffuf", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:ffuf:{assessment_id}")],
             [InlineKeyboardButton("Run testssl.sh", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:testssl:{assessment_id}")],
             [InlineKeyboardButton("Run Gitleaks", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:gitleaks:{assessment_id}")],
+            [InlineKeyboardButton("Run Prowler", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:prowler:{assessment_id}")],
             [
                 InlineKeyboardButton("Ask Mongrel", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ask:{assessment_id}"),
                 InlineKeyboardButton("Generate AI Report", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ai_report:{assessment_id}"),
@@ -391,6 +393,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
     context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY] = {
         "assessment_id": assessment_id,
         "target_id": target["id"],
+        "cloud_context": target.get("name") or f"assessment-{str(target['address']).strip().lower()}",
         "tool": tool,
     }
     synthetic_update = type(
@@ -409,7 +412,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 
 
 def _scan_statuses(scans: list[dict]) -> dict[str, str]:
-    statuses = {"nmap": "Not run", "bbot": "Not run", "nuclei": "Not run", "httpx": "Not run", "katana": "Not run", "playwright": "Not run", "ffuf": "Not run", "testssl": "Not run", "gitleaks": "Not run"}
+    statuses = {"nmap": "Not run", "bbot": "Not run", "nuclei": "Not run", "httpx": "Not run", "katana": "Not run", "playwright": "Not run", "ffuf": "Not run", "testssl": "Not run", "gitleaks": "Not run", "prowler": "Not run"}
     for scan in scans:
         tool = str(scan.get("tool") or "").lower()
         if tool in statuses:
