@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     prowler_enabled: bool = False
     prowler_binary: str = "prowler"
     prowler_timeout_seconds: int = 900
+    metasploit_binary: str = "msfconsole"
+    metasploit_timeout_seconds: int = 300
 
 
 @lru_cache
