@@ -2,6 +2,7 @@ import asyncio
 import logging
 import secrets
 import time
+from datetime import UTC
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -70,8 +71,11 @@ from app.services.metasploit_approval import (
     approve_metasploit_proposal,
     get_metasploit_proposal,
     propose_metasploit_action,
+    record_metasploit_result_reference,
     reject_metasploit_proposal,
 )
+from app.services.metasploit_ai_assessment import FALLBACK_LINES as METASPLOIT_AI_FALLBACK_LINES
+from app.services.metasploit_ai_assessment import generate_metasploit_ai_assessment
 from app.services.metasploit_policy import build_metasploit_action_request
 from app.services.observation_store import add_observations
 from app.services.risk_rules import assess_nmap_ports
@@ -328,6 +332,7 @@ def build_metasploit_proposal_text(proposal: object) -> str:
             f"Risk tier: {str(request.get('risk_tier') or 'unknown').upper()}",
             f"Expected effect: {request.get('expected_effect') or 'unknown'}",
             f"Timeout: {request.get('timeout_seconds') or 'unknown'}s",
+            f"Expires: {_format_metasploit_timestamp(getattr(proposal, 'expires_at', None))}",
             "Approved options: " + (_format_metasploit_options(options) if options else "none"),
             "",
             "Approve only if this exact action is authorized.",
@@ -1177,6 +1182,8 @@ def store_metasploit_scan_result(
                 "module": result.get("module"),
                 "action_type": result.get("action_type"),
                 "port": result.get("port"),
+                "risk_tier": result.get("risk_tier"),
+                "expected_effect": result.get("expected_effect"),
                 "elapsed_seconds": result.get("elapsed_seconds"),
                 "returncode": result.get("returncode"),
                 "error_type": result.get("error_type"),
@@ -1187,6 +1194,12 @@ def store_metasploit_scan_result(
 
 def _format_metasploit_options(options: dict) -> str:
     return ", ".join(f"{key}={value}" for key, value in sorted(options.items())) if options else "none"
+
+
+def _format_metasploit_timestamp(value: object) -> str:
+    if hasattr(value, "astimezone"):
+        return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return "unknown"
 
 
 def store_prowler_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
@@ -2182,6 +2195,25 @@ async def _send_prowler_ai_assessment(message: object, finding: dict) -> None:
         await message.reply_text(chunk)
 
 
+async def _send_metasploit_ai_assessment(message: object, finding: dict) -> None:
+    evidence = finding.get("metasploit_evidence") or {}
+    if not evidence:
+        await message.reply_text("No normalized Metasploit validation evidence was available from this run.")
+        return
+
+    progress_message = await message.reply_text("Generating Metasploit AI assessment...")
+    assessment_lines = await asyncio.to_thread(generate_metasploit_ai_assessment, finding)
+    if assessment_lines == METASPLOIT_AI_FALLBACK_LINES:
+        await safe_edit_text(progress_message, "Metasploit AI assessment unavailable.", context="Metasploit AI assessment status")
+        await message.reply_text("\n".join(assessment_lines))
+        return
+
+    await safe_edit_text(progress_message, "AI assessment ready.", context="Metasploit AI assessment status")
+    assessment_text = render_ai_summary_card(assessment_lines, title="Metasploit AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
+
+
 async def _handle_ffuf_target(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2560,8 +2592,12 @@ async def _handle_metasploit_request(
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
-    proposal = propose_metasploit_action(user_id, request)
     assessment_context = _pop_assessment_scan_context(context, "metasploit")
+    proposal = propose_metasploit_action(
+        user_id,
+        request,
+        assessment_context=assessment_context if isinstance(assessment_context, dict) else None,
+    )
     _metasploit_pending_context[proposal.id] = {
         "scan_request_id": scan_request_id,
         "assessment_context": assessment_context,
@@ -2619,6 +2655,7 @@ async def _handle_metasploit_callback(query: object, user_id: int) -> None:
     pending = _metasploit_pending_context.pop(approved.id, {})
     assessment_context = pending.get("assessment_context") if isinstance(pending, dict) else None
     artifact_ref = _store_metasploit_artifact(assessment_context, result, normalized, approved.id)
+    record_metasploit_result_reference(approved.id, artifact_ref)
     finding = store_metasploit_scan_result(user_id, result, normalized, approved.id, artifact_ref)
 
     scan_request_id = pending.get("scan_request_id") if isinstance(pending, dict) else None
@@ -2630,6 +2667,10 @@ async def _handle_metasploit_callback(query: object, user_id: int) -> None:
     reply_text = getattr(message, "reply_text", None)
     if reply_text is not None:
         await reply_text(build_metasploit_result_text(finding))
+        if normalized:
+            await _send_metasploit_ai_assessment(message, finding)
+        else:
+            await reply_text("No normalized Metasploit validation evidence was available from this run.")
     else:
         await query.edit_message_text(build_metasploit_result_text(finding))
 

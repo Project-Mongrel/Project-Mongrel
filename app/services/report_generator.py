@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime
 
 from app.services.ai_client import ask_ai
@@ -16,6 +17,12 @@ AI_UNAVAILABLE_RESPONSES = {
     "Empty AI response.",
     "Mongrel generated internal reasoning but no final answer. Try rephrasing the question.",
 }
+
+_SECRET_PATTERNS = (
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"ASIA[0-9A-Z]{16}"),
+    re.compile(r"(?i)(password|token|secret|api[_-]?key|access[_-]?key|session[_-]?token)\s*[:=]\s*\S+"),
+)
 
 
 def generate_markdown_report(
@@ -227,6 +234,18 @@ def _format_scan_run_for_ai_prompt(index: int, scan_run: dict) -> list[str]:
             )
         if not evidence.get("findings"):
             lines.append("   - none")
+    if scan_run.get("source") == "metasploit":
+        evidence = scan_run.get("metasploit_evidence") or {}
+        metadata = scan_run.get("metadata") or {}
+        lines.extend(
+            [
+                f"   Module: {evidence.get('module') or metadata.get('module') or 'unknown'}",
+                f"   Action: {evidence.get('action_type') or metadata.get('action_type') or 'unknown'}",
+                f"   Validation State: {evidence.get('validation_state') or 'unknown'}",
+                f"   Evidence: {evidence.get('summary') or scan_run.get('summary') or 'none'}",
+                f"   Provenance: proposal={metadata.get('proposal_id') or 'not supplied'} artifact={metadata.get('artifact_ref') or 'not supplied'}",
+            ]
+        )
 
     return lines
 
@@ -313,6 +332,8 @@ def _format_technical_findings(scan_runs: list[dict]) -> list[str]:
             finding_lines.extend(_format_nuclei_findings(scan_run))
         elif source == "prowler":
             finding_lines.extend(_format_prowler_findings(scan_run))
+        elif source == "metasploit":
+            finding_lines.extend(_format_metasploit_findings(scan_run))
         else:
             finding_lines.append(f"- {_source_label(source)} finding for {scan_run.get('target') or 'unknown target'}.")
 
@@ -398,6 +419,27 @@ def _format_prowler_findings(scan_run: dict) -> list[str]:
     return lines
 
 
+def _format_metasploit_findings(scan_run: dict) -> list[str]:
+    evidence = scan_run.get("metasploit_evidence") or {}
+    metadata = scan_run.get("metadata") or {}
+    lines = [
+        "- Metasploit controlled validation summary:",
+        f"  - Target: {_clean(evidence.get('target') or scan_run.get('target') or 'unknown')}",
+        f"  - Module: {_clean(evidence.get('module') or metadata.get('module') or 'unknown')}",
+        f"  - Action: {_clean(evidence.get('action_type') or metadata.get('action_type') or 'unknown')}",
+        f"  - Validation State: {_clean(evidence.get('validation_state') or 'unknown')}",
+        f"  - Evidence: {_clean(evidence.get('summary') or scan_run.get('summary') or 'none')}",
+        f"  - Proposal Reference: {_clean(metadata.get('proposal_id') or 'not supplied')}",
+        f"  - Artifact Reference: {_clean(metadata.get('artifact_ref') or 'not supplied')}",
+        "  - Limitation: Validation output is bounded to the approved module/action/options.",
+        "  - Limitation: Failed, blocked, or not reproduced validation does not mean the target is secure.",
+    ]
+    excerpt = _clean(evidence.get("raw_evidence_excerpt") or "")
+    if excerpt:
+        lines.append(f"  - Normalized evidence excerpt: {excerpt}")
+    return lines
+
+
 def _format_clean_scan_notes(scan_runs: list[dict]) -> list[str]:
     clean_scans = [scan_run for scan_run in scan_runs if _is_clean_scan(scan_run)]
     if not clean_scans:
@@ -422,6 +464,8 @@ def _format_recommendations(scan_runs: list[dict]) -> list[str]:
         recommendations.append("- Patch or reconfigure affected services identified by Nuclei.")
     if "prowler" in sources:
         recommendations.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
+    if "metasploit" in sources:
+        recommendations.append("- Review Metasploit validation evidence with the owner; do not treat failed validation as proof that the target is secure.")
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
         recommendations.append("- Treat clean scans as point-in-time evidence, not proof that no vulnerabilities exist.")
     recommendations.extend(_format_finding_aware_recommendations(scan_runs))
@@ -561,6 +605,13 @@ def _number_word(value: int) -> str:
     return words.get(value, str(value))
 
 
+def _clean(value: object) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()[:800]
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("<REDACTED>", text)
+    return text
+
+
 def _format_finding_aware_recommendations(scan_runs: list[dict]) -> list[str]:
     recommendations = []
     ports = {
@@ -582,6 +633,8 @@ def _format_finding_aware_recommendations(scan_runs: list[dict]) -> list[str]:
         recommendations.append("- Clean Nuclei: treat the result as point-in-time evidence, not proof that no issues exist.")
     if any(scan_run.get("source") == "prowler" for scan_run in scan_runs):
         recommendations.append("- Prowler: treat FAIL results as scanner-reported failed checks requiring cloud-context validation.")
+    if any(scan_run.get("source") == "metasploit" for scan_run in scan_runs):
+        recommendations.append("- Metasploit: preserve proposal/artifact provenance and manually validate scope before follow-up testing.")
 
     return recommendations
 
@@ -628,6 +681,8 @@ def _finding_count(scan_run: dict) -> int:
         return int(scan_run.get("finding_count") or 0)
     if isinstance(scan_run.get("prowler_evidence"), dict):
         return int((scan_run.get("prowler_evidence") or {}).get("finding_count") or len((scan_run.get("prowler_evidence") or {}).get("findings") or []))
+    if isinstance(scan_run.get("metasploit_evidence"), dict):
+        return 1 if (scan_run.get("metasploit_evidence") or {}).get("validation_state") == "VALIDATED" else 0
     if isinstance(scan_run.get("nuclei_findings"), list):
         return len(scan_run.get("nuclei_findings") or [])
     if isinstance(scan_run.get("open_ports"), list):
@@ -642,6 +697,7 @@ def _source_label(source: object) -> str:
         "nuclei": "Nuclei",
         "bbot": "BBOT",
         "prowler": "Prowler",
+        "metasploit": "Metasploit",
     }
     return labels.get(str(source), str(source or "Unknown"))
 
@@ -659,5 +715,7 @@ def _source_icon_key(source_label: str) -> str:
     if normalized.startswith("bbot"):
         return "bbot"
     if normalized.startswith("prowler"):
+        return "observation"
+    if normalized.startswith("metasploit"):
         return "observation"
     return "observation"

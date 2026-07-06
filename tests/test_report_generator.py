@@ -371,3 +371,47 @@ def test_report_generation_includes_prowler_provider_context_counts_and_failed_c
     assert "FAIL iam_root_mfa severity=Critical service=iam" in report
     assert "AKIAABCDEFGHIJKLMNOP" not in report
     assert "{\"" not in report
+
+
+def test_report_generation_includes_metasploit_validation_without_raw_console_dump() -> None:
+    add_finding(
+        user_id=9018,
+        finding={
+            "source": "metasploit",
+            "target": "example.com",
+            "target_key": "example.com",
+            "risk_level": "high",
+            "finding_count": 1,
+            "status": "completed",
+            "summary": "Metasploit reported validation evidence. This is not proof of full compromise.",
+            "raw_output": "RAW " * 500,
+            "metasploit_evidence": {
+                "module": "auxiliary/scanner/http/http_version",
+                "action_type": "auxiliary_validation",
+                "target": "example.com",
+                "port": 80,
+                "validation_state": "VALIDATED",
+                "summary": "Metasploit reported validation evidence. This is not proof of full compromise.",
+                "raw_evidence_excerpt": "The target appears vulnerable",
+            },
+            "metadata": {
+                "proposal_id": "proposal-123",
+                "artifact_ref": "assessment_artifact:9",
+                "module": "auxiliary/scanner/http/http_version",
+                "action_type": "auxiliary_validation",
+                "port": 80,
+            },
+        },
+    )
+
+    report = generate_markdown_report(user_id=9018, target="example.com")
+
+    assert "- Metasploit" in report
+    assert "Module: auxiliary/scanner/http/http_version" in report
+    assert "Action: auxiliary_validation" in report
+    assert "Validation State: VALIDATED" in report
+    assert "Proposal Reference: proposal-123" in report
+    assert "Artifact Reference: assessment_artifact:9" in report
+    assert "The target appears vulnerable" in report
+    assert "not proof of full compromise" in report
+    assert ("RAW " * 20) not in report

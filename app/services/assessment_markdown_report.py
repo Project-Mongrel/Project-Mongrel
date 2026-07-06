@@ -117,7 +117,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
-    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks", "prowler"):
+    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks", "prowler", "metasploit"):
         tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
         if not tool_scans:
             continue
@@ -180,6 +180,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         testssl_evidence = finding.get("testssl_evidence") or {}
         gitleaks_evidence = finding.get("gitleaks_evidence") or {}
         prowler_evidence = finding.get("prowler_evidence") or {}
+        metasploit_evidence = finding.get("metasploit_evidence") or {}
 
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
@@ -200,6 +201,8 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
             lines.append(f"- {tool}: {int(gitleaks_evidence.get('finding_count') or 0)} redacted secret-exposure finding(s) recorded.")
         elif prowler_evidence:
             lines.append(f"- {tool}: {int(prowler_evidence.get('finding_count') or 0)} scanner-reported cloud posture check(s) recorded.")
+        elif metasploit_evidence:
+            lines.append(f"- {tool}: validation state {metasploit_evidence.get('validation_state') or 'unknown'} recorded.")
         elif observation_counts:
             total = sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
@@ -270,6 +273,9 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
         actions.append("- Rotate or revoke detected secrets, remove them from repositories/artifacts, and review commit history for exposure.")
     if prowler_evidence:
         actions.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
+    metasploit_evidence = [finding.get("metasploit_evidence") for finding in findings if finding.get("metasploit_evidence")]
+    if metasploit_evidence:
+        actions.append("- Review Metasploit validation evidence and preserve proposal/artifact provenance before follow-up testing.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -315,6 +321,9 @@ def _scan_summary(scan: dict) -> str:
     if tool == "prowler":
         evidence = finding.get("prowler_evidence") or {}
         return f"{int(evidence.get('finding_count') or 0)} scanner-reported cloud posture check(s) recorded." if evidence else "Prowler completed with no structured cloud posture evidence."
+    if tool == "metasploit":
+        evidence = finding.get("metasploit_evidence") or {}
+        return f"Metasploit validation state {evidence.get('validation_state') or 'unknown'} recorded." if evidence else "Metasploit completed with no structured validation evidence."
     return "Completed scan evidence recorded."
 
 
@@ -496,6 +505,24 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             )
         return lines
 
+    metasploit_evidence = finding.get("metasploit_evidence") or {}
+    if metasploit_evidence:
+        metadata = finding.get("metadata") or {}
+        lines = [
+            f"- Target: {_clean(metasploit_evidence.get('target') or finding.get('target') or 'unknown')}",
+            f"- Module: {_clean(metasploit_evidence.get('module') or metadata.get('module') or 'unknown')}",
+            f"- Action: {_clean(metasploit_evidence.get('action_type') or metadata.get('action_type') or 'unknown')}",
+            f"- Validation State: {_clean(metasploit_evidence.get('validation_state') or 'unknown')}",
+            f"- Evidence: {_clean(metasploit_evidence.get('summary') or finding.get('summary') or 'none')}",
+            f"- Proposal Reference: {_clean(metadata.get('proposal_id') or 'not supplied')}",
+            f"- Artifact Reference: {_clean(metadata.get('artifact_ref') or 'not supplied')}",
+            "- Limitation: Failed, blocked, or not reproduced validation does not mean the target is secure.",
+        ]
+        excerpt = _clean(metasploit_evidence.get("raw_evidence_excerpt") or "")
+        if excerpt:
+            lines.append(f"- Normalized evidence excerpt: {excerpt}")
+        return lines
+
     if str(scan.get("tool") or "").lower() == "nuclei":
         return ["- No matching findings were observed with the selected template/profile."]
     return ["- No additional structured observations are linked to this scan."]
@@ -631,6 +658,19 @@ def _collect_assets(targets: list[dict], findings: list[dict]) -> dict[str, list
                 if service:
                     assets["services"].append(f"Prowler {status} {check_id} {service}")
 
+        metasploit_evidence = finding.get("metasploit_evidence") or {}
+        if metasploit_evidence:
+            target_value = _clean(metasploit_evidence.get("target") or finding.get("target") or "")
+            if target_value:
+                assets["hosts"].append(target_value)
+            module = _clean(metasploit_evidence.get("module") or "")
+            state = _clean(metasploit_evidence.get("validation_state") or "")
+            if module:
+                assets["services"].append(f"Metasploit {state} {module}".strip())
+            proposal_id = _clean((finding.get("metadata") or {}).get("proposal_id") or "")
+            if proposal_id:
+                assets["other"].append(f"Metasploit proposal: {proposal_id}")
+
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -659,7 +699,7 @@ def _risk_suffix(scan: dict) -> str:
 
 
 def _tool_label(tool: object) -> str:
-    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh", "gitleaks": "Gitleaks", "prowler": "Prowler"}
+    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh", "gitleaks": "Gitleaks", "prowler": "Prowler", "metasploit": "Metasploit"}
     return labels.get(str(tool or "").lower(), _clean(tool or "Unknown"))
 
 

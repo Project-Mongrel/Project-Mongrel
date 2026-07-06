@@ -457,3 +457,66 @@ def test_assessment_markdown_report_includes_ffuf_section() -> None:
     assert "https://example.com/login status=302 classification=redirect redirect=https://example.com/sso" in report
     assert "- ffuf: 3 hidden-content path observation(s) recorded." in report
     assert "- Review discovered hidden-content paths and status codes as follow-up candidates before manual validation." in report
+
+
+def test_assessment_markdown_report_includes_metasploit_validation() -> None:
+    report = generate_assessment_markdown_report(
+        {
+            "assessment": {
+                "name": "Metasploit Assessment",
+                "status": "active",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "updated_at": datetime(2026, 1, 2, tzinfo=UTC),
+            },
+            "targets": [{"address": "example.com"}],
+            "scans": [
+                {
+                    "tool": "metasploit",
+                    "status": "completed",
+                    "risk": "high",
+                    "completed_at": datetime(2026, 1, 1, 12, tzinfo=UTC),
+                    "finding": {
+                        "summary": "Metasploit reported validation evidence. This is not proof of full compromise.",
+                        "target": "example.com",
+                        "risk_level": "high",
+                        "raw_output": "RAW " * 500,
+                        "metasploit_evidence": {
+                            "module": "auxiliary/scanner/http/http_version",
+                            "action_type": "auxiliary_validation",
+                            "target": "example.com",
+                            "port": 80,
+                            "validation_state": "VALIDATED",
+                            "summary": "Metasploit reported validation evidence. This is not proof of full compromise.",
+                            "raw_evidence_excerpt": "The target appears vulnerable",
+                        },
+                        "metadata": {
+                            "proposal_id": "proposal-abc",
+                            "artifact_ref": "assessment_artifact:10",
+                        },
+                    },
+                }
+            ],
+            "findings": [
+                {
+                    "target": "example.com",
+                    "metasploit_evidence": {
+                        "module": "auxiliary/scanner/http/http_version",
+                        "validation_state": "VALIDATED",
+                    },
+                    "metadata": {"proposal_id": "proposal-abc"},
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        }
+    )
+
+    assert "### Metasploit" in report
+    assert "- Metasploit: validation state VALIDATED recorded." in report
+    assert "Module: auxiliary/scanner/http/http_version" in report
+    assert "Action: auxiliary_validation" in report
+    assert "Validation State: VALIDATED" in report
+    assert "Proposal Reference: proposal-abc" in report
+    assert "Artifact Reference: assessment_artifact:10" in report
+    assert "Failed, blocked, or not reproduced validation does not mean the target is secure." in report
+    assert ("RAW " * 20) not in report

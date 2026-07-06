@@ -2,8 +2,11 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from app.core.config import Settings
 from app.services.metasploit_approval import approve_metasploit_proposal, clear_metasploit_proposals, propose_metasploit_action
+from app.services.findings_store import close_findings_database, configure_findings_database
 from app.services.metasploit_policy import build_metasploit_action_request
 from app.tools.metasploit_runner import build_metasploit_resource_commands, run_metasploit_validation
 
@@ -26,8 +29,14 @@ class FakeProcess:
         self.returncode = -9
 
 
-def setup_function() -> None:
+@pytest.fixture(autouse=True)
+def isolated_store(tmp_path) -> None:
+    configure_findings_database(tmp_path / "mongrel.db")
     clear_metasploit_proposals()
+    yield
+    clear_metasploit_proposals()
+    close_findings_database()
+    configure_findings_database(None)
 
 
 def _request(action_type: str = "auxiliary_validation") -> dict:

@@ -50,6 +50,7 @@ from app.bot.handlers.scan import (
     PENDING_NMAP_REQUEST_KEY,
     _finalize_nuclei_status,
     _metasploit_pending_context,
+    _send_metasploit_ai_assessment,
     _update_nuclei_status_card,
     append_change_summary,
     build_bbot_ai_assessment_keyboard,
@@ -1985,6 +1986,7 @@ def test_metasploit_structured_request_creates_proposal_without_execution() -> N
     assert "Action: auxiliary_validation" in sent
     assert "Target: example.com" in sent
     assert "Risk tier: LOW" in sent
+    assert "Expires:" in sent
     assert "TARGETURI=/" in sent
     assert buttons == ["Approve", "Reject", "Details"]
     assert _metasploit_pending_context
@@ -2012,6 +2014,7 @@ def test_metasploit_details_callback_shows_exact_proposal() -> None:
     assert "Action: auxiliary_validation" in details
     assert "Target: example.com" in details
     assert "Port: 80" in details
+    assert "Expires:" in details
 
 
 def test_metasploit_invalid_raw_command_rejected() -> None:
@@ -2112,7 +2115,10 @@ def test_metasploit_approve_executes_and_stores_evidence() -> None:
         "returncode": 0,
     }
 
-    with patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result) as runner_mock:
+    with (
+        patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result) as runner_mock,
+        patch("app.bot.handlers.scan.generate_metasploit_ai_assessment", return_value=["Executive Summary", "- Metasploit evidence reviewed."]) as ai_mock,
+    ):
         asyncio.run(scan_callback_handler(callback_update, context))
 
     runner_mock.assert_called_once()
@@ -2122,6 +2128,9 @@ def test_metasploit_approve_executes_and_stores_evidence() -> None:
     assert runner_kwargs["request"]["module"] == "auxiliary/scanner/http/http_version"
     sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
     assert any("Metasploit Validation" in text and "VALIDATED" in text for text in sent_messages)
+    assert "Generating Metasploit AI assessment..." in sent_messages
+    assert any("Metasploit AI Assessment" in text for text in sent_messages)
+    ai_mock.assert_called_once()
     finding = get_user_findings(7306)[0]
     assert finding["source"] == "metasploit"
     assert finding["metasploit_evidence"]["validation_state"] == "VALIDATED"
@@ -2163,7 +2172,10 @@ def test_metasploit_assessment_context_records_artifact_and_scan(tmp_path) -> No
         "returncode": 0,
     }
 
-    with patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result):
+    with (
+        patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result),
+        patch("app.bot.handlers.scan.generate_metasploit_ai_assessment", return_value=["Executive Summary", "- Metasploit evidence reviewed."]),
+    ):
         asyncio.run(scan_callback_handler(callback_update, context))
 
     scans = list_assessment_scans(assessment["id"])
@@ -2182,6 +2194,14 @@ def test_metasploit_assessment_context_records_artifact_and_scan(tmp_path) -> No
     assert assessment_context["findings"][0]["source"] == "metasploit"
     assert "metasploit" in guard["completed_tools"]
     assert "Metasploit validation not run" not in guard["locked_tool_limitations"]
+
+
+def test_metasploit_ai_no_evidence_path_does_not_invent_findings() -> None:
+    message = SimpleNamespace(reply_text=AsyncMock())
+
+    asyncio.run(_send_metasploit_ai_assessment(message, {"source": "metasploit"}))
+
+    assert message.reply_text.call_args.args[0] == "No normalized Metasploit validation evidence was available from this run."
 
 
 def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
