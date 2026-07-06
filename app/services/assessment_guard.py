@@ -188,6 +188,14 @@ def collect_observed_assets(context: dict) -> dict[str, list[str] | str]:
                 status = str(item.get("status") or "unknown").strip()
                 service = str(item.get("service") or "unknown").strip()
                 services.append(f"prowler {status} {check_id} {service}")
+        metasploit_evidence = finding.get("metasploit_evidence") or {}
+        if metasploit_evidence:
+            target_value = str(metasploit_evidence.get("target") or finding.get("target") or "").strip()
+            if target_value:
+                hosts.append(target_value)
+            module = str(metasploit_evidence.get("module") or "unknown").strip()
+            state = str(metasploit_evidence.get("validation_state") or "INCONCLUSIVE").strip()
+            services.append(f"metasploit {state} {module}")
         counts = finding.get("observation_counts") or {}
         for key, value in sorted(counts.items()):
             if int(value or 0) > 0:
@@ -234,6 +242,8 @@ def _locked_tool_limitations(status_by_tool: dict[str, set[str]]) -> list[str]:
         limitations = [limitation for limitation in limitations if limitation != "Gitleaks not run"]
     if "prowler" in status_by_tool:
         limitations = [limitation for limitation in limitations if limitation != "ScoutSuite/Prowler not run"]
+    if "metasploit" in status_by_tool:
+        limitations = [limitation for limitation in limitations if limitation != "Metasploit validation not run"]
     return limitations
 
 

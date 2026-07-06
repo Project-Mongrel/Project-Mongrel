@@ -32,8 +32,10 @@ from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.parsers.playwright_parser import normalize_playwright_observation, summarize_playwright_observation
 from app.parsers.prowler_parser import ProwlerParserError, normalize_prowler_output
 from app.parsers.testssl_parser import TestsslParserError, normalize_testssl_output, summarize_testssl_evidence
+from app.parsers.metasploit_parser import parse_metasploit_validation_result
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import (
+    add_assessment_artifact,
     get_assessment,
     list_assessment_scans,
     list_assessment_targets,
@@ -63,6 +65,14 @@ from app.services.evidence_vault import (
 from app.services.icon_helper import section_label
 from app.services.impact_engine import assess_change_impact
 from app.services.investigation_store import add_investigation_event, get_investigation, get_or_create_latest_open_investigation
+from app.services.metasploit_approval import (
+    MetasploitApprovalError,
+    approve_metasploit_proposal,
+    get_metasploit_proposal,
+    propose_metasploit_action,
+    reject_metasploit_proposal,
+)
+from app.services.metasploit_policy import build_metasploit_action_request
 from app.services.observation_store import add_observations
 from app.services.risk_rules import assess_nmap_ports
 from app.services.scan_manager import (
@@ -99,6 +109,7 @@ from app.tools.ffuf_runner import run_ffuf_scan
 from app.tools.gitleaks_runner import run_gitleaks_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
+from app.tools.metasploit_runner import run_metasploit_validation
 from app.tools.playwright_runner import run_playwright_observation
 from app.tools.prowler_runner import normalize_prowler_provider, run_prowler_scan, summarize_prowler_failure
 from app.tools.testssl_runner import run_testssl_scan
@@ -115,8 +126,10 @@ BBOT_AI_ASSESSMENT_CALLBACK_PREFIX = "bbot_ai"
 GITLEAKS_EVIDENCE_VIEW_CALLBACK_PREFIX = "glev"
 GITLEAKS_EVIDENCE_REVEAL_CALLBACK_PREFIX = "glrv"
 GITLEAKS_EVIDENCE_CANCEL_CALLBACK_PREFIX = "glcx"
+METASPLOIT_CALLBACK_PREFIX = "msf"
 GITLEAKS_EVIDENCE_TOKEN_TTL_SECONDS = 900
 _gitleaks_evidence_action_tokens: dict[str, dict[str, object]] = {}
+_metasploit_pending_context: dict[str, dict[str, object]] = {}
 logger = logging.getLogger(__name__)
 
 
@@ -274,6 +287,92 @@ def build_prowler_provider_prompt() -> str:
             "- Mongrel does not create credentials.",
             "- Mongrel does not modify cloud resources.",
             "- No remediation or validation actions are performed.",
+        ]
+    )
+
+
+def build_metasploit_request_prompt() -> str:
+    return "\n".join(
+        [
+            "Metasploit controlled validation request created.",
+            "",
+            "Send a structured request only:",
+            "module=<allowlisted_module>",
+            "action=<check|auxiliary_validation|exploit_validation>",
+            "target=<authorized_target>",
+            "port=<port>",
+            "",
+            "Optional policy-approved options:",
+            "option.TARGETURI=/",
+            "option.SSL=true",
+            "",
+            "Raw msfconsole commands, resource scripts, sessions, post-exploitation, lateral movement, and brute force are not accepted.",
+        ]
+    )
+
+
+def build_metasploit_proposal_text(proposal: object) -> str:
+    request = getattr(proposal, "request", {}) or {}
+    options = request.get("options") or {}
+    return "\n".join(
+        [
+            "Metasploit Validation Proposal",
+            "",
+            "Controlled offensive validation for explicitly authorized targets only.",
+            "",
+            f"Proposal ID: {getattr(proposal, 'id', 'unknown')}",
+            f"Module: {request.get('module') or 'unknown'}",
+            f"Action: {request.get('action_type') or 'unknown'}",
+            f"Target: {request.get('target') or 'unknown'}",
+            f"Port: {request.get('port') or 'unknown'}",
+            f"Risk tier: {str(request.get('risk_tier') or 'unknown').upper()}",
+            f"Expected effect: {request.get('expected_effect') or 'unknown'}",
+            f"Timeout: {request.get('timeout_seconds') or 'unknown'}s",
+            "Approved options: " + (_format_metasploit_options(options) if options else "none"),
+            "",
+            "Approve only if this exact action is authorized.",
+        ]
+    )
+
+
+def build_metasploit_proposal_keyboard(proposal_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Approve", callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:approve:{proposal_id}"),
+                InlineKeyboardButton("Reject", callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:reject:{proposal_id}"),
+            ],
+            [InlineKeyboardButton("Details", callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:details:{proposal_id}")],
+        ]
+    )
+
+
+def build_metasploit_result_text(finding: dict) -> str:
+    evidence = finding.get("metasploit_evidence") or {}
+    return "\n".join(
+        [
+            "Metasploit Validation",
+            "",
+            "Target:",
+            str(finding.get("target") or evidence.get("target") or "unknown"),
+            "",
+            "Module:",
+            str(evidence.get("module") or "unknown"),
+            "",
+            "Action:",
+            str(evidence.get("action_type") or "unknown"),
+            "",
+            "Status:",
+            str(finding.get("status") or "unknown").title(),
+            "",
+            "Validation State:",
+            str(evidence.get("validation_state") or "INCONCLUSIVE"),
+            "",
+            "Evidence:",
+            str(evidence.get("summary") or "No conclusive validation evidence recorded."),
+            "",
+            "Artifact/ref:",
+            str((finding.get("metadata") or {}).get("artifact_ref") or "not captured"),
         ]
     )
 
@@ -1009,6 +1108,87 @@ def _safe_prowler_failure_text(result: dict[str, object], provider: str) -> str:
     return "Prowler scan failed."
 
 
+def parse_metasploit_request_text(text: str) -> dict:
+    values: dict[str, object] = {}
+    options: dict[str, object] = {}
+    raw_command_verbs = {"use", "set", "run", "exploit", "sessions", "jobs", "route", "shell", "background", "load"}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        first_token = line.split(maxsplit=1)[0].lower()
+        if first_token in raw_command_verbs:
+            raise ValueError("Raw msfconsole commands are not accepted.")
+        if "=" not in line:
+            raise ValueError("Metasploit request lines must use key=value format.")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        normalized_key = key.lower()
+        if normalized_key in {"module", "action", "target", "port", "timeout"}:
+            values[normalized_key] = value
+        elif normalized_key.startswith("option."):
+            option_name = key.split(".", 1)[1].strip().upper()
+            options[option_name] = value
+        elif key.isupper():
+            options[key.upper()] = value
+        else:
+            raise ValueError("Unsupported Metasploit request field.")
+    if "module" not in values or "action" not in values or "target" not in values:
+        raise ValueError("Metasploit request requires module, action, and target.")
+    port = int(values.get("port") or 0)
+    if not port:
+        raise ValueError("Metasploit request requires port.")
+    timeout = int(values["timeout"]) if values.get("timeout") else None
+    return build_metasploit_action_request(
+        module=str(values["module"]),
+        action_type=str(values["action"]),
+        target=str(values["target"]),
+        port=port,
+        options=options,
+        timeout_seconds=timeout,
+    )
+
+
+def store_metasploit_scan_result(
+    user_id: int,
+    result: dict[str, object],
+    normalized: dict,
+    proposal_id: str,
+    artifact_ref: str,
+) -> dict:
+    validation_state = str(normalized.get("validation_state") or "INCONCLUSIVE")
+    status = "completed" if result.get("success") is True else "failed"
+    return add_finding(
+        user_id=user_id,
+        finding={
+            "source": "metasploit",
+            "target": result.get("target"),
+            "target_key": normalize_target_key(result.get("target")),
+            "status": status,
+            "summary": normalized.get("summary"),
+            "risk_level": "high" if validation_state == "VALIDATED" else ("info" if status == "completed" else "unknown"),
+            "finding_count": 1 if validation_state == "VALIDATED" else 0,
+            "raw_output": str(result.get("output") or result.get("error") or ""),
+            "metasploit_evidence": normalized,
+            "metadata": {
+                "proposal_id": proposal_id,
+                "artifact_ref": artifact_ref,
+                "module": result.get("module"),
+                "action_type": result.get("action_type"),
+                "port": result.get("port"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "returncode": result.get("returncode"),
+                "error_type": result.get("error_type"),
+            },
+        },
+    )
+
+
+def _format_metasploit_options(options: dict) -> str:
+    return ", ".join(f"{key}={value}" for key, value in sorted(options.items())) if options else "none"
+
+
 def store_prowler_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
     evidence = evidence or {}
     summary = summarize_prowler_evidence(evidence) if evidence else {}
@@ -1603,6 +1783,14 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _handle_gitleaks_evidence_vault_callback(query, user_id)
         return
 
+    if query.data and str(query.data).startswith(f"{METASPLOIT_CALLBACK_PREFIX}:"):
+        user_id = update.effective_user.id if update.effective_user is not None else None
+        if user_id is None:
+            await query.edit_message_text("Unable to identify Telegram user.")
+            return
+        await _handle_metasploit_callback(query, user_id)
+        return
+
     if query.data is None or not query.data.startswith("scan:"):
         return
 
@@ -1675,6 +1863,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
         context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
         await query.edit_message_text(build_prowler_provider_prompt())
+        return
+
+    if scan_type == "metasploit":
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+        await query.edit_message_text(build_metasploit_request_prompt())
         return
 
     await query.edit_message_text(build_scan_created_text(scan_type))
@@ -1782,6 +1976,10 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if scan_request.scan_type == "prowler":
         await _handle_prowler_provider(update, context, user_id, scan_request_id)
+        return
+
+    if scan_request.scan_type == "metasploit":
+        await _handle_metasploit_request(update, context, user_id, scan_request_id)
         return
 
     if scan_request.scan_type != "nmap":
@@ -2345,6 +2543,119 @@ async def _handle_prowler_provider(
         await _send_prowler_ai_assessment(update.message, finding)
     await _send_assessment_dashboard(update.message, assessment_context)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+
+
+async def _handle_metasploit_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    scan_request_id: str,
+) -> None:
+    if update.message is None:
+        return
+    try:
+        request = parse_metasploit_request_text(update.message.text or "")
+    except (ValueError, TypeError) as exc:
+        await update.message.reply_text(f"Invalid Metasploit validation request: {exc}")
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
+
+    proposal = propose_metasploit_action(user_id, request)
+    assessment_context = _pop_assessment_scan_context(context, "metasploit")
+    _metasploit_pending_context[proposal.id] = {
+        "scan_request_id": scan_request_id,
+        "assessment_context": assessment_context,
+    }
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    await update.message.reply_text(
+        build_metasploit_proposal_text(proposal),
+        reply_markup=build_metasploit_proposal_keyboard(proposal.id),
+    )
+
+
+async def _handle_metasploit_callback(query: object, user_id: int) -> None:
+    data = str(getattr(query, "data", "") or "")
+    parts = data.split(":")
+    if len(parts) != 3:
+        await query.edit_message_text("Unsupported Metasploit action.")
+        return
+    action, proposal_id = parts[1], parts[2]
+    proposal = get_metasploit_proposal(proposal_id)
+    if proposal is None:
+        await query.edit_message_text("Metasploit proposal not found.")
+        return
+    if action == "details":
+        await query.edit_message_text(build_metasploit_proposal_text(proposal), reply_markup=build_metasploit_proposal_keyboard(proposal.id))
+        return
+    if action == "reject":
+        try:
+            reject_metasploit_proposal(proposal_id, user_id=user_id)
+        except MetasploitApprovalError as exc:
+            await query.edit_message_text(f"Metasploit proposal rejection denied: {exc}")
+            return
+        pending = _metasploit_pending_context.pop(proposal_id, {})
+        scan_request_id = pending.get("scan_request_id") if isinstance(pending, dict) else None
+        if isinstance(scan_request_id, str):
+            complete_scan_request(
+                user_id=user_id,
+                scan_request_id=scan_request_id,
+                target=str((proposal.request or {}).get("target") or ""),
+                result={"success": False, "error": "Metasploit validation proposal rejected.", "error_type": "rejected"},
+            )
+        await query.edit_message_text("Metasploit validation proposal rejected. No execution was performed.")
+        return
+    if action != "approve":
+        await query.edit_message_text("Unsupported Metasploit action.")
+        return
+    try:
+        approved = approve_metasploit_proposal(proposal_id, user_id=user_id, actor="human")
+    except MetasploitApprovalError as exc:
+        await query.edit_message_text(f"Metasploit approval denied: {exc}")
+        return
+
+    await query.edit_message_text("Metasploit proposal approved. Executing bounded validation...")
+    result = await asyncio.to_thread(run_metasploit_validation, user_id=user_id, proposal_id=approved.id, request=approved.request)
+    normalized = parse_metasploit_validation_result(result)
+    pending = _metasploit_pending_context.pop(approved.id, {})
+    assessment_context = pending.get("assessment_context") if isinstance(pending, dict) else None
+    artifact_ref = _store_metasploit_artifact(assessment_context, result, normalized, approved.id)
+    finding = store_metasploit_scan_result(user_id, result, normalized, approved.id, artifact_ref)
+
+    scan_request_id = pending.get("scan_request_id") if isinstance(pending, dict) else None
+    if isinstance(scan_request_id, str):
+        complete_scan_request(user_id=user_id, scan_request_id=scan_request_id, target=str(result.get("target") or ""), result=result)
+    _record_assessment_scan(assessment_context if isinstance(assessment_context, dict) else None, tool="metasploit", result=result, finding=finding)
+
+    message = getattr(query, "message", None)
+    reply_text = getattr(message, "reply_text", None)
+    if reply_text is not None:
+        await reply_text(build_metasploit_result_text(finding))
+    else:
+        await query.edit_message_text(build_metasploit_result_text(finding))
+
+
+def _store_metasploit_artifact(assessment_context: object, result: dict[str, object], normalized: dict, proposal_id: str) -> str:
+    content = "\n".join(
+        [
+            "Metasploit raw validation output",
+            f"Proposal: {proposal_id}",
+            f"Module: {result.get('module')}",
+            f"Action: {result.get('action_type')}",
+            f"Target: {result.get('target')}:{result.get('port')}",
+            f"Validation state: {normalized.get('validation_state')}",
+            "",
+            str(result.get("output") or result.get("error") or ""),
+        ]
+    )
+    if isinstance(assessment_context, dict) and assessment_context.get("assessment_id") is not None:
+        artifact = add_assessment_artifact(
+            int(assessment_context["assessment_id"]),
+            artifact_type="metasploit_raw_output",
+            title=f"Metasploit {result.get('module')} {result.get('target')}",
+            content=content,
+        )
+        return f"assessment_artifact:{artifact.get('id')}"
+    return "finding.raw_output"
 
 
 async def _handle_playwright_target(

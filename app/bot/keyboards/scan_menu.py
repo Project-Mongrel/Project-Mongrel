@@ -16,6 +16,7 @@ def build_scan_type_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("testssl.sh TLS", callback_data="scan:testssl")],
             [InlineKeyboardButton("Gitleaks Secrets", callback_data="scan:gitleaks")],
             [InlineKeyboardButton("Prowler Cloud", callback_data="scan:prowler")],
+            [InlineKeyboardButton("Metasploit Validation", callback_data="scan:metasploit")],
             [InlineKeyboardButton("Back", callback_data="nav:home")],
         ]
     )

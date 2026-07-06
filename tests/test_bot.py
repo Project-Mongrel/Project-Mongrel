@@ -49,6 +49,7 @@ from app.bot.handlers.scan import (
     NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS,
     PENDING_NMAP_REQUEST_KEY,
     _finalize_nuclei_status,
+    _metasploit_pending_context,
     _update_nuclei_status_card,
     append_change_summary,
     build_bbot_ai_assessment_keyboard,
@@ -61,6 +62,8 @@ from app.bot.handlers.scan import (
     build_httpx_target_prompt,
     build_katana_result_text,
     build_katana_target_prompt,
+    build_metasploit_request_prompt,
+    build_metasploit_result_text,
     build_playwright_result_text,
     build_playwright_target_prompt,
     build_prowler_provider_prompt,
@@ -108,11 +111,14 @@ from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build
 from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edit_text
 from app.core.config import Settings
 from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
+from app.services.assessment_context import build_assessment_context
+from app.services.assessment_guard import build_assessment_guard
 from app.services.assessment_store import (
     add_assessment_target,
     create_assessment,
     record_assessment_scan,
     list_assessment_scans,
+    list_assessment_artifacts,
     list_assessment_targets,
     list_assessments,
 )
@@ -135,6 +141,7 @@ from app.services.investigation_store import (
     get_investigation_events,
     get_user_investigations,
 )
+from app.services.metasploit_approval import clear_metasploit_proposals, get_metasploit_proposal
 from app.services.observation_store import add_observation, clear_user_observations, get_investigation_observations, get_user_observations
 from app.services.chat_state import (
     clear_ai_waiting,
@@ -223,6 +230,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "testssl.sh: Not run" in dashboard
     assert "Gitleaks: Not run" in dashboard
     assert "Prowler: Not run" in dashboard
+    assert "Metasploit: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
@@ -234,6 +242,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
         "Run testssl.sh",
         "Run Gitleaks",
         "Run Prowler",
+        "Run Metasploit",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",
@@ -1431,6 +1440,7 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "testssl.sh TLS" in rendered_buttons
     assert "Gitleaks Secrets" in rendered_buttons
     assert "Prowler Cloud" in rendered_buttons
+    assert "Metasploit Validation" in rendered_buttons
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
@@ -1570,6 +1580,13 @@ def test_scan_callback_pattern_routes_gitleaks_button() -> None:
 
 def test_scan_callback_pattern_routes_prowler_button() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:prowler")
+
+
+def test_scan_callback_pattern_routes_metasploit_button_and_actions() -> None:
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:metasploit")
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "msf:approve:proposal-id")
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "msf:reject:proposal-id")
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "msf:details:proposal-id")
 
 
 def test_scan_callback_pattern_routes_evidence_vault_actions() -> None:
@@ -1920,6 +1937,251 @@ def test_prowler_result_card_does_not_dump_huge_raw_output() -> None:
     assert "Prowler Cloud Posture Scan Complete" in card
     assert "RAWRAWRAW" not in card
     assert card.count("check_") <= 3
+
+
+def _metasploit_request_text() -> str:
+    return "\n".join(
+        [
+            "module=auxiliary/scanner/http/http_version",
+            "action=auxiliary_validation",
+            "target=example.com",
+            "port=80",
+            "option.TARGETURI=/",
+        ]
+    )
+
+
+def test_metasploit_scan_callback_prompts_for_structured_request() -> None:
+    clear_user_scan_requests(7300)
+    query = SimpleNamespace(data="scan:metasploit", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7300))
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(update, context))
+
+    assert query.edit_message_text.call_args.args[0] == build_metasploit_request_prompt()
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_metasploit_structured_request_creates_proposal_without_execution() -> None:
+    clear_user_scan_requests(7301)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    scan_request = create_scan_request(user_id=7301, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7301, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text=_metasploit_request_text(), reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7301))
+
+    with patch("app.bot.handlers.scan.run_metasploit_validation") as runner_mock:
+        asyncio.run(scan_target_handler(update, context))
+
+    runner_mock.assert_not_called()
+    sent = message.reply_text.call_args.args[0]
+    markup = message.reply_text.call_args.kwargs["reply_markup"]
+    buttons = [button.text for row in markup.inline_keyboard for button in row]
+    assert "Metasploit Validation Proposal" in sent
+    assert "Module: auxiliary/scanner/http/http_version" in sent
+    assert "Action: auxiliary_validation" in sent
+    assert "Target: example.com" in sent
+    assert "Risk tier: LOW" in sent
+    assert "TARGETURI=/" in sent
+    assert buttons == ["Approve", "Reject", "Details"]
+    assert _metasploit_pending_context
+
+
+def test_metasploit_details_callback_shows_exact_proposal() -> None:
+    clear_user_scan_requests(7310)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    scan_request = create_scan_request(user_id=7310, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7310, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text=_metasploit_request_text(), reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7310))
+    asyncio.run(scan_target_handler(update, context))
+    proposal_id = next(iter(_metasploit_pending_context))
+    query = SimpleNamespace(data=f"msf:details:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=message)
+    callback_update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7310))
+
+    asyncio.run(scan_callback_handler(callback_update, context))
+
+    details = query.edit_message_text.call_args.args[0]
+    assert f"Proposal ID: {proposal_id}" in details
+    assert "Module: auxiliary/scanner/http/http_version" in details
+    assert "Action: auxiliary_validation" in details
+    assert "Target: example.com" in details
+    assert "Port: 80" in details
+
+
+def test_metasploit_invalid_raw_command_rejected() -> None:
+    clear_user_scan_requests(7302)
+    scan_request = create_scan_request(user_id=7302, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7302, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="use exploit/windows/smb/psexec\nrun", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7302))
+
+    asyncio.run(scan_target_handler(update, context))
+
+    assert "Raw msfconsole commands are not accepted" in message.reply_text.call_args.args[0]
+
+
+def test_metasploit_unknown_module_and_unapproved_option_rejected() -> None:
+    clear_user_scan_requests(7303)
+    for text in (
+        "module=auxiliary/scanner/unknown\naction=auxiliary_validation\ntarget=example.com\nport=80",
+        _metasploit_request_text() + "\noption.CMD=id",
+    ):
+        scan_request = create_scan_request(user_id=7303, scan_type="metasploit")
+        mark_scan_request_awaiting_target(user_id=7303, scan_request_id=scan_request.id)
+        context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+        message = SimpleNamespace(text=text, reply_text=AsyncMock())
+        update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7303))
+
+        asyncio.run(scan_target_handler(update, context))
+
+        assert "Invalid Metasploit validation request" in message.reply_text.call_args.args[0]
+
+
+def test_metasploit_reject_does_not_execute() -> None:
+    clear_user_scan_requests(7304)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    scan_request = create_scan_request(user_id=7304, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7304, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text=_metasploit_request_text(), reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7304))
+    asyncio.run(scan_target_handler(update, context))
+    proposal_id = next(iter(_metasploit_pending_context))
+    query = SimpleNamespace(data=f"msf:reject:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=message)
+    callback_update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7304))
+
+    with patch("app.bot.handlers.scan.run_metasploit_validation") as runner_mock:
+        asyncio.run(scan_callback_handler(callback_update, context))
+
+    runner_mock.assert_not_called()
+    assert "rejected" in query.edit_message_text.call_args.args[0]
+
+
+def test_metasploit_wrong_user_approval_denied() -> None:
+    clear_user_scan_requests(7305)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    scan_request = create_scan_request(user_id=7305, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7305, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text=_metasploit_request_text(), reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7305))
+    asyncio.run(scan_target_handler(update, context))
+    proposal_id = next(iter(_metasploit_pending_context))
+    query = SimpleNamespace(data=f"msf:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=message)
+    callback_update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9999))
+
+    with patch("app.bot.handlers.scan.run_metasploit_validation") as runner_mock:
+        asyncio.run(scan_callback_handler(callback_update, context))
+
+    runner_mock.assert_not_called()
+    assert "approval denied" in query.edit_message_text.call_args.args[0].lower()
+
+
+def test_metasploit_approve_executes_and_stores_evidence() -> None:
+    clear_user_findings(7306)
+    clear_user_scan_requests(7306)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    scan_request = create_scan_request(user_id=7306, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7306, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text=_metasploit_request_text(), reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7306))
+    asyncio.run(scan_target_handler(update, context))
+    proposal_id = next(iter(_metasploit_pending_context))
+    query = SimpleNamespace(data=f"msf:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=message)
+    callback_update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7306))
+    result = {
+        "success": True,
+        "module": "auxiliary/scanner/http/http_version",
+        "action_type": "auxiliary_validation",
+        "target": "example.com",
+        "port": 80,
+        "output": "The target appears vulnerable.",
+        "error": "",
+        "elapsed_seconds": 2,
+        "returncode": 0,
+    }
+
+    with patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result) as runner_mock:
+        asyncio.run(scan_callback_handler(callback_update, context))
+
+    runner_mock.assert_called_once()
+    runner_kwargs = runner_mock.call_args.kwargs
+    assert runner_kwargs["user_id"] == 7306
+    assert runner_kwargs["proposal_id"] == proposal_id
+    assert runner_kwargs["request"]["module"] == "auxiliary/scanner/http/http_version"
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert any("Metasploit Validation" in text and "VALIDATED" in text for text in sent_messages)
+    finding = get_user_findings(7306)[0]
+    assert finding["source"] == "metasploit"
+    assert finding["metasploit_evidence"]["validation_state"] == "VALIDATED"
+    assert "not proof of full compromise" in finding["metasploit_evidence"]["summary"]
+    assert finding["metadata"]["artifact_ref"] == "finding.raw_output"
+    assert finding["raw_output"] == "The target appears vulnerable."
+
+
+def test_metasploit_assessment_context_records_artifact_and_scan(tmp_path) -> None:
+    clear_user_findings(7307)
+    clear_user_scan_requests(7307)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    assessment = create_assessment("Metasploit Assessment")
+    target = add_assessment_target(assessment["id"], address="example.com")
+    scan_request = create_scan_request(user_id=7307, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7307, scan_request_id=scan_request.id)
+    context = SimpleNamespace(
+        user_data={
+            PENDING_NMAP_REQUEST_KEY: scan_request.id,
+            ASSESSMENT_SCAN_CONTEXT_KEY: {"assessment_id": assessment["id"], "target_id": target["id"], "tool": "metasploit"},
+        }
+    )
+    message = SimpleNamespace(text=_metasploit_request_text(), reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7307))
+    asyncio.run(scan_target_handler(update, context))
+    proposal_id = next(iter(_metasploit_pending_context))
+    query = SimpleNamespace(data=f"msf:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=message)
+    callback_update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7307))
+    result = {
+        "success": True,
+        "module": "auxiliary/scanner/http/http_version",
+        "action_type": "auxiliary_validation",
+        "target": "example.com",
+        "port": 80,
+        "output": "The target does not appear to be vulnerable.",
+        "error": "",
+        "elapsed_seconds": 1,
+        "returncode": 0,
+    }
+
+    with patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result):
+        asyncio.run(scan_callback_handler(callback_update, context))
+
+    scans = list_assessment_scans(assessment["id"])
+    artifacts = list_assessment_artifacts(assessment["id"])
+    dashboard = build_assessment_dashboard_text(assessment, [target], scans)
+    assessment_context = build_assessment_context(assessment["id"], user_id=7307)
+    guard = build_assessment_guard(assessment_context)
+    finding = get_user_findings(7307)[0]
+    assert scans[0]["tool"] == "metasploit"
+    assert scans[0]["status"] == "completed"
+    assert "Metasploit: Completed" in dashboard
+    assert artifacts[0]["artifact_type"] == "metasploit_raw_output"
+    assert finding["metadata"]["artifact_ref"].startswith("assessment_artifact:")
+    assert finding["metasploit_evidence"]["validation_state"] == "NOT_REPRODUCED"
+    assert "not proof that the target is secure" in finding["metasploit_evidence"]["summary"]
+    assert assessment_context["findings"][0]["source"] == "metasploit"
+    assert "metasploit" in guard["completed_tools"]
+    assert "Metasploit validation not run" not in guard["locked_tool_limitations"]
 
 
 def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
