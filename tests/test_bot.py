@@ -64,6 +64,7 @@ from app.bot.handlers.scan import (
     build_katana_result_text,
     build_katana_target_prompt,
     build_metasploit_request_prompt,
+    build_metasploit_readiness_failure_text,
     build_metasploit_result_text,
     build_playwright_result_text,
     build_playwright_target_prompt,
@@ -1958,10 +1959,36 @@ def test_metasploit_scan_callback_prompts_for_structured_request() -> None:
     update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7300))
     context = SimpleNamespace(user_data={})
 
-    asyncio.run(scan_callback_handler(update, context))
+    with patch("app.bot.handlers.scan.check_metasploit_readiness", return_value={"ready": True, "resolved_binary": "msfconsole"}):
+        asyncio.run(scan_callback_handler(update, context))
 
     assert query.edit_message_text.call_args.args[0] == build_metasploit_request_prompt()
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_metasploit_scan_callback_missing_binary_shows_clean_readiness_failure() -> None:
+    clear_user_scan_requests(7320)
+    clear_metasploit_proposals()
+    query = SimpleNamespace(data="scan:metasploit", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7320))
+    context = SimpleNamespace(user_data={})
+    readiness = {
+        "ready": False,
+        "error": "Metasploit/msfconsole is not installed or configured. Set METASPLOIT_BINARY to the msfconsole path on the VPS.",
+        "error_type": "missing_binary",
+        "configured_binary": "/opt/metasploit-framework/bin/msfconsole",
+    }
+
+    with patch("app.bot.handlers.scan.check_metasploit_readiness", return_value=readiness):
+        asyncio.run(scan_callback_handler(update, context))
+
+    text = query.edit_message_text.call_args.args[0]
+    assert text == build_metasploit_readiness_failure_text(readiness)
+    assert "Metasploit/msfconsole is not installed or configured." in text
+    assert "METASPLOIT_BINARY" in text
+    assert "Traceback" not in text
+    assert "No validation proposal was created" in text
+    assert PENDING_NMAP_REQUEST_KEY not in context.user_data
 
 
 def test_metasploit_structured_request_creates_proposal_without_execution() -> None:

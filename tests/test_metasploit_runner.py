@@ -8,7 +8,7 @@ from app.core.config import Settings
 from app.services.metasploit_approval import approve_metasploit_proposal, clear_metasploit_proposals, propose_metasploit_action
 from app.services.findings_store import close_findings_database, configure_findings_database
 from app.services.metasploit_policy import build_metasploit_action_request
-from app.tools.metasploit_runner import build_metasploit_resource_commands, run_metasploit_validation
+from app.tools.metasploit_runner import METASPLOIT_NOT_AVAILABLE_ERROR, build_metasploit_resource_commands, check_metasploit_readiness, run_metasploit_validation
 
 
 class FakeProcess:
@@ -128,3 +128,66 @@ def test_metasploit_runner_denies_mutated_request_after_approval() -> None:
 
     assert result["success"] is False
     assert result["error_type"] == "approval_required"
+
+
+def test_metasploit_missing_binary_returns_clean_error_and_blocks_execution(tmp_path) -> None:
+    request = _request()
+    proposal_id = _approved(request)
+    missing_binary = tmp_path / "missing-msfconsole"
+
+    with (
+        patch("app.tools.metasploit_runner.get_settings", return_value=Settings(_env_file=None, metasploit_binary=str(missing_binary), metasploit_timeout_seconds=120)),
+        patch("app.tools.metasploit_runner.subprocess.Popen") as popen_mock,
+    ):
+        result = run_metasploit_validation(user_id=100, proposal_id=proposal_id, request=request, work_dir=tmp_path)
+
+    popen_mock.assert_not_called()
+    assert result["success"] is False
+    assert result["error_type"] == "missing_binary"
+    assert result["error"] == METASPLOIT_NOT_AVAILABLE_ERROR
+    assert "Traceback" not in result["error"]
+
+
+def test_metasploit_readiness_honors_configured_binary_path_and_does_not_execute_modules(tmp_path) -> None:
+    binary = tmp_path / "msfconsole"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    with (
+        patch("app.tools.metasploit_runner.get_settings", return_value=Settings(_env_file=None, metasploit_binary=str(binary), metasploit_timeout_seconds=120)),
+        patch("app.tools.metasploit_runner.os.access", return_value=True),
+        patch("app.tools.metasploit_runner.subprocess.run") as run_mock,
+        patch("app.tools.metasploit_runner.subprocess.Popen") as popen_mock,
+    ):
+        readiness = check_metasploit_readiness(run_version_check=False)
+
+    assert readiness["ready"] is True
+    assert readiness["resolved_binary"] == str(binary)
+    run_mock.assert_not_called()
+    popen_mock.assert_not_called()
+
+
+def test_metasploit_readiness_version_check_is_safe_and_bounded(tmp_path) -> None:
+    binary = tmp_path / "msfconsole"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    completed = SimpleNamespace(returncode=0, stdout="Framework Version 6.4.0", stderr="")
+
+    with (
+        patch("app.tools.metasploit_runner.get_settings", return_value=Settings(_env_file=None, metasploit_binary=str(binary), metasploit_timeout_seconds=120)),
+        patch("app.tools.metasploit_runner.os.access", return_value=True),
+        patch("app.tools.metasploit_runner.subprocess.run", return_value=completed) as run_mock,
+        patch("app.tools.metasploit_runner.subprocess.Popen") as popen_mock,
+    ):
+        readiness = check_metasploit_readiness(run_version_check=True)
+
+    assert readiness["ready"] is True
+    assert readiness["version"] == "Framework Version 6.4.0"
+    run_mock.assert_called_once_with(
+        [str(binary), "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        shell=False,
+        check=False,
+    )
+    popen_mock.assert_not_called()

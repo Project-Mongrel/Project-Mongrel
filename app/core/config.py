@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     prowler_enabled: bool = False
     prowler_binary: str = "prowler"
     prowler_timeout_seconds: int = 900
+    # Set METASPLOIT_BINARY to the absolute msfconsole path on VPS installs when it is not on PATH.
     metasploit_binary: str = "msfconsole"
     metasploit_timeout_seconds: int = 300
 

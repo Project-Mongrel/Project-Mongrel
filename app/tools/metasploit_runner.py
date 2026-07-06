@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import shutil
 import subprocess  # nosec B404
@@ -15,8 +16,9 @@ from app.services.metasploit_approval import (
 
 logger = logging.getLogger(__name__)
 
-METASPLOIT_NOT_AVAILABLE_ERROR = "msfconsole executable was not found."
+METASPLOIT_NOT_AVAILABLE_ERROR = "Metasploit/msfconsole is not installed or configured. Set METASPLOIT_BINARY to the msfconsole path on the VPS."
 METASPLOIT_TIMEOUT_ERROR = "Metasploit validation timed out."
+METASPLOIT_VERSION_TIMEOUT_SECONDS = 10
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(password|pass|token|secret|apikey|api_key)\s*=>\s*\S+"),
     re.compile(r"(?i)(password|pass|token|secret|apikey|api_key)\s*[:=]\s*\S+"),
@@ -36,8 +38,10 @@ def run_metasploit_validation(
         return _result(request=request, success=False, error=str(exc), error_type="approval_required", elapsed_seconds=0, command=None)
 
     settings = get_settings()
-    executable = _resolve_msfconsole_executable(settings.metasploit_binary)
-    if executable is None:
+    readiness = check_metasploit_readiness(run_version_check=False)
+    executable = str(readiness.get("resolved_binary") or "")
+    if readiness.get("ready") is not True:
+        mark_metasploit_proposal_status(proposal.id, "failed")
         return _result(request=request, success=False, error=METASPLOIT_NOT_AVAILABLE_ERROR, error_type="missing_binary", elapsed_seconds=0, command=None)
 
     timeout_seconds = min(int(request.get("timeout_seconds") or settings.metasploit_timeout_seconds), settings.metasploit_timeout_seconds)
@@ -136,6 +140,64 @@ def redact_metasploit_text(text: str) -> str:
     return redacted[:20000]
 
 
+def check_metasploit_readiness(*, run_version_check: bool = False) -> dict[str, object]:
+    settings = get_settings()
+    configured_binary = str(settings.metasploit_binary or "msfconsole").strip() or "msfconsole"
+    executable = _resolve_msfconsole_executable(configured_binary)
+    if executable is None:
+        return {
+            "ready": False,
+            "error": METASPLOIT_NOT_AVAILABLE_ERROR,
+            "error_type": "missing_binary",
+            "configured_binary": configured_binary,
+            "resolved_binary": None,
+        }
+    if run_version_check:
+        try:
+            completed = subprocess.run(  # nosec B603
+                [executable, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=METASPLOIT_VERSION_TIMEOUT_SECONDS,
+                shell=False,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {
+                "ready": False,
+                "error": "Metasploit/msfconsole readiness check failed.",
+                "error_type": "version_check_failed",
+                "configured_binary": configured_binary,
+                "resolved_binary": executable,
+            }
+        version_output = redact_metasploit_text((completed.stdout or completed.stderr or "").strip())[:300]
+        if completed.returncode != 0:
+            return {
+                "ready": False,
+                "error": "Metasploit/msfconsole readiness check failed.",
+                "error_type": "version_check_failed",
+                "configured_binary": configured_binary,
+                "resolved_binary": executable,
+                "version": version_output,
+            }
+        return {
+            "ready": True,
+            "error": "",
+            "error_type": None,
+            "configured_binary": configured_binary,
+            "resolved_binary": executable,
+            "version": version_output,
+        }
+    return {
+        "ready": True,
+        "error": "",
+        "error_type": None,
+        "configured_binary": configured_binary,
+        "resolved_binary": executable,
+    }
+
+
 def _write_resource_file(request: dict, working_directory: Path) -> Path:
     commands = build_metasploit_resource_commands(request)
     handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".rc", prefix="mongrel-msf-", dir=working_directory, delete=False)
@@ -146,8 +208,12 @@ def _write_resource_file(request: dict, working_directory: Path) -> Path:
 
 
 def _resolve_msfconsole_executable(configured_binary: str = "msfconsole") -> str | None:
-    if configured_binary and configured_binary != "msfconsole":
-        return configured_binary
+    configured = str(configured_binary or "msfconsole").strip() or "msfconsole"
+    if configured != "msfconsole":
+        path = Path(configured).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+        return None
     return shutil.which("msfconsole")
 
 

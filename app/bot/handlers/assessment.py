@@ -399,7 +399,13 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         "tool": tool,
     }
     if tool == "metasploit":
-        from app.bot.handlers.scan import build_metasploit_request_prompt
+        from app.bot.handlers.scan import build_metasploit_readiness_failure_text, build_metasploit_request_prompt
+        from app.tools.metasploit_runner import check_metasploit_readiness
+
+        readiness = check_metasploit_readiness(run_version_check=False)
+        if readiness.get("ready") is not True:
+            await message.reply_text(build_metasploit_readiness_failure_text(readiness))
+            return
 
         await message.reply_text(build_metasploit_request_prompt())
         return

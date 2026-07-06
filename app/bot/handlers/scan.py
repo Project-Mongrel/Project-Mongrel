@@ -113,7 +113,7 @@ from app.tools.ffuf_runner import run_ffuf_scan
 from app.tools.gitleaks_runner import run_gitleaks_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
-from app.tools.metasploit_runner import run_metasploit_validation
+from app.tools.metasploit_runner import check_metasploit_readiness, run_metasploit_validation
 from app.tools.playwright_runner import run_playwright_observation
 from app.tools.prowler_runner import normalize_prowler_provider, run_prowler_scan, summarize_prowler_failure
 from app.tools.testssl_runner import run_testssl_scan
@@ -311,6 +311,22 @@ def build_metasploit_request_prompt() -> str:
             "option.SSL=true",
             "",
             "Raw msfconsole commands, resource scripts, sessions, post-exploitation, lateral movement, and brute force are not accepted.",
+        ]
+    )
+
+
+def build_metasploit_readiness_failure_text(readiness: dict[str, object] | None = None) -> str:
+    readiness = readiness or {}
+    configured = str(readiness.get("configured_binary") or "msfconsole")
+    return "\n".join(
+        [
+            "Metasploit Validation is not ready.",
+            "",
+            "Metasploit/msfconsole is not installed or configured.",
+            f"Configured binary: {configured}",
+            "",
+            "Set METASPLOIT_BINARY to the msfconsole path on the Mongrel VPS, then try again.",
+            "No validation proposal was created and no target was touched.",
         ]
     )
 
@@ -1816,6 +1832,12 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if user_id is None:
         await query.edit_message_text("Unable to identify Telegram user.")
         return
+
+    if scan_type == "metasploit":
+        readiness = await asyncio.to_thread(check_metasploit_readiness, run_version_check=False)
+        if readiness.get("ready") is not True:
+            await query.edit_message_text(build_metasploit_readiness_failure_text(readiness))
+            return
 
     scan_request = create_scan_request(user_id=user_id, scan_type=scan_type)
     if scan_type == "nmap":
