@@ -6,6 +6,7 @@ from datetime import UTC
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from app.bot.handlers.home import build_home_text
@@ -352,6 +353,20 @@ def build_metasploit_proposal_text(proposal: object) -> str:
             "Approved options: " + (_format_metasploit_options(options) if options else "none"),
             "",
             "Approve only if this exact action is authorized.",
+        ]
+    )
+
+
+def build_metasploit_proposal_details_text(proposal: object) -> str:
+    base_lines = build_metasploit_proposal_text(proposal).splitlines()
+    return "\n".join(
+        [
+            "Metasploit Validation Proposal Details",
+            "",
+            *base_lines[2:],
+            "",
+            f"Approval status: {getattr(proposal, 'status', 'unknown')}",
+            f"Execution state: {getattr(proposal, 'execution_state', 'unknown')}",
         ]
     )
 
@@ -2643,7 +2658,16 @@ async def _handle_metasploit_callback(query: object, user_id: int) -> None:
         await query.edit_message_text("Metasploit proposal not found.")
         return
     if action == "details":
-        await query.edit_message_text(build_metasploit_proposal_text(proposal), reply_markup=build_metasploit_proposal_keyboard(proposal.id))
+        try:
+            await query.edit_message_text(
+                build_metasploit_proposal_details_text(proposal),
+                reply_markup=build_metasploit_proposal_keyboard(proposal.id),
+            )
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                await query.answer("Proposal details are already shown.")
+                return
+            raise
         return
     if action == "reject":
         try:

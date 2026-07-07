@@ -37,3 +37,35 @@ def test_metasploit_parser_execution_failure_is_failed_not_safe() -> None:
 
     assert parsed["validation_state"] == "FAILED"
     assert "does not mean the target is safe" in parsed["summary"]
+
+
+def test_metasploit_parser_ssh_version_banner_is_detected_not_vulnerable() -> None:
+    parsed = parse_metasploit_validation_result(
+        {
+            "success": True,
+            "module": "auxiliary/scanner/ssh/ssh_version",
+            "action_type": "auxiliary_validation",
+            "target": "example.com",
+            "port": 22,
+            "output": "[+] 10.0.0.1:22 - SSH server version: SSH-2.0-OpenSSH_8.9p1 Ubuntu",
+        }
+    )
+
+    assert parsed["validation_state"] == "DETECTED"
+    assert "service or version metadata" in parsed["summary"]
+    assert "not proof of vulnerability, exploitation, or compromise" in parsed["summary"]
+    lowered = parsed["summary"].lower()
+    assert "exploited" not in lowered
+    assert "appears vulnerable" not in lowered
+
+
+def test_metasploit_parser_unknown_success_output_remains_inconclusive() -> None:
+    parsed = parse_metasploit_validation_result(
+        {
+            "success": True,
+            "module": "auxiliary/scanner/ssh/ssh_version",
+            "output": "Module completed without structured metadata.",
+        }
+    )
+
+    assert parsed["validation_state"] == "INCONCLUSIVE"

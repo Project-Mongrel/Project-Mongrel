@@ -1,4 +1,4 @@
-VALIDATION_STATES = frozenset({"VALIDATED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"})
+VALIDATION_STATES = frozenset({"VALIDATED", "DETECTED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"})
 
 
 def parse_metasploit_validation_result(result: dict) -> dict:
@@ -20,6 +20,9 @@ def parse_metasploit_validation_result(result: dict) -> dict:
     elif _contains_any(combined, ("connection refused", "filtered", "timed out", "unreachable")):
         state = "BLOCKED"
         summary = "Metasploit validation was blocked by connectivity or filtering."
+    elif _looks_like_service_detection(result, combined):
+        state = "DETECTED"
+        summary = "Metasploit reported service or version metadata. This is detection evidence, not proof of vulnerability, exploitation, or compromise."
     else:
         state = "INCONCLUSIVE"
         summary = "Metasploit output did not provide a conclusive validation result."
@@ -35,6 +38,7 @@ def parse_metasploit_validation_result(result: dict) -> dict:
         "limitations": [
             "Metasploit validation evidence is bounded to the approved module/action/options.",
             "Appears vulnerable is validation evidence, not automatic proof of full compromise.",
+            "Detected service or version metadata is not proof of vulnerability, exploitation, or compromise.",
             "Failed, blocked, timed out, or not reproduced results do not mean the target is secure.",
             "No CVE, session, persistence, impact, or attacker access is inferred unless explicitly present in tool output.",
         ],
@@ -44,6 +48,23 @@ def parse_metasploit_validation_result(result: dict) -> dict:
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _looks_like_service_detection(result: dict, text: str) -> bool:
+    module = str(result.get("module") or "").lower()
+    if "scanner/" not in module:
+        return False
+    detection_terms = (
+        "server version",
+        "service version",
+        "version:",
+        "banner:",
+        "detected",
+        "ssh-2.0",
+        "protocol version",
+        "service info",
+    )
+    return _contains_any(text, detection_terms)
 
 
 def _excerpt(text: str, limit: int = 1200) -> str:

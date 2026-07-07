@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from telegram.error import BadRequest
 from telegram.error import TimedOut
 
 from app.bot.auth import is_admin
@@ -2036,12 +2037,38 @@ def test_metasploit_details_callback_shows_exact_proposal() -> None:
     asyncio.run(scan_callback_handler(callback_update, context))
 
     details = query.edit_message_text.call_args.args[0]
+    assert "Metasploit Validation Proposal Details" in details
     assert f"Proposal ID: {proposal_id}" in details
     assert "Module: auxiliary/scanner/http/http_version" in details
     assert "Action: auxiliary_validation" in details
     assert "Target: example.com" in details
     assert "Port: 80" in details
     assert "Expires:" in details
+    assert "Approval status: proposed" in details
+
+
+def test_metasploit_details_callback_handles_message_not_modified() -> None:
+    clear_user_scan_requests(7311)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    scan_request = create_scan_request(user_id=7311, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7311, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text=_metasploit_request_text(), reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7311))
+    asyncio.run(scan_target_handler(update, context))
+    proposal_id = next(iter(_metasploit_pending_context))
+    query = SimpleNamespace(
+        data=f"msf:details:{proposal_id}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(side_effect=BadRequest("Message is not modified")),
+        message=message,
+    )
+    callback_update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7311))
+
+    asyncio.run(scan_callback_handler(callback_update, context))
+
+    assert query.answer.call_args_list[-1].args[0] == "Proposal details are already shown."
 
 
 def test_metasploit_invalid_raw_command_rejected() -> None:
