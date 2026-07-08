@@ -1,9 +1,11 @@
 import asyncio
+import ipaddress
 import logging
 import secrets
 import time
 from datetime import UTC
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
@@ -2630,6 +2632,16 @@ async def _handle_metasploit_request(
         return
 
     assessment_context = _pop_assessment_scan_context(context, "metasploit")
+    if assessment_context and not _metasploit_target_belongs_to_assessment(
+        str(request.get("target") or ""),
+        assessment_context,
+    ):
+        await update.message.reply_text(
+            "Metasploit target is not part of this assessment's known target/assets. "
+            "Add it explicitly or run standalone."
+        )
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        return
     proposal = propose_metasploit_action(
         user_id,
         request,
@@ -2644,6 +2656,33 @@ async def _handle_metasploit_request(
         build_metasploit_proposal_text(proposal),
         reply_markup=build_metasploit_proposal_keyboard(proposal.id),
     )
+
+
+def _metasploit_target_belongs_to_assessment(target: str, assessment_context: dict) -> bool:
+    requested = _comparison_host(target)
+    if not requested:
+        return False
+    candidates = [
+        str(assessment_context.get("primary_target") or ""),
+        *(str(value or "") for value in assessment_context.get("known_assets") or []),
+    ]
+    assessment_id = assessment_context.get("assessment_id")
+    if assessment_id is not None:
+        candidates.extend(str(item.get("address") or "") for item in list_assessment_targets(int(assessment_id)))
+    known_hosts = {_comparison_host(value) for value in candidates}
+    return requested in known_hosts
+
+
+def _comparison_host(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    parsed = urlsplit(text if "://" in text else f"//{text}")
+    host = parsed.hostname or text.split("/", 1)[0].split(":", 1)[0]
+    try:
+        return ipaddress.ip_address(host).compressed
+    except ValueError:
+        return host.rstrip(".")
 
 
 async def _handle_metasploit_callback(query: object, user_id: int) -> None:

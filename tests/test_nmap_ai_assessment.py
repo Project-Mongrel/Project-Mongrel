@@ -31,6 +31,9 @@ def test_nmap_ai_prompt_includes_observed_ports_and_constraints() -> None:
     assert "Host: scanme.nmap.org" in prompt
     assert "Services: 22/tcp ssh" in prompt
     assert "SSH exposed" in prompt
+    assert "State only observed ports, services, and reachability" in prompt
+    assert 'Do not say "no significant vulnerabilities"' in prompt
+    assert "overall low-risk verdict" in prompt
 
 
 def test_nmap_ai_prompt_includes_comparison_and_impact() -> None:

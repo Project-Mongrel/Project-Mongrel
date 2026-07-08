@@ -54,7 +54,7 @@ def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
             "- Separate observed facts from potential risks and recommendations.",
             f'- For clean scans, say "{CLEAN_SCAN_FACT}"',
             f"- For clean scans, explain this limitation: {CLEAN_SCAN_LIMITATION}",
-            '- State "No confirmed vulnerabilities were identified during reconnaissance" when appropriate.',
+            "- Zero matches means only that no selected templates matched; it does not establish that no exploitable vulnerabilities exist.",
             "- Mention uncertainty clearly when evidence is limited.",
             "- Confidence must describe assessment quality based on the executed template set, not target security.",
             "- Recommended next actions must map directly to observed evidence.",

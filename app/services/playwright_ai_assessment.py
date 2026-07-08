@@ -41,6 +41,8 @@ def build_playwright_ai_assessment_prompt(finding: dict) -> str:
             "- Use only the supplied observed Playwright evidence.",
             "- Do not invent vulnerabilities.",
             "- Do not invent URLs, forms, links, console errors, network errors, titles, or status codes.",
+            "- Do not infer form field meanings or page content beyond normalized evidence.",
+            "- Do not say there are no interactive elements when normalized forms, inputs, or links were observed.",
             "- Do not say the site is safe or vulnerable from page load alone.",
             "- Describe observations as browser behavior and web surface, not confirmed vulnerabilities.",
             "- Do not claim compromise.",

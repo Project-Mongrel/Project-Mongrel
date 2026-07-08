@@ -462,6 +462,65 @@ def test_assessment_failed_scan_records_failed_status() -> None:
     assert "Nmap: Failed" in query_message.reply_text.call_args_list[-1].args[0]
 
 
+def test_domain_assessment_skips_incompatible_gitleaks_and_prowler_without_findings() -> None:
+    assessment = create_assessment("Domain Tool Compatibility")
+    add_assessment_target(assessment["id"], address="example.com")
+
+    for tool in ("gitleaks", "prowler"):
+        query = SimpleNamespace(
+            data=f"assessment:run:{tool}:{assessment['id']}",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with (
+            patch("app.bot.handlers.scan.run_gitleaks_scan") as gitleaks_runner,
+            patch("app.bot.handlers.scan.run_prowler_scan") as prowler_runner,
+        ):
+            asyncio.run(
+                assessment_callback_handler(
+                    SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8124)),
+                    SimpleNamespace(user_data={}),
+                )
+            )
+
+        assert "not applicable" in query.edit_message_text.call_args.args[0]
+        gitleaks_runner.assert_not_called()
+        prowler_runner.assert_not_called()
+
+    assert list_assessment_scans(assessment["id"]) == []
+
+
+def test_assessment_metasploit_launch_routes_only_to_metasploit_prompt() -> None:
+    clear_user_scan_requests(8125)
+    assessment = create_assessment("Metasploit Routing")
+    add_assessment_target(assessment["id"], address="example.com")
+    message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:run:metasploit:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=message,
+    )
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: "stale-prowler"})
+
+    with (
+        patch("app.tools.metasploit_runner.check_metasploit_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.scan.run_prowler_scan") as prowler_runner,
+    ):
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8125)),
+                context,
+            )
+        )
+
+    assert "Launching METASPLOIT" in query.edit_message_text.call_args.args[0]
+    assert message.reply_text.call_args.args[0] == build_metasploit_request_prompt()
+    assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["tool"] == "metasploit"
+    prowler_runner.assert_not_called()
+
+
 def test_assessment_history_callback_lists_recorded_scans() -> None:
     assessment = create_assessment("History Callback Assessment")
     record_assessment_scan(assessment["id"], tool="bbot", status="completed", elapsed_seconds=19, risk="info")
@@ -2018,6 +2077,65 @@ def test_metasploit_structured_request_creates_proposal_without_execution() -> N
     assert "TARGETURI=/" in sent
     assert buttons == ["Approve", "Reject", "Details"]
     assert _metasploit_pending_context
+
+
+def test_assessment_metasploit_rejects_target_outside_known_assets() -> None:
+    clear_user_scan_requests(7312)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    assessment = create_assessment("Metasploit Target Binding")
+    target = add_assessment_target(assessment["id"], address="example.com")
+    scan_request = create_scan_request(user_id=7312, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7312, scan_request_id=scan_request.id)
+    context = SimpleNamespace(
+        user_data={
+            PENDING_NMAP_REQUEST_KEY: scan_request.id,
+            ASSESSMENT_SCAN_CONTEXT_KEY: {
+                "assessment_id": assessment["id"],
+                "target_id": target["id"],
+                "primary_target": "example.com",
+                "known_assets": ["https://www.example.com"],
+                "tool": "metasploit",
+            },
+        }
+    )
+    request_text = _metasploit_request_text().replace("target=example.com", "target=127.0.0.1")
+    message = SimpleNamespace(text=request_text, reply_text=AsyncMock())
+
+    asyncio.run(
+        scan_target_handler(
+            SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7312)),
+            context,
+        )
+    )
+
+    assert message.reply_text.call_args.args[0] == (
+        "Metasploit target is not part of this assessment's known target/assets. "
+        "Add it explicitly or run standalone."
+    )
+    assert not _metasploit_pending_context
+    assert list_assessment_scans(assessment["id"]) == []
+
+
+def test_standalone_metasploit_allows_unrelated_authorized_target() -> None:
+    clear_user_scan_requests(7313)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    scan_request = create_scan_request(user_id=7313, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7313, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    request_text = _metasploit_request_text().replace("target=example.com", "target=127.0.0.1")
+    message = SimpleNamespace(text=request_text, reply_text=AsyncMock())
+
+    asyncio.run(
+        scan_target_handler(
+            SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7313)),
+            context,
+        )
+    )
+
+    assert "Metasploit Validation Proposal" in message.reply_text.call_args.args[0]
+    assert "Target: 127.0.0.1" in message.reply_text.call_args.args[0]
 
 
 def test_metasploit_details_callback_shows_exact_proposal() -> None:

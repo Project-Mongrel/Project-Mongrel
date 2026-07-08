@@ -61,3 +61,13 @@ def test_metasploit_ai_prompt_redacts_secret_like_values() -> None:
     assert "<REDACTED>" in prompt
     assert "SuperSecret" not in prompt
     assert "abc123" not in prompt
+
+
+def test_metasploit_ai_prompt_preserves_detected_without_upgrading_it() -> None:
+    prompt = build_metasploit_ai_assessment_prompt(_finding("DETECTED"))
+
+    assert "Validation State: DETECTED" in prompt
+    assert "Repeat the supplied Validation State exactly" in prompt
+    assert "DETECTED means service, banner, or version metadata was observed only." in prompt
+    assert "DETECTED must never be described as vulnerable, exploited, compromised, or VALIDATED." in prompt
+    assert "Do not invent access, impact, or vulnerability from DETECTED metadata." in prompt

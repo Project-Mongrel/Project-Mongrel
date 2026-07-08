@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
@@ -382,13 +384,29 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     target = targets[0]
+    target_address = str(target["address"]).strip()
+    if tool == "gitleaks" and not Path(target_address).is_dir():
+        await query.edit_message_text(
+            "Gitleaks is not applicable to this assessment target. "
+            "Gitleaks requires a valid local directory; run it standalone with a local path."
+        )
+        return
+    if tool == "prowler" and target_address.lower() not in {"aws", "azure", "gcp"}:
+        await query.edit_message_text(
+            "Prowler is not applicable to this assessment target. "
+            "Prowler requires the assessment target to be exactly aws, azure, or gcp for this workflow."
+        )
+        return
+
     await query.edit_message_text(
-        f"Launching {tool.upper()} for assessment target:\n{target['address']}",
+        f"Launching {tool.upper()} for assessment target:\n{target_address}",
         reply_markup=build_assessment_dashboard_keyboard(assessment_id),
     )
     from app.bot.handlers.scan import PENDING_NMAP_REQUEST_KEY, scan_target_handler
     from app.services.scan_manager import create_scan_request, mark_scan_request_awaiting_target
 
+    context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    context.user_data.pop(ASSESSMENT_SCAN_CONTEXT_KEY, None)
     scan_request = create_scan_request(user_id=user_id, scan_type=tool)
     mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
     context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
@@ -396,6 +414,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         "assessment_id": assessment_id,
         "target_id": target["id"],
         "cloud_context": target.get("name") or f"assessment-{str(target['address']).strip().lower()}",
+        "primary_target": target_address,
         "tool": tool,
     }
     if tool == "metasploit":
@@ -404,9 +423,29 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 
         readiness = check_metasploit_readiness(run_version_check=False)
         if readiness.get("ready") is not True:
+            context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+            context.user_data.pop(ASSESSMENT_SCAN_CONTEXT_KEY, None)
             await message.reply_text(build_metasploit_readiness_failure_text(readiness))
             return
 
+        assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
+        known_assets = {target_address}
+        for finding in assessment_context.get("findings") or []:
+            candidate = str(finding.get("target") or "").strip()
+            if candidate:
+                known_assets.add(candidate)
+            for key in ("httpx_services", "katana_observations", "ffuf_results"):
+                for item in finding.get(key) or []:
+                    for value_key in ("url", "host"):
+                        candidate = str(item.get(value_key) or "").strip()
+                        if candidate:
+                            known_assets.add(candidate)
+            observation = finding.get("playwright_observation") or {}
+            for value_key in ("requested_url", "final_url"):
+                candidate = str(observation.get(value_key) or "").strip()
+                if candidate:
+                    known_assets.add(candidate)
+        context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["known_assets"] = sorted(known_assets)
         await message.reply_text(build_metasploit_request_prompt())
         return
     synthetic_update = type(

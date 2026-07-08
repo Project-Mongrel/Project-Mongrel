@@ -25,6 +25,8 @@ def test_nuclei_ai_prompt_includes_target_and_finding_count() -> None:
     assert "Risk level: high" in prompt
     assert "Scan profile/templates: fast" in prompt
     assert "Elapsed time: 9s" in prompt
+    assert "no selected templates matched" in prompt
+    assert "does not establish that no exploitable vulnerabilities exist" in prompt
 
 
 def test_nuclei_ai_prompt_includes_matched_findings_and_templates() -> None:

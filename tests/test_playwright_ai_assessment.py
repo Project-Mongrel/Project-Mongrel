@@ -34,6 +34,8 @@ def test_playwright_ai_prompt_uses_only_stored_playwright_evidence() -> None:
     assert "Use only the supplied observed Playwright evidence." in prompt
     assert "Do not invent vulnerabilities." in prompt
     assert "Do not say the site is safe or vulnerable from page load alone." in prompt
+    assert "Do not infer form field meanings or page content" in prompt
+    assert "forms, inputs, or links were observed" in prompt
     assert "Final URL: https://www.example.com" in prompt
     assert "Forms: 1" in prompt
     assert "https://www.example.com/about" in prompt

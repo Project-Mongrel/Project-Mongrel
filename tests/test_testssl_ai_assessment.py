@@ -33,6 +33,9 @@ def test_testssl_ai_prompt_uses_only_stored_tls_evidence() -> None:
     assert "Use only the supplied observed testssl.sh evidence." in prompt
     assert "Do not invent TLS vulnerabilities" in prompt
     assert "Do not claim the overall site is safe or secure from TLS evidence alone." in prompt
+    assert 'Do not say "TLS appears robust"' in prompt
+    assert "early_data, LUCKY13" in prompt
+    assert "scanner-reported evidence requiring context and validation" in prompt
     assert "Certificate issuer: Example CA" in prompt
     assert "Supported protocols: TLS 1.2, TLS 1.3" in prompt
 

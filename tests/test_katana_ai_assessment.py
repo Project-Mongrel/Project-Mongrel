@@ -27,6 +27,8 @@ def test_katana_ai_prompt_uses_only_stored_katana_evidence() -> None:
     assert "Use only the supplied observed Katana evidence." in prompt
     assert "Do not invent vulnerabilities." in prompt
     assert "Describe discovered URLs and endpoints as attack surface, not confirmed risk." in prompt
+    assert "crawl visibility was limited" in prompt
+    assert "not that site structure is limited" in prompt
     assert "url=https://example.com/search?q=test type=parameterized_url method=GET status=200 depth=2 source=https://example.com params=q" in prompt
 
 

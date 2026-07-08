@@ -42,6 +42,8 @@ def build_testssl_ai_assessment_prompt(finding: dict) -> str:
             "- Treat this as TLS configuration evidence only.",
             "- Do not invent TLS vulnerabilities, protocols, certificate fields, ciphers, headers, or grades.",
             "- Do not claim the overall site is safe or secure from TLS evidence alone.",
+            '- Do not say "TLS appears robust" or provide a broad TLS safety verdict.',
+            "- Preserve scanner confidence and describe early_data, LUCKY13, and similar items as scanner-reported evidence requiring context and validation.",
             "- Do not claim exploitation or compromise.",
             "- Separate observed facts from potential risks and recommendations.",
             "- Mention uncertainty clearly when evidence is limited.",

@@ -32,6 +32,9 @@ def test_ffuf_ai_prompt_uses_only_stored_ffuf_evidence() -> None:
     assert "Use only the supplied observed ffuf evidence." in prompt
     assert "Do not invent vulnerabilities." in prompt
     assert "Do not claim discovered admin, backup, API, or config-looking paths are exploitable." in prompt
+    assert "no paths were discovered with the selected wordlist/profile" in prompt
+    assert "does not imply a static site" in prompt
+    assert "resistance to injection" in prompt
     assert "https://example.com/admin" in prompt
     assert "status=200" in prompt
     assert "word=admin" in prompt

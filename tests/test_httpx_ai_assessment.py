@@ -25,6 +25,8 @@ def test_httpx_ai_prompt_uses_only_stored_httpx_evidence() -> None:
 
     assert "Use only the supplied observed httpx evidence." in prompt
     assert "Do not invent vulnerabilities." in prompt
+    assert "Do not call HTTP 429 a misconfiguration" in prompt
+    assert "rate-limit, challenge, or access-control uncertainty" in prompt
     assert "url=https://example.com status=200 title=Example server=nginx tech=React redirect=https://www.example.com" in prompt
 
 

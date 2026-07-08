@@ -44,6 +44,7 @@ def build_httpx_ai_assessment_prompt(finding: dict) -> str:
             "- Do not claim compromise.",
             "- Do not recommend exploitation.",
             "- Do not claim the target is safe or secure.",
+            "- Do not call HTTP 429 a misconfiguration without explicit evidence; preserve rate-limit, challenge, or access-control uncertainty.",
             "- Explain what the HTTP fingerprinting suggests and what follow-up actions are reasonable.",
             "- Separate observed facts from potential risks and recommendations.",
             "- Mention uncertainty clearly when evidence is limited.",

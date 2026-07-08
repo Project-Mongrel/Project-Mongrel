@@ -46,6 +46,8 @@ def build_ffuf_ai_assessment_prompt(finding: dict) -> str:
             "- Do not claim compromise.",
             "- Do not recommend exploitation.",
             "- Do not claim the target is safe or secure.",
+            "- Zero discoveries means no paths were discovered with the selected wordlist/profile.",
+            "- Zero discoveries does not imply a static site, no exploitable paths, or resistance to injection.",
             "- Explain what the hidden-content observations suggest and what follow-up actions are reasonable.",
             "- Separate observed facts from potential risks and recommendations.",
             "- Mention uncertainty clearly when evidence is limited.",

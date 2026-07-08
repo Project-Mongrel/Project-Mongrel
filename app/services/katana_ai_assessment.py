@@ -46,6 +46,7 @@ def build_katana_ai_assessment_prompt(finding: dict) -> str:
             "- Do not claim compromise.",
             "- Do not recommend exploitation.",
             "- Do not claim the target is safe or secure.",
+            "- A small crawl surface under HTTP 429 or challenge conditions means crawl visibility was limited, not that site structure is limited.",
             "- Explain what the crawl surface suggests and what follow-up actions are reasonable.",
             "- Separate observed facts from potential risks and recommendations.",
             "- Mention uncertainty clearly when evidence is limited.",
