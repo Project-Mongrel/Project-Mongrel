@@ -35,6 +35,8 @@ def generate_metasploit_ai_assessment(finding: dict) -> list[str]:
     if _is_unavailable_response(response):
         return list(FALLBACK_LINES)
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
+    if _validation_state(finding) == "DETECTED" and _unsafe_detected_output(lines):
+        return _detected_assessment_lines(finding)
     return lines or list(FALLBACK_LINES)
 
 
@@ -50,6 +52,10 @@ def build_metasploit_ai_assessment_prompt(finding: dict) -> str:
             "- Repeat the supplied Validation State exactly; never translate or upgrade it to another state.",
             "- DETECTED means service, banner, or version metadata was observed only.",
             "- DETECTED must never be described as vulnerable, exploited, compromised, or VALIDATED.",
+            '- For DETECTED, say: "This action detected service/banner/key metadata only and did not validate a vulnerability condition."',
+            '- For DETECTED, do not say "did not observe any vulnerabilities", "no vulnerabilities observed", or "no remediation required".',
+            "- Do not infer that a connection is legitimate or unauthorized from an SSH key fingerprint or banner.",
+            "- For DETECTED next actions, neutrally review exposure and authorization if relevant, correlate with Nmap or service inventory, and make no vulnerability conclusion from this result alone.",
             "- Scanner evidence is not automatically proof of exploitation.",
             "- The phrase appears vulnerable remains scanner-reported validation evidence, not proof of full compromise.",
             "- VALIDATED must reflect actual observed validation evidence in the supplied normalized result.",
@@ -111,3 +117,46 @@ def _clean(value: object) -> str:
 def _is_unavailable_response(response: object) -> bool:
     text = str(response or "").strip()
     return not text or any(text.startswith(message) for message in AI_UNAVAILABLE_MESSAGES)
+
+
+def _validation_state(finding: dict) -> str:
+    return str((finding.get("metasploit_evidence") or {}).get("validation_state") or "").strip().upper()
+
+
+def _unsafe_detected_output(lines: list[str]) -> bool:
+    text = " ".join(lines).lower()
+    forbidden = (
+        "did not observe any vulnerabilities",
+        "no vulnerabilities observed",
+        "no remediation required",
+        "legitimate connection",
+        "unauthorized connection",
+        "legitimate access",
+        "unauthorized access",
+    )
+    return any(phrase in text for phrase in forbidden)
+
+
+def _detected_assessment_lines(finding: dict) -> list[str]:
+    evidence = finding.get("metasploit_evidence") or {}
+    module = _clean(evidence.get("module") or (finding.get("metadata") or {}).get("module") or "unknown")
+    target = _clean(evidence.get("target") or finding.get("target") or "unknown")
+    return [
+        "Executive Summary",
+        "This action detected service/banner/key metadata only and did not validate a vulnerability condition.",
+        "",
+        "Observed Validation Facts",
+        f"Metasploit module {module} observed metadata for {target}.",
+        "",
+        "Validation Outcome",
+        "Validation State: DETECTED. No vulnerability conclusion can be made from this result alone.",
+        "",
+        "Potential Impact",
+        "The observed metadata identifies a service for authorized review; it does not establish access, exploitation, or compromise.",
+        "",
+        "Recommended Next Actions",
+        "Review exposure and authorization if relevant, and correlate the metadata with Nmap or the service inventory.",
+        "",
+        "Evidence Confidence / Limitations",
+        "Service, banner, or key metadata only; no vulnerability condition was validated.",
+    ]

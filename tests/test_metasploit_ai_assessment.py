@@ -1,4 +1,6 @@
-from app.services.metasploit_ai_assessment import build_metasploit_ai_assessment_prompt
+from unittest.mock import patch
+
+from app.services.metasploit_ai_assessment import build_metasploit_ai_assessment_prompt, generate_metasploit_ai_assessment
 
 
 def _finding(validation_state: str = "NOT_REPRODUCED") -> dict:
@@ -71,3 +73,30 @@ def test_metasploit_ai_prompt_preserves_detected_without_upgrading_it() -> None:
     assert "DETECTED means service, banner, or version metadata was observed only." in prompt
     assert "DETECTED must never be described as vulnerable, exploited, compromised, or VALIDATED." in prompt
     assert "Do not invent access, impact, or vulnerability from DETECTED metadata." in prompt
+    assert "did not observe any vulnerabilities" in prompt
+    assert "no vulnerabilities observed" in prompt
+    assert "no remediation required" in prompt
+    assert "Do not infer that a connection is legitimate or unauthorized from an SSH key fingerprint" in prompt
+    assert "detected service/banner/key metadata only and did not validate a vulnerability condition" in prompt
+    assert "correlate with Nmap or service inventory" in prompt
+
+
+def test_metasploit_detected_output_replaces_unsafe_ai_wording() -> None:
+    unsafe_response = "\n".join(
+        [
+            "Executive Summary",
+            "No vulnerabilities observed and no remediation required.",
+            "The SSH fingerprint indicates a legitimate connection.",
+        ]
+    )
+
+    with patch("app.services.metasploit_ai_assessment.ask_ai", return_value=unsafe_response):
+        lines = generate_metasploit_ai_assessment(_finding("DETECTED"))
+
+    output = "\n".join(lines)
+    assert "no vulnerabilities observed" not in output.lower()
+    assert "no remediation required" not in output.lower()
+    assert "legitimate connection" not in output.lower()
+    assert "detected service/banner/key metadata only and did not validate a vulnerability condition" in output
+    assert "correlate the metadata with Nmap or the service inventory" in output
+    assert "No vulnerability conclusion can be made from this result alone." in output

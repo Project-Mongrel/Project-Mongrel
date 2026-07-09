@@ -386,15 +386,25 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
     target = targets[0]
     target_address = str(target["address"]).strip()
     if tool == "gitleaks" and not Path(target_address).is_dir():
-        await query.edit_message_text(
+        skip_message = (
             "Gitleaks is not applicable to this assessment target. "
             "Gitleaks requires a valid local directory; run it standalone with a local path."
         )
+        await query.edit_message_text(
+            f"{skip_message}\n\n"
+            + build_assessment_dashboard_text(assessment, targets, list_assessment_scans(assessment_id)),
+            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+        )
         return
     if tool == "prowler" and target_address.lower() not in {"aws", "azure", "gcp"}:
-        await query.edit_message_text(
+        skip_message = (
             "Prowler is not applicable to this assessment target. "
             "Prowler requires the assessment target to be exactly aws, azure, or gcp for this workflow."
+        )
+        await query.edit_message_text(
+            f"{skip_message}\n\n"
+            + build_assessment_dashboard_text(assessment, targets, list_assessment_scans(assessment_id)),
+            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
         )
         return
 

@@ -485,6 +485,12 @@ def test_domain_assessment_skips_incompatible_gitleaks_and_prowler_without_findi
             )
 
         assert "not applicable" in query.edit_message_text.call_args.args[0]
+        assert "Assessment Dashboard" in query.edit_message_text.call_args.args[0]
+        keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+        buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+        assert "Run Gitleaks" in buttons
+        assert "Run Prowler" in buttons
+        assert "Run Metasploit" in buttons
         gitleaks_runner.assert_not_called()
         prowler_runner.assert_not_called()
 
