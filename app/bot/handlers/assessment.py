@@ -161,6 +161,15 @@ async def _safe_edit_assessment_dashboard(query: object, text: str, assessment_i
         raise
 
 
+async def _send_assessment_skip_dashboard(query: object, text: str, assessment_id: int) -> None:
+    message = getattr(query, "message", None)
+    reply_text = getattr(message, "reply_text", None)
+    if reply_text is not None:
+        await reply_text(text, reply_markup=build_assessment_dashboard_keyboard(assessment_id))
+        return
+    await _safe_edit_assessment_dashboard(query, text, assessment_id, text.splitlines()[0] if text else None)
+
+
 def build_assessment_history_text(assessment: dict, scans: list[dict] | None = None) -> str:
     scans = scans or []
     lines = [
@@ -410,12 +419,11 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
             "Gitleaks is not applicable to this assessment target. "
             "Gitleaks requires a valid local directory; run it standalone with a local path."
         )
-        await _safe_edit_assessment_dashboard(
+        await _send_assessment_skip_dashboard(
             query,
             f"{skip_message}\n\n"
             + build_assessment_dashboard_text(assessment, targets, list_assessment_scans(assessment_id)),
             assessment_id,
-            skip_message,
         )
         return
     if tool == "prowler" and target_address.lower() not in {"aws", "azure", "gcp"}:
@@ -423,12 +431,11 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
             "Prowler is not applicable to this assessment target. "
             "Prowler requires the assessment target to be exactly aws, azure, or gcp for this workflow."
         )
-        await _safe_edit_assessment_dashboard(
+        await _send_assessment_skip_dashboard(
             query,
             f"{skip_message}\n\n"
             + build_assessment_dashboard_text(assessment, targets, list_assessment_scans(assessment_id)),
             assessment_id,
-            skip_message,
         )
         return
 

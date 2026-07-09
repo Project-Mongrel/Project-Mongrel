@@ -484,9 +484,10 @@ def test_domain_assessment_skips_incompatible_gitleaks_and_prowler_without_findi
                 )
             )
 
-        assert "not applicable" in query.edit_message_text.call_args.args[0]
-        assert "Assessment Dashboard" in query.edit_message_text.call_args.args[0]
-        keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+        query.edit_message_text.assert_not_called()
+        assert "not applicable" in query.message.reply_text.call_args.args[0]
+        assert "Assessment Dashboard" in query.message.reply_text.call_args.args[0]
+        keyboard = query.message.reply_text.call_args.kwargs["reply_markup"]
         buttons = [button.text for row in keyboard.inline_keyboard for button in row]
         assert "Run Gitleaks" in buttons
         assert "Run Prowler" in buttons
@@ -495,6 +496,19 @@ def test_domain_assessment_skips_incompatible_gitleaks_and_prowler_without_findi
         prowler_runner.assert_not_called()
 
     assert list_assessment_scans(assessment["id"]) == []
+
+
+def test_assessment_dashboard_gitleaks_and_prowler_buttons_route_to_assessment_handler() -> None:
+    assessment = create_assessment("Dashboard Callback Routing")
+    keyboard = build_assessment_dashboard_keyboard(assessment["id"])
+    callbacks = {button.text: button.callback_data for row in keyboard.inline_keyboard for button in row}
+
+    assert callbacks["Run Gitleaks"] == f"assessment:run:gitleaks:{assessment['id']}"
+    assert callbacks["Run Prowler"] == f"assessment:run:prowler:{assessment['id']}"
+    assert re.fullmatch(r"^assessment:.+", callbacks["Run Gitleaks"])
+    assert re.fullmatch(r"^assessment:.+", callbacks["Run Prowler"])
+    assert not re.fullmatch(SCAN_CALLBACK_PATTERN, callbacks["Run Gitleaks"])
+    assert not re.fullmatch(SCAN_CALLBACK_PATTERN, callbacks["Run Prowler"])
 
 
 def test_repeated_assessment_dashboard_render_handles_message_not_modified() -> None:
@@ -557,7 +571,8 @@ def test_assessment_gitleaks_skip_dashboard_handles_message_not_modified() -> No
             )
         )
 
-    assert "Gitleaks is not applicable" in query.answer.call_args_list[-1].args[0]
+    assert query.edit_message_text.assert_not_called() is None
+    assert query.answer.await_count == 1
     query.message.reply_text.assert_called_once()
     assert "Gitleaks is not applicable" in query.message.reply_text.call_args.args[0]
     assert query.message.reply_text.call_args.kwargs["reply_markup"] is not None
@@ -582,11 +597,68 @@ def test_assessment_prowler_skip_dashboard_handles_message_not_modified() -> Non
             )
         )
 
-    assert "Prowler is not applicable" in query.answer.call_args_list[-1].args[0]
+    assert query.edit_message_text.assert_not_called() is None
+    assert query.answer.await_count == 1
     query.message.reply_text.assert_called_once()
     assert "Prowler is not applicable" in query.message.reply_text.call_args.args[0]
     assert query.message.reply_text.call_args.kwargs["reply_markup"] is not None
     prowler_runner.assert_not_called()
+
+
+def test_valid_local_directory_gitleaks_assessment_still_runs(tmp_path) -> None:
+    clear_user_scan_requests(8130)
+    assessment = create_assessment("Local Gitleaks")
+    target = add_assessment_target(assessment["id"], address=str(tmp_path))
+    message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:run:gitleaks:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=message,
+    )
+    context = SimpleNamespace(user_data={})
+
+    with patch("app.bot.handlers.scan.scan_target_handler", new_callable=AsyncMock) as scan_target_mock:
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8130)),
+                context,
+            )
+        )
+
+    query.edit_message_text.assert_called_once()
+    assert "Launching GITLEAKS" in query.edit_message_text.call_args.args[0]
+    assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["tool"] == "gitleaks"
+    assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["target_id"] == target["id"]
+    scan_target_mock.assert_awaited_once()
+
+
+def test_valid_provider_prowler_assessment_still_runs() -> None:
+    clear_user_scan_requests(8131)
+    assessment = create_assessment("AWS Prowler")
+    target = add_assessment_target(assessment["id"], address="aws")
+    message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:run:prowler:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=message,
+    )
+    context = SimpleNamespace(user_data={})
+
+    with patch("app.bot.handlers.scan.scan_target_handler", new_callable=AsyncMock) as scan_target_mock:
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8131)),
+                context,
+            )
+        )
+
+    query.edit_message_text.assert_called_once()
+    assert "Launching PROWLER" in query.edit_message_text.call_args.args[0]
+    assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["tool"] == "prowler"
+    assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["target_id"] == target["id"]
+    scan_target_mock.assert_awaited_once()
 
 
 def test_assessment_metasploit_launch_routes_only_to_metasploit_prompt() -> None:
