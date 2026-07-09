@@ -497,6 +497,92 @@ def test_domain_assessment_skips_incompatible_gitleaks_and_prowler_without_findi
     assert list_assessment_scans(assessment["id"]) == []
 
 
+def test_repeated_assessment_dashboard_render_handles_message_not_modified() -> None:
+    assessment = create_assessment("Repeated Dashboard")
+    add_assessment_target(assessment["id"], address="example.com")
+    query = SimpleNamespace(
+        data=f"assessment:dashboard:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(side_effect=BadRequest("Message is not modified")),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+
+    asyncio.run(
+        assessment_callback_handler(
+            SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8126)),
+            SimpleNamespace(user_data={}),
+        )
+    )
+
+    assert query.answer.call_args_list[-1].args[0] == "Assessment dashboard is already shown."
+
+
+def test_assessment_dashboard_changed_render_still_edits_message() -> None:
+    assessment = create_assessment("Changed Dashboard")
+    add_assessment_target(assessment["id"], address="example.com")
+    query = SimpleNamespace(
+        data=f"assessment:dashboard:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+
+    asyncio.run(
+        assessment_callback_handler(
+            SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8127)),
+            SimpleNamespace(user_data={}),
+        )
+    )
+
+    query.edit_message_text.assert_called_once()
+    assert "Assessment Dashboard" in query.edit_message_text.call_args.args[0]
+    assert query.edit_message_text.call_args.kwargs["reply_markup"] is not None
+
+
+def test_assessment_gitleaks_skip_dashboard_handles_message_not_modified() -> None:
+    assessment = create_assessment("Gitleaks Skip Repeated")
+    add_assessment_target(assessment["id"], address="example.com")
+    query = SimpleNamespace(
+        data=f"assessment:run:gitleaks:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(side_effect=BadRequest("Message is not modified")),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+
+    with patch("app.bot.handlers.scan.run_gitleaks_scan") as gitleaks_runner:
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8128)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    assert query.answer.call_args_list[-1].args[0] == "Assessment dashboard is already shown."
+    gitleaks_runner.assert_not_called()
+
+
+def test_assessment_prowler_skip_dashboard_handles_message_not_modified() -> None:
+    assessment = create_assessment("Prowler Skip Repeated")
+    add_assessment_target(assessment["id"], address="example.com")
+    query = SimpleNamespace(
+        data=f"assessment:run:prowler:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(side_effect=BadRequest("Message is not modified")),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+
+    with patch("app.bot.handlers.scan.run_prowler_scan") as prowler_runner:
+        asyncio.run(
+            assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8129)),
+                SimpleNamespace(user_data={}),
+            )
+        )
+
+    assert query.answer.call_args_list[-1].args[0] == "Assessment dashboard is already shown."
+    prowler_runner.assert_not_called()
+
+
 def test_assessment_metasploit_launch_routes_only_to_metasploit_prompt() -> None:
     clear_user_scan_requests(8125)
     assessment = create_assessment("Metasploit Routing")

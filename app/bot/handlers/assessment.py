@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
@@ -140,6 +141,19 @@ def build_assessment_dashboard_keyboard(assessment_id: int) -> InlineKeyboardMar
             [InlineKeyboardButton("Home", callback_data="nav:home")],
         ]
     )
+
+
+async def _safe_edit_assessment_dashboard(query: object, text: str, assessment_id: int) -> None:
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+        )
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            await query.answer("Assessment dashboard is already shown.")
+            return
+        raise
 
 
 def build_assessment_history_text(assessment: dict, scans: list[dict] | None = None) -> str:
@@ -299,13 +313,14 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 
     if action == "dashboard":
         clear_assessment_chat_state(context)
-        await query.edit_message_text(
+        await _safe_edit_assessment_dashboard(
+            query,
             build_assessment_dashboard_text(
                 assessment,
                 list_assessment_targets(assessment_id),
                 list_assessment_scans(assessment_id),
             ),
-            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+            assessment_id,
         )
         return
 
@@ -390,10 +405,11 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
             "Gitleaks is not applicable to this assessment target. "
             "Gitleaks requires a valid local directory; run it standalone with a local path."
         )
-        await query.edit_message_text(
+        await _safe_edit_assessment_dashboard(
+            query,
             f"{skip_message}\n\n"
             + build_assessment_dashboard_text(assessment, targets, list_assessment_scans(assessment_id)),
-            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+            assessment_id,
         )
         return
     if tool == "prowler" and target_address.lower() not in {"aws", "azure", "gcp"}:
@@ -401,10 +417,11 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
             "Prowler is not applicable to this assessment target. "
             "Prowler requires the assessment target to be exactly aws, azure, or gcp for this workflow."
         )
-        await query.edit_message_text(
+        await _safe_edit_assessment_dashboard(
+            query,
             f"{skip_message}\n\n"
             + build_assessment_dashboard_text(assessment, targets, list_assessment_scans(assessment_id)),
-            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+            assessment_id,
         )
         return
 
