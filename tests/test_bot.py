@@ -557,7 +557,10 @@ def test_assessment_gitleaks_skip_dashboard_handles_message_not_modified() -> No
             )
         )
 
-    assert query.answer.call_args_list[-1].args[0] == "Assessment dashboard is already shown."
+    assert "Gitleaks is not applicable" in query.answer.call_args_list[-1].args[0]
+    query.message.reply_text.assert_called_once()
+    assert "Gitleaks is not applicable" in query.message.reply_text.call_args.args[0]
+    assert query.message.reply_text.call_args.kwargs["reply_markup"] is not None
     gitleaks_runner.assert_not_called()
 
 
@@ -579,7 +582,10 @@ def test_assessment_prowler_skip_dashboard_handles_message_not_modified() -> Non
             )
         )
 
-    assert query.answer.call_args_list[-1].args[0] == "Assessment dashboard is already shown."
+    assert "Prowler is not applicable" in query.answer.call_args_list[-1].args[0]
+    query.message.reply_text.assert_called_once()
+    assert "Prowler is not applicable" in query.message.reply_text.call_args.args[0]
+    assert query.message.reply_text.call_args.kwargs["reply_markup"] is not None
     prowler_runner.assert_not_called()
 
 

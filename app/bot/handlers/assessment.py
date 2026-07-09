@@ -143,7 +143,7 @@ def build_assessment_dashboard_keyboard(assessment_id: int) -> InlineKeyboardMar
     )
 
 
-async def _safe_edit_assessment_dashboard(query: object, text: str, assessment_id: int) -> None:
+async def _safe_edit_assessment_dashboard(query: object, text: str, assessment_id: int, unchanged_notice: str | None = None) -> None:
     try:
         await query.edit_message_text(
             text,
@@ -151,7 +151,12 @@ async def _safe_edit_assessment_dashboard(query: object, text: str, assessment_i
         )
     except BadRequest as exc:
         if "message is not modified" in str(exc).lower():
-            await query.answer("Assessment dashboard is already shown.")
+            notice = unchanged_notice or "Assessment dashboard is already shown."
+            message = getattr(query, "message", None)
+            reply_text = getattr(message, "reply_text", None)
+            if reply_text is not None and unchanged_notice:
+                await reply_text(notice, reply_markup=build_assessment_dashboard_keyboard(assessment_id))
+            await query.answer(notice)
             return
         raise
 
@@ -410,6 +415,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
             f"{skip_message}\n\n"
             + build_assessment_dashboard_text(assessment, targets, list_assessment_scans(assessment_id)),
             assessment_id,
+            skip_message,
         )
         return
     if tool == "prowler" and target_address.lower() not in {"aws", "azure", "gcp"}:
@@ -422,6 +428,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
             f"{skip_message}\n\n"
             + build_assessment_dashboard_text(assessment, targets, list_assessment_scans(assessment_id)),
             assessment_id,
+            skip_message,
         )
         return
 

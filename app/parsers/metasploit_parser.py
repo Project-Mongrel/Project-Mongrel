@@ -54,6 +54,22 @@ def _looks_like_service_detection(result: dict, text: str) -> bool:
     module = str(result.get("module") or "").lower()
     if "scanner/" not in module:
         return False
+    if module.endswith(("_version", "_banner")) and _contains_any(
+        text,
+        (
+            "http/",
+            "https/",
+            "apache",
+            "nginx",
+            "microsoft-iis",
+            "openssh",
+            "dropbear",
+            "server:",
+            "title:",
+            "powered by",
+        ),
+    ):
+        return True
     detection_terms = (
         "server version",
         "service version",

@@ -59,6 +59,23 @@ def test_metasploit_parser_ssh_version_banner_is_detected_not_vulnerable() -> No
     assert "appears vulnerable" not in lowered
 
 
+def test_metasploit_parser_http_version_banner_is_detected_not_vulnerable() -> None:
+    parsed = parse_metasploit_validation_result(
+        {
+            "success": True,
+            "module": "auxiliary/scanner/http/http_version",
+            "action_type": "auxiliary_validation",
+            "target": "example.com",
+            "port": 80,
+            "output": "[+] 203.0.113.10:80 Apache/2.4.58 (Ubuntu)",
+        }
+    )
+
+    assert parsed["validation_state"] == "DETECTED"
+    assert "service or version metadata" in parsed["summary"]
+    assert "not proof of vulnerability, exploitation, or compromise" in parsed["summary"]
+
+
 def test_metasploit_parser_unknown_success_output_remains_inconclusive() -> None:
     parsed = parse_metasploit_validation_result(
         {

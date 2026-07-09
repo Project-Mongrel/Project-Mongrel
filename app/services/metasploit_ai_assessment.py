@@ -41,6 +41,7 @@ def generate_metasploit_ai_assessment(finding: dict) -> list[str]:
 
 
 def build_metasploit_ai_assessment_prompt(finding: dict) -> str:
+    state_specific_rules = _state_specific_rules(finding)
     return "\n".join(
         [
             "You are a senior security validation consultant preparing Metasploit validation notes for another security consultant.",
@@ -50,12 +51,7 @@ def build_metasploit_ai_assessment_prompt(finding: dict) -> str:
             "- Do not include raw console scripts, raw resource files, huge console dumps, credentials, secrets, or tokens.",
             "- Preserve the exact module, action, target, validation state, and provenance.",
             "- Repeat the supplied Validation State exactly; never translate or upgrade it to another state.",
-            "- DETECTED means service, banner, or version metadata was observed only.",
-            "- DETECTED must never be described as vulnerable, exploited, compromised, or VALIDATED.",
-            '- For DETECTED, say: "This action detected service/banner/key metadata only and did not validate a vulnerability condition."',
-            '- For DETECTED, do not say "did not observe any vulnerabilities", "no vulnerabilities observed", or "no remediation required".',
-            "- Do not infer that a connection is legitimate or unauthorized from an SSH key fingerprint or banner.",
-            "- For DETECTED next actions, neutrally review exposure and authorization if relevant, correlate with Nmap or service inventory, and make no vulnerability conclusion from this result alone.",
+            *state_specific_rules,
             "- Scanner evidence is not automatically proof of exploitation.",
             "- The phrase appears vulnerable remains scanner-reported validation evidence, not proof of full compromise.",
             "- VALIDATED must reflect actual observed validation evidence in the supplied normalized result.",
@@ -121,6 +117,25 @@ def _is_unavailable_response(response: object) -> bool:
 
 def _validation_state(finding: dict) -> str:
     return str((finding.get("metasploit_evidence") or {}).get("validation_state") or "").strip().upper()
+
+
+def _state_specific_rules(finding: dict) -> list[str]:
+    state = _validation_state(finding)
+    if state == "DETECTED":
+        return [
+            "- DETECTED means service, banner, or version metadata was observed only.",
+            "- DETECTED must never be described as vulnerable, exploited, compromised, or VALIDATED.",
+            '- For DETECTED, say: "This action detected service/banner/key metadata only and did not validate a vulnerability condition."',
+            '- For DETECTED, do not say "did not observe any vulnerabilities", "no vulnerabilities observed", or "no remediation required".',
+            "- Do not infer that a connection is legitimate or unauthorized from an SSH key fingerprint or banner.",
+            "- For DETECTED next actions, neutrally review exposure and authorization if relevant, correlate with Nmap or service inventory, and make no vulnerability conclusion from this result alone.",
+        ]
+    if state == "INCONCLUSIVE":
+        return [
+            "- INCONCLUSIVE means no conclusive validation evidence was parsed.",
+            "- For INCONCLUSIVE, do not claim service, banner, version, or key metadata was observed.",
+        ]
+    return []
 
 
 def _unsafe_detected_output(lines: list[str]) -> bool:

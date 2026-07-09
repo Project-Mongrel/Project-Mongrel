@@ -81,6 +81,20 @@ def test_metasploit_ai_prompt_preserves_detected_without_upgrading_it() -> None:
     assert "correlate with Nmap or service inventory" in prompt
 
 
+def test_metasploit_ai_prompt_inconclusive_does_not_claim_metadata_observed() -> None:
+    finding = _finding("INCONCLUSIVE")
+    finding["metasploit_evidence"]["summary"] = "Metasploit output did not provide a conclusive validation result."
+    finding["metasploit_evidence"]["raw_evidence_excerpt"] = "Module completed without structured metadata."
+
+    prompt = build_metasploit_ai_assessment_prompt(finding)
+
+    assert "Validation State: INCONCLUSIVE" in prompt
+    assert "INCONCLUSIVE means no conclusive validation evidence was parsed." in prompt
+    assert "do not claim service, banner, version, or key metadata was observed" in prompt
+    assert "DETECTED means service, banner, or version metadata was observed only." not in prompt
+    assert "This action detected service/banner/key metadata only" not in prompt
+
+
 def test_metasploit_detected_output_replaces_unsafe_ai_wording() -> None:
     unsafe_response = "\n".join(
         [
