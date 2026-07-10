@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
@@ -299,6 +300,8 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
     source_file = normalized.get("source_file") or {}
     truncation = normalized.get("truncation") or {}
     status = "Complete" if normalized.get("success") else "Failed"
+    live_capture = _is_tshark_live_result(result)
+    source_label = "Live Capture" if live_capture else _escape(source_file.get("name") or "uploaded capture")
     lines = [
         section_label("scan", "TShark PCAP Analysis"),
         "",
@@ -306,15 +309,16 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
         _escape(status),
         "",
         "Source File:",
-        _escape(source_file.get("name") or "uploaded capture"),
+        source_label,
         "",
         "Packet / Byte Counts:",
         f"Packets: {int(normalized.get('packet_count') or 0)}",
         f"Bytes: {int(normalized.get('byte_count') or 0)}",
         "",
         "Time Range:",
-        f"Start: {_escape(normalized.get('capture_start') or 'not available')}",
-        f"End: {_escape(normalized.get('capture_end') or 'not available')}",
+        f"Start: {_format_tshark_timestamp(normalized.get('capture_start'), live_capture=live_capture)}",
+        f"End: {_format_tshark_timestamp(normalized.get('capture_end'), live_capture=live_capture)}",
+        *_format_tshark_duration(result, live_capture=live_capture),
         "",
         "Protocols:",
         *_format_tshark_protocols(normalized.get("observed_protocols") or []),
@@ -1246,7 +1250,8 @@ async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 def _format_tshark_protocols(protocols: list[dict]) -> list[str]:
     if not protocols:
         return ["- none observed"]
-    return [f"- {_escape(item.get('protocol'))}: {int(item.get('packet_count') or 0)}" for item in protocols[:8]]
+    ordered = sorted(enumerate(protocols), key=lambda indexed: (_tshark_protocol_rank(indexed[1].get("protocol")), indexed[0]))
+    return [f"- {_escape(item.get('protocol'))}: {int(item.get('packet_count') or 0)}" for _, item in ordered[:8]]
 
 
 def _format_tshark_endpoints(endpoints: list[dict]) -> list[str]:
@@ -1296,9 +1301,12 @@ def _format_tshark_tls(observations: list[dict]) -> list[str]:
 
 
 def _format_tshark_warnings(warnings: list[str], result: dict) -> list[str]:
-    lines = [f"- {_escape(warning)}" for warning in warnings[:5]]
+    unique_warnings = _dedupe_tshark_warnings(warnings)
+    lines = [f"- {_escape(warning)}" for warning in unique_warnings[:5]]
     if result.get("error"):
-        lines.append(f"- {_escape(result.get('error'))}")
+        error = str(result.get("error") or "")
+        if error not in unique_warnings:
+            lines.append(f"- {_escape(error)}")
     return lines or ["- none"]
 
 
@@ -1311,6 +1319,64 @@ def _format_tshark_truncation(truncation: dict) -> list[str]:
 
 def _escape(value: object) -> str:
     return html.escape(str(value or ""), quote=False)
+
+
+def _is_tshark_live_result(result: dict) -> bool:
+    return str(result.get("source") or "") == "tshark_live" or bool(result.get("interface") and result.get("duration_seconds"))
+
+
+def _format_tshark_timestamp(value: object, *, live_capture: bool) -> str:
+    if value in (None, ""):
+        return "not available"
+    if not live_capture:
+        return _escape(value)
+    try:
+        timestamp = float(str(value).strip())
+    except (TypeError, ValueError):
+        return _escape(value)
+    return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _format_tshark_duration(result: dict, *, live_capture: bool) -> list[str]:
+    if not live_capture:
+        return []
+    value = result.get("elapsed_seconds")
+    if value in (None, ""):
+        value = result.get("duration_seconds")
+    try:
+        seconds = max(0.0, float(str(value).strip()))
+    except (TypeError, ValueError):
+        return []
+    return [f"Duration: {seconds:.1f}s"]
+
+
+def _tshark_protocol_rank(protocol: object) -> int:
+    lowered = str(protocol or "").lower()
+    application = ("http", "dns", "tls", "ssl", "quic", "ssh", "smtp", "imap", "pop", "ftp", "smb", "rdp")
+    transport = ("tcp", "udp", "sctp")
+    network = ("ip", "ipv6", "icmp", "arp")
+    link = ("eth", "frame", "data")
+    if any(item in lowered for item in application):
+        return 0
+    if any(item in lowered for item in transport):
+        return 1
+    if any(item in lowered for item in network):
+        return 2
+    if any(item in lowered for item in link):
+        return 3
+    return 4
+
+
+def _dedupe_tshark_warnings(warnings: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique = []
+    for warning in warnings:
+        text = str(warning or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique
 
 
 def _truncate_tshark_card(message: str) -> str:

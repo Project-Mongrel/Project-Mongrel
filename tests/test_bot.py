@@ -4749,6 +4749,48 @@ def _tshark_normalized(success: bool = True) -> dict:
     }
 
 
+def test_tshark_live_result_card_polishes_source_time_duration_protocols_and_warnings() -> None:
+    normalized = _tshark_normalized()
+    normalized["source_file"] = {"name": "mongrel-tshark-live-secret-temp.pcapng", "extension": ".pcapng", "size_bytes": 160}
+    normalized["observed_protocols"] = [
+        {"protocol": "eth", "packet_count": 2},
+        {"protocol": "tcp", "packet_count": 2},
+        {"protocol": "ip", "packet_count": 2},
+        {"protocol": "http", "packet_count": 1},
+        {"protocol": "dns", "packet_count": 1},
+    ]
+    normalized["parser_warnings"] = ["encrypted traffic limits visibility", "encrypted traffic limits visibility", "bounded capture"]
+
+    card = build_tshark_result_text(normalized, {"source": "tshark_live", "elapsed_seconds": 1.24, "duration_seconds": 5})
+
+    assert "Live Capture" in card
+    assert "mongrel-tshark-live-secret-temp.pcapng" not in card
+    assert "Start: 2024-03-09 16:00:00 UTC" in card
+    assert "End: 2024-03-09 16:00:01 UTC" in card
+    assert "Duration: 1.2s" in card
+    assert card.index("- http: 1") < card.index("- tcp: 2")
+    assert card.index("- dns: 1") < card.index("- ip: 2")
+    assert card.count("encrypted traffic limits visibility") == 1
+    assert "Packet activity is not automatically malicious." in card
+    assert "A connection is not compromise." in card
+
+
+def test_tshark_result_card_keeps_endpoint_and_conversation_lists_bounded() -> None:
+    normalized = _tshark_normalized()
+    normalized["observed_endpoints"] = [{"address": f"192.0.2.{index}", "packet_count": index} for index in range(10)]
+    normalized["observed_conversations"] = [
+        {"src": f"192.0.2.{index}", "dst": "198.51.100.20", "src_port": str(53000 + index), "dst_port": "443", "transport": "tcp", "packet_count": 1}
+        for index in range(8)
+    ]
+
+    card = build_tshark_result_text(normalized, {"source": "tshark_live", "elapsed_seconds": 1.0})
+
+    assert "192.0.2.7 packets=7" in card
+    assert "192.0.2.8 packets=8" not in card
+    assert "192.0.2.5:53005" in card
+    assert "192.0.2.6:53006" not in card
+
+
 def test_tshark_scan_callback_prompts_for_upload_or_live_choice() -> None:
     query = SimpleNamespace(data="scan:tshark", answer=AsyncMock(), edit_message_text=AsyncMock())
     context = SimpleNamespace(user_data={})
