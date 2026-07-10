@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     tshark_max_dns_observations: int = 500
     tshark_max_http_observations: int = 500
     tshark_max_tls_observations: int = 500
+    tshark_live_interface_allowlist: str = ""
+    tshark_live_max_duration_seconds: int = 30
+    tshark_live_max_packet_count: int = 500
+    tshark_live_max_file_size_kb: int = 4096
 
 
 @lru_cache
