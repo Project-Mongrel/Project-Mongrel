@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import json
 
 from app.services.assessment_markdown_report import generate_assessment_markdown_report
 
@@ -520,3 +521,78 @@ def test_assessment_markdown_report_includes_metasploit_validation() -> None:
     assert "Artifact Reference: assessment_artifact:10" in report
     assert "Failed, blocked, or not reproduced validation does not mean the target is secure." in report
     assert ("RAW " * 20) not in report
+
+
+def test_assessment_markdown_report_includes_tshark_normalized_evidence_only() -> None:
+    evidence = {
+        "source": "tshark",
+        "execution_status": "completed",
+        "source_file": {"name": "capture.pcap"},
+        "packet_count": 3,
+        "byte_count": 354,
+        "capture_start": "1710000000.1",
+        "capture_end": "1710000002.3",
+        "observed_protocols": [{"protocol": "dns", "packet_count": 1}, {"protocol": "tls", "packet_count": 1}],
+        "observed_endpoints": [{"address": "192.0.2.10", "packet_count": 2}],
+        "observed_conversations": [{"src": "192.0.2.10", "dst": "198.51.100.20", "src_port": "53000", "dst_port": "53", "transport": "udp", "packet_count": 1}],
+        "dns_observations": [{"query_name": "example.com", "response_address": "93.184.216.34"}],
+        "http_observations": [{"method": "GET", "host": "example.com", "uri": "/?token=<REDACTED>", "response_code": "200"}],
+        "tls_observations": [{"sni": "tls.example.com", "version": "0x0303"}],
+        "parser_warnings": ["one malformed row skipped"],
+        "truncation": {"output_truncated": True},
+        "evidence_limitations": [
+            "A packet observation is not malicious by itself.",
+            "A connection is not evidence of compromise by itself.",
+            "A DNS query is not evidence of exfiltration by itself.",
+            "Encrypted traffic limits application visibility.",
+            "Absence from the capture does not prove absence from the network.",
+        ],
+        "output": "raw tshark stdout should not appear",
+    }
+    report = generate_assessment_markdown_report(
+        {
+            "assessment": {
+                "name": "TShark Assessment",
+                "status": "active",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "updated_at": datetime(2026, 1, 2, tzinfo=UTC),
+            },
+            "targets": [{"address": "example.com"}],
+            "scans": [
+                {
+                    "id": 42,
+                    "tool": "tshark",
+                    "status": "completed",
+                    "risk": "info",
+                    "completed_at": datetime(2026, 1, 1, 12, tzinfo=UTC),
+                }
+            ],
+            "findings": [],
+            "artifacts": [
+                {
+                    "id": 7,
+                    "scan_id": 42,
+                    "artifact_type": "tshark_normalized_evidence",
+                    "title": "TShark normalized evidence",
+                    "content": json.dumps(evidence),
+                }
+            ],
+            "notes": [],
+        }
+    )
+
+    assert "### TShark" in report
+    assert "TShark normalized 3 packet metadata observation(s)." in report
+    assert "- TShark: 3 packet metadata observation(s) recorded." in report
+    assert "- Source file: capture.pcap" in report
+    assert "- Packet count: 3" in report
+    assert "- Protocols: dns=1, tls=1" in report
+    assert "query=example.com response=93.184.216.34" in report
+    assert "sni=tls.example.com version=0x0303" in report
+    assert "packet activity is not automatically malicious" in report
+    assert "a connection is not compromise" in report
+    assert "a DNS query is not exfiltration" in report
+    assert "encrypted traffic limits visibility" in report
+    assert "absence from a capture proves nothing" in report
+    assert "raw tshark stdout should not appear" not in report
+    assert "secret-value" not in report

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 
@@ -5,6 +6,8 @@ def generate_assessment_markdown_report(context: dict) -> str:
     assessment = context.get("assessment") or {}
     targets = context.get("targets") or []
     scans = context.get("scans") or []
+    artifacts = context.get("artifacts") or []
+    scans = _attach_tshark_artifacts(scans, artifacts)
     findings = context.get("findings") or []
 
     lines = [
@@ -117,7 +120,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
         return ["No completed or partial scans are recorded yet."]
 
     lines: list[str] = []
-    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks", "prowler", "metasploit"):
+    for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks", "prowler", "metasploit", "tshark"):
         tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
         if not tool_scans:
             continue
@@ -181,6 +184,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         gitleaks_evidence = finding.get("gitleaks_evidence") or {}
         prowler_evidence = finding.get("prowler_evidence") or {}
         metasploit_evidence = finding.get("metasploit_evidence") or {}
+        tshark_evidence = scan.get("tshark_evidence") or finding.get("tshark_evidence") or {}
 
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
@@ -203,6 +207,8 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
             lines.append(f"- {tool}: {int(prowler_evidence.get('finding_count') or 0)} scanner-reported cloud posture check(s) recorded.")
         elif metasploit_evidence:
             lines.append(f"- {tool}: validation state {metasploit_evidence.get('validation_state') or 'unknown'} recorded.")
+        elif tshark_evidence:
+            lines.append(f"- {tool}: {int(tshark_evidence.get('packet_count') or 0)} packet metadata observation(s) recorded.")
         elif observation_counts:
             total = sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
@@ -246,6 +252,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     testssl_evidence = [finding.get("testssl_evidence") for finding in findings if finding.get("testssl_evidence")]
     gitleaks_evidence = [finding.get("gitleaks_evidence") for finding in findings if finding.get("gitleaks_evidence")]
     prowler_evidence = [finding.get("prowler_evidence") for finding in findings if finding.get("prowler_evidence")]
+    tshark_evidence = [scan.get("tshark_evidence") for scan in completed if scan.get("tshark_evidence")]
 
     if open_ports:
         actions.append("- Validate externally exposed services and confirm each service is authorized.")
@@ -276,6 +283,8 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     metasploit_evidence = [finding.get("metasploit_evidence") for finding in findings if finding.get("metasploit_evidence")]
     if metasploit_evidence:
         actions.append("- Review Metasploit validation evidence and preserve proposal/artifact provenance before follow-up testing.")
+    if tshark_evidence:
+        actions.append("- Review TShark PCAP metadata for unexpected endpoints, DNS names, HTTP hosts, and TLS SNI values without treating packet activity as proof of compromise.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -324,6 +333,9 @@ def _scan_summary(scan: dict) -> str:
     if tool == "metasploit":
         evidence = finding.get("metasploit_evidence") or {}
         return f"Metasploit validation state {evidence.get('validation_state') or 'unknown'} recorded." if evidence else "Metasploit completed with no structured validation evidence."
+    if tool == "tshark":
+        evidence = scan.get("tshark_evidence") or finding.get("tshark_evidence") or {}
+        return f"TShark normalized {int(evidence.get('packet_count') or 0)} packet metadata observation(s)." if evidence else "TShark completed with no normalized PCAP evidence."
     return "Completed scan evidence recorded."
 
 
@@ -523,6 +535,10 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             lines.append(f"- Normalized evidence excerpt: {excerpt}")
         return lines
 
+    tshark_evidence = scan.get("tshark_evidence") or finding.get("tshark_evidence") or {}
+    if tshark_evidence:
+        return _format_tshark_observations(tshark_evidence)
+
     if str(scan.get("tool") or "").lower() == "nuclei":
         return ["- No matching findings were observed with the selected template/profile."]
     return ["- No additional structured observations are linked to this scan."]
@@ -699,7 +715,7 @@ def _risk_suffix(scan: dict) -> str:
 
 
 def _tool_label(tool: object) -> str:
-    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh", "gitleaks": "Gitleaks", "prowler": "Prowler", "metasploit": "Metasploit"}
+    labels = {"nmap": "Nmap", "bbot": "BBOT", "nuclei": "Nuclei", "httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf", "testssl": "testssl.sh", "gitleaks": "Gitleaks", "prowler": "Prowler", "metasploit": "Metasploit", "tshark": "TShark"}
     return labels.get(str(tool or "").lower(), _clean(tool or "Unknown"))
 
 
@@ -782,3 +798,80 @@ def _is_notable_testssl_item(item: dict) -> bool:
 
 def _format_count_summary(counts: dict) -> str:
     return ", ".join(f"{_clean(key)}={int(value or 0)}" for key, value in sorted(counts.items())) if counts else "none"
+
+
+def _attach_tshark_artifacts(scans: list[dict], artifacts: list[dict]) -> list[dict]:
+    evidence_by_scan: dict[int, dict] = {}
+    for artifact in artifacts:
+        if str(artifact.get("artifact_type") or "") != "tshark_normalized_evidence":
+            continue
+        scan_id = artifact.get("scan_id")
+        if scan_id is None:
+            continue
+        try:
+            content = json.loads(str(artifact.get("content") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(content, dict):
+            evidence_by_scan[int(scan_id)] = content
+    enriched = []
+    for scan in scans:
+        scan_id = scan.get("id")
+        if scan_id is not None and int(scan_id) in evidence_by_scan:
+            enriched.append({**scan, "tshark_evidence": evidence_by_scan[int(scan_id)]})
+        else:
+            enriched.append(scan)
+    return enriched
+
+
+def _format_tshark_observations(evidence: dict) -> list[str]:
+    source_file = evidence.get("source_file") or {}
+    truncation = evidence.get("truncation") or {}
+    lines = [
+        f"- Source file: {_clean(source_file.get('name') or 'uploaded capture')}",
+        f"- Packet count: {int(evidence.get('packet_count') or 0)}",
+        f"- Byte count: {int(evidence.get('byte_count') or 0)}",
+        f"- Capture start: {_clean(evidence.get('capture_start') or 'not available')}",
+        f"- Capture end: {_clean(evidence.get('capture_end') or 'not available')}",
+        "- Protocols: " + (", ".join(f"{_clean(item.get('protocol'))}={int(item.get('packet_count') or 0)}" for item in (evidence.get("observed_protocols") or [])[:10]) or "none recorded"),
+        "- Limitation: packet activity is not automatically malicious; a connection is not compromise; a DNS query is not exfiltration.",
+        "- Limitation: encrypted traffic limits visibility, and absence from a capture proves nothing about absence from the network.",
+    ]
+    endpoints = evidence.get("observed_endpoints") or []
+    if endpoints:
+        lines.append("- Endpoints:")
+        for item in endpoints[:10]:
+            lines.append(f"  - {_clean(item.get('address') or 'unknown')} packets={int(item.get('packet_count') or 0)}")
+    conversations = evidence.get("observed_conversations") or []
+    if conversations:
+        lines.append("- Conversations:")
+        for item in conversations[:10]:
+            lines.append(
+                f"  - {_clean(item.get('src') or 'unknown')}:{_clean(item.get('src_port') or '')} -> "
+                f"{_clean(item.get('dst') or 'unknown')}:{_clean(item.get('dst_port') or '')} "
+                f"{_clean(item.get('transport') or 'unknown')} packets={int(item.get('packet_count') or 0)}"
+            )
+    dns_observations = evidence.get("dns_observations") or []
+    if dns_observations:
+        lines.append("- DNS metadata:")
+        for item in dns_observations[:10]:
+            lines.append(f"  - query={_clean(item.get('query_name') or 'n/a')} response={_clean(item.get('response_name') or item.get('response_address') or 'n/a')}")
+    http_observations = evidence.get("http_observations") or []
+    if http_observations:
+        lines.append("- HTTP metadata:")
+        for item in http_observations[:10]:
+            lines.append(
+                f"  - {_clean(item.get('method') or 'HTTP')} host={_clean(item.get('host') or 'n/a')} "
+                f"uri={_clean(item.get('uri') or 'n/a')} status={_clean(item.get('response_code') or 'n/a')}"
+            )
+    tls_observations = evidence.get("tls_observations") or []
+    if tls_observations:
+        lines.append("- TLS metadata:")
+        for item in tls_observations[:10]:
+            lines.append(f"  - sni={_clean(item.get('sni') or 'n/a')} version={_clean(item.get('version') or 'n/a')}")
+    active_truncation = [key for key, value in sorted(truncation.items()) if value is True]
+    if active_truncation:
+        lines.append("- Truncation: " + ", ".join(_clean(value) for value in active_truncation))
+    for warning in evidence.get("parser_warnings") or []:
+        lines.append(f"- Parser warning: {_clean(warning)}")
+    return lines
