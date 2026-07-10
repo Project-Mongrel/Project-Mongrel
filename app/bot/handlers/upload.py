@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html
 import json
 import logging
@@ -9,6 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
+from app.core.config import get_settings
 from app.ui.scan_actions import build_scan_result_actions
 from app.ui.result_cards import render_scan_result_card
 from app.bot.handlers.scan import store_parsed_nmap_finding
@@ -21,7 +23,10 @@ from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
 from app.services.icon_helper import section_label
 from app.services.target_normalizer import normalize_target_key
+from app.services.tshark_approval import TSharkApprovalError, approve_tshark_capture, get_tshark_capture_proposal, propose_tshark_capture, reject_tshark_capture
+from app.services.tshark_policy import build_tshark_capture_request
 from app.services.verdict_engine import generate_mongrel_verdict
+from app.tools.tshark_live_runner import check_tshark_live_readiness, run_tshark_live_capture
 from app.tools.tshark_runner import check_tshark_readiness, run_tshark_offline_analysis
 
 UPLOAD_STATE_AWAITING_NMAP_XML = "awaiting_nmap_xml"
@@ -36,6 +41,7 @@ MAX_TSHARK_CARD_LENGTH = 3800
 NUCLEI_SEVERITIES = ("critical", "high", "medium", "low", "info")
 _upload_states: dict[int, str] = {}
 _tshark_assessment_upload_contexts: dict[int, dict] = {}
+_tshark_live_contexts: dict[str, dict] = {}
 _latest_upload_scan_summaries: dict[int, dict] = {}
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,91 @@ def build_tshark_upload_controls() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True)
 
 
+def build_tshark_mode_text() -> str:
+    return (
+        f"{section_label('scan', 'TShark')}\n\n"
+        "Choose how to analyze packet metadata.\n\n"
+        "Upload PCAP uses an existing .pcap or .pcapng file. Live Capture requires explicit approval and uses only configured allowlisted interfaces."
+    )
+
+
+def build_tshark_mode_keyboard(assessment_id: int | None = None) -> InlineKeyboardMarkup:
+    suffix = f":{int(assessment_id)}" if assessment_id is not None else ""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Upload PCAP", callback_data=f"tshark:upload{suffix}")],
+            [InlineKeyboardButton("Live Capture", callback_data=f"tshark:live{suffix}")],
+            [InlineKeyboardButton("Back", callback_data="nav:home" if assessment_id is None else f"assessment:dashboard:{int(assessment_id)}")],
+        ]
+    )
+
+
+def build_tshark_interface_keyboard(interfaces: list[str], assessment_id: int | None = None) -> InlineKeyboardMarkup:
+    action = "iface" if assessment_id is None else f"iface_assessment:{int(assessment_id)}"
+    rows = [[InlineKeyboardButton(interface, callback_data=f"tshark:{action}:{_encode_callback_value(interface)}")] for interface in interfaces[:12]]
+    rows.append([InlineKeyboardButton("Back", callback_data="tshark:choose" if assessment_id is None else f"tshark:choose:{int(assessment_id)}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_tshark_live_proposal_text(proposal: object, *, details: bool = False) -> str:
+    request = getattr(proposal, "request", {}) or {}
+    lines = [
+        f"{section_label('scan', 'TShark Live Capture Proposal')}",
+        "",
+        "Controlled live capture for authorized environments only.",
+        "",
+        "Interface:",
+        _escape(request.get("interface") or "unknown"),
+        "",
+        "Duration:",
+        f"{int(request.get('duration_seconds') or 0)} seconds",
+        "",
+        "Packet Limit:",
+        str(int(request.get("packet_count") or 0)),
+        "",
+        "File Size Limit:",
+        f"{int(request.get('file_size_kb') or 0)} KB",
+        "",
+        "Risk Tier:",
+        _escape(request.get("risk_tier") or "medium"),
+        "",
+        "Expected Effect:",
+        _escape(request.get("expected_effect") or "Bounded packet metadata capture for offline analysis."),
+        "",
+        "Expires:",
+        _escape(getattr(proposal, "expires_at", "")),
+        "",
+        "Approval is required before capture starts. No filters, raw commands, indefinite capture, or background capture are accepted.",
+    ]
+    if details:
+        lines.extend(
+            [
+                "",
+                "Proposal ID:",
+                _escape(getattr(proposal, "id", "")),
+                "",
+                "Status:",
+                _escape(getattr(proposal, "status", "")),
+                "",
+                "Request Fingerprint:",
+                _escape(str(getattr(proposal, "fingerprint", ""))[:16]),
+            ]
+        )
+    return "\n".join(lines)
+
+
+def build_tshark_live_approval_keyboard(proposal_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Approve", callback_data=f"tshark:approve:{proposal_id}"),
+                InlineKeyboardButton("Reject", callback_data=f"tshark:reject:{proposal_id}"),
+            ],
+            [InlineKeyboardButton("Details", callback_data=f"tshark:details:{proposal_id}")],
+        ]
+    )
+
+
 def set_upload_state(user_id: int, state: str) -> None:
     _upload_states[user_id] = state
 
@@ -85,6 +176,10 @@ def get_upload_state(user_id: int) -> str | None:
 def clear_upload_state(user_id: int) -> None:
     _upload_states.pop(user_id, None)
     _tshark_assessment_upload_contexts.pop(user_id, None)
+
+
+def clear_tshark_live_context(proposal_id: str) -> None:
+    _tshark_live_contexts.pop(str(proposal_id), None)
 
 
 def store_latest_upload_scan_summary(user_id: int, finding: dict) -> dict:
@@ -908,6 +1003,207 @@ def _parse_elapsed_seconds(value: object) -> int | None:
         return max(0, int(float(str(value).strip())))
     except (TypeError, ValueError):
         return None
+
+
+def build_tshark_live_interface_text(interfaces: list[str]) -> str:
+    rendered = "\n".join(f"- {_escape(interface)}" for interface in interfaces[:12]) or "- none configured"
+    return (
+        f"{section_label('scan', 'TShark Live Capture')}\n\n"
+        "Choose an allowlisted interface for bounded live capture.\n\n"
+        "Allowlisted interfaces:\n"
+        f"{rendered}\n\n"
+        "No arbitrary capture filters or raw TShark commands are accepted."
+    )
+
+
+def _build_default_live_request(interface: str) -> dict:
+    settings = get_settings()
+    return build_tshark_capture_request(
+        interface=interface,
+        duration_seconds=int(settings.tshark_live_max_duration_seconds),
+        packet_count=int(settings.tshark_live_max_packet_count),
+        file_size_kb=int(settings.tshark_live_max_file_size_kb),
+    )
+
+
+def _normalized_tshark_live_evidence(result: dict) -> dict:
+    normalized = result.get("normalized_evidence") if isinstance(result, dict) else None
+    if isinstance(normalized, dict) and normalized:
+        return normalized
+    error = str((result or {}).get("error") or "TShark live capture did not produce normalized evidence.")
+    return {
+        "source": "tshark",
+        "execution_status": "failed",
+        "success": False,
+        "source_file": {"name": "live capture", "extension": ".pcapng", "size_bytes": 0},
+        "packet_count": 0,
+        "byte_count": 0,
+        "capture_start": None,
+        "capture_end": None,
+        "observed_protocols": [],
+        "observed_endpoints": [],
+        "observed_conversations": [],
+        "dns_observations": [],
+        "http_observations": [],
+        "tls_observations": [],
+        "parser_warnings": [_escape(error)],
+        "truncation": {},
+        "evidence_limitations": [
+            "Packet activity is not automatically malicious.",
+            "A connection is not compromise.",
+            "A DNS query is not exfiltration.",
+            "Encrypted traffic limits visibility.",
+            "Capture scope/time limits conclusions.",
+            "Absence from the capture does not prove absence from the network.",
+        ],
+        "error_type": (result or {}).get("error_type"),
+    }
+
+
+def _parse_optional_int(value: object) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _encode_callback_value(value: str) -> str:
+    encoded = base64.urlsafe_b64encode(str(value).encode("utf-8")).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def _decode_callback_value(value: str) -> str:
+    padded = str(value or "") + ("=" * (-len(str(value or "")) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+
+
+async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    data = str(query.data or "")
+    user_id = update.effective_user.id if update.effective_user is not None else None
+    if user_id is None:
+        await query.edit_message_text("Unable to identify Telegram user.")
+        return
+
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "choose":
+        assessment_id = _parse_optional_int(parts[2] if len(parts) > 2 else None)
+        await query.edit_message_text(build_tshark_mode_text(), reply_markup=build_tshark_mode_keyboard(assessment_id))
+        return
+
+    if action == "upload":
+        assessment_id = _parse_optional_int(parts[2] if len(parts) > 2 else None)
+        clear_upload_state(user_id)
+        set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+        prompt = build_tshark_upload_prompt() + (
+            "\n\nThis TShark assessment action requires an uploaded .pcap or .pcapng artifact. The assessment target is not used as a capture file."
+            if assessment_id is not None
+            else ""
+        )
+        if assessment_id is not None:
+            set_tshark_assessment_upload_context(user_id, {"assessment_id": assessment_id, "user_id": user_id})
+            if query.message is not None:
+                await query.message.reply_text(prompt, reply_markup=build_tshark_upload_controls())
+            await query.edit_message_text("TShark PCAP upload prompt sent. The assessment dashboard remains available above.")
+        else:
+            await query.edit_message_text(prompt)
+        return
+
+    if action == "live":
+        assessment_id = _parse_optional_int(parts[2] if len(parts) > 2 else None)
+        readiness = await asyncio.to_thread(check_tshark_live_readiness)
+        if readiness.get("ready") is not True:
+            await query.edit_message_text(_escape(str(readiness.get("error") or "TShark live capture is not ready.")))
+            return
+        interfaces = [str(interface) for interface in readiness.get("allowed_interfaces") or []]
+        await query.edit_message_text(
+            build_tshark_live_interface_text(interfaces),
+            reply_markup=build_tshark_interface_keyboard(interfaces, assessment_id),
+        )
+        return
+
+    if action in {"iface", "iface_assessment"}:
+        assessment_id = _parse_optional_int(parts[2] if action == "iface_assessment" and len(parts) > 3 else None)
+        encoded_interface = parts[3] if action == "iface_assessment" and len(parts) > 3 else (parts[2] if len(parts) > 2 else "")
+        try:
+            interface = _decode_callback_value(encoded_interface)
+            request = _build_default_live_request(interface)
+            proposal = propose_tshark_capture(user_id, request)
+        except (ValueError, TSharkApprovalError) as exc:
+            await query.edit_message_text(_escape(str(exc)))
+            return
+        _tshark_live_contexts[proposal.id] = {"request": request, "user_id": user_id, "assessment_id": assessment_id}
+        await query.edit_message_text(
+            build_tshark_live_proposal_text(proposal),
+            reply_markup=build_tshark_live_approval_keyboard(proposal.id),
+        )
+        return
+
+    if action == "details":
+        proposal_id = parts[2] if len(parts) > 2 else ""
+        proposal = get_tshark_capture_proposal(proposal_id)
+        if proposal is None:
+            clear_tshark_live_context(proposal_id)
+            await query.edit_message_text("TShark live capture proposal was not found or has expired.")
+            return
+        if proposal.user_id != user_id:
+            await query.edit_message_text("TShark live capture proposal is not available for this user.")
+            return
+        await query.edit_message_text(
+            build_tshark_live_proposal_text(proposal, details=True),
+            reply_markup=build_tshark_live_approval_keyboard(proposal.id),
+        )
+        return
+
+    if action == "reject":
+        proposal_id = parts[2] if len(parts) > 2 else ""
+        try:
+            reject_tshark_capture(proposal_id, user_id=user_id)
+        except TSharkApprovalError as exc:
+            await query.edit_message_text(_escape(str(exc)))
+            return
+        clear_tshark_live_context(proposal_id)
+        clear_upload_state(user_id)
+        await query.edit_message_text("TShark live capture proposal rejected. No capture was run.")
+        return
+
+    if action == "approve":
+        proposal_id = parts[2] if len(parts) > 2 else ""
+        live_context = _tshark_live_contexts.get(proposal_id) or {}
+        request = dict(live_context.get("request") or {})
+        try:
+            approve_tshark_capture(proposal_id, user_id=user_id)
+        except TSharkApprovalError as exc:
+            clear_tshark_live_context(proposal_id)
+            clear_upload_state(user_id)
+            await query.edit_message_text(_escape(str(exc)))
+            return
+        if not request:
+            clear_tshark_live_context(proposal_id)
+            clear_upload_state(user_id)
+            await query.edit_message_text("TShark live capture context is no longer available.")
+            return
+
+        await query.edit_message_text("TShark live capture approved. Running bounded capture...")
+        result = await asyncio.to_thread(run_tshark_live_capture, user_id=user_id, proposal_id=proposal_id, request=request)
+        normalized = _normalized_tshark_live_evidence(result)
+        assessment_id = _parse_optional_int(live_context.get("assessment_id"))
+        if assessment_id is not None:
+            _persist_tshark_assessment_evidence({"assessment_id": assessment_id}, result, normalized)
+        if query.message is not None:
+            await query.message.reply_text(build_tshark_result_text(normalized, result.get("offline_result") or result))
+            if assessment_id is not None:
+                await _send_tshark_assessment_dashboard(query.message, assessment_id)
+        clear_tshark_live_context(proposal_id)
+        clear_upload_state(user_id)
+        return
 
 
 async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

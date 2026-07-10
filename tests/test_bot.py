@@ -2,6 +2,8 @@ import asyncio
 import json
 import re
 import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -98,6 +100,7 @@ from app.bot.handlers.upload import (
     UPLOAD_STATE_AWAITING_NMAP_XML,
     UPLOAD_EXPLAIN_CALLBACK,
     UPLOAD_STATE_AWAITING_TSHARK_PCAP,
+    build_tshark_mode_text,
     build_tshark_result_text,
     build_tshark_upload_prompt,
     build_upload_ai_prompt,
@@ -112,6 +115,7 @@ from app.bot.handlers.upload import (
     set_upload_state,
     store_nuclei_finding,
     store_latest_upload_scan_summary,
+    tshark_callback_handler,
     upload_callback_handler,
     upload_document_handler,
 )
@@ -151,6 +155,7 @@ from app.services.investigation_store import (
 )
 from app.services.metasploit_approval import clear_metasploit_proposals, get_metasploit_proposal
 from app.services.observation_store import add_observation, clear_user_observations, get_investigation_observations, get_user_observations
+from app.services.tshark_approval import clear_tshark_capture_proposals, get_tshark_capture_proposal
 from app.services.chat_state import (
     clear_ai_waiting,
     clear_finding_analysis_context,
@@ -698,7 +703,7 @@ def test_assessment_metasploit_launch_routes_only_to_metasploit_prompt() -> None
     prowler_runner.assert_not_called()
 
 
-def test_assessment_tshark_button_prompts_for_artifact_upload_and_clears_stale_state() -> None:
+def test_assessment_tshark_button_shows_separate_upload_live_choice_and_clears_stale_state() -> None:
     assessment = create_assessment("TShark Assessment")
     add_assessment_target(assessment["id"], address="example.com")
     query = SimpleNamespace(
@@ -718,14 +723,15 @@ def test_assessment_tshark_button_prompts_for_artifact_upload_and_clears_stale_s
 
     assert PENDING_NMAP_REQUEST_KEY not in context.user_data
     assert ASSESSMENT_SCAN_CONTEXT_KEY not in context.user_data
-    assert get_upload_state(8132) == UPLOAD_STATE_AWAITING_TSHARK_PCAP
-    assert get_tshark_assessment_upload_context(8132)["assessment_id"] == assessment["id"]
+    assert get_upload_state(8132) is None
+    assert get_tshark_assessment_upload_context(8132) is None
     query.edit_message_text.assert_not_called()
     query.message.reply_text.assert_called_once()
-    assert "requires an uploaded .pcap or .pcapng artifact" in query.message.reply_text.call_args.args[0]
+    assert query.message.reply_text.call_args.args[0] == build_tshark_mode_text()
     keyboard = query.message.reply_text.call_args.kwargs["reply_markup"]
-    assert [[button.text for button in row] for row in keyboard.keyboard] == [["Cancel"]]
-    assert not hasattr(keyboard, "inline_keyboard")
+    callbacks = {button.text: button.callback_data for row in keyboard.inline_keyboard for button in row}
+    assert callbacks["Upload PCAP"] == f"tshark:upload:{assessment['id']}"
+    assert callbacks["Live Capture"] == f"tshark:live:{assessment['id']}"
 
 
 def test_assessment_dashboard_shows_tshark_button_and_status() -> None:
@@ -4743,14 +4749,17 @@ def _tshark_normalized(success: bool = True) -> dict:
     }
 
 
-def test_tshark_scan_callback_prompts_for_pcap_upload() -> None:
+def test_tshark_scan_callback_prompts_for_upload_or_live_choice() -> None:
     query = SimpleNamespace(data="scan:tshark", answer=AsyncMock(), edit_message_text=AsyncMock())
     context = SimpleNamespace(user_data={})
 
     asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5300)), context))
 
-    assert query.edit_message_text.call_args.args[0] == build_tshark_upload_prompt()
-    assert get_upload_state(5300) == UPLOAD_STATE_AWAITING_TSHARK_PCAP
+    assert query.edit_message_text.call_args.args[0] == build_tshark_mode_text()
+    callbacks = {button.text: button.callback_data for row in query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard for button in row}
+    assert callbacks["Upload PCAP"] == "tshark:upload"
+    assert callbacks["Live Capture"] == "tshark:live"
+    assert get_upload_state(5300) is None
 
 
 def test_scan_menu_includes_tshark_pcap_button() -> None:
@@ -4758,6 +4767,235 @@ def test_scan_menu_includes_tshark_pcap_button() -> None:
     callbacks = {button.text: button.callback_data for row in keyboard.inline_keyboard for button in row}
 
     assert callbacks["TShark PCAP"] == "scan:tshark"
+
+
+def test_tshark_upload_choice_preserves_existing_upload_flow() -> None:
+    query = SimpleNamespace(data="tshark:upload", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5900)), SimpleNamespace()))
+
+    assert query.edit_message_text.call_args.args[0] == build_tshark_upload_prompt()
+    assert "reply_markup" not in query.edit_message_text.call_args.kwargs
+    assert get_upload_state(5900) == UPLOAD_STATE_AWAITING_TSHARK_PCAP
+    assert get_tshark_assessment_upload_context(5900) is None
+    query.message.reply_text.assert_not_called()
+    clear_upload_state(5900)
+
+
+def test_tshark_assessment_upload_choice_uses_separate_cancel_prompt() -> None:
+    assessment = create_assessment("TShark Upload Choice")
+    query = SimpleNamespace(data=f"tshark:upload:{assessment['id']}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5901)), SimpleNamespace()))
+
+    assert get_upload_state(5901) == UPLOAD_STATE_AWAITING_TSHARK_PCAP
+    assert get_tshark_assessment_upload_context(5901)["assessment_id"] == assessment["id"]
+    assert "upload prompt sent" in query.edit_message_text.call_args.args[0].lower()
+    assert "requires an uploaded .pcap or .pcapng artifact" in query.message.reply_text.call_args.args[0]
+    keyboard = query.message.reply_text.call_args.kwargs["reply_markup"]
+    assert [[button.text for button in row] for row in keyboard.keyboard] == [["Cancel"]]
+    clear_upload_state(5901)
+
+
+def test_tshark_live_choice_shows_only_allowlisted_interfaces() -> None:
+    query = SimpleNamespace(data="tshark:live", answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    with patch("app.bot.handlers.upload.check_tshark_live_readiness", return_value={"ready": True, "allowed_interfaces": ["eth0", "lo"]}):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5902)), SimpleNamespace()))
+
+    text = query.edit_message_text.call_args.args[0]
+    callbacks = {button.text: button.callback_data for row in query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard for button in row}
+    assert "eth0" in text
+    assert "lo" in text
+    assert "wlan0" not in text
+    assert callbacks["eth0"] == "tshark:iface:ZXRoMA"
+    assert callbacks["lo"] == "tshark:iface:bG8"
+
+
+def test_tshark_live_readiness_failure_is_sanitized() -> None:
+    query = SimpleNamespace(data="tshark:live", answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    with patch("app.bot.handlers.upload.check_tshark_live_readiness", return_value={"ready": False, "error": "TShark live capture interface allowlist is not configured. <bad>"}):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5910)), SimpleNamespace()))
+
+    assert query.edit_message_text.call_args.args[0] == "TShark live capture interface allowlist is not configured. &lt;bad&gt;"
+
+
+def test_tshark_live_interface_selection_creates_exact_proposal_without_execution() -> None:
+    clear_tshark_capture_proposals()
+    query = SimpleNamespace(data="tshark:iface:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0,lo", tshark_live_max_duration_seconds=7, tshark_live_max_packet_count=11, tshark_live_max_file_size_kb=128)
+
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+        patch("app.bot.handlers.upload.run_tshark_live_capture") as runner,
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5903)), SimpleNamespace()))
+
+    runner.assert_not_called()
+    text = query.edit_message_text.call_args.args[0]
+    callbacks = {button.text: button.callback_data for row in query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard for button in row}
+    proposal_id = callbacks["Approve"].removeprefix("tshark:approve:")
+    proposal = get_tshark_capture_proposal(proposal_id)
+    assert proposal is not None
+    assert proposal.user_id == 5903
+    assert proposal.request["interface"] == "eth0"
+    assert proposal.request["duration_seconds"] == 7
+    assert proposal.request["packet_count"] == 11
+    assert proposal.request["file_size_kb"] == 128
+    assert "Interface:" in text
+    assert "eth0" in text
+    assert "Approval is required before capture starts" in text
+
+
+def test_tshark_live_details_renders_proposal_metadata() -> None:
+    clear_tshark_capture_proposals()
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0", tshark_live_max_duration_seconds=5, tshark_live_max_packet_count=25, tshark_live_max_file_size_kb=512)
+    create_query = SimpleNamespace(data="tshark:iface:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=create_query, effective_user=SimpleNamespace(id=5911)), SimpleNamespace()))
+    proposal_id = create_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    details_query = SimpleNamespace(data=f"tshark:details:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=details_query, effective_user=SimpleNamespace(id=5911)), SimpleNamespace()))
+
+    text = details_query.edit_message_text.call_args.args[0]
+    assert "Proposal ID:" in text
+    assert "Request Fingerprint:" in text
+    assert "Status:" in text
+
+
+def test_tshark_live_approve_runs_bounded_capture_and_cleans_state() -> None:
+    clear_tshark_capture_proposals()
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0", tshark_live_max_duration_seconds=5, tshark_live_max_packet_count=25, tshark_live_max_file_size_kb=512)
+    create_query = SimpleNamespace(data="tshark:iface:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=create_query, effective_user=SimpleNamespace(id=5904)), SimpleNamespace()))
+    proposal_id = create_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    approve_query = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    live_result = {"success": True, "elapsed_seconds": 1.2, "offline_result": {"success": True}, "normalized_evidence": _tshark_normalized()}
+
+    with patch("app.bot.handlers.upload.run_tshark_live_capture", return_value=live_result) as runner:
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5904)), SimpleNamespace()))
+
+    runner.assert_called_once()
+    assert runner.call_args.kwargs["user_id"] == 5904
+    assert runner.call_args.kwargs["proposal_id"] == proposal_id
+    assert runner.call_args.kwargs["request"]["interface"] == "eth0"
+    assert "Running bounded capture" in approve_query.edit_message_text.call_args.args[0]
+    assert "TShark PCAP Analysis" in approve_query.message.reply_text.call_args.args[0]
+    assert get_upload_state(5904) is None
+
+
+def test_tshark_live_reject_wrong_user_expired_and_mutated_request_fail_closed() -> None:
+    clear_tshark_capture_proposals()
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0", tshark_live_max_duration_seconds=5, tshark_live_max_packet_count=25, tshark_live_max_file_size_kb=512)
+    create_query = SimpleNamespace(data="tshark:iface:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=create_query, effective_user=SimpleNamespace(id=5905)), SimpleNamespace()))
+    proposal_id = create_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+
+    reject_query = SimpleNamespace(data=f"tshark:reject:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock())
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=reject_query, effective_user=SimpleNamespace(id=5905)), SimpleNamespace()))
+    assert "rejected" in reject_query.edit_message_text.call_args.args[0].lower()
+
+    create_query = SimpleNamespace(data="tshark:iface:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=create_query, effective_user=SimpleNamespace(id=5906)), SimpleNamespace()))
+    proposal_id = create_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    wrong_user = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    with patch("app.bot.handlers.upload.run_tshark_live_capture") as runner:
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=wrong_user, effective_user=SimpleNamespace(id=9999)), SimpleNamespace()))
+    runner.assert_not_called()
+    assert "denied for user" in wrong_user.edit_message_text.call_args.args[0]
+
+    create_query = SimpleNamespace(data="tshark:iface:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=create_query, effective_user=SimpleNamespace(id=5912)), SimpleNamespace()))
+    proposal_id = create_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    import app.services.tshark_approval as approval_module
+
+    proposal = get_tshark_capture_proposal(proposal_id)
+    approval_module._proposals[proposal_id] = replace(proposal, expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    expired = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    with patch("app.bot.handlers.upload.run_tshark_live_capture") as runner:
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=expired, effective_user=SimpleNamespace(id=5912)), SimpleNamespace()))
+    runner.assert_not_called()
+    assert "not awaiting approval" in expired.edit_message_text.call_args.args[0]
+
+    create_query = SimpleNamespace(data="tshark:iface:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=create_query, effective_user=SimpleNamespace(id=5907)), SimpleNamespace()))
+    proposal_id = create_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    import app.bot.handlers.upload as upload_module
+
+    upload_module._tshark_live_contexts[proposal_id]["request"] = {**upload_module._tshark_live_contexts[proposal_id]["request"], "packet_count": 26}
+    mutated = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    with patch("app.bot.handlers.upload.run_tshark_live_capture", return_value={"success": False, "error_type": "approval_required", "error": "TShark approved capture details changed."}) as runner:
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=mutated, effective_user=SimpleNamespace(id=5907)), SimpleNamespace()))
+    runner.assert_called_once()
+    assert "Failed" in mutated.message.reply_text.call_args.args[0]
+
+
+def test_tshark_assessment_live_success_and_permission_failure_persist_and_cleanup() -> None:
+    clear_tshark_capture_proposals()
+    assessment = create_assessment("TShark Live Assessment")
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0", tshark_live_max_duration_seconds=5, tshark_live_max_packet_count=25, tshark_live_max_file_size_kb=512)
+    create_query = SimpleNamespace(data=f"tshark:iface_assessment:{assessment['id']}:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=create_query, effective_user=SimpleNamespace(id=5908)), SimpleNamespace()))
+    proposal_id = create_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    approve_query = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    live_result = {"success": True, "elapsed_seconds": 1.2, "offline_result": {"success": True}, "normalized_evidence": _tshark_normalized()}
+
+    with patch("app.bot.handlers.upload.run_tshark_live_capture", return_value=live_result):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5908)), SimpleNamespace()))
+
+    scans = list_assessment_scans(assessment["id"])
+    artifacts = list_assessment_artifacts(assessment["id"])
+    assert scans[-1]["tool"] == "tshark"
+    assert scans[-1]["status"] == "completed"
+    assert artifacts[-1]["artifact_type"] == "tshark_normalized_evidence"
+    assert "TShark: Completed" in approve_query.message.reply_text.call_args_list[-1].args[0]
+
+    create_query = SimpleNamespace(data=f"tshark:iface_assessment:{assessment['id']}:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=create_query, effective_user=SimpleNamespace(id=5909)), SimpleNamespace()))
+    proposal_id = create_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    approve_query = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    permission = {"success": False, "error_type": "permission_denied", "error": "TShark live capture could not start with the current interface permissions.", "elapsed_seconds": 0}
+
+    with patch("app.bot.handlers.upload.run_tshark_live_capture", return_value=permission):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5909)), SimpleNamespace()))
+
+    assert list_assessment_scans(assessment["id"])[-1]["status"] == "failed"
+    assert "current interface permissions" in approve_query.message.reply_text.call_args_list[0].args[0]
+    assert "dumpcap" not in approve_query.message.reply_text.call_args_list[0].args[0]
 
 
 def test_valid_tshark_pcap_upload_uses_safe_temp_file_and_cleans_up() -> None:
