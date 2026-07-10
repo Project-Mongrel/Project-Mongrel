@@ -1850,6 +1850,13 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Unable to identify Telegram user.")
         return
 
+    if scan_type == "tshark":
+        from app.bot.handlers.upload import UPLOAD_STATE_AWAITING_TSHARK_PCAP, build_tshark_upload_prompt, set_upload_state
+
+        set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+        await query.edit_message_text(build_tshark_upload_prompt())
+        return
+
     if scan_type == "metasploit":
         readiness = await asyncio.to_thread(check_metasploit_readiness, run_version_check=False)
         if readiness.get("ready") is not True:

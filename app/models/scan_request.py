@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import uuid4
 
-SUPPORTED_SCAN_TYPES: frozenset[str] = frozenset({"nmap", "nuclei", "bbot", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks", "prowler", "metasploit"})
+SUPPORTED_SCAN_TYPES: frozenset[str] = frozenset({"nmap", "nuclei", "bbot", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks", "prowler", "metasploit", "tshark"})
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,5 +1,8 @@
 import asyncio
+import html
 import logging
+import tempfile
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -10,19 +13,24 @@ from app.ui.result_cards import render_scan_result_card
 from app.bot.handlers.scan import store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
+from app.parsers.tshark_parser import normalize_tshark_result
 from app.services.ai_client import ask_ai
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
 from app.services.icon_helper import section_label
 from app.services.target_normalizer import normalize_target_key
 from app.services.verdict_engine import generate_mongrel_verdict
+from app.tools.tshark_runner import check_tshark_readiness, run_tshark_offline_analysis
 
 UPLOAD_STATE_AWAITING_NMAP_XML = "awaiting_nmap_xml"
+UPLOAD_STATE_AWAITING_TSHARK_PCAP = "awaiting_tshark_pcap"
 UPLOAD_EXPLAIN_CALLBACK = "upload:explain_ai"
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
+MAX_TSHARK_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024
 MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY = 10
 MAX_NUCLEI_FINDINGS_IN_REPORT = 10
 MAX_UPLOAD_REPORT_LENGTH = 3800
+MAX_TSHARK_CARD_LENGTH = 3800
 NUCLEI_SEVERITIES = ("critical", "high", "medium", "low", "info")
 _upload_states: dict[int, str] = {}
 _latest_upload_scan_summaries: dict[int, dict] = {}
@@ -35,9 +43,18 @@ def build_upload_text() -> str:
         "- Nmap XML (supported)\n"
         "- Nuclei JSON (supported)\n"
         "- Nuclei JSONL (supported)\n"
+        "- TShark PCAP/PCAPNG (supported via Scan > TShark PCAP)\n"
         "- BBOT (coming soon)\n"
         "- Logs (coming soon)\n\n"
         "Send an Nmap XML or Nuclei results file to begin analysis."
+    )
+
+
+def build_tshark_upload_prompt() -> str:
+    return (
+        f"{section_label('scan', 'TShark PCAP Upload')}\n\n"
+        "Upload a local .pcap or .pcapng file for offline metadata analysis.\n\n"
+        "This uses TShark with -r only. Live capture, interfaces, and arbitrary filters are not supported."
     )
 
 
@@ -163,6 +180,63 @@ def build_nuclei_import_success_text(finding: dict, elapsed: str | None = None) 
             assets=_nuclei_observed_assets(nuclei_findings),
         )
     )
+
+
+def build_tshark_result_text(normalized: dict, result: dict | None = None) -> str:
+    result = result or {}
+    source_file = normalized.get("source_file") or {}
+    truncation = normalized.get("truncation") or {}
+    status = "Complete" if normalized.get("success") else "Failed"
+    lines = [
+        section_label("scan", "TShark PCAP Analysis"),
+        "",
+        "Status:",
+        _escape(status),
+        "",
+        "Source File:",
+        _escape(source_file.get("name") or "uploaded capture"),
+        "",
+        "Packet / Byte Counts:",
+        f"Packets: {int(normalized.get('packet_count') or 0)}",
+        f"Bytes: {int(normalized.get('byte_count') or 0)}",
+        "",
+        "Time Range:",
+        f"Start: {_escape(normalized.get('capture_start') or 'not available')}",
+        f"End: {_escape(normalized.get('capture_end') or 'not available')}",
+        "",
+        "Protocols:",
+        *_format_tshark_protocols(normalized.get("observed_protocols") or []),
+        "",
+        "Endpoints:",
+        *_format_tshark_endpoints(normalized.get("observed_endpoints") or []),
+        "",
+        "Conversations:",
+        *_format_tshark_conversations(normalized.get("observed_conversations") or []),
+        "",
+        "DNS Metadata:",
+        *_format_tshark_dns(normalized.get("dns_observations") or []),
+        "",
+        "HTTP Metadata:",
+        *_format_tshark_http(normalized.get("http_observations") or []),
+        "",
+        "TLS Metadata:",
+        *_format_tshark_tls(normalized.get("tls_observations") or []),
+        "",
+        "Warnings:",
+        *_format_tshark_warnings(normalized.get("parser_warnings") or [], result),
+        "",
+        "Truncation:",
+        *_format_tshark_truncation(truncation),
+        "",
+        "Capture Limitations:",
+        "- Packet activity is not automatically malicious.",
+        "- A connection is not compromise.",
+        "- A DNS query is not exfiltration.",
+        "- Encrypted traffic limits visibility.",
+        "- Capture scope/time limits conclusions.",
+        "- Absence from the capture does not prove absence from the network.",
+    ]
+    return _truncate_tshark_card("\n".join(lines))
 
 
 def _summarize_nuclei_severities(nuclei_findings: list[dict]) -> dict[str, int]:
@@ -617,7 +691,15 @@ async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     user_id = update.effective_user.id if update.effective_user is not None else None
-    if user_id is None or get_upload_state(user_id) != UPLOAD_STATE_AWAITING_NMAP_XML:
+    if user_id is None:
+        return
+
+    upload_state = get_upload_state(user_id)
+    if upload_state == UPLOAD_STATE_AWAITING_TSHARK_PCAP:
+        await _handle_tshark_document_upload(update, user_id)
+        return
+
+    if upload_state != UPLOAD_STATE_AWAITING_NMAP_XML:
         return
 
     document = update.message.document
@@ -675,6 +757,66 @@ async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
+    if update.message is None or update.message.document is None:
+        return
+
+    document = update.message.document
+    file_name = str(document.file_name or "").strip()
+    if not file_name:
+        clear_upload_state(user_id)
+        await update.message.reply_text("TShark upload requires a .pcap or .pcapng filename.")
+        return
+
+    extension = _get_upload_extension(file_name)
+    if extension not in {".pcap", ".pcapng"}:
+        clear_upload_state(user_id)
+        await update.message.reply_text("Please upload a .pcap or .pcapng file for TShark analysis.")
+        return
+
+    if document.file_size is not None and document.file_size > MAX_TSHARK_UPLOAD_SIZE_BYTES:
+        clear_upload_state(user_id)
+        await update.message.reply_text("TShark capture file exceeds maximum size.")
+        return
+
+    readiness = await asyncio.to_thread(check_tshark_readiness, run_version_check=False)
+    if readiness.get("ready") is not True:
+        clear_upload_state(user_id)
+        await update.message.reply_text(_escape(str(readiness.get("error") or "TShark is not ready.")))
+        return
+
+    temp_path: Path | None = None
+    try:
+        telegram_file = await document.get_file()
+        file_bytes = bytes(await telegram_file.download_as_bytearray())
+        if not file_bytes:
+            clear_upload_state(user_id)
+            await update.message.reply_text("TShark capture file is empty.")
+            return
+        if len(file_bytes) > MAX_TSHARK_UPLOAD_SIZE_BYTES:
+            clear_upload_state(user_id)
+            await update.message.reply_text("TShark capture file exceeds maximum size.")
+            return
+
+        handle = tempfile.NamedTemporaryFile(prefix="mongrel-tshark-", suffix=extension, delete=False)
+        try:
+            temp_path = Path(handle.name)
+            handle.write(file_bytes)
+        finally:
+            handle.close()
+
+        result = await asyncio.to_thread(run_tshark_offline_analysis, temp_path)
+        normalized = await asyncio.to_thread(normalize_tshark_result, result)
+        await update.message.reply_text(build_tshark_result_text(normalized, result))
+    finally:
+        clear_upload_state(user_id)
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Unable to remove temporary TShark upload file: %s", temp_path)
+
+
 async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -710,3 +852,80 @@ async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     await query.message.reply_text(ai_response)
+
+
+def _format_tshark_protocols(protocols: list[dict]) -> list[str]:
+    if not protocols:
+        return ["- none observed"]
+    return [f"- {_escape(item.get('protocol'))}: {int(item.get('packet_count') or 0)}" for item in protocols[:8]]
+
+
+def _format_tshark_endpoints(endpoints: list[dict]) -> list[str]:
+    if not endpoints:
+        return ["- none observed"]
+    return [f"- {_escape(item.get('address'))} packets={int(item.get('packet_count') or 0)}" for item in endpoints[:8]]
+
+
+def _format_tshark_conversations(conversations: list[dict]) -> list[str]:
+    if not conversations:
+        return ["- none observed"]
+    lines = []
+    for item in conversations[:6]:
+        src = _escape(item.get("src"))
+        dst = _escape(item.get("dst"))
+        src_port = _escape(item.get("src_port") or "")
+        dst_port = _escape(item.get("dst_port") or "")
+        transport = _escape(item.get("transport") or "unknown")
+        src_label = f"{src}:{src_port}" if src_port else src
+        dst_label = f"{dst}:{dst_port}" if dst_port else dst
+        lines.append(f"- {src_label} -> {dst_label} {transport} packets={int(item.get('packet_count') or 0)}")
+    return lines
+
+
+def _format_tshark_dns(observations: list[dict]) -> list[str]:
+    if not observations:
+        return ["- none observed"]
+    return [
+        f"- query={_escape(item.get('query_name') or 'n/a')} response={_escape(item.get('response_name') or item.get('response_address') or 'n/a')}"
+        for item in observations[:6]
+    ]
+
+
+def _format_tshark_http(observations: list[dict]) -> list[str]:
+    if not observations:
+        return ["- none observed"]
+    return [
+        f"- {_escape(item.get('method') or 'HTTP')} host={_escape(item.get('host') or 'n/a')} uri={_escape(item.get('uri') or 'n/a')} status={_escape(item.get('response_code') or 'n/a')}"
+        for item in observations[:6]
+    ]
+
+
+def _format_tshark_tls(observations: list[dict]) -> list[str]:
+    if not observations:
+        return ["- none observed"]
+    return [f"- sni={_escape(item.get('sni') or 'n/a')} version={_escape(item.get('version') or 'n/a')}" for item in observations[:6]]
+
+
+def _format_tshark_warnings(warnings: list[str], result: dict) -> list[str]:
+    lines = [f"- {_escape(warning)}" for warning in warnings[:5]]
+    if result.get("error"):
+        lines.append(f"- {_escape(result.get('error'))}")
+    return lines or ["- none"]
+
+
+def _format_tshark_truncation(truncation: dict) -> list[str]:
+    active = [key for key, value in sorted(truncation.items()) if value is True]
+    if not active:
+        return ["- none"]
+    return [f"- {_escape(key)}" for key in active]
+
+
+def _escape(value: object) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def _truncate_tshark_card(message: str) -> str:
+    text = str(message or "")
+    if len(text) <= MAX_TSHARK_CARD_LENGTH:
+        return text
+    return f"{text[:MAX_TSHARK_CARD_LENGTH]}\n\n[output truncated]"

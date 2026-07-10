@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -96,6 +97,9 @@ from app.bot.handlers.upload import build_upload_text
 from app.bot.handlers.upload import (
     UPLOAD_STATE_AWAITING_NMAP_XML,
     UPLOAD_EXPLAIN_CALLBACK,
+    UPLOAD_STATE_AWAITING_TSHARK_PCAP,
+    build_tshark_result_text,
+    build_tshark_upload_prompt,
     build_upload_ai_prompt,
     build_nmap_xml_import_success_text,
     build_nuclei_import_success_text,
@@ -1819,6 +1823,10 @@ def test_scan_callback_pattern_routes_metasploit_button_and_actions() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "msf:approve:proposal-id")
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "msf:reject:proposal-id")
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "msf:details:proposal-id")
+
+
+def test_scan_callback_pattern_routes_tshark_button() -> None:
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:tshark")
 
 
 def test_scan_callback_pattern_routes_evidence_vault_actions() -> None:
@@ -4662,6 +4670,191 @@ def test_wrong_file_type_handling() -> None:
     asyncio.run(upload_document_handler(update, SimpleNamespace()))
 
     assert message.reply_text.call_args.args[0] == "Please upload an Nmap XML or Nuclei JSON/JSONL file."
+
+
+def _tshark_upload_update(user_id: int, *, file_name: str | None = "capture.pcap", file_size: int | None = 4, content: bytes = b"pcap") -> SimpleNamespace:
+    telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(content)))
+    document = SimpleNamespace(file_name=file_name, file_size=file_size, get_file=AsyncMock(return_value=telegram_file))
+    message = SimpleNamespace(document=document, reply_text=AsyncMock())
+    return SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id))
+
+
+def _tshark_normalized(success: bool = True) -> dict:
+    return {
+        "success": success,
+        "source_file": {"name": "capture.pcap", "extension": ".pcap", "size_bytes": 4},
+        "packet_count": 2,
+        "byte_count": 160,
+        "capture_start": "1710000000.1",
+        "capture_end": "1710000001.2",
+        "observed_protocols": [{"protocol": "dns", "packet_count": 1}, {"protocol": "tls", "packet_count": 1}],
+        "observed_endpoints": [{"address": "192.0.2.10", "packet_count": 2}, {"address": "198.51.100.20", "packet_count": 1}],
+        "observed_conversations": [{"src": "192.0.2.10", "dst": "198.51.100.20", "src_port": "53000", "dst_port": "53", "transport": "udp", "packet_count": 1}],
+        "dns_observations": [{"query_name": "example.com", "response_address": "93.184.216.34"}],
+        "http_observations": [{"method": "GET", "host": "example.com", "uri": "/?token=<REDACTED>", "response_code": "200"}],
+        "tls_observations": [{"sni": "tls.example.com", "version": "0x0303"}],
+        "parser_warnings": [],
+        "truncation": {"output_truncated": False},
+        "evidence_limitations": [],
+    }
+
+
+def test_tshark_scan_callback_prompts_for_pcap_upload() -> None:
+    query = SimpleNamespace(data="scan:tshark", answer=AsyncMock(), edit_message_text=AsyncMock())
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5300)), context))
+
+    assert query.edit_message_text.call_args.args[0] == build_tshark_upload_prompt()
+    assert get_upload_state(5300) == UPLOAD_STATE_AWAITING_TSHARK_PCAP
+
+
+def test_scan_menu_includes_tshark_pcap_button() -> None:
+    keyboard = build_scan_type_keyboard()
+    callbacks = {button.text: button.callback_data for row in keyboard.inline_keyboard for button in row}
+
+    assert callbacks["TShark PCAP"] == "scan:tshark"
+
+
+def test_valid_tshark_pcap_upload_uses_safe_temp_file_and_cleans_up() -> None:
+    user_id = 5301
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    update = _tshark_upload_update(user_id, file_name="client name.pcap", content=b"pcap-bytes")
+    seen_paths = []
+
+    def fake_runner(path):
+        seen_paths.append(Path(path))
+        assert Path(path).name.startswith("mongrel-tshark-")
+        assert Path(path).suffix == ".pcap"
+        assert Path(path).exists()
+        return {"success": True, "capture_file": str(path), "output": "structured", "command": ["tshark", "-r", str(path)], "error": ""}
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", side_effect=fake_runner) as runner,
+        patch("app.bot.handlers.upload.normalize_tshark_result", return_value=_tshark_normalized()) as parser,
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    runner.assert_called_once()
+    parser.assert_called_once()
+    assert seen_paths and not seen_paths[0].exists()
+    assert get_upload_state(user_id) is None
+    text = update.message.reply_text.call_args.args[0]
+    assert "TShark PCAP Analysis" in text
+    assert "Packets: 2" in text
+    assert "Bytes: 160" in text
+    assert "connection is not compromise" in text.lower()
+
+
+def test_valid_tshark_pcapng_upload_is_accepted() -> None:
+    user_id = 5302
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    update = _tshark_upload_update(user_id, file_name="capture.pcapng", content=b"pcapng")
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", return_value={"success": True, "capture_file": "tmp.pcapng", "output": ""}) as runner,
+        patch("app.bot.handlers.upload.normalize_tshark_result", return_value=_tshark_normalized()),
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    runner.assert_called_once()
+    assert get_upload_state(user_id) is None
+
+
+def test_tshark_upload_rejects_missing_invalid_empty_and_oversized_files() -> None:
+    cases = [
+        (5303, None, 4, b"pcap", "requires a .pcap or .pcapng filename"),
+        (5304, "capture.txt", 4, b"pcap", "Please upload a .pcap or .pcapng file"),
+        (5305, "capture.pcap", 0, b"", "TShark capture file is empty."),
+        (5306, "capture.pcap", 30 * 1024 * 1024, b"pcap", "exceeds maximum size"),
+    ]
+    for user_id, file_name, file_size, content, expected in cases:
+        set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+        update = _tshark_upload_update(user_id, file_name=file_name, file_size=file_size, content=content)
+        with (
+            patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+            patch("app.bot.handlers.upload.run_tshark_offline_analysis") as runner,
+        ):
+            asyncio.run(upload_document_handler(update, SimpleNamespace()))
+        assert expected in update.message.reply_text.call_args.args[0]
+        assert get_upload_state(user_id) is None
+        runner.assert_not_called()
+
+
+def test_tshark_upload_readiness_failure_clears_state_and_does_not_download() -> None:
+    user_id = 5307
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    update = _tshark_upload_update(user_id)
+
+    with patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": False, "error": "TShark is not installed <bad>"}) as readiness:
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    readiness.assert_called_once()
+    update.message.document.get_file.assert_not_called()
+    assert "TShark is not installed &lt;bad&gt;" in update.message.reply_text.call_args.args[0]
+    assert get_upload_state(user_id) is None
+
+
+def test_tshark_upload_runner_failure_and_timeout_render_bounded_card() -> None:
+    user_id = 5308
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    update = _tshark_upload_update(user_id)
+    normalized = _tshark_normalized(success=False)
+    normalized["parser_warnings"] = ["Malformed row <script>"]
+    normalized["truncation"] = {"output_truncated": True, "packets_truncated": True}
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", return_value={"success": False, "error_type": "timeout", "error": "timeout <bad>", "command": ["tshark", "-r", "tmp.pcap"]}),
+        patch("app.bot.handlers.upload.normalize_tshark_result", return_value=normalized),
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "Status:\nFailed" in text
+    assert "Malformed row &lt;script&gt;" in text
+    assert "timeout &lt;bad&gt;" in text
+    assert "output_truncated" in text
+    assert len(text) <= 3820
+    assert get_upload_state(user_id) is None
+
+
+def test_tshark_result_card_escapes_bounds_and_omits_sensitive_content() -> None:
+    normalized = _tshark_normalized()
+    normalized["http_observations"] = [
+        {"method": "GET", "host": "example.com<script>", "uri": "/?token=<REDACTED>", "response_code": "200"},
+        *[{"method": "GET", "host": f"h{index}.example", "uri": "/", "response_code": "200"} for index in range(200)],
+    ]
+
+    text = build_tshark_result_text(normalized, {"error": ""})
+
+    assert "&lt;script&gt;" in text
+    assert "secret-value" not in text
+    assert "authorization" not in text.lower()
+    assert "cookie" not in text.lower()
+    assert "raw hex" not in text.lower()
+    assert "Packet activity is not automatically malicious." in text
+    assert "A DNS query is not exfiltration." in text
+    assert len(text) <= 3820
+
+
+def test_tshark_upload_confirms_no_live_capture_path() -> None:
+    user_id = 5309
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    update = _tshark_upload_update(user_id)
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", return_value={"success": True, "capture_file": "tmp.pcap", "output": "", "command": ["tshark", "-r", "tmp.pcap"]}) as runner,
+        patch("app.bot.handlers.upload.normalize_tshark_result", return_value=_tshark_normalized()),
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    command = runner.return_value["command"]
+    assert "-r" in command
+    assert "-i" not in command
 
 
 def test_malformed_xml_upload_handling() -> None:
