@@ -60,6 +60,9 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         exited_finding_analysis = is_finding_analysis_active(update.effective_user.id)
         clear_finding_analysis_context(update.effective_user.id)
         clear_assessment_flow_state(context)
+        from app.bot.handlers.upload import clear_upload_state
+
+        clear_upload_state(update.effective_user.id)
         if exited_finding_analysis:
             logger.info("Finding analysis ended for user_id=%s", update.effective_user.id)
         cancelled_scan = cancel_active_scan(update.effective_user.id)

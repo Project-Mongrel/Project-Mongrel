@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 import tempfile
 from pathlib import Path
@@ -15,6 +16,7 @@ from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.parsers.tshark_parser import normalize_tshark_result
 from app.services.ai_client import ask_ai
+from app.services.assessment_store import add_assessment_artifact, get_assessment, list_assessment_scans, list_assessment_targets, record_assessment_scan
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
 from app.services.icon_helper import section_label
@@ -33,6 +35,7 @@ MAX_UPLOAD_REPORT_LENGTH = 3800
 MAX_TSHARK_CARD_LENGTH = 3800
 NUCLEI_SEVERITIES = ("critical", "high", "medium", "low", "info")
 _upload_states: dict[int, str] = {}
+_tshark_assessment_upload_contexts: dict[int, dict] = {}
 _latest_upload_scan_summaries: dict[int, dict] = {}
 logger = logging.getLogger(__name__)
 
@@ -62,12 +65,22 @@ def set_upload_state(user_id: int, state: str) -> None:
     _upload_states[user_id] = state
 
 
+def set_tshark_assessment_upload_context(user_id: int, assessment_context: dict) -> None:
+    _tshark_assessment_upload_contexts[user_id] = dict(assessment_context)
+
+
+def get_tshark_assessment_upload_context(user_id: int) -> dict | None:
+    context = _tshark_assessment_upload_contexts.get(user_id)
+    return dict(context) if isinstance(context, dict) else None
+
+
 def get_upload_state(user_id: int) -> str | None:
     return _upload_states.get(user_id)
 
 
 def clear_upload_state(user_id: int) -> None:
     _upload_states.pop(user_id, None)
+    _tshark_assessment_upload_contexts.pop(user_id, None)
 
 
 def store_latest_upload_scan_summary(user_id: int, finding: dict) -> dict:
@@ -762,6 +775,16 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
         return
 
     document = update.message.document
+    assessment_context = get_tshark_assessment_upload_context(user_id)
+    if assessment_context and int(assessment_context.get("user_id") or user_id) != user_id:
+        clear_upload_state(user_id)
+        await update.message.reply_text("TShark assessment upload is not authorized for this Telegram user.")
+        return
+    if assessment_context and get_assessment(int(assessment_context.get("assessment_id") or 0)) is None:
+        clear_upload_state(user_id)
+        await update.message.reply_text("TShark assessment upload context is no longer valid.")
+        return
+
     file_name = str(document.file_name or "").strip()
     if not file_name:
         clear_upload_state(user_id)
@@ -807,7 +830,11 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
 
         result = await asyncio.to_thread(run_tshark_offline_analysis, temp_path)
         normalized = await asyncio.to_thread(normalize_tshark_result, result)
+        if assessment_context:
+            await asyncio.to_thread(_persist_tshark_assessment_evidence, assessment_context, result, normalized)
         await update.message.reply_text(build_tshark_result_text(normalized, result))
+        if assessment_context:
+            await _send_tshark_assessment_dashboard(update.message, int(assessment_context["assessment_id"]))
     finally:
         clear_upload_state(user_id)
         if temp_path is not None:
@@ -815,6 +842,68 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 logger.warning("Unable to remove temporary TShark upload file: %s", temp_path)
+
+
+def _persist_tshark_assessment_evidence(assessment_context: dict, result: dict, normalized: dict) -> None:
+    assessment_id = int(assessment_context["assessment_id"])
+    status = "completed" if result.get("success") is True else "failed"
+    scan = record_assessment_scan(
+        assessment_id=assessment_id,
+        tool="tshark",
+        status=status,
+        elapsed_seconds=_parse_elapsed_seconds(result.get("elapsed_seconds")),
+        raw_reference="assessment_artifact:tshark_normalized_evidence",
+    )
+    add_assessment_artifact(
+        assessment_id=assessment_id,
+        scan_id=scan["id"],
+        artifact_type="tshark_normalized_evidence",
+        title="TShark normalized PCAP evidence",
+        content=json.dumps(_bounded_tshark_artifact_payload(normalized), sort_keys=True),
+        file_path=None,
+    )
+
+
+def _bounded_tshark_artifact_payload(normalized: dict) -> dict:
+    return {
+        "source": "tshark",
+        "execution_status": normalized.get("execution_status"),
+        "success": normalized.get("success"),
+        "source_file": normalized.get("source_file"),
+        "packet_count": normalized.get("packet_count"),
+        "byte_count": normalized.get("byte_count"),
+        "capture_start": normalized.get("capture_start"),
+        "capture_end": normalized.get("capture_end"),
+        "observed_protocols": (normalized.get("observed_protocols") or [])[:20],
+        "observed_endpoints": (normalized.get("observed_endpoints") or [])[:50],
+        "observed_conversations": (normalized.get("observed_conversations") or [])[:50],
+        "dns_observations": (normalized.get("dns_observations") or [])[:50],
+        "http_observations": (normalized.get("http_observations") or [])[:50],
+        "tls_observations": (normalized.get("tls_observations") or [])[:50],
+        "parser_warnings": (normalized.get("parser_warnings") or [])[:20],
+        "truncation": normalized.get("truncation") or {},
+        "evidence_limitations": normalized.get("evidence_limitations") or [],
+        "error_type": normalized.get("error_type"),
+    }
+
+
+async def _send_tshark_assessment_dashboard(message: object, assessment_id: int) -> None:
+    assessment = get_assessment(assessment_id)
+    if assessment is None:
+        return
+    from app.bot.handlers.assessment import build_assessment_dashboard_keyboard, build_assessment_dashboard_text
+
+    await message.reply_text(
+        build_assessment_dashboard_text(assessment, list_assessment_targets(assessment_id), list_assessment_scans(assessment_id)),
+        reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+    )
+
+
+def _parse_elapsed_seconds(value: object) -> int | None:
+    try:
+        return max(0, int(float(str(value).strip())))
+    except (TypeError, ValueError):
+        return None
 
 
 async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

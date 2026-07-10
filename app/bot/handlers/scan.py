@@ -1851,8 +1851,9 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if scan_type == "tshark":
-        from app.bot.handlers.upload import UPLOAD_STATE_AWAITING_TSHARK_PCAP, build_tshark_upload_prompt, set_upload_state
+        from app.bot.handlers.upload import UPLOAD_STATE_AWAITING_TSHARK_PCAP, build_tshark_upload_prompt, clear_upload_state, set_upload_state
 
+        clear_upload_state(user_id)
         set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
         await query.edit_message_text(build_tshark_upload_prompt())
         return

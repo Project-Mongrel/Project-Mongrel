@@ -107,6 +107,7 @@ from app.bot.handlers.upload import (
     clear_latest_upload_scan_summary,
     clear_upload_state,
     get_latest_upload_scan_summary,
+    get_tshark_assessment_upload_context,
     get_upload_state,
     set_upload_state,
     store_nuclei_finding,
@@ -238,6 +239,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "Gitleaks: Not run" in dashboard
     assert "Prowler: Not run" in dashboard
     assert "Metasploit: Not run" in dashboard
+    assert "TShark: Not run" in dashboard
     assert rendered_buttons == [
         "Run Nmap",
         "Run BBOT",
@@ -250,6 +252,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
         "Run Gitleaks",
         "Run Prowler",
         "Run Metasploit",
+        "Run TShark",
         "Ask Mongrel",
         "Generate AI Report",
         "Markdown Report",
@@ -693,6 +696,44 @@ def test_assessment_metasploit_launch_routes_only_to_metasploit_prompt() -> None
     assert message.reply_text.call_args.args[0] == build_metasploit_request_prompt()
     assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["tool"] == "metasploit"
     prowler_runner.assert_not_called()
+
+
+def test_assessment_tshark_button_prompts_for_artifact_upload_and_clears_stale_state() -> None:
+    assessment = create_assessment("TShark Assessment")
+    add_assessment_target(assessment["id"], address="example.com")
+    query = SimpleNamespace(
+        data=f"assessment:run:tshark:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: "stale", ASSESSMENT_SCAN_CONTEXT_KEY: {"tool": "prowler"}})
+
+    asyncio.run(
+        assessment_callback_handler(
+            SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8132)),
+            context,
+        )
+    )
+
+    assert PENDING_NMAP_REQUEST_KEY not in context.user_data
+    assert ASSESSMENT_SCAN_CONTEXT_KEY not in context.user_data
+    assert get_upload_state(8132) == UPLOAD_STATE_AWAITING_TSHARK_PCAP
+    assert get_tshark_assessment_upload_context(8132)["assessment_id"] == assessment["id"]
+    assert "requires an uploaded .pcap or .pcapng artifact" in query.edit_message_text.call_args.args[0]
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert any(button.text == "Run TShark" for row in keyboard.inline_keyboard for button in row)
+
+
+def test_assessment_dashboard_shows_tshark_button_and_status() -> None:
+    assessment = create_assessment("TShark Dashboard")
+    record_assessment_scan(assessment["id"], tool="tshark", status="completed", elapsed_seconds=2)
+    dashboard = build_assessment_dashboard_text(assessment, [{"address": "example.com"}], list_assessment_scans(assessment["id"]))
+    keyboard = build_assessment_dashboard_keyboard(assessment["id"])
+    buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "TShark: Completed" in dashboard
+    assert "Run TShark" in buttons
 
 
 def test_assessment_history_callback_lists_recorded_scans() -> None:
@@ -4761,6 +4802,124 @@ def test_valid_tshark_pcapng_upload_is_accepted() -> None:
 
     runner.assert_called_once()
     assert get_upload_state(user_id) is None
+
+
+def test_valid_tshark_assessment_upload_records_scan_artifact_and_dashboard() -> None:
+    user_id = 5310
+    assessment = create_assessment("Assessment PCAP")
+    add_assessment_target(assessment["id"], address="example.com")
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    from app.bot.handlers.upload import set_tshark_assessment_upload_context
+
+    set_tshark_assessment_upload_context(user_id, {"assessment_id": assessment["id"], "user_id": user_id})
+    update = _tshark_upload_update(user_id, file_name="capture.pcap", content=b"pcap")
+    runner_paths = []
+
+    def fake_runner(path):
+        runner_paths.append(str(path))
+        return {"success": True, "capture_file": str(path), "output": "structured", "command": ["tshark", "-r", str(path)], "elapsed_seconds": 1.4}
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", side_effect=fake_runner),
+        patch("app.bot.handlers.upload.normalize_tshark_result", return_value=_tshark_normalized()),
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    scans = list_assessment_scans(assessment["id"])
+    artifacts = list_assessment_artifacts(assessment["id"])
+    assert scans[0]["tool"] == "tshark"
+    assert scans[0]["status"] == "completed"
+    assert scans[0]["target_id"] is None
+    assert artifacts[0]["artifact_type"] == "tshark_normalized_evidence"
+    assert artifacts[0]["scan_id"] == scans[0]["id"]
+    assert '"packet_count": 2' in artifacts[0]["content"]
+    assert runner_paths and "example.com" not in runner_paths[0]
+    assert "-i" not in str(update.message.reply_text.call_args_list[0].args[0])
+    assert "TShark PCAP Analysis" in update.message.reply_text.call_args_list[0].args[0]
+    assert "TShark: Completed" in update.message.reply_text.call_args_list[-1].args[0]
+    assert get_upload_state(user_id) is None
+    assert get_tshark_assessment_upload_context(user_id) is None
+
+
+def test_tshark_assessment_upload_failure_records_failed_scan_and_artifact() -> None:
+    user_id = 5311
+    assessment = create_assessment("Assessment PCAP Failure")
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    from app.bot.handlers.upload import set_tshark_assessment_upload_context
+
+    set_tshark_assessment_upload_context(user_id, {"assessment_id": assessment["id"], "user_id": user_id})
+    update = _tshark_upload_update(user_id, file_name="capture.pcap", content=b"pcap")
+    normalized = _tshark_normalized(success=False)
+    normalized["error_type"] = "timeout"
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", return_value={"success": False, "capture_file": "tmp.pcap", "output": "", "error_type": "timeout", "error": "timeout", "elapsed_seconds": 2}),
+        patch("app.bot.handlers.upload.normalize_tshark_result", return_value=normalized),
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    scans = list_assessment_scans(assessment["id"])
+    artifacts = list_assessment_artifacts(assessment["id"])
+    assert scans[0]["tool"] == "tshark"
+    assert scans[0]["status"] == "failed"
+    assert artifacts[0]["artifact_type"] == "tshark_normalized_evidence"
+    assert '"error_type": "timeout"' in artifacts[0]["content"]
+    assert "TShark: Failed" in update.message.reply_text.call_args_list[-1].args[0]
+
+
+def test_tshark_assessment_upload_wrong_user_and_missing_assessment_are_blocked() -> None:
+    from app.bot.handlers.upload import set_tshark_assessment_upload_context
+
+    set_upload_state(5312, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    set_tshark_assessment_upload_context(5312, {"assessment_id": 999999, "user_id": 5312})
+    update = _tshark_upload_update(5312, file_name="capture.pcap", content=b"pcap")
+    with patch("app.bot.handlers.upload.run_tshark_offline_analysis") as runner:
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+    assert "context is no longer valid" in update.message.reply_text.call_args.args[0]
+    runner.assert_not_called()
+    assert get_upload_state(5312) is None
+
+    set_upload_state(5313, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    set_tshark_assessment_upload_context(5313, {"assessment_id": create_assessment("Wrong User")["id"], "user_id": 9999})
+    update = _tshark_upload_update(5313, file_name="capture.pcap", content=b"pcap")
+    with patch("app.bot.handlers.upload.run_tshark_offline_analysis") as runner:
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+    assert "not authorized" in update.message.reply_text.call_args.args[0]
+    runner.assert_not_called()
+    assert get_upload_state(5313) is None
+
+
+def test_tshark_standalone_upload_remains_unbound_to_assessment() -> None:
+    user_id = 5314
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    update = _tshark_upload_update(user_id, file_name="capture.pcap", content=b"pcap")
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", return_value={"success": True, "capture_file": "tmp.pcap", "output": "", "command": ["tshark", "-r", "tmp.pcap"]}),
+        patch("app.bot.handlers.upload.normalize_tshark_result", return_value=_tshark_normalized()),
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    assert "TShark PCAP Analysis" in update.message.reply_text.call_args.args[0]
+    assert not list_assessment_scans(create_assessment("No TShark Link")["id"])
+
+
+def test_tshark_assessment_upload_cancel_clears_state() -> None:
+    from app.bot.handlers.upload import set_tshark_assessment_upload_context
+
+    user_id = 5315
+    assessment = create_assessment("Cancel PCAP")
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    set_tshark_assessment_upload_context(user_id, {"assessment_id": assessment["id"], "user_id": user_id})
+    message = SimpleNamespace(text="Cancel", reply_text=AsyncMock())
+
+    asyncio.run(cancel_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id)), SimpleNamespace(user_data={})))
+
+    assert get_upload_state(user_id) is None
+    assert get_tshark_assessment_upload_context(user_id) is None
+    assert "Ask Mongrel session closed." in message.reply_text.call_args.args[0]
 
 
 def test_tshark_upload_rejects_missing_invalid_empty_and_oversized_files() -> None:

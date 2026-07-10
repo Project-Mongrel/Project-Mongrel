@@ -110,6 +110,7 @@ def build_assessment_dashboard_text(assessment: dict, targets: list[dict] | None
             f"Gitleaks: {scan_status['gitleaks']}",
             f"Prowler: {scan_status['prowler']}",
             f"Metasploit: {scan_status['metasploit']}",
+            f"TShark: {scan_status['tshark']}",
         ]
     )
 
@@ -130,6 +131,7 @@ def build_assessment_dashboard_keyboard(assessment_id: int) -> InlineKeyboardMar
             [InlineKeyboardButton("Run Gitleaks", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:gitleaks:{assessment_id}")],
             [InlineKeyboardButton("Run Prowler", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:prowler:{assessment_id}")],
             [InlineKeyboardButton("Run Metasploit", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:metasploit:{assessment_id}")],
+            [InlineKeyboardButton("Run TShark", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:tshark:{assessment_id}")],
             [
                 InlineKeyboardButton("Ask Mongrel", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ask:{assessment_id}"),
                 InlineKeyboardButton("Generate AI Report", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ai_report:{assessment_id}"),
@@ -402,14 +404,31 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 
     tool = parts[2]
     targets = list_assessment_targets(assessment_id)
-    if not targets:
-        await query.edit_message_text("Assessment has no target configured.")
-        return
 
     user_id = update.effective_user.id if update.effective_user is not None else None
     message = getattr(query, "message", None)
     if user_id is None or message is None:
         await query.edit_message_text("Unable to launch assessment scan.")
+        return
+
+    if tool == "tshark":
+        from app.bot.handlers.upload import UPLOAD_STATE_AWAITING_TSHARK_PCAP, build_tshark_upload_prompt, clear_upload_state, set_tshark_assessment_upload_context, set_upload_state
+        from app.bot.handlers.scan import PENDING_NMAP_REQUEST_KEY
+
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        context.user_data.pop(ASSESSMENT_SCAN_CONTEXT_KEY, None)
+        clear_upload_state(user_id)
+        set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+        set_tshark_assessment_upload_context(user_id, {"assessment_id": assessment_id, "user_id": user_id})
+        await query.edit_message_text(
+            build_tshark_upload_prompt()
+            + "\n\nThis TShark assessment action requires an uploaded .pcap or .pcapng artifact. The assessment target is not used as a capture file.",
+            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+        )
+        return
+
+    if not targets:
+        await query.edit_message_text("Assessment has no target configured.")
         return
 
     target = targets[0]
@@ -505,7 +524,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 
 
 def _scan_statuses(scans: list[dict]) -> dict[str, str]:
-    statuses = {"nmap": "Not run", "bbot": "Not run", "nuclei": "Not run", "httpx": "Not run", "katana": "Not run", "playwright": "Not run", "ffuf": "Not run", "testssl": "Not run", "gitleaks": "Not run", "prowler": "Not run", "metasploit": "Not run"}
+    statuses = {"nmap": "Not run", "bbot": "Not run", "nuclei": "Not run", "httpx": "Not run", "katana": "Not run", "playwright": "Not run", "ffuf": "Not run", "testssl": "Not run", "gitleaks": "Not run", "prowler": "Not run", "metasploit": "Not run", "tshark": "Not run"}
     for scan in scans:
         tool = str(scan.get("tool") or "").lower()
         if tool in statuses:
