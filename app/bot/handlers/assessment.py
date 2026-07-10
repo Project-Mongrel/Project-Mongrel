@@ -412,7 +412,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     if tool == "tshark":
-        from app.bot.handlers.upload import UPLOAD_STATE_AWAITING_TSHARK_PCAP, build_tshark_upload_prompt, clear_upload_state, set_tshark_assessment_upload_context, set_upload_state
+        from app.bot.handlers.upload import UPLOAD_STATE_AWAITING_TSHARK_PCAP, build_tshark_upload_controls, build_tshark_upload_prompt, clear_upload_state, set_tshark_assessment_upload_context, set_upload_state
         from app.bot.handlers.scan import PENDING_NMAP_REQUEST_KEY
 
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
@@ -420,10 +420,10 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         clear_upload_state(user_id)
         set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
         set_tshark_assessment_upload_context(user_id, {"assessment_id": assessment_id, "user_id": user_id})
-        await query.edit_message_text(
+        await message.reply_text(
             build_tshark_upload_prompt()
             + "\n\nThis TShark assessment action requires an uploaded .pcap or .pcapng artifact. The assessment target is not used as a capture file.",
-            reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+            reply_markup=build_tshark_upload_controls(),
         )
         return
 

@@ -5,7 +5,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
@@ -59,6 +59,10 @@ def build_tshark_upload_prompt() -> str:
         "Upload a local .pcap or .pcapng file for offline metadata analysis.\n\n"
         "This uses TShark with -r only. Live capture, interfaces, and arbitrary filters are not supported."
     )
+
+
+def build_tshark_upload_controls() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True)
 
 
 def set_upload_state(user_id: int, state: str) -> None:

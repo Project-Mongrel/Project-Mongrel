@@ -720,9 +720,12 @@ def test_assessment_tshark_button_prompts_for_artifact_upload_and_clears_stale_s
     assert ASSESSMENT_SCAN_CONTEXT_KEY not in context.user_data
     assert get_upload_state(8132) == UPLOAD_STATE_AWAITING_TSHARK_PCAP
     assert get_tshark_assessment_upload_context(8132)["assessment_id"] == assessment["id"]
-    assert "requires an uploaded .pcap or .pcapng artifact" in query.edit_message_text.call_args.args[0]
-    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
-    assert any(button.text == "Run TShark" for row in keyboard.inline_keyboard for button in row)
+    query.edit_message_text.assert_not_called()
+    query.message.reply_text.assert_called_once()
+    assert "requires an uploaded .pcap or .pcapng artifact" in query.message.reply_text.call_args.args[0]
+    keyboard = query.message.reply_text.call_args.kwargs["reply_markup"]
+    assert [[button.text for button in row] for row in keyboard.keyboard] == [["Cancel"]]
+    assert not hasattr(keyboard, "inline_keyboard")
 
 
 def test_assessment_dashboard_shows_tshark_button_and_status() -> None:
