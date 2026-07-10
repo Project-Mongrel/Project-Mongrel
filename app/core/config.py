@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     # Set METASPLOIT_BINARY to the absolute msfconsole path on VPS installs when it is not on PATH.
     metasploit_binary: str = "msfconsole"
     metasploit_timeout_seconds: int = 300
+    tshark_binary: str = "tshark"
+    tshark_timeout_seconds: int = 120
+    tshark_max_output_bytes: int = 2_000_000
+    tshark_max_packets_normalized: int = 5000
+    tshark_max_unique_endpoints: int = 500
+    tshark_max_conversations: int = 1000
+    tshark_max_dns_observations: int = 500
+    tshark_max_http_observations: int = 500
+    tshark_max_tls_observations: int = 500
 
 
 @lru_cache
