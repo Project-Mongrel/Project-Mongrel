@@ -301,7 +301,7 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
     truncation = normalized.get("truncation") or {}
     status = "Complete" if normalized.get("success") else "Failed"
     live_capture = _is_tshark_live_result(result)
-    source_label = "Live Capture" if live_capture else _escape(source_file.get("name") or "uploaded capture")
+    source_label = "Live Capture" if live_capture else _escape(result.get("uploaded_filename") or source_file.get("name") or "uploaded capture")
     lines = [
         section_label("scan", "TShark PCAP Analysis"),
         "",
@@ -316,9 +316,9 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
         f"Bytes: {int(normalized.get('byte_count') or 0)}",
         "",
         "Time Range:",
-        f"Start: {_format_tshark_timestamp(normalized.get('capture_start'), live_capture=live_capture)}",
-        f"End: {_format_tshark_timestamp(normalized.get('capture_end'), live_capture=live_capture)}",
-        *_format_tshark_duration(result, live_capture=live_capture),
+        f"Start: {_format_tshark_timestamp(normalized.get('capture_start'))}",
+        f"End: {_format_tshark_timestamp(normalized.get('capture_end'))}",
+        *_format_tshark_duration(result, normalized, live_capture=live_capture),
         "",
         "Protocols:",
         *_format_tshark_protocols(normalized.get("observed_protocols") or []),
@@ -935,7 +935,8 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
         normalized = await asyncio.to_thread(normalize_tshark_result, result)
         if assessment_context:
             await asyncio.to_thread(_persist_tshark_assessment_evidence, assessment_context, result, normalized)
-        await update.message.reply_text(build_tshark_result_text(normalized, result))
+        display_result = {**result, "uploaded_filename": _safe_uploaded_filename(file_name)}
+        await update.message.reply_text(build_tshark_result_text(normalized, display_result))
         if assessment_context:
             await _send_tshark_assessment_dashboard(update.message, int(assessment_context["assessment_id"]))
     finally:
@@ -1279,9 +1280,10 @@ def _format_tshark_conversations(conversations: list[dict]) -> list[str]:
 def _format_tshark_dns(observations: list[dict]) -> list[str]:
     if not observations:
         return ["- none observed"]
+    deduped = _dedupe_tshark_dns(observations)
     return [
         f"- query={_escape(item.get('query_name') or 'n/a')} response={_escape(item.get('response_name') or item.get('response_address') or 'n/a')}"
-        for item in observations[:6]
+        for item in deduped[:6]
     ]
 
 
@@ -1297,7 +1299,7 @@ def _format_tshark_http(observations: list[dict]) -> list[str]:
 def _format_tshark_tls(observations: list[dict]) -> list[str]:
     if not observations:
         return ["- none observed"]
-    return [f"- sni={_escape(item.get('sni') or 'n/a')} version={_escape(item.get('version') or 'n/a')}" for item in observations[:6]]
+    return [f"- sni={_escape(item.get('sni') or 'n/a')} version={_escape(_format_tshark_tls_version(item.get('version')))}" for item in observations[:6]]
 
 
 def _format_tshark_warnings(warnings: list[str], result: dict) -> list[str]:
@@ -1325,11 +1327,9 @@ def _is_tshark_live_result(result: dict) -> bool:
     return str(result.get("source") or "") == "tshark_live" or bool(result.get("interface") and result.get("duration_seconds"))
 
 
-def _format_tshark_timestamp(value: object, *, live_capture: bool) -> str:
+def _format_tshark_timestamp(value: object) -> str:
     if value in (None, ""):
         return "not available"
-    if not live_capture:
-        return _escape(value)
     try:
         timestamp = float(str(value).strip())
     except (TypeError, ValueError):
@@ -1337,12 +1337,12 @@ def _format_tshark_timestamp(value: object, *, live_capture: bool) -> str:
     return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _format_tshark_duration(result: dict, *, live_capture: bool) -> list[str]:
-    if not live_capture:
-        return []
+def _format_tshark_duration(result: dict, normalized: dict, *, live_capture: bool) -> list[str]:
     value = result.get("elapsed_seconds")
-    if value in (None, ""):
+    if value in (None, "") and live_capture:
         value = result.get("duration_seconds")
+    if value in (None, ""):
+        value = _capture_duration_from_timestamps(normalized.get("capture_start"), normalized.get("capture_end"))
     try:
         seconds = max(0.0, float(str(value).strip()))
     except (TypeError, ValueError):
@@ -1377,6 +1377,48 @@ def _dedupe_tshark_warnings(warnings: list[str]) -> list[str]:
         seen.add(text)
         unique.append(text)
     return unique
+
+
+def _dedupe_tshark_dns(observations: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str, str]] = set()
+    unique = []
+    for item in observations:
+        key = (
+            str(item.get("query_name") or ""),
+            str(item.get("response_name") or ""),
+            str(item.get("response_address") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _format_tshark_tls_version(version: object) -> str:
+    raw = str(version or "n/a").strip()
+    versions = {
+        "0x0301": "TLS 1.0",
+        "0x0302": "TLS 1.1",
+        "0x0303": "TLS 1.2",
+        "0x0304": "TLS 1.3",
+    }
+    return versions.get(raw.lower(), raw or "n/a")
+
+
+def _capture_duration_from_timestamps(start: object, end: object) -> float | None:
+    try:
+        return float(str(end).strip()) - float(str(start).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_uploaded_filename(file_name: object) -> str:
+    name = str(file_name or "").replace("\\", "/").split("/")[-1].strip()
+    if not name:
+        return "uploaded capture"
+    cleaned = "".join(character for character in name if character.isprintable()).strip()
+    return cleaned[:160] or "uploaded capture"
 
 
 def _truncate_tshark_card(message: str) -> str:

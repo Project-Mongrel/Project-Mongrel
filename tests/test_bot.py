@@ -4791,6 +4791,48 @@ def test_tshark_result_card_keeps_endpoint_and_conversation_lists_bounded() -> N
     assert "192.0.2.6:53006" not in card
 
 
+def test_tshark_offline_result_card_uses_uploaded_filename_readable_time_duration_dns_tls_and_escaping() -> None:
+    normalized = _tshark_normalized()
+    normalized["source_file"] = {"name": "mongrel-tshark-temp-123.pcap", "extension": ".pcap", "size_bytes": 160}
+    normalized["dns_observations"] = [
+        {"query_name": "<Root>", "response_address": "192.0.2.10"},
+        {"query_name": "<Root>", "response_address": "192.0.2.10"},
+        {"query_name": "example.com", "response_address": "198.51.100.20"},
+    ]
+    normalized["tls_observations"] = [{"sni": "<Root>", "version": "0x0303"}]
+
+    card = build_tshark_result_text(normalized, {"uploaded_filename": "../Client <Root>.pcap"})
+
+    assert "Client &lt;Root&gt;.pcap" in card
+    assert "mongrel-tshark-temp-123.pcap" not in card
+    assert "Start: 2024-03-09 16:00:00 UTC" in card
+    assert "End: 2024-03-09 16:00:01 UTC" in card
+    assert "Duration: 1.1s" in card
+    assert card.count("query=&lt;Root&gt; response=192.0.2.10") == 1
+    assert "sni=&lt;Root&gt; version=TLS 1.2" in card
+    assert normalized["tls_observations"][0]["version"] == "0x0303"
+
+
+def test_tshark_offline_upload_result_card_uses_original_safe_filename_not_temp_file() -> None:
+    user_id = 5920
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    update = _tshark_upload_update(user_id, file_name="nested/Client <Root>.pcap", content=b"pcap")
+    normalized = _tshark_normalized()
+    normalized["source_file"] = {"name": "mongrel-tshark-generated.pcap", "extension": ".pcap", "size_bytes": 4}
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", return_value={"success": True, "capture_file": "mongrel-tshark-generated.pcap", "output": ""}),
+        patch("app.bot.handlers.upload.normalize_tshark_result", return_value=normalized),
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    card = update.message.reply_text.call_args.args[0]
+    assert "Client &lt;Root&gt;.pcap" in card
+    assert "mongrel-tshark-generated.pcap" not in card
+    assert get_upload_state(user_id) is None
+
+
 def test_tshark_scan_callback_prompts_for_upload_or_live_choice() -> None:
     query = SimpleNamespace(data="scan:tshark", answer=AsyncMock(), edit_message_text=AsyncMock())
     context = SimpleNamespace(user_data={})
