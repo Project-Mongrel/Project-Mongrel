@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 # Required to run authorized local ffuf subprocesses.
 import subprocess  # nosec B404
@@ -15,6 +16,10 @@ FFUF_NOT_AVAILABLE_ERROR = "ffuf executable was not found."
 FFUF_TIMEOUT_ERROR = "ffuf hidden-content discovery timed out."
 FFUF_WORDLIST_MISSING_ERROR = "ffuf wordlist was not found."
 DEFAULT_FFUF_WORDLIST = Path("app/resources/wordlists/ffuf_default.txt")
+FFUF_MATCH_STATUS_CODES = "200-299,300-399,401,403,405,407,409,429,500-599"
+MAX_FFUF_THREADS = 50
+MAX_FFUF_RATE_LIMIT = 500
+SAFE_FFUF_EXTENSION_PATTERN = re.compile(r"^\.[A-Za-z0-9]{1,16}$")
 
 
 def run_ffuf_scan(target: str) -> dict[str, object]:
@@ -55,13 +60,28 @@ def run_ffuf_scan(target: str) -> dict[str, object]:
         )
 
     fuzz_url = _build_fuzz_url(validated_target)
-    command = _build_ffuf_command(
-        executable,
-        fuzz_url,
-        wordlist_path,
-        threads=settings.ffuf_threads,
-        rate_limit=settings.ffuf_rate_limit,
-    )
+    try:
+        command = _build_ffuf_command(
+            executable,
+            fuzz_url,
+            wordlist_path,
+            threads=settings.ffuf_threads,
+            rate_limit=settings.ffuf_rate_limit,
+            extensions=settings.ffuf_extensions,
+        )
+    except ValueError as exc:
+        return _result(
+            target=validated_target,
+            success=False,
+            error=str(exc),
+            error_type="invalid_configuration",
+            elapsed_seconds=0,
+            command=None,
+            working_directory=working_directory,
+            wordlist_path=wordlist_path,
+            wordlist_count=wordlist_count,
+            fuzz_url=fuzz_url,
+        )
     start_time = time.monotonic()
     logger.info("ffuf scan started: target=%s timeout=%s wordlist_count=%s", validated_target, settings.ffuf_scan_timeout_seconds, wordlist_count)
     logger.info("ffuf subprocess argv: %r", command)
@@ -196,15 +216,17 @@ def _count_wordlist_entries(path: Path) -> int:
 
 def _build_fuzz_url(target: str) -> str:
     parsed = urlparse(target)
+    if "FUZZ" in target:
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", parsed.query, ""))
     base_path = parsed.path.rstrip("/")
     fuzz_path = f"{base_path}/FUZZ" if base_path else "/FUZZ"
     return urlunparse((parsed.scheme, parsed.netloc, fuzz_path, "", "", ""))
 
 
-def _build_ffuf_command(executable: str, fuzz_url: str, wordlist_path: Path, *, threads: int = 5, rate_limit: int = 25) -> list[str]:
-    safe_threads = max(1, min(int(threads or 5), 10))
-    safe_rate_limit = max(1, min(int(rate_limit or 25), 50))
-    return [
+def _build_ffuf_command(executable: str, fuzz_url: str, wordlist_path: Path, *, threads: int = 5, rate_limit: int = 25, extensions: str = "") -> list[str]:
+    safe_threads = max(1, min(int(threads or 5), MAX_FFUF_THREADS))
+    safe_rate_limit = max(1, min(int(rate_limit or 25), MAX_FFUF_RATE_LIMIT))
+    command = [
         executable,
         "-u",
         fuzz_url,
@@ -218,8 +240,29 @@ def _build_ffuf_command(executable: str, fuzz_url: str, wordlist_path: Path, *, 
         "-rate",
         str(safe_rate_limit),
         "-mc",
-        "200,204,301,302,307,308,401,403,500",
+        FFUF_MATCH_STATUS_CODES,
     ]
+    safe_extensions = _normalize_ffuf_extensions(extensions)
+    if safe_extensions:
+        command.extend(["-e", ",".join(safe_extensions)])
+    return command
+
+
+def _normalize_ffuf_extensions(raw_extensions: object) -> list[str]:
+    normalized: list[str] = []
+    for item in str(raw_extensions or "").split(","):
+        extension = item.strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if not SAFE_FFUF_EXTENSION_PATTERN.fullmatch(extension):
+            raise ValueError("ffuf extension configuration is malformed.")
+        if extension not in normalized:
+            normalized.append(extension)
+        if len(normalized) >= 20:
+            break
+    return normalized
 
 
 def _result(

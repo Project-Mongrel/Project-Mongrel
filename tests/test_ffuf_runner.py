@@ -8,9 +8,11 @@ from app.core.config import Settings
 from app.parsers.ffuf_parser import parse_ffuf_output, summarize_ffuf_results
 from app.tools.ffuf_runner import (
     DEFAULT_FFUF_WORDLIST,
+    FFUF_MATCH_STATUS_CODES,
     _build_ffuf_command,
     _build_fuzz_url,
     _count_wordlist_entries,
+    _normalize_ffuf_extensions,
     _resolve_ffuf_executable,
     run_ffuf_scan,
 )
@@ -49,6 +51,7 @@ def test_ffuf_runner_success_uses_safe_subprocess_args(tmp_path: Path) -> None:
     assert result["output"] == output
     assert result["wordlist_count"] == 2
     assert result["fuzz_url"] == "https://example.com/FUZZ"
+    assert expected_command[expected_command.index("-mc") + 1] == FFUF_MATCH_STATUS_CODES
 
 
 def test_ffuf_missing_binary_is_clean_failure(tmp_path: Path) -> None:
@@ -138,11 +141,40 @@ def test_default_ffuf_wordlist_exists_and_is_small() -> None:
     assert 1 <= count <= 50
 
 
-def test_ffuf_command_clamps_conservative_limits(tmp_path: Path) -> None:
+def test_ffuf_command_clamps_professional_bounded_limits(tmp_path: Path) -> None:
     command = _build_ffuf_command("ffuf", "https://example.com/FUZZ", tmp_path / "words.txt", threads=99, rate_limit=999)
-    assert command[command.index("-t") + 1] == "10"
-    assert command[command.index("-rate") + 1] == "50"
+    assert command[command.index("-t") + 1] == "50"
+    assert command[command.index("-rate") + 1] == "500"
+    assert command[command.index("-mc") + 1] == "200-299,300-399,401,403,405,407,409,429,500-599"
 
 
-def test_ffuf_fuzz_url_preserves_base_path_without_query() -> None:
+def test_ffuf_fuzz_url_preserves_base_path_without_query_unless_fuzz_is_explicit() -> None:
     assert _build_fuzz_url("https://example.com/app?x=1") == "https://example.com/app/FUZZ"
+    assert _build_fuzz_url("https://example.com/api/FUZZ") == "https://example.com/api/FUZZ"
+    assert _build_fuzz_url("https://example.com/search?q=FUZZ") == "https://example.com/search?q=FUZZ"
+
+
+def test_ffuf_command_supports_safe_configured_extensions(tmp_path: Path) -> None:
+    command = _build_ffuf_command("ffuf", "https://example.com/FUZZ", tmp_path / "words.txt", extensions="php,.txt,php")
+
+    assert command[command.index("-e") + 1] == ".php,.txt"
+    assert _normalize_ffuf_extensions("js,.bak") == [".js", ".bak"]
+
+
+def test_ffuf_rejects_malformed_extension_configuration(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="extension"):
+        _normalize_ffuf_extensions(".php;id")
+
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("admin\n", encoding="utf-8")
+    with (
+        patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_path=wordlist, ffuf_extensions=".php;id")),
+        patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
+        patch("app.tools.ffuf_runner.subprocess.run") as run_mock,
+    ):
+        result = run_ffuf_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_configuration"
+    assert result["command"] is None
+    run_mock.assert_not_called()

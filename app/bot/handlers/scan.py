@@ -232,10 +232,13 @@ def build_ffuf_target_prompt() -> str:
         [
             "ffuf discovery request created. Send the authorized HTTP target URL or hostname.",
             "",
-            "Conservative hidden-content discovery only.",
+            "Hidden-content discovery uses the configured wordlist and bounded ffuf settings.",
+            "Optional: include FUZZ in an authorized URL to control the fuzz position.",
             "",
             "Examples:",
             "https://example.com",
+            "https://example.com/api/FUZZ",
+            "https://example.com/search?q=FUZZ",
             "example.com",
         ]
     )
