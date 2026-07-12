@@ -194,6 +194,9 @@ def build_httpx_target_prompt() -> str:
         [
             "httpx fingerprint request created. Send the authorized HTTP target URL or hostname.",
             "",
+            "Bounded web-service probing covers configured ports/schemes, redirects, TLS/certificate, IP/CDN/CNAME, timing, and technology metadata.",
+            "No response bodies, cookies, auth headers, credentials, or secrets are collected for Telegram output.",
+            "",
             "Examples:",
             "https://example.com",
             "example.com",
@@ -576,6 +579,7 @@ def build_httpx_result_text(result: dict[str, object], services: list[dict] | No
         if service.get("title")
     ]
     technologies = [str(value) for value in summary.get("technologies") or []]
+    content_types = [str(value) for value in summary.get("content_types") or []]
     redirects = [
         f"{service.get('url') or service.get('host')} -> {service.get('redirect_location') or service.get('final_url')}"
         for service in services
@@ -587,8 +591,20 @@ def build_httpx_result_text(result: dict[str, object], services: list[dict] | No
     ]
     if titles:
         findings.append("Titles: " + "; ".join(titles[:3]))
+    metadata_details = []
+    if content_types:
+        metadata_details.append("Content types: " + ", ".join(content_types[:5]))
+    network_metadata = [
+        f"IPs: {summary.get('ip_count', 0)}",
+        f"CDN observations: {summary.get('cdn_count', 0)}",
+        f"CNAME observations: {summary.get('cname_count', 0)}",
+        f"TLS/certificate metadata: {summary.get('tls_count', 0)}",
+    ]
+    metadata_details.append("Metadata: " + ", ".join(network_metadata))
     if technologies:
-        findings.append("Technologies: " + ", ".join(technologies[:8]))
+        findings.append("Technologies: " + ", ".join(technologies[:8]) + " | " + " | ".join(metadata_details))
+    else:
+        findings.append(" | ".join(metadata_details))
     if redirects:
         findings.append("Redirects: " + "; ".join(redirects[:3]))
     if limitations:
@@ -599,7 +615,10 @@ def build_httpx_result_text(result: dict[str, object], services: list[dict] | No
         status="Complete" if result.get("success") is True else "Failed",
         elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
         risk="INFO" if result.get("success") is True else None,
-        summary=f"{summary.get('service_count', 0)} HTTP service/URL observation(s) recorded.",
+        summary=(
+            f"{summary.get('service_count', 0)} HTTP service/URL observation(s) recorded. "
+            "HTTP status, CDN/challenge, and technology metadata are observations only, not vulnerability findings."
+        ),
         findings=findings,
         assets=[str(service.get("url") or service.get("host")) for service in services if service.get("url") or service.get("host")],
     )

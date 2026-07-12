@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 # Required to run authorized local httpx subprocesses.
 import subprocess  # nosec B404
+import re
 import shutil
 import time
 
@@ -12,6 +13,13 @@ from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
 logger = logging.getLogger(__name__)
 HTTPX_NOT_AVAILABLE_ERROR = "httpx executable was not found."
 HTTPX_TIMEOUT_ERROR = "httpx scan timed out. Try a smaller target or reduce the scan scope."
+MAX_HTTPX_THREADS = 100
+MAX_HTTPX_RATE_LIMIT = 500
+MAX_HTTPX_REQUEST_TIMEOUT_SECONDS = 30
+MAX_HTTPX_RETRIES = 5
+MAX_HTTPX_REDIRECTS = 10
+MAX_HTTPX_RESPONSE_SIZE_BYTES = 5_000_000
+SAFE_HTTPX_PORTS_PATTERN = re.compile(r"^[A-Za-z0-9:,\-]{1,200}$")
 
 
 def run_httpx_scan(target: str) -> dict[str, object]:
@@ -34,7 +42,29 @@ def run_httpx_scan(target: str) -> dict[str, object]:
             working_directory=working_directory,
         )
 
-    command = _build_httpx_command(executable, validated_target)
+    try:
+        command = _build_httpx_command(
+            executable,
+            validated_target,
+            threads=settings.httpx_threads,
+            rate_limit=settings.httpx_rate_limit,
+            request_timeout_seconds=settings.httpx_request_timeout_seconds,
+            retries=settings.httpx_retries,
+            ports=settings.httpx_ports,
+            max_redirects=settings.httpx_max_redirects,
+            max_response_size_bytes=settings.httpx_max_response_size_bytes,
+        )
+    except ValueError as exc:
+        logger.warning("httpx configuration rejected: target=%s error=%s", validated_target, exc)
+        return _result(
+            target=validated_target,
+            success=False,
+            error=str(exc),
+            error_type="invalid_configuration",
+            elapsed_seconds=0,
+            command=None,
+            working_directory=working_directory,
+        )
     start_time = time.monotonic()
     logger.info("httpx scan started: target=%s timeout=%s", validated_target, settings.httpx_scan_timeout_seconds)
     logger.info("httpx subprocess argv: %r", command)
@@ -153,8 +183,32 @@ def _httpx_executable_candidates() -> tuple[Path, Path, Path, Path, Path]:
     )
 
 
-def _build_httpx_command(executable: str, target: str) -> list[str]:
-    return [
+def _build_httpx_command(
+    executable: str,
+    target: str,
+    *,
+    threads: int = 25,
+    rate_limit: int = 100,
+    request_timeout_seconds: int = 10,
+    retries: int = 1,
+    ports: str = "http:80,8080,8000,8888,https:443,8443",
+    max_redirects: int = 3,
+    max_response_size_bytes: int = 1_000_000,
+) -> list[str]:
+    safe_threads = _bounded_int(threads, minimum=1, maximum=MAX_HTTPX_THREADS, default=25)
+    safe_rate_limit = _bounded_int(rate_limit, minimum=1, maximum=MAX_HTTPX_RATE_LIMIT, default=100)
+    safe_timeout = _bounded_int(request_timeout_seconds, minimum=1, maximum=MAX_HTTPX_REQUEST_TIMEOUT_SECONDS, default=10)
+    safe_retries = _bounded_int(retries, minimum=0, maximum=MAX_HTTPX_RETRIES, default=1)
+    safe_redirects = _bounded_int(max_redirects, minimum=0, maximum=MAX_HTTPX_REDIRECTS, default=3)
+    safe_response_size = _bounded_int(
+        max_response_size_bytes,
+        minimum=1_024,
+        maximum=MAX_HTTPX_RESPONSE_SIZE_BYTES,
+        default=1_000_000,
+    )
+    safe_ports = _normalize_httpx_ports(ports)
+
+    command = [
         executable,
         "-u",
         target,
@@ -165,9 +219,67 @@ def _build_httpx_command(executable: str, target: str) -> list[str]:
         "-tech-detect",
         "-server",
         "-content-length",
+        "-content-type",
         "-location",
+        "-response-time",
+        "-method",
+        "-ip",
+        "-cdn",
+        "-cname",
+        "-asn",
+        "-probe",
         "-tls-probe",
+        "-tls-grab",
+        "-follow-host-redirects",
+        "-maxr",
+        str(safe_redirects),
+        "-t",
+        str(safe_threads),
+        "-rl",
+        str(safe_rate_limit),
+        "-timeout",
+        str(safe_timeout),
+        "-retries",
+        str(safe_retries),
+        "-rstr",
+        str(safe_response_size),
+        "-ob",
     ]
+    if safe_ports:
+        command.extend(["-ports", safe_ports])
+    return command
+
+
+def _bounded_int(value: object, *, minimum: int, maximum: int, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _normalize_httpx_ports(raw_ports: object) -> str:
+    raw = str(raw_ports or "").strip()
+    if not raw:
+        return ""
+    if any(character in raw for character in DANGEROUS_SHELL_CHARACTERS):
+        raise ValueError("httpx ports configuration contains unsupported shell characters.")
+    if not SAFE_HTTPX_PORTS_PATTERN.fullmatch(raw):
+        raise ValueError("httpx ports configuration contains unsupported characters.")
+
+    parts: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        if cleaned.lower() in seen:
+            continue
+        seen.add(cleaned.lower())
+        parts.append(cleaned)
+    if len(parts) > 50:
+        raise ValueError("httpx ports configuration exceeds the bounded port list size.")
+    return ",".join(parts)
 
 
 def _result(

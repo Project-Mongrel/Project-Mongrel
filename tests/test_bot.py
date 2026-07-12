@@ -1765,6 +1765,8 @@ def test_httpx_scan_callback_prompts_for_target() -> None:
     asyncio.run(scan_callback_handler(update, context))
 
     assert query.edit_message_text.call_args.args[0] == build_httpx_target_prompt()
+    assert "configured ports/schemes" in query.edit_message_text.call_args.args[0]
+    assert "No response bodies, cookies, auth headers, credentials, or secrets" in query.edit_message_text.call_args.args[0]
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 
@@ -2616,6 +2618,11 @@ def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
             "title": "Example",
             "technologies": ["nginx"],
             "redirect_location": "https://www.example.com",
+            "content_type": "text/html",
+            "ip": "93.184.216.34",
+            "cdn": True,
+            "cname": ["edge.example.net"],
+            "tls": {"probe": True},
         },
         {"url": "https://www.example.com", "status_code": 200, "title": "Home", "technologies": ["React"]},
     ]
@@ -2627,7 +2634,10 @@ def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     assert "Status codes: 200: 1, 301: 1" in card
     assert "Titles: https://example.com: Example" in card
     assert "Technologies: nginx, React" in card
+    assert "Content types: text/html" in card
+    assert "Metadata: IPs: 1, CDN observations: 1, CNAME observations: 1, TLS/certificate metadata: 1" in card
     assert "Redirects: https://example.com -> https://www.example.com" in card
+    assert "not vulnerability findings" in card
     assert '{"url":"raw"}' not in card
 
 

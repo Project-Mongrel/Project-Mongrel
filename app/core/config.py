@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     nuclei_retries: int = 1
     httpx_path: str = "httpx"
     httpx_scan_timeout_seconds: int = 120
+    httpx_request_timeout_seconds: int = 10
+    httpx_retries: int = 1
+    httpx_threads: int = 25
+    httpx_rate_limit: int = 100
+    httpx_ports: str = "http:80,8080,8000,8888,https:443,8443"
+    httpx_max_redirects: int = 3
+    httpx_max_response_size_bytes: int = 1_000_000
     katana_path: str = "katana"
     katana_scan_timeout_seconds: int = 180
     katana_crawl_depth: int = 3
