@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     katana_js_crawl: bool = True
     katana_form_extraction: bool = True
     playwright_scan_timeout_seconds: int = 45
+    playwright_max_links: int = 25
+    playwright_max_forms: int = 10
+    playwright_max_inputs: int = 25
+    playwright_max_console_messages: int = 10
+    playwright_max_network_events: int = 25
+    playwright_max_response_size_bytes: int = 1_000_000
+    playwright_capture_screenshot_metadata: bool = True
     ffuf_path: str = "ffuf"
     ffuf_scan_timeout_seconds: int = 120
     ffuf_wordlist_path: Path = Path("app/resources/wordlists/ffuf_default.txt")

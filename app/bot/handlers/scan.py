@@ -221,7 +221,8 @@ def build_playwright_target_prompt() -> str:
         [
             "Playwright observation request created. Send the authorized HTTP target URL or hostname.",
             "",
-            "Passive browser observation only.",
+            "Passive browser observation of JavaScript-rendered content, links, forms, inputs, redirects, console, and network metadata.",
+            "No clicks, form submissions, credential entry, purchases, account changes, or custom scripts are performed.",
             "",
             "Examples:",
             "https://example.com",
@@ -741,6 +742,8 @@ def build_playwright_result_text(result: dict[str, object], observation: dict | 
         f"Status code: {summary.get('status_code') or 'not observed'}",
         f"Forms/inputs: {summary.get('forms_count', 0)} forms / {summary.get('inputs_count', 0)} inputs",
         f"Links: {summary.get('links_count', 0)}",
+        f"Observed samples: {summary.get('form_samples_count', 0)} forms / {summary.get('input_samples_count', 0)} inputs / {summary.get('network_events_count', 0)} network events",
+        f"Out-of-scope redirect: {'yes' if summary.get('redirected_out_of_scope') else 'no'}",
         f"Console/network issues: {summary.get('console_issue_count', 0)} console / {summary.get('network_issue_count', 0)} network / {summary.get('page_error_count', 0)} page errors",
         f"Screenshot/artifact: {screenshot_status}",
     ]

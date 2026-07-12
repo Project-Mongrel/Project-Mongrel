@@ -42,6 +42,9 @@ class FakeLocator:
 class FakeConsoleMessage:
     type = "error"
 
+    def text(self) -> str:
+        return "console error"
+
 
 class FakePage:
     url = "https://example.com/final"
@@ -49,12 +52,15 @@ class FakePage:
     def __init__(self, *, timeout_on_goto: bool = False) -> None:
         self.handlers = {}
         self.timeout_on_goto = timeout_on_goto
+        self.default_timeout = None
+        self.default_navigation_timeout = None
+        self.screenshot_called = False
 
-    def set_default_timeout(self, _: int) -> None:
-        return None
+    def set_default_timeout(self, timeout: int) -> None:
+        self.default_timeout = timeout
 
-    def set_default_navigation_timeout(self, _: int) -> None:
-        return None
+    def set_default_navigation_timeout(self, timeout: int) -> None:
+        self.default_navigation_timeout = timeout
 
     def on(self, event: str, handler: object) -> None:
         self.handlers[event] = handler
@@ -64,6 +70,9 @@ class FakePage:
             raise FakePlaywrightTimeoutError("timeout")
         self.handlers["console"](FakeConsoleMessage())
         self.handlers["requestfailed"](object())
+        if "response" in self.handlers:
+            response = types.SimpleNamespace(url="https://example.com/api", status=200)
+            self.handlers["response"](response)
         return FakeResponse()
 
     def wait_for_load_state(self, *_: object, **__: object) -> None:
@@ -76,8 +85,16 @@ class FakePage:
         counts = {"form": 2, "input, textarea, select, button": 5, "a[href]": 7}
         return FakeLocator(counts[selector])
 
-    def eval_on_selector_all(self, *_: object) -> list[str]:
-        return ["https://example.com/a", "https://example.com/b"]
+    def eval_on_selector_all(self, selector: str, *_: object) -> list[object]:
+        if selector == "a[href]":
+            return ["https://example.com/a", "https://other.example/b", "https://example.com/c"]
+        if selector == "form":
+            return [{"action": "/login", "method": "post", "input_count": 2}]
+        return [{"tag": "INPUT", "type": "text", "name": "q", "id": "search", "required": True}]
+
+    def screenshot(self, **_: object) -> bytes:
+        self.screenshot_called = True
+        return b"png"
 
 
 class FakeBrowser:
@@ -145,8 +162,43 @@ def test_playwright_runner_success_with_mocked_browser() -> None:
     assert observation["links_count"] == 7
     assert observation["console_issue_count"] == 1
     assert observation["network_issue_count"] == 1
-    assert observation["link_samples"] == ["https://example.com/a", "https://example.com/b"]
+    assert observation["link_samples"] == ["https://example.com/a", "https://example.com/c"]
+    assert observation["form_samples"] == [{"action": "/login", "method": "post", "input_count": "2"}]
+    assert observation["input_samples"] == [{"id": "search", "name": "q", "required": True, "tag": "INPUT", "type": "text"}]
+    assert observation["console_messages"] == [{"text": "console error", "type": "error"}]
+    assert observation["network_events"] == [{"host": "example.com", "same_host": True, "status": "200", "url": "https://example.com/api"}]
+    assert observation["screenshot"] == {"bytes": 3, "captured": True, "type": "png"}
     assert observation["limitations"]
+    assert page.default_timeout == 9000
+    assert page.default_navigation_timeout == 9000
+    assert page.screenshot_called is True
+
+
+def test_playwright_runner_clamps_timeout_and_result_bounds() -> None:
+    page = FakePage()
+    _install_fake_playwright(FakeChromium(FakeBrowser(page)))
+
+    settings = Settings(
+        _env_file=None,
+        playwright_scan_timeout_seconds=999,
+        playwright_max_links=1,
+        playwright_max_forms=1,
+        playwright_max_inputs=1,
+        playwright_max_console_messages=1,
+        playwright_max_network_events=1,
+        playwright_capture_screenshot_metadata=False,
+    )
+    with patch("app.tools.playwright_runner.get_settings", return_value=settings):
+        result = run_playwright_observation("example.com")
+
+    observation = result["output"]
+    assert page.default_timeout == 120000
+    assert observation["link_samples"] == ["https://example.com/a"]
+    assert len(observation["form_samples"]) == 1
+    assert len(observation["input_samples"]) == 1
+    assert len(observation["console_messages"]) == 1
+    assert len(observation["network_events"]) == 1
+    assert "screenshot" not in observation
 
 
 def test_playwright_missing_dependency_is_clean_failure() -> None:
@@ -201,6 +253,10 @@ def test_playwright_observation_normalizer_shape() -> None:
             "link_samples": ["https://www.example.com/a"],
             "console_issue_count": "2",
             "network_issue_count": "1",
+            "redirected_out_of_scope": True,
+            "form_samples": [{"action": "/login", "method": "POST"}],
+            "input_samples": [{"name": "q", "type": "search"}],
+            "network_events": [{"url": "https://www.example.com/api", "status": 200}],
         }
     )
     summary = summarize_playwright_observation(observation)
@@ -210,3 +266,7 @@ def test_playwright_observation_normalizer_shape() -> None:
     assert summary["forms_count"] == 1
     assert summary["links_count"] == 9
     assert summary["console_issue_count"] == 2
+    assert summary["redirected_out_of_scope"] is True
+    assert summary["form_samples_count"] == 1
+    assert summary["input_samples_count"] == 1
+    assert summary["network_events_count"] == 1
