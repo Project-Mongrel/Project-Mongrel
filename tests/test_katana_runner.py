@@ -6,7 +6,7 @@ import pytest
 
 from app.core.config import Settings
 from app.parsers.katana_parser import parse_katana_output, summarize_katana_observations
-from app.tools.katana_runner import _build_katana_command, _resolve_katana_executable, run_katana_scan
+from app.tools.katana_runner import _build_katana_command, _normalize_field_scope, _normalize_known_files, _resolve_katana_executable, run_katana_scan
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:
@@ -15,7 +15,7 @@ def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subpr
 
 def test_katana_runner_success_uses_safe_subprocess_args() -> None:
     output = '{"url":"https://example.com/app.js","depth":1}\n'
-    settings = Settings(_env_file=None, katana_scan_timeout_seconds=19, katana_crawl_depth=2)
+    settings = Settings(_env_file=None, katana_scan_timeout_seconds=19, katana_crawl_depth=3, katana_concurrency=7, katana_rate_limit=40, katana_crawl_duration_seconds=90, katana_field_scope="fqdn", katana_known_files="robotstxt,sitemapxml")
 
     with (
         patch("app.tools.katana_runner.get_settings", return_value=settings),
@@ -24,7 +24,7 @@ def test_katana_runner_success_uses_safe_subprocess_args() -> None:
     ):
         result = run_katana_scan("example.com")
 
-    expected_command = _build_katana_command("katana", "https://example.com", 2)
+    expected_command = _build_katana_command("katana", "https://example.com", crawl_depth=3, concurrency=7, rate_limit=40, crawl_duration_seconds=90, field_scope="fqdn", known_files="robotstxt,sitemapxml")
     run_mock.assert_called_once_with(
         expected_command,
         stdout=subprocess.PIPE,
@@ -39,6 +39,12 @@ def test_katana_runner_success_uses_safe_subprocess_args() -> None:
     assert result["target"] == "https://example.com"
     assert result["output"] == output
     assert result["error_type"] is None
+    assert "-jc" in expected_command
+    assert "-fx" in expected_command
+    assert expected_command[expected_command.index("-fs") + 1] == "fqdn"
+    assert expected_command[expected_command.index("-kf") + 1] == "robotstxt,sitemapxml"
+    assert expected_command[expected_command.index("-ct") + 1] == "90s"
+    assert "-ob" in expected_command
 
 
 def test_katana_missing_binary_is_clean_failure() -> None:
@@ -103,5 +109,48 @@ def test_katana_parser_normalizes_jsonl_and_json() -> None:
     assert summary["max_depth"] == 2
 
 
-def test_katana_command_clamps_depth() -> None:
-    assert _build_katana_command("katana", "https://example.com", 99)[6] == "5"
+def test_katana_command_clamps_professional_bounded_profile() -> None:
+    command = _build_katana_command("katana", "https://example.com", crawl_depth=99, concurrency=999, rate_limit=999, crawl_duration_seconds=9999, max_response_size_bytes=99_999_999)
+
+    assert command[command.index("-d") + 1] == "10"
+    assert command[command.index("-c") + 1] == "50"
+    assert command[command.index("-rl") + 1] == "300"
+    assert command[command.index("-ct") + 1] == "900s"
+    assert command[command.index("-mrs") + 1] == "8388608"
+
+
+def test_katana_command_can_disable_optional_discovery_without_raw_flags() -> None:
+    command = _build_katana_command("katana", "https://example.com", js_crawl=False, form_extraction=False, known_files="")
+
+    assert "-jc" not in command
+    assert "-fx" not in command
+    assert "-kf" not in command
+    assert "-j" in command
+    assert "-silent" in command
+
+
+def test_katana_scope_and_known_files_are_validated() -> None:
+    assert _normalize_field_scope("rdn") == "rdn"
+    assert _normalize_known_files("robotstxt,sitemapxml,robotstxt") == "robotstxt,sitemapxml"
+    assert _normalize_known_files("all,robotstxt") == "all"
+
+    with pytest.raises(ValueError, match="field scope"):
+        _normalize_field_scope(".*")
+    with pytest.raises(ValueError, match="known-files"):
+        _normalize_known_files("robotstxt;id")
+    with pytest.raises(ValueError, match="known-files"):
+        _normalize_known_files("private")
+
+
+def test_katana_invalid_configuration_fails_cleanly() -> None:
+    with (
+        patch("app.tools.katana_runner.get_settings", return_value=Settings(_env_file=None, katana_field_scope=".*")),
+        patch("app.tools.katana_runner.shutil.which", return_value="katana"),
+        patch("app.tools.katana_runner.subprocess.run") as run_mock,
+    ):
+        result = run_katana_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_configuration"
+    assert result["command"] is None
+    run_mock.assert_not_called()

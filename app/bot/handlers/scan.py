@@ -206,6 +206,9 @@ def build_katana_target_prompt() -> str:
         [
             "Katana crawl request created. Send the authorized HTTP target URL or hostname.",
             "",
+            "Bounded authorized crawling with JavaScript endpoint discovery, forms, redirects, and known files where configured.",
+            "Scope remains constrained by validated target and configured Katana field scope.",
+            "",
             "Examples:",
             "https://example.com",
             "example.com",

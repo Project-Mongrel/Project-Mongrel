@@ -207,6 +207,7 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "Choose a scan workflow" in build_scan_text()
     assert "pending" in build_scan_created_text("nmap")
     assert "authorized target" in build_nmap_target_prompt()
+    assert "JavaScript endpoint discovery" in build_katana_target_prompt()
     assert "ffuf discovery request created" in build_ffuf_target_prompt()
     assert "https://example.com/search?q=FUZZ" in build_ffuf_target_prompt()
     assert "Nmap XML" in build_upload_text()

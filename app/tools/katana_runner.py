@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 # Required to run authorized local Katana subprocesses.
 import subprocess  # nosec B404
@@ -12,6 +13,14 @@ from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
 logger = logging.getLogger(__name__)
 KATANA_NOT_AVAILABLE_ERROR = "Katana executable was not found."
 KATANA_TIMEOUT_ERROR = "Katana crawl timed out. Try a smaller target or reduce crawl depth."
+MAX_KATANA_DEPTH = 10
+MAX_KATANA_CONCURRENCY = 50
+MAX_KATANA_RATE_LIMIT = 300
+MAX_KATANA_CRAWL_DURATION_SECONDS = 900
+MAX_KATANA_RESPONSE_SIZE_BYTES = 8_388_608
+KATANA_FIELD_SCOPES = frozenset({"fqdn", "dn", "rdn"})
+KATANA_KNOWN_FILE_VALUES = frozenset({"all", "robotstxt", "sitemapxml"})
+SAFE_KATANA_KNOWN_FILE_PATTERN = re.compile(r"^[A-Za-z0-9,]{1,64}$")
 
 
 def run_katana_scan(target: str) -> dict[str, object]:
@@ -34,7 +43,30 @@ def run_katana_scan(target: str) -> dict[str, object]:
             working_directory=working_directory,
         )
 
-    command = _build_katana_command(executable, validated_target, settings.katana_crawl_depth)
+    try:
+        command = _build_katana_command(
+            executable,
+            validated_target,
+            crawl_depth=settings.katana_crawl_depth,
+            concurrency=settings.katana_concurrency,
+            rate_limit=settings.katana_rate_limit,
+            crawl_duration_seconds=settings.katana_crawl_duration_seconds,
+            max_response_size_bytes=settings.katana_max_response_size_bytes,
+            field_scope=settings.katana_field_scope,
+            known_files=settings.katana_known_files,
+            js_crawl=settings.katana_js_crawl,
+            form_extraction=settings.katana_form_extraction,
+        )
+    except ValueError as exc:
+        return _result(
+            target=validated_target,
+            success=False,
+            error=str(exc),
+            error_type="invalid_configuration",
+            elapsed_seconds=0,
+            command=None,
+            working_directory=working_directory,
+        )
     start_time = time.monotonic()
     logger.info(
         "Katana crawl started: target=%s timeout=%s depth=%s",
@@ -158,19 +190,90 @@ def _katana_executable_candidates() -> tuple[Path, Path, Path, Path, Path]:
     )
 
 
-def _build_katana_command(executable: str, target: str, crawl_depth: int = 2) -> list[str]:
-    depth = max(1, min(int(crawl_depth or 2), 5))
-    return [
+def _build_katana_command(
+    executable: str,
+    target: str,
+    crawl_depth: int = 3,
+    *,
+    concurrency: int = 10,
+    rate_limit: int = 50,
+    crawl_duration_seconds: int = 120,
+    max_response_size_bytes: int = 4_194_304,
+    field_scope: str = "fqdn",
+    known_files: str = "robotstxt,sitemapxml",
+    js_crawl: bool = True,
+    form_extraction: bool = True,
+) -> list[str]:
+    depth = _bounded_int(crawl_depth, default=3, minimum=1, maximum=MAX_KATANA_DEPTH)
+    safe_concurrency = _bounded_int(concurrency, default=10, minimum=1, maximum=MAX_KATANA_CONCURRENCY)
+    safe_rate_limit = _bounded_int(rate_limit, default=50, minimum=1, maximum=MAX_KATANA_RATE_LIMIT)
+    safe_duration = _bounded_int(crawl_duration_seconds, default=120, minimum=1, maximum=MAX_KATANA_CRAWL_DURATION_SECONDS)
+    safe_response_size = _bounded_int(max_response_size_bytes, default=4_194_304, minimum=1, maximum=MAX_KATANA_RESPONSE_SIZE_BYTES)
+    safe_scope = _normalize_field_scope(field_scope)
+    safe_known_files = _normalize_known_files(known_files)
+    command = [
         executable,
         "-u",
         target,
-        "-jsonl",
+        "-j",
         "-silent",
+        "-nc",
         "-d",
         str(depth),
-        "-jc",
-        "-fx",
+        "-c",
+        str(safe_concurrency),
+        "-rl",
+        str(safe_rate_limit),
+        "-ct",
+        f"{safe_duration}s",
+        "-mrs",
+        str(safe_response_size),
+        "-fs",
+        safe_scope,
+        "-ob",
     ]
+    if js_crawl:
+        command.append("-jc")
+    if form_extraction:
+        command.append("-fx")
+    if safe_known_files:
+        command.extend(["-kf", safe_known_files])
+    return command
+
+
+def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _normalize_field_scope(value: object) -> str:
+    scope = str(value or "fqdn").strip().lower()
+    if scope not in KATANA_FIELD_SCOPES:
+        raise ValueError("Katana field scope configuration is malformed.")
+    return scope
+
+
+def _normalize_known_files(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if not SAFE_KATANA_KNOWN_FILE_PATTERN.fullmatch(raw):
+        raise ValueError("Katana known-files configuration is malformed.")
+    values = []
+    for item in raw.split(","):
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        if cleaned not in KATANA_KNOWN_FILE_VALUES:
+            raise ValueError("Katana known-files configuration is malformed.")
+        if cleaned not in values:
+            values.append(cleaned)
+    if "all" in values:
+        return "all"
+    return ",".join(values)
 
 
 def _result(

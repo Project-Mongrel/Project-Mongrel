@@ -39,7 +39,15 @@ class Settings(BaseSettings):
     httpx_scan_timeout_seconds: int = 120
     katana_path: str = "katana"
     katana_scan_timeout_seconds: int = 180
-    katana_crawl_depth: int = 2
+    katana_crawl_depth: int = 3
+    katana_concurrency: int = 10
+    katana_rate_limit: int = 50
+    katana_crawl_duration_seconds: int = 120
+    katana_max_response_size_bytes: int = 4_194_304
+    katana_field_scope: str = "fqdn"
+    katana_known_files: str = "robotstxt,sitemapxml"
+    katana_js_crawl: bool = True
+    katana_form_extraction: bool = True
     playwright_scan_timeout_seconds: int = 45
     ffuf_path: str = "ffuf"
     ffuf_scan_timeout_seconds: int = 120
