@@ -74,7 +74,7 @@ def _normalize_finding(raw_finding: dict[str, Any]) -> dict:
     if not isinstance(info, dict):
         info = {}
 
-    return {
+    normalized = {
         "template_id": _first_string(raw_finding.get("template-id"), raw_finding.get("templateID")),
         "severity": _normalize_severity(_first_string(info.get("severity"), raw_finding.get("severity"))),
         "name": _first_string(info.get("name"), raw_finding.get("name")),
@@ -85,6 +85,15 @@ def _normalize_finding(raw_finding: dict[str, Any]) -> dict:
         "description": _first_string(info.get("description"), raw_finding.get("description")),
         "remediation": _first_string(info.get("remediation"), raw_finding.get("remediation")),
     }
+    optional_fields = {
+        "template_path": _first_string(raw_finding.get("template-path"), raw_finding.get("template_path")),
+        "template_type": _first_string(raw_finding.get("type"), raw_finding.get("template-type")),
+        "matcher_name": _first_string(raw_finding.get("matcher-name"), raw_finding.get("matcher_name")),
+        "classification": _normalize_mapping(info.get("classification")),
+        "metadata": _normalize_mapping(info.get("metadata")),
+    }
+    normalized.update({key: value for key, value in optional_fields.items() if value not in (None, "", [], {})})
+    return normalized
 
 
 def _normalize_severity(severity: str | None) -> str:
@@ -110,6 +119,20 @@ def _normalize_list(value: Any) -> list[str]:
         return [stripped_value] if stripped_value else []
 
     return [str(value).strip()] if str(value).strip() else []
+
+
+def _normalize_mapping(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for key, nested_value in value.items():
+        cleaned_key = str(key).strip()
+        if not cleaned_key or cleaned_key.lower() in {"request", "response", "body", "headers", "cookie", "authorization"}:
+            continue
+        cleaned_value = str(nested_value).strip()
+        if cleaned_value:
+            normalized[cleaned_key] = cleaned_value[:500]
+    return normalized
 
 
 def _first_string(*values: Any) -> str | None:

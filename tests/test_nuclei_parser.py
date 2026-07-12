@@ -141,3 +141,19 @@ def test_matched_at_fallback_behavior() -> None:
     assert matched[0]["matched_at"] == "https://example.com/matched"
     assert url[0]["matched_at"] == "https://example.com/url"
     assert host[0]["matched_at"] == "https://example.com"
+
+
+def test_parser_preserves_professional_metadata_without_raw_request_response() -> None:
+    results = parse_nuclei_json(
+        '{"template-id":"cve-test","template-path":"http/cves/test.yaml","type":"http","matcher-name":"status",'
+        '"info":{"severity":"high","classification":{"cve-id":"CVE-2099-0001"},"metadata":{"product":"Example","authorization":"secret"}},'
+        '"request":"GET /secret","response":"HTTP/1.1 200","host":"https://example.com"}'
+    )
+
+    assert results[0]["template_path"] == "http/cves/test.yaml"
+    assert results[0]["template_type"] == "http"
+    assert results[0]["matcher_name"] == "status"
+    assert results[0]["classification"] == {"cve-id": "CVE-2099-0001"}
+    assert results[0]["metadata"] == {"product": "Example"}
+    assert "request" not in results[0]
+    assert "response" not in results[0]

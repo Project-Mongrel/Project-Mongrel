@@ -1741,6 +1741,8 @@ def test_nuclei_scan_callback_prompts_for_target() -> None:
     asyncio.run(scan_callback_handler(update, context))
 
     assert query.edit_message_text.call_args.args[0] == build_nuclei_target_prompt()
+    assert "configured bounded Nuclei profile" in query.edit_message_text.call_args.args[0]
+    assert "Zero matches means no selected templates matched" in query.edit_message_text.call_args.args[0]
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 

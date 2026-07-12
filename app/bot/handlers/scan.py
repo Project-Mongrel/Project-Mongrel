@@ -168,6 +168,9 @@ def build_nuclei_target_prompt() -> str:
         [
             "Nuclei scan request created. Send the authorized target URL.",
             "",
+            "Uses the configured bounded Nuclei profile: selected templates/tags/severities, exclusions, redirects, rate, concurrency, timeout, retries, and result limits.",
+            "Template matches are scanner evidence, not automatic exploit confirmation. Zero matches means no selected templates matched.",
+            "",
             "Examples:",
             "https://example.com",
             "https://scanme.nmap.org",
