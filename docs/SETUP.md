@@ -1,6 +1,6 @@
 # Setup
 
-Project Mongrel supports Windows development and Linux deployment from the same `requirements.txt`.
+Project Mongrel supports Windows development and Linux deployment from the same runtime/test `requirements.txt`.
 
 ## Python Environment
 
@@ -26,6 +26,29 @@ Install dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
+python -m pip check
+```
+
+`requirements.txt` is the supported Mongrel app/test/default-audit environment. It intentionally does not install Semgrep or the BBOT Python package because current BBOT and Semgrep releases require dependency ranges that cannot share one valid, audit-clean Python environment.
+
+## Optional Semgrep Audit Environment
+
+For the slower full audit, install Semgrep into a separate virtual environment:
+
+```bash
+python -m venv .venv-semgrep
+.venv-semgrep\Scripts\activate
+python -m pip install -r requirements-semgrep.txt
+semgrep scan --config auto
+```
+
+On Linux/macOS:
+
+```bash
+python -m venv .venv-semgrep
+source .venv-semgrep/bin/activate
+python -m pip install -r requirements-semgrep.txt
+semgrep scan --config auto
 ```
 
 ## Platform-Specific Dependencies
@@ -44,9 +67,10 @@ Linux deployments should use the same install command:
 
 ```bash
 python -m pip install -r requirements.txt
+python -m pip check
 ```
 
-BBOT scan execution should run in a Linux-compatible runtime such as Linux, Kali, or WSL. Windows development remains supported, but BBOT scan modes that import Linux-only modules may not run directly in native Windows Python.
+BBOT scan execution should run as an external tool in a Linux-compatible runtime such as Linux, Kali, or WSL. Install the BBOT CLI outside the Mongrel app virtual environment, for example in a tool-specific environment or system tool path, and point Mongrel at that executable. Windows development remains supported, but BBOT scan modes that import Linux-only modules may not run directly in native Windows Python.
 
 ## Verification
 

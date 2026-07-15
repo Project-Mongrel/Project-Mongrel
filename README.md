@@ -268,7 +268,10 @@ Install dependencies:
 
 ```bash
 pip install -r requirements.txt
+python -m pip check
 ```
+
+Use `requirements.txt` for the main Mongrel app/test/default-audit environment. Install Semgrep from `requirements-semgrep.txt` only in a separate optional audit virtual environment, and install the BBOT CLI outside the Mongrel app venv, because current BBOT and Semgrep dependency ranges cannot share one valid, audit-clean environment.
 
 Run tests:
 

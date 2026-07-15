@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 # Required to run authorized local testssl.sh subprocesses.
 import subprocess  # nosec B404
+import re
 import shutil
 import tempfile
 import time
@@ -14,6 +15,29 @@ from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
 logger = logging.getLogger(__name__)
 TESTSSL_NOT_AVAILABLE_ERROR = "testssl.sh executable was not found."
 TESTSSL_TIMEOUT_ERROR = "testssl.sh scan timed out. Try a smaller target or run manually with an approved scope."
+MAX_TESTSSL_CONNECT_TIMEOUT_SECONDS = 30
+MAX_TESTSSL_OPENSSL_TIMEOUT_SECONDS = 30
+MAX_TESTSSL_OUTPUT_BYTES = 2_000_000
+MAX_TESTSSL_JSON_BYTES = 5_000_000
+ALLOWED_TESTSSL_IP_MODES = {"", "one", "4", "6"}
+ALLOWED_TESTSSL_STARTTLS_PROTOCOLS = {
+    "",
+    "ftp",
+    "smtp",
+    "pop3",
+    "imap",
+    "xmpp",
+    "sieve",
+    "xmpp-server",
+    "telnet",
+    "ldap",
+    "irc",
+    "lmtp",
+    "nntp",
+    "postgres",
+    "mysql",
+}
+SAFE_TESTSSL_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
 def run_testssl_scan(target: str) -> dict[str, object]:
@@ -36,7 +60,23 @@ def run_testssl_scan(target: str) -> dict[str, object]:
     with tempfile.NamedTemporaryFile(prefix="mongrel-testssl-", suffix=".json", delete=False) as json_file:
         json_path = Path(json_file.name)
 
-    command = _build_testssl_command(executable, validated_target, json_path)
+    try:
+        command = _build_testssl_command(executable, validated_target, json_path, settings)
+    except ValueError as exc:
+        logger.warning("testssl.sh configuration rejected: target=%s error=%s", validated_target, exc)
+        try:
+            json_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Unable to remove temporary testssl.sh JSON artifact after config rejection: %s", json_path)
+        return _result(
+            target=validated_target,
+            success=False,
+            error=str(exc),
+            error_type="invalid_configuration",
+            elapsed_seconds=0,
+            command=None,
+            working_directory=working_directory,
+        )
     start_time = time.monotonic()
     logger.info("testssl.sh scan started: target=%s timeout=%s", validated_target, settings.testssl_scan_timeout_seconds)
     logger.info("testssl.sh subprocess argv: %r", command)
@@ -51,7 +91,15 @@ def run_testssl_scan(target: str) -> dict[str, object]:
             shell=False,
             check=False,
         )
-        json_output = json_path.read_text(encoding="utf-8") if json_path.exists() else ""
+        json_output, json_truncated = _read_bounded_text(
+            json_path,
+            _bounded_int(
+                getattr(settings, "testssl_max_json_bytes", 2_000_000),
+                minimum=10_000,
+                maximum=MAX_TESTSSL_JSON_BYTES,
+                default=2_000_000,
+            ),
+        )
     except subprocess.TimeoutExpired as exc:
         elapsed_seconds = time.monotonic() - start_time
         logger.warning("testssl.sh scan timed out: target=%s elapsed_seconds=%.2f", validated_target, elapsed_seconds)
@@ -97,8 +145,27 @@ def run_testssl_scan(target: str) -> dict[str, object]:
             logger.warning("Unable to remove temporary testssl.sh JSON artifact: %s", json_path)
 
     elapsed_seconds = time.monotonic() - start_time
-    stdout = completed.stdout or ""
-    stderr = completed.stderr or ""
+    stdout, stdout_truncated = _bounded_text(
+        completed.stdout or "",
+        _bounded_int(
+            getattr(settings, "testssl_max_output_bytes", 500_000),
+            minimum=10_000,
+            maximum=MAX_TESTSSL_OUTPUT_BYTES,
+            default=500_000,
+        ),
+        label="stdout",
+    )
+    stderr, stderr_truncated = _bounded_text(
+        completed.stderr or "",
+        _bounded_int(
+            getattr(settings, "testssl_max_output_bytes", 500_000),
+            minimum=10_000,
+            maximum=MAX_TESTSSL_OUTPUT_BYTES,
+            default=500_000,
+        ),
+        label="stderr",
+    )
+    output_truncated = bool(stdout_truncated or stderr_truncated or json_truncated)
     logger.info(
         "testssl.sh scan completed: target=%s elapsed_seconds=%.2f stdout_len=%s stderr_len=%s json_len=%s exit_code=%s",
         validated_target,
@@ -110,28 +177,45 @@ def run_testssl_scan(target: str) -> dict[str, object]:
     )
     return _result(
         target=validated_target,
-        success=completed.returncode == 0 and bool(json_output.strip()),
+        success=completed.returncode == 0 and bool(json_output.strip()) and not json_truncated,
         output=stdout,
-        error=stderr if completed.returncode == 0 else (stderr or "testssl.sh did not complete successfully."),
-        error_type=None if completed.returncode == 0 and json_output.strip() else "execution_failed",
+        error=(
+            "testssl.sh JSON output exceeded the configured bounded result size."
+            if json_truncated
+            else stderr if completed.returncode == 0
+            else (stderr or "testssl.sh did not complete successfully.")
+        ),
+        error_type="output_too_large" if json_truncated else None if completed.returncode == 0 and json_output.strip() else "execution_failed",
         returncode=completed.returncode,
         elapsed_seconds=elapsed_seconds,
         command=command,
         working_directory=working_directory,
         json_output=json_output,
+        output_truncated=output_truncated,
     )
 
 
 def _validate_target(target: str) -> str:
-    if any(character in str(target or "") for character in DANGEROUS_SHELL_CHARACTERS):
+    raw_target = str(target or "").strip()
+    if any(character in raw_target for character in DANGEROUS_SHELL_CHARACTERS):
         raise ValueError("testssl.sh target contains unsupported shell characters.")
-    normalized = normalize_for_httpx(target)
+    if "://" in raw_target:
+        parsed_raw = urlparse(raw_target)
+        if parsed_raw.scheme.lower() not in {"http", "https"} or not parsed_raw.hostname:
+            raise ValueError("testssl.sh target must include a hostname or IP address.")
+        normalized = raw_target
+    else:
+        normalized = normalize_for_httpx(target)
     parsed = urlparse(normalized)
     host = parsed.hostname or ""
     if not host:
         raise ValueError("testssl.sh target must include a hostname or IP address.")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    return f"{host}:{port}"
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError("testssl.sh target must include a valid port.") from exc
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{display_host}:{port}"
 
 
 def _resolve_testssl_executable(configured_path: str = "testssl.sh") -> str | None:
@@ -155,18 +239,83 @@ def _testssl_executable_candidates() -> tuple[Path, Path, Path, Path]:
     )
 
 
-def _build_testssl_command(executable: str, target: str, json_path: Path) -> list[str]:
-    return [
+def _build_testssl_command(executable: str, target: str, json_path: Path, settings: object | None = None) -> list[str]:
+    connect_timeout = _bounded_int(
+        getattr(settings, "testssl_connect_timeout_seconds", 10),
+        minimum=1,
+        maximum=MAX_TESTSSL_CONNECT_TIMEOUT_SECONDS,
+        default=10,
+    )
+    openssl_timeout = _bounded_int(
+        getattr(settings, "testssl_openssl_timeout_seconds", 5),
+        minimum=1,
+        maximum=MAX_TESTSSL_OPENSSL_TIMEOUT_SECONDS,
+        default=5,
+    )
+    ip_mode = _normalize_option_value(getattr(settings, "testssl_ip_mode", ""), field_name="testssl IP mode", allowed=ALLOWED_TESTSSL_IP_MODES)
+    starttls_protocol = _normalize_option_value(
+        getattr(settings, "testssl_starttls_protocol", ""),
+        field_name="testssl STARTTLS protocol",
+        allowed=ALLOWED_TESTSSL_STARTTLS_PROTOCOLS,
+    )
+
+    command = [
         executable,
         "--jsonfile-pretty",
         str(json_path),
         "--warnings",
         "batch",
+        "--connect-timeout",
+        str(connect_timeout),
         "--openssl-timeout",
-        "5",
+        str(openssl_timeout),
         "--quiet",
-        target,
     ]
+    if ip_mode == "4":
+        command.append("-4")
+    elif ip_mode == "6":
+        command.append("-6")
+    elif ip_mode == "one":
+        command.extend(["--ip", "one"])
+    if starttls_protocol:
+        command.extend(["--starttls", starttls_protocol])
+    if bool(getattr(settings, "testssl_ids_friendly", False)):
+        command.append("--ids-friendly")
+    command.append(target)
+    return command
+
+
+def _bounded_int(value: object, *, minimum: int, maximum: int, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _normalize_option_value(raw_value: object, *, field_name: str, allowed: set[str]) -> str:
+    value = str(raw_value or "").strip().lower()
+    if value not in allowed:
+        raise ValueError(f"{field_name} contains unsupported value.")
+    if value and (any(character in value for character in DANGEROUS_SHELL_CHARACTERS) or not SAFE_TESTSSL_VALUE_PATTERN.fullmatch(value)):
+        raise ValueError(f"{field_name} contains unsupported characters.")
+    return value
+
+
+def _read_bounded_text(path: Path, max_bytes: int) -> tuple[str, bool]:
+    if not path.exists():
+        return "", False
+    raw = path.read_bytes()
+    text, truncated = _bounded_text(raw.decode("utf-8", errors="replace"), max_bytes, label="json")
+    return text, truncated
+
+
+def _bounded_text(text: str, max_bytes: int, *, label: str) -> tuple[str, bool]:
+    encoded = str(text or "").encode("utf-8", errors="ignore")
+    if len(encoded) <= max_bytes:
+        return str(text or ""), False
+    truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return f"{truncated}\n[{label} truncated at {max_bytes} bytes]", True
 
 
 def _result(
@@ -181,6 +330,7 @@ def _result(
     command: list[str] | None,
     working_directory: Path,
     json_output: str = "",
+    output_truncated: bool = False,
 ) -> dict[str, object]:
     return {
         "target": target,
@@ -197,4 +347,5 @@ def _result(
         "stdout_len": len(output or ""),
         "stderr_len": len(error or ""),
         "json_len": len(json_output or ""),
+        "output_truncated": output_truncated,
     }

@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     ffuf_extensions: str = ""
     testssl_path: str = "testssl.sh"
     testssl_scan_timeout_seconds: int = 180
+    testssl_connect_timeout_seconds: int = 10
+    testssl_openssl_timeout_seconds: int = 5
+    testssl_ip_mode: str = ""
+    testssl_starttls_protocol: str = ""
+    testssl_ids_friendly: bool = False
+    testssl_max_output_bytes: int = 500_000
+    testssl_max_json_bytes: int = 2_000_000
     gitleaks_path: str = "gitleaks"
     gitleaks_scan_timeout_seconds: int = 120
     evidence_vault_path: Path = Path("data/evidence_vault.db")

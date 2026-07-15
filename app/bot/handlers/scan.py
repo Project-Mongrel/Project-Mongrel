@@ -259,7 +259,8 @@ def build_testssl_target_prompt() -> str:
         [
             "testssl.sh TLS assessment request created. Send the authorized TLS target URL or hostname.",
             "",
-            "Conservative TLS configuration evidence only.",
+            "Bounded TLS assessment using the configured testssl.sh profile: protocols, cipher categories, certificate/trust metadata, vulnerabilities, SNI/IP mode, STARTTLS where configured, and time/output limits.",
+            "Scanner labels are TLS evidence, not automatic exploit confirmation. Absence of findings is not a secure verdict.",
             "",
             "Examples:",
             "https://example.com",
@@ -921,7 +922,7 @@ def build_testssl_result_text(result: dict[str, object], evidence: dict | None =
     findings.extend(
         [
             "Notable TLS findings: " + (str(len(notable)) if notable else "none recorded"),
-            "Limitation: TLS configuration evidence only; not an overall site security verdict.",
+            "Limitation: TLS configuration evidence only; scanner labels are not automatic exploit confirmation.",
         ]
     )
     for item in notable[:5]:
@@ -934,7 +935,11 @@ def build_testssl_result_text(result: dict[str, object], evidence: dict | None =
         status="Complete" if result.get("success") is True else "Failed",
         elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
         risk="INFO" if result.get("success") is True else None,
-        summary="TLS configuration evidence recorded. TLS configuration evidence only." if evidence else "No structured testssl.sh evidence was stored.",
+        summary=(
+            "TLS configuration evidence recorded. No secure/robust conclusion is made from absence of findings."
+            if evidence
+            else "No structured testssl.sh evidence was stored."
+        ),
         findings=findings,
         assets=[str(evidence.get("host") or result.get("target") or "")],
     )

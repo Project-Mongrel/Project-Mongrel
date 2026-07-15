@@ -1817,6 +1817,8 @@ def test_testssl_scan_callback_prompts_for_target() -> None:
     asyncio.run(scan_callback_handler(update, context))
 
     assert query.edit_message_text.call_args.args[0] == build_testssl_target_prompt()
+    assert "configured testssl.sh profile" in query.edit_message_text.call_args.args[0]
+    assert "Absence of findings is not a secure verdict" in query.edit_message_text.call_args.args[0]
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 

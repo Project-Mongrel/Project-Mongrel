@@ -103,11 +103,101 @@ def test_build_testssl_command_uses_explicit_argv() -> None:
         "out.json",
         "--warnings",
         "batch",
+        "--connect-timeout",
+        "10",
         "--openssl-timeout",
         "5",
         "--quiet",
         "example.com:443",
     ]
+
+
+def test_build_testssl_command_supports_validated_profile_options() -> None:
+    settings = Settings(
+        _env_file=None,
+        testssl_connect_timeout_seconds=999,
+        testssl_openssl_timeout_seconds=999,
+        testssl_ip_mode="one",
+        testssl_starttls_protocol="smtp",
+        testssl_ids_friendly=True,
+    )
+
+    command = _build_testssl_command("testssl.sh", "mail.example.com:25", Path("out.json"), settings)
+
+    assert command == [
+        "testssl.sh",
+        "--jsonfile-pretty",
+        "out.json",
+        "--warnings",
+        "batch",
+        "--connect-timeout",
+        "30",
+        "--openssl-timeout",
+        "30",
+        "--quiet",
+        "--ip",
+        "one",
+        "--starttls",
+        "smtp",
+        "--ids-friendly",
+        "mail.example.com:25",
+    ]
+
+
+def test_build_testssl_command_supports_ipv4_and_ipv6_modes() -> None:
+    ipv4_command = _build_testssl_command("testssl.sh", "example.com:443", Path("out.json"), Settings(_env_file=None, testssl_ip_mode="4"))
+    ipv6_command = _build_testssl_command("testssl.sh", "example.com:443", Path("out.json"), Settings(_env_file=None, testssl_ip_mode="6"))
+
+    assert "-4" in ipv4_command
+    assert "-6" in ipv6_command
+
+
+def test_testssl_rejects_invalid_config_without_subprocess() -> None:
+    settings = Settings(_env_file=None, testssl_starttls_protocol="smtp;whoami")
+
+    with (
+        patch("app.tools.testssl_runner.get_settings", return_value=settings),
+        patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
+        patch("app.tools.testssl_runner.subprocess.run") as run_mock,
+    ):
+        result = run_testssl_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_configuration"
+    assert result["command"] is None
+    run_mock.assert_not_called()
+
+
+def test_testssl_ipv6_target_is_bracketed_for_testssl() -> None:
+    with (
+        patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
+        patch("app.tools.testssl_runner.subprocess.run", return_value=_completed()) as run_mock,
+    ):
+        result = run_testssl_scan("https://[2001:db8::1]")
+
+    assert result["target"] == "[2001:db8::1]:443"
+    assert run_mock.call_args.args[0][-1] == "[2001:db8::1]:443"
+
+
+def test_testssl_oversized_json_is_clean_failure() -> None:
+    settings = Settings(_env_file=None, testssl_max_json_bytes=10)
+
+    def run_side_effect(command, **kwargs):
+        Path(command[2]).write_text("[" + (" " * 12_000) + "]", encoding="utf-8")
+        return _completed(stdout="human output")
+
+    with (
+        patch("app.tools.testssl_runner.get_settings", return_value=settings),
+        patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
+        patch("app.tools.testssl_runner.subprocess.run", side_effect=run_side_effect),
+    ):
+        result = run_testssl_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "output_too_large"
+    assert result["output_truncated"] is True
+    assert result["json_len"] < 11_000
 
 
 def test_testssl_json_normalization_extracts_tls_evidence() -> None:
@@ -123,6 +213,8 @@ def test_testssl_json_normalization_extracts_tls_evidence() -> None:
     assert evidence["cipher_findings"][0]["id"] == "cipherlist_NULL"
     assert evidence["security_headers"][0]["id"] == "HSTS"
     assert summary["supported_protocols"] == ["TLS 1.0", "TLS 1.2", "TLS 1.3"]
+    assert evidence["raw_record_count"] == 10
+    assert "raw_json" not in evidence
 
 
 def test_testssl_json_normalization_handles_nested_scan_result_shape() -> None:
@@ -155,3 +247,19 @@ def test_testssl_json_normalization_handles_nested_scan_result_shape() -> None:
     assert evidence["certificate"]["subject_alt_names"] == "DNS:example.com, DNS:www.example.com"
     assert summary["supported_protocols"] == ["TLS 1.2", "TLS 1.3"]
     assert evidence["vulnerabilities"][0]["id"] == "heartbleed"
+
+
+def test_testssl_normalization_excludes_sensitive_header_material() -> None:
+    output = """
+[
+  {"id":"header_set_cookie","severity":"INFO","finding":"Set-Cookie: sessionid=secret; HttpOnly"},
+  {"id":"HSTS","severity":"INFO","finding":"max-age=31536000"},
+  {"id":"TLS1_2","severity":"OK","finding":"offered"}
+]
+"""
+    evidence = normalize_testssl_output(output, target="example.com:443")
+
+    rendered = str(evidence)
+    assert "sessionid=secret" not in rendered
+    assert "Set-Cookie" not in rendered
+    assert evidence["security_headers"] == [{"id": "HSTS", "finding": "max-age=31536000", "severity": "INFO"}]

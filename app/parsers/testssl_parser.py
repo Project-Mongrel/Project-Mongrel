@@ -59,6 +59,8 @@ VULNERABILITY_PREFIXES = (
     "rc4",
 )
 HEADER_IDS = {"HSTS", "HPKP", "header_HSTS", "header_server", "security_headers"}
+SENSITIVE_ID_TERMS = ("cookie", "authorization", "auth", "reqheader", "request", "response_body", "body")
+SENSITIVE_FINDING_TERMS = ("set-cookie", "authorization:", "proxy-authorization:", "cookie:")
 
 
 class TestsslParserError(ValueError):
@@ -79,10 +81,11 @@ def normalize_testssl_output(output: str | list | dict, target: str | None = Non
         "vulnerabilities": [],
         "security_headers": [],
         "notable_findings": [],
-        "raw_json": records,
+        "raw_record_count": len(records),
         "limitations": [
             "testssl.sh evidence reflects TLS configuration only.",
             "Findings are not proof of overall site security.",
+            "Scanner labels are not automatic exploit confirmation; potential findings require validation in context.",
         ],
     }
 
@@ -91,6 +94,8 @@ def normalize_testssl_output(output: str | list | dict, target: str | None = Non
             continue
         item_id = str(record.get("id") or record.get("idName") or record.get("id_name") or record.get("name") or "").strip()
         finding = _finding_text(record)
+        if _is_sensitive_record(item_id, finding):
+            continue
         severity = str(record.get("severity") or record.get("severityLevel") or "").strip().upper()
         normalized_protocol_id = _normalize_protocol_id(item_id)
         if normalized_protocol_id in PROTOCOL_IDS:
@@ -225,6 +230,12 @@ def _normalize_protocol_id(item_id: str) -> str:
 
 def _finding_record(item_id: str, finding: str, severity: str) -> dict:
     return {"id": item_id, "finding": finding, "severity": severity or "INFO"}
+
+
+def _is_sensitive_record(item_id: str, finding: str) -> bool:
+    lowered_id = str(item_id or "").lower()
+    lowered_finding = str(finding or "").lower()
+    return any(term in lowered_id for term in SENSITIVE_ID_TERMS) or any(term in lowered_finding for term in SENSITIVE_FINDING_TERMS)
 
 
 def _looks_supported(finding: object, severity: object = None) -> bool:

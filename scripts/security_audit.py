@@ -80,7 +80,7 @@ SEMGREP_CHECK = AuditCheck(
     name="Semgrep",
     command=["semgrep", "scan", "--config", "auto"],
     executable_name="semgrep",
-    install_hint="Install with: python -m pip install semgrep",
+    install_hint="Install in a separate Semgrep audit environment with: python -m pip install -r requirements-semgrep.txt",
     timeout_seconds=180,
 )
 
