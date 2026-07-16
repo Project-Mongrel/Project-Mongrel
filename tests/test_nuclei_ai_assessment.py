@@ -76,6 +76,63 @@ def test_nuclei_ai_prompt_clean_scan_includes_template_limitation() -> None:
     assert "should not be interpreted as confirmation" in prompt
 
 
+def test_nuclei_ai_prompt_partial_timeout_with_findings_is_not_clean_scan() -> None:
+    prompt = build_nuclei_ai_assessment_prompt(
+        {
+            "target": "https://example.com",
+            "finding_count": 2,
+            "risk_level": "info",
+            "severity_summary": {"info": 2},
+            "metadata": {
+                "partial": True,
+                "timed_out": True,
+                "timeout_reason": "Execution time limit reached.",
+                "elapsed": "180s",
+            },
+            "nuclei_findings": [
+                {"template_id": "tech-detect", "severity": "info", "name": "Technology Detection", "host": "https://example.com"},
+                {"template_id": "panel-detect", "severity": "info", "name": "Panel Detection", "host": "https://example.com"},
+            ],
+        }
+    )
+
+    assert "Scan completion: partial/incomplete" in prompt
+    assert "Finding count: 2" in prompt
+    assert "info: 2" in prompt
+    assert "additional selected templates may not have executed" in prompt
+    assert CLEAN_SCAN_FACT not in prompt
+
+
+def test_nuclei_ai_partial_timeout_response_filters_clean_scan_contradiction() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "- No matching Nuclei findings were observed using the selected template/profile.",
+            "Observed Facts",
+            "- Two informational observations were collected.",
+        ]
+    )
+
+    finding = {
+        "target": "https://example.com",
+        "finding_count": 2,
+        "metadata": {"partial": True, "timed_out": True, "timeout_reason": "Execution time limit reached."},
+        "nuclei_findings": [
+            {"template_id": "tech-detect", "severity": "info", "name": "Technology Detection", "host": "https://example.com"},
+            {"template_id": "panel-detect", "severity": "info", "name": "Panel Detection", "host": "https://example.com"},
+        ],
+    }
+
+    with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
+        lines = generate_nuclei_ai_assessment(finding)
+
+    text = "\n".join(lines)
+    assert "configured execution time limit" in text
+    assert "2 observations were collected before termination" in text
+    assert "additional findings should not be interpreted" in text
+    assert "No matching Nuclei findings were observed" not in text
+
+
 def test_nuclei_ai_assessment_success_returns_response_lines() -> None:
     response = "Executive Summary\n- One matched finding was observed.\n\nConfidence\nMedium"
 

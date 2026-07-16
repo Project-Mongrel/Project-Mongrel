@@ -3796,18 +3796,15 @@ async def _run_nuclei_scan_background(
 
     from app.bot.handlers.upload import build_nuclei_import_success_text, store_nuclei_finding
 
-    finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
-    finding.setdefault("metadata", {})
-    finding["metadata"].update(
-        {
-            "elapsed": elapsed_label,
-            "elapsed_seconds": int(elapsed_seconds),
-            "scan_profile": "fast",
-            "partial": is_partial_timeout,
-            "timed_out": is_partial_timeout,
-            "timeout_reason": result.get("timeout_reason") if is_partial_timeout else None,
-        }
-    )
+    nuclei_metadata = {
+        "elapsed": elapsed_label,
+        "elapsed_seconds": int(elapsed_seconds),
+        "scan_profile": "fast",
+        "partial": is_partial_timeout,
+        "timed_out": is_partial_timeout,
+        "timeout_reason": result.get("timeout_reason") if is_partial_timeout else None,
+    }
+    finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings, metadata=nuclei_metadata)
     add_investigation_event(
         investigation_id=investigation_id,
         user_id=user_id,

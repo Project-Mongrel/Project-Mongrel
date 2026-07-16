@@ -35,10 +35,23 @@ def generate_nuclei_ai_assessment(finding: dict) -> list[str]:
         return list(FALLBACK_LINES)
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
-    return lines or list(FALLBACK_LINES)
+    lines = lines or list(FALLBACK_LINES)
+    return _guard_partial_timeout_response(finding, lines)
 
 
 def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
+    metadata = finding.get("metadata") or {}
+    nuclei_findings = finding.get("nuclei_findings") or []
+    finding_count = int(finding.get("finding_count") or len(nuclei_findings) or 0)
+    is_partial = metadata.get("partial") is True or metadata.get("timed_out") is True
+    clean_scan_rules = (
+        [
+            f'- For clean scans, say "{CLEAN_SCAN_FACT}"',
+            f"- For clean scans, explain this limitation: {CLEAN_SCAN_LIMITATION}",
+        ]
+        if not is_partial and finding_count <= 0 and not nuclei_findings
+        else []
+    )
     return "\n".join(
         [
             "You are a senior penetration tester preparing reconnaissance notes for another security consultant.",
@@ -52,8 +65,10 @@ def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
             "- Do not claim the target is safe or secure.",
             "- Do not say a finding is confirmed vulnerable unless the supplied evidence explicitly supports it.",
             "- Separate observed facts from potential risks and recommendations.",
-            f'- For clean scans, say "{CLEAN_SCAN_FACT}"',
-            f"- For clean scans, explain this limitation: {CLEAN_SCAN_LIMITATION}",
+            *clean_scan_rules,
+            "- If the scan is partial or timed out, state that the assessment did not complete.",
+            "- If partial or timed out findings are present, acknowledge the retained findings and never say no findings were observed.",
+            "- For partial or timed out scans, explain that additional templates may not have executed.",
             "- Zero matches means only that no selected templates matched; it does not establish that no exploitable vulnerabilities exist.",
             "- Mention uncertainty clearly when evidence is limited.",
             "- Confidence must describe assessment quality based on the executed template set, not target security.",
@@ -86,15 +101,31 @@ def _format_nuclei_evidence(finding: dict) -> str:
         f"- Finding count: {finding_count}",
         f"- Risk level: {_clean(finding.get('risk_level') or 'unknown')}",
     ]
+    is_partial = metadata.get("partial") is True or metadata.get("timed_out") is True
+    if is_partial:
+        lines.extend(
+            [
+                "- Scan completion: partial/incomplete",
+                f"- Timeout state: {'timed out' if metadata.get('timed_out') is True else 'partial'}",
+                f"- Timeout reason: {_clean(metadata.get('timeout_reason') or 'Execution time limit reached')}",
+                "- Partial limitation: additional selected templates may not have executed before termination.",
+                "- Partial interpretation: absence of additional findings must not be interpreted as confirmation that no vulnerabilities exist.",
+            ]
+        )
 
     if severity_summary:
         lines.append("- Severity summary:")
         for severity, count in sorted(severity_summary.items()):
             lines.append(f"  - {_clean(severity)}: {int(count or 0)}")
 
-    if not nuclei_findings:
+    if not nuclei_findings and finding_count <= 0:
         lines.append(f"- Clean scan observation: {CLEAN_SCAN_FACT}")
         lines.append(f"- Limitation: {CLEAN_SCAN_LIMITATION}")
+        return "\n".join(lines)
+    if not nuclei_findings:
+        lines.append("- Matched findings/templates: retained finding count was supplied, but individual finding details were not available in this record.")
+        if is_partial:
+            lines.append("- Retained findings: findings were collected before timeout, but detail records were not supplied to this AI prompt.")
         return "\n".join(lines)
 
     lines.append("- Matched findings/templates:")
@@ -170,6 +201,37 @@ def _extract_cves(nuclei_findings: list[dict]) -> list[str]:
 
 def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").strip()[:500]
+
+
+def _guard_partial_timeout_response(finding: dict, lines: list[str]) -> list[str]:
+    metadata = finding.get("metadata") or {}
+    finding_count = int(finding.get("finding_count") or len(finding.get("nuclei_findings") or []) or 0)
+    is_partial = metadata.get("partial") is True or metadata.get("timed_out") is True
+    if not is_partial or finding_count <= 0:
+        return lines
+
+    retained_label = f"{finding_count} {'observation' if finding_count == 1 else 'observations'}"
+    prefix = [
+        "Executive Summary",
+        f"- The scan reached the configured execution time limit before completion. {retained_label} were collected before termination.",
+        "- Because the assessment is partial, the absence of additional findings should not be interpreted as confirmation that no vulnerabilities exist.",
+        "- Additional selected templates may not have executed before timeout.",
+        "",
+    ]
+    filtered = [line for line in lines if not _contradicts_partial_findings(line)]
+    return prefix + filtered
+
+
+def _contradicts_partial_findings(line: str) -> bool:
+    lowered = str(line or "").lower()
+    contradictory_phrases = (
+        "no matching nuclei findings were observed",
+        "no matching findings were observed",
+        "no findings were observed",
+        "no findings were detected",
+        "zero matches",
+    )
+    return any(phrase in lowered for phrase in contradictory_phrases)
 
 
 def _is_unavailable_response(response: object) -> bool:

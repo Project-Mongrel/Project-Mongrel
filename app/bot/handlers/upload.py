@@ -245,10 +245,11 @@ def build_nmap_xml_import_success_text(finding: dict) -> str:
     return _truncate_message("\n".join(lines))
 
 
-def store_nuclei_finding(user_id: int, nuclei_findings: list[dict]) -> dict:
+def store_nuclei_finding(user_id: int, nuclei_findings: list[dict], metadata: dict | None = None) -> dict:
     severity_summary = _summarize_nuclei_severities(nuclei_findings)
     target = _extract_nuclei_target(nuclei_findings)
     risk_level = _score_nuclei_risk(severity_summary)
+    finding_metadata = dict(metadata or {})
     return add_finding(
         user_id=user_id,
         finding={
@@ -259,6 +260,7 @@ def store_nuclei_finding(user_id: int, nuclei_findings: list[dict]) -> dict:
             "nuclei_findings": nuclei_findings,
             "finding_count": len(nuclei_findings),
             "severity_summary": severity_summary,
+            "metadata": finding_metadata,
         },
     )
 

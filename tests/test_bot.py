@@ -3530,6 +3530,71 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
     assert context.user_data == {}
 
 
+def test_partial_timeout_nuclei_scan_retains_findings_and_ai_context() -> None:
+    clear_user_findings(7115)
+    clear_user_investigations(7115)
+    clear_user_scan_requests(7115)
+    clear_active_scan(7115)
+    scan_request = create_scan_request(user_id=7115, scan_type="nuclei")
+    mark_scan_request_awaiting_target(user_id=7115, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7115))
+    nuclei_output = "\n".join(
+        [
+            '{"template-id":"tech-detect","info":{"severity":"info","name":"Technology Detection"},"host":"https://example.com"}',
+            '{"template-id":"panel-detect","info":{"severity":"info","name":"Panel Detection"},"host":"https://example.com/admin"}',
+        ]
+    )
+
+    def assert_ai_context(finding: dict) -> list[str]:
+        assert finding["finding_count"] == 2
+        assert finding["metadata"]["partial"] is True
+        assert finding["metadata"]["timed_out"] is True
+        assert finding["metadata"]["timeout_reason"] == "Execution time limit reached."
+        return [
+            "Executive Summary",
+            "- The scan reached the configured execution time limit before completion. Two informational observations were collected before termination.",
+        ]
+
+    async def run_flow() -> None:
+        with (
+            patch(
+                "app.bot.handlers.scan.run_nuclei_scan",
+                return_value={
+                    "success": False,
+                    "partial": True,
+                    "timed_out": True,
+                    "scan_completed": False,
+                    "target": "https://example.com",
+                    "output": nuclei_output,
+                    "error": "Execution time limit reached.",
+                    "error_type": "timeout",
+                    "timeout_reason": "Execution time limit reached.",
+                    "returncode": -9,
+                },
+            ),
+            patch("app.bot.handlers.scan.generate_nuclei_ai_assessment", side_effect=assert_ai_context),
+        ):
+            await scan_target_handler(update, context)
+            active_scan = get_active_scan(7115)
+            assert active_scan is not None
+            assert active_scan.task is not None
+            await active_scan.task
+
+    asyncio.run(run_flow())
+    sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
+    assert "Status\nPartial" in sent_messages[1]
+    assert "Reason: Execution time limit reached" in sent_messages[1]
+    assert "Findings collected before timeout: retained" in sent_messages[1]
+    assert "Findings detected: 2" in sent_messages[1]
+    assert "No matching Nuclei findings were observed" not in sent_messages[-1]
+    finding = get_user_findings(7115)[0]
+    assert finding["finding_count"] == 2
+    assert finding["metadata"]["partial"] is True
+
+
 def test_nuclei_scan_no_findings_output() -> None:
     clear_user_findings(7103)
     clear_user_scan_requests(7103)
