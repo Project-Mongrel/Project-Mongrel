@@ -267,8 +267,11 @@ def build_nuclei_import_success_text(finding: dict, elapsed: str | None = None) 
     nuclei_findings = finding.get("nuclei_findings") or []
     severity_summary = finding.get("severity_summary") or _summarize_nuclei_severities(nuclei_findings)
     risk_level = str(finding.get("risk_level") or _score_nuclei_risk(severity_summary)).upper()
+    metadata = finding.get("metadata") or {}
+    status = "Partial" if metadata.get("partial") is True else "Complete"
     summary = "\n".join(
         [
+            *(["Reason: Execution time limit reached", "Findings collected before timeout: retained", "Scan completed: No", ""] if status == "Partial" else []),
             f"Findings detected: {finding.get('finding_count') or len(nuclei_findings)}",
             "Severity Summary:",
             *_format_nuclei_severity_summary(severity_summary),
@@ -286,6 +289,7 @@ def build_nuclei_import_success_text(finding: dict, elapsed: str | None = None) 
         render_scan_result_card(
             tool_name="Nuclei",
             target=str(finding.get("target") or "unknown"),
+            status=status,
             elapsed=elapsed,
             risk=risk_level,
             summary=summary,

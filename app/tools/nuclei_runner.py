@@ -13,7 +13,9 @@ from app.services.target_normalizer import normalize_for_nuclei
 
 logger = logging.getLogger(__name__)
 NUCLEI_NOT_AVAILABLE_ERROR = "Nuclei executable was not found."
-NUCLEI_TIMEOUT_ERROR = "Nuclei fast scan timed out. Try a smaller target or use a deeper scan profile later."
+NUCLEI_TIMEOUT_ERROR = "Execution time limit reached."
+NUCLEI_DEFAULT_PROCESS_TIMEOUT_SECONDS = 600
+MAX_NUCLEI_PROCESS_TIMEOUT_SECONDS = 1800
 MAX_NUCLEI_RATE_LIMIT = 300
 MAX_NUCLEI_CONCURRENCY = 50
 MAX_NUCLEI_BULK_SIZE = 50
@@ -85,14 +87,15 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
     logger.info(
         "Nuclei scan started: target=%s timeout=%s rate_limit=%s request_timeout=%s retries=%s",
         validated_target,
-        settings.nuclei_scan_timeout_seconds,
+        _nuclei_process_timeout(settings),
         settings.nuclei_rate_limit,
         settings.nuclei_request_timeout,
         settings.nuclei_retries,
     )
     logger.info("Nuclei subprocess argv: %r", command)
     logger.info("Nuclei working directory: %s", working_directory)
-    logger.info("Nuclei subprocess timeout: %s", settings.nuclei_scan_timeout_seconds)
+    process_timeout_seconds = _nuclei_process_timeout(settings)
+    logger.info("Nuclei subprocess timeout: %s", process_timeout_seconds)
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
@@ -200,9 +203,9 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
     stdout_thread = _start_stream_thread(process.stdout, stdout_lines, "stdout", max_output_bytes)
     stderr_thread = _start_stream_thread(process.stderr, stderr_lines, "stderr", max_output_bytes)
     try:
-        returncode = process.wait(timeout=settings.nuclei_scan_timeout_seconds)
+        returncode = process.wait(timeout=process_timeout_seconds)
     except subprocess.TimeoutExpired:
-        logger.warning("Nuclei scan timed out after %ss: argv=%r cwd=%s", settings.nuclei_scan_timeout_seconds, command, working_directory)
+        logger.warning("Nuclei scan timed out after %ss: argv=%r cwd=%s", process_timeout_seconds, command, working_directory)
         process.kill()
         returncode = process.wait()
         _join_stream_thread(stdout_thread, "stdout")
@@ -221,9 +224,14 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
         return {
             "target": validated_target,
             "success": False,
+            "partial": bool(stdout.strip()),
+            "timed_out": True,
+            "scan_completed": False,
             "output": stdout,
             "error": stderr or NUCLEI_TIMEOUT_ERROR,
             "error_type": "timeout",
+            "timeout_seconds": process_timeout_seconds,
+            "timeout_reason": NUCLEI_TIMEOUT_ERROR,
             "returncode": returncode,
             "exit_code": returncode,
             "elapsed_seconds": elapsed_seconds,
@@ -250,6 +258,9 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
     return {
         "target": validated_target,
         "success": returncode == 0,
+        "partial": False,
+        "timed_out": False,
+        "scan_completed": returncode == 0,
         "output": stdout,
         "error": stderr,
         "error_type": None if returncode == 0 else "execution_failed",
@@ -383,6 +394,15 @@ def _build_nuclei_command(executable: str, target: str, settings: object) -> lis
     if template_profile:
         command.extend(["-profile", template_profile])
     return command
+
+
+def _nuclei_process_timeout(settings: object) -> int:
+    return _bounded_int(
+        getattr(settings, "nuclei_scan_timeout_seconds", NUCLEI_DEFAULT_PROCESS_TIMEOUT_SECONDS),
+        minimum=60,
+        maximum=MAX_NUCLEI_PROCESS_TIMEOUT_SECONDS,
+        default=NUCLEI_DEFAULT_PROCESS_TIMEOUT_SECONDS,
+    )
 
 
 def _bounded_int(value: object, *, minimum: int, maximum: int, default: int) -> int:

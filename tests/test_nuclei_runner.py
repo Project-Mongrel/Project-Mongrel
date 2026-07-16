@@ -7,7 +7,7 @@ import pytest
 
 from app.core.config import Settings
 from app.parsers.nuclei_parser import parse_nuclei_results
-from app.tools.nuclei_runner import _build_nuclei_command, _resolve_nuclei_executable, run_nuclei_scan
+from app.tools.nuclei_runner import MAX_NUCLEI_PROCESS_TIMEOUT_SECONDS, _build_nuclei_command, _resolve_nuclei_executable, run_nuclei_scan
 
 
 def _expected_nuclei_command(executable: str = "nuclei", target: str = "https://example.com") -> list[str]:
@@ -138,6 +138,7 @@ def test_nuclei_subprocess_called_with_list_args_and_shell_false() -> None:
     assert result["working_directory"] == str(Path.cwd().resolve())
     assert result["stdout_len"] == len('{"template-id":"one"}')
     assert result["stderr_len"] == 0
+    assert process.wait_timeouts == [600]
 
 
 def test_nuclei_command_uses_custom_configured_path() -> None:
@@ -166,6 +167,21 @@ def test_nuclei_subprocess_timeout_uses_config_value() -> None:
 
     assert process.wait_timeouts == [444]
     assert result["error_type"] == "timeout"
+
+
+def test_nuclei_subprocess_timeout_is_bounded() -> None:
+    process = FakeNucleiProcess(returncode=0, stdout="", stderr="")
+    settings = Settings(_env_file=None, nuclei_scan_timeout_seconds=999_999)
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=settings),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_nuclei_scan("https://example.com")
+
+    assert result["success"] is True
+    assert process.wait_timeouts == [MAX_NUCLEI_PROCESS_TIMEOUT_SECONDS]
 
 
 def test_nuclei_command_uses_configured_rate_limit_timeout_and_retries() -> None:
@@ -316,13 +332,58 @@ def test_nuclei_timeout_handled() -> None:
 
     assert result["target"] == "https://example.com"
     assert result["success"] is False
+    assert result["partial"] is True
+    assert result["timed_out"] is True
+    assert result["scan_completed"] is False
     assert result["output"] == "partial output"
-    assert result["error"] == "Nuclei fast scan timed out. Try a smaller target or use a deeper scan profile later."
+    assert result["error"] == "Execution time limit reached."
     assert result["error_type"] == "timeout"
+    assert result["timeout_seconds"] == 600
+    assert result["timeout_reason"] == "Execution time limit reached."
     assert result["returncode"] == -9
     assert result["exit_code"] == -9
     assert result["stdout_len"] == len("partial output")
     assert result["stderr_len"] == 0
+    assert process.killed is True
+
+
+def test_nuclei_timeout_preserves_partial_jsonl_findings() -> None:
+    partial_jsonl = '{"template-id":"one","info":{"severity":"high","name":"One"},"host":"https://example.com"}\n'
+    process = FakeNucleiProcess(returncode=-9, stdout=partial_jsonl, stderr="", timeout=True)
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_nuclei_scan("https://example.com")
+
+    findings = parse_nuclei_results(str(result["output"]))
+    assert result["success"] is False
+    assert result["partial"] is True
+    assert result["timed_out"] is True
+    assert findings[0]["template_id"] == "one"
+    assert findings[0]["severity"] == "high"
+    assert findings[0]["host"] == "https://example.com"
+    assert process.killed is True
+
+
+def test_nuclei_timeout_without_findings_is_not_partial() -> None:
+    process = FakeNucleiProcess(returncode=-9, stdout="", stderr="", timeout=True)
+
+    with (
+        patch("app.tools.nuclei_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.nuclei_runner.shutil.which", return_value="nuclei"),
+        patch("app.tools.nuclei_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_nuclei_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["partial"] is False
+    assert result["timed_out"] is True
+    assert result["scan_completed"] is False
+    assert result["output"] == ""
+    assert result["error_type"] == "timeout"
     assert process.killed is True
 
 

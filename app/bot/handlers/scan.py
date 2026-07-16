@@ -185,6 +185,9 @@ def build_bbot_target_prompt() -> str:
         [
             "BBOT recon request created. Send the authorized target domain or hostname.",
             "",
+            "Uses the configured external BBOT CLI profile with allowlisted presets/modules, scope distance, DNS/web concurrency, timeout, and output limits.",
+            "Discoveries are observations only. Technology detection is not vulnerability proof, and absence of discoveries does not prove absence.",
+            "",
             "Examples:",
             "scanme.nmap.org",
             "example.com",
@@ -3701,7 +3704,10 @@ async def _run_nuclei_scan_background(
     elapsed_label = f"{int(elapsed_seconds)}s"
     logger.info("Nuclei scan completed for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
 
-    if result.get("success") is not True:
+    output = str(result.get("output") or "")
+    is_partial_timeout = result.get("error_type") == "timeout" and bool(output.strip())
+
+    if result.get("success") is not True and not is_partial_timeout:
         await progress_card.fail(str(result.get("error") or "Unknown error."))
         add_investigation_event(
             investigation_id=investigation_id,
@@ -3717,8 +3723,10 @@ async def _run_nuclei_scan_background(
         await _send_assessment_dashboard(message, assessment_context)
         return
 
-    await progress_card.complete()
-    output = str(result.get("output") or "")
+    if is_partial_timeout:
+        await progress_card.update("Partial")
+    else:
+        await progress_card.complete()
     if not output.strip():
         clean_target = str(result.get("target") or target)
         finding = store_clean_nuclei_scan(user_id=user_id, target=clean_target)
@@ -3757,6 +3765,11 @@ async def _run_nuclei_scan_background(
         return
 
     if not nuclei_findings:
+        if is_partial_timeout:
+            await _send_scan_message(message, "Nuclei scan partial: execution time limit reached before any parseable findings were collected.")
+            _record_assessment_scan(assessment_context, tool="nuclei", result=result)
+            await _send_assessment_dashboard(message, assessment_context)
+            return
         clean_target = str(result.get("target") or target)
         finding = store_clean_nuclei_scan(user_id=user_id, target=clean_target)
         add_investigation_event(
@@ -3785,15 +3798,24 @@ async def _run_nuclei_scan_background(
 
     finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings)
     finding.setdefault("metadata", {})
-    finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
+    finding["metadata"].update(
+        {
+            "elapsed": elapsed_label,
+            "elapsed_seconds": int(elapsed_seconds),
+            "scan_profile": "fast",
+            "partial": is_partial_timeout,
+            "timed_out": is_partial_timeout,
+            "timeout_reason": result.get("timeout_reason") if is_partial_timeout else None,
+        }
+    )
     add_investigation_event(
         investigation_id=investigation_id,
         user_id=user_id,
         target=str(finding.get("target") or display_target),
         event_type="nuclei_scan_completed",
         tool="nuclei",
-        status="completed",
-        summary="Nuclei scan completed",
+        status="partial" if is_partial_timeout else "completed",
+        summary="Nuclei scan partial - findings retained before timeout" if is_partial_timeout else "Nuclei scan completed",
         metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count")},
     )
     await _send_scan_message(
