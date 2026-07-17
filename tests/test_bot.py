@@ -2885,8 +2885,8 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     assert "Observations:" in findings[0]["summary"]
     investigation = get_user_investigations(7202)[0]
     events = get_investigation_events(investigation["id"], 7202)
-    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_completed"]
-    assert "Recon Summary Generated" in events[-1]["summary"]
+    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_completed", "bbot_ai_assessment_fallback"]
+    assert "Recon Summary Generated" in events[1]["summary"]
     observations = get_investigation_observations(investigation["id"], 7202)
     assert observations
     assert get_user_observations(7202) == observations
@@ -3152,9 +3152,11 @@ def test_bbot_scan_failure_creates_failed_event_and_stores_result() -> None:
                 "elapsed_seconds": 2,
             },
         ),
+        patch("app.bot.handlers.scan.generate_bbot_ai_assessment") as generate_bbot_ai_assessment,
     ):
         asyncio.run(scan_target_handler(update, context))
 
+    generate_bbot_ai_assessment.assert_not_called()
     assert "Status\nFailed" in message.reply_text.call_args_list[1].args[0]
     finding = get_user_findings(7204)[0]
     assert finding["source"] == "bbot"
@@ -3210,7 +3212,7 @@ def test_bbot_scan_nonzero_with_observations_is_partial_and_clean() -> None:
     assert observations[0]["value"] == "app.example.com"
     investigation = get_user_investigations(7205)[0]
     events = get_investigation_events(investigation["id"], 7205)
-    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_partial"]
+    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_partial", "bbot_ai_assessment_fallback"]
 
 
 def test_bbot_scan_starts_and_stops_progress_auto_refresh() -> None:
@@ -3351,13 +3353,14 @@ def test_bbot_scan_summary_chunks_are_sent() -> None:
     ):
         asyncio.run(scan_target_handler(update, context))
 
-    splitter.assert_called_once()
-    assert [call.args[0] for call in message.reply_text.call_args_list] == [
+    assert splitter.call_args_list[0].args[0].startswith("BBOT Scan Complete")
+    assert [call.args[0] for call in message.reply_text.call_args_list[:3]] == [
         f" BBOT Scan\n\n{icon('target')} Target\nexample.com\n\n"
         f"{icon('running')} Status\nLaunching scan...\n\n{icon('elapsed')} Elapsed\n0s",
         "chunk one",
         "chunk two",
     ]
+    assert "Generating BBOT AI assessment..." in [call.args[0] for call in message.reply_text.call_args_list]
 
 
 def test_bbot_scan_result_formatter_uses_recon_summary() -> None:

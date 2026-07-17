@@ -3188,6 +3188,9 @@ async def _handle_bbot_target(
     assessment_context = _pop_assessment_scan_context(context, "bbot")
     _record_assessment_scan(assessment_context, tool="bbot", result=result, finding=finding)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    elapsed_seconds = _parse_elapsed_seconds(result.get("elapsed_seconds"))
+    if elapsed_seconds is not None:
+        progress_card.started_at = time.monotonic() - elapsed_seconds
     if is_partial:
         await progress_card.partial()
     elif result.get("success") is True:
@@ -3207,7 +3210,43 @@ async def _handle_bbot_target(
     for index, chunk in enumerate(chunks):
         kwargs = {"reply_markup": keyboard} if keyboard is not None and index == len(chunks) - 1 else {}
         await update.message.reply_text(chunk, **kwargs)
+    if is_successful_or_partial and observations:
+        await _send_bbot_ai_assessment(
+            update.message,
+            user_id=user_id,
+            investigation_id=investigation["id"],
+            target=str(result.get("target") or display_target),
+        )
     await _send_assessment_dashboard(update.message, assessment_context)
+
+
+async def _send_bbot_ai_assessment(message: object, *, user_id: int, investigation_id: str, target: str) -> None:
+    progress_message = await message.reply_text("Generating BBOT AI assessment...")
+    assessment_lines = await asyncio.to_thread(
+        generate_bbot_ai_assessment,
+        user_id,
+        investigation_id=investigation_id,
+        target=target,
+    )
+    fallback = assessment_lines == FALLBACK_LINES
+    add_investigation_event(
+        investigation_id=investigation_id,
+        user_id=user_id,
+        target=target,
+        event_type="bbot_ai_assessment_fallback" if fallback else "bbot_ai_assessment_generated",
+        tool="bbot",
+        status="completed" if not fallback else "fallback",
+        summary="BBOT AI Recon Assessment Generated" if not fallback else "BBOT AI Recon Assessment Fallback",
+        metadata={"line_count": len(assessment_lines), "fallback": fallback, "automatic": True},
+    )
+    await safe_edit_text(
+        progress_message,
+        "BBOT AI assessment unavailable." if fallback else "AI assessment ready.",
+        context="BBOT AI assessment status",
+    )
+    assessment_text = "\n".join(assessment_lines) if fallback else render_ai_summary_card(assessment_lines, title="BBOT AI Assessment")
+    for chunk in split_report_text(assessment_text):
+        await message.reply_text(chunk)
 
 
 async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> None:

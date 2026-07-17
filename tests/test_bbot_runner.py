@@ -1,6 +1,7 @@
 from io import StringIO
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -17,7 +18,7 @@ from app.tools.bbot_runner import (
 
 
 def _expected_bbot_command(executable: str = "bbot", target: str = "example.com", output_dir: Path | None = None) -> list[str]:
-    output_dir = output_dir or Path("data") / "bbot" / target
+    output_dir = output_dir or Path("data") / "bbot" / target / "run-fixed"
     return [
         executable,
         "-t",
@@ -104,12 +105,13 @@ def test_bbot_subprocess_called_with_list_args_and_shell_false(tmp_path: Path) -
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process) as popen_mock,
     ):
         result = run_bbot_scan("https://example.com/path")
 
-    expected_command = _expected_bbot_command("bbot", "example.com", tmp_path / "example.com")
+    expected_command = _expected_bbot_command("bbot", "example.com", tmp_path / "example.com" / "run-fixed")
     popen_mock.assert_called_once_with(
         expected_command,
         stdout=subprocess.PIPE,
@@ -125,7 +127,7 @@ def test_bbot_subprocess_called_with_list_args_and_shell_false(tmp_path: Path) -
     assert result["error"] == ""
     assert result["returncode"] == 0
     assert "elapsed_seconds" in result
-    assert result["output_dir"] == str(tmp_path / "example.com")
+    assert result["output_dir"] == str(tmp_path / "example.com" / "run-fixed")
     assert result["command"] == expected_command
     assert result["working_directory"] == str(Path.cwd().resolve())
     assert process.wait_timeouts == [600]
@@ -137,6 +139,7 @@ def test_bbot_timeout_handled(tmp_path: Path) -> None:
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
     ):
@@ -150,7 +153,7 @@ def test_bbot_timeout_handled(tmp_path: Path) -> None:
 
 
 def test_bbot_timeout_harvests_json_output(tmp_path: Path) -> None:
-    json_output_dir = tmp_path / "example.com" / "scan" / "output"
+    json_output_dir = tmp_path / "example.com" / "run-fixed" / "scan" / "output"
     json_output_dir.mkdir(parents=True)
     json_file = json_output_dir / "output.jsonl"
     json_file.write_text('{"type":"DNS_NAME","data":"partial.example.com"}\n', encoding="utf-8")
@@ -159,6 +162,7 @@ def test_bbot_timeout_harvests_json_output(tmp_path: Path) -> None:
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
     ):
@@ -176,6 +180,7 @@ def test_bbot_missing_binary_handled(tmp_path: Path) -> None:
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value=None),
         patch("app.tools.bbot_runner.Path.is_file", return_value=False),
         patch("app.tools.bbot_runner.subprocess.Popen") as popen_mock,
@@ -196,12 +201,13 @@ def test_bbot_subprocess_uses_configured_external_binary(tmp_path: Path) -> None
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None, bbot_binary=external_bbot)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process) as popen_mock,
     ):
         result = run_bbot_scan("example.com")
 
     popen_mock.assert_called_once_with(
-        _expected_bbot_command(external_bbot, "example.com", tmp_path / "example.com"),
+        _expected_bbot_command(external_bbot, "example.com", tmp_path / "example.com" / "run-fixed"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -272,6 +278,7 @@ def test_bbot_rejects_flag_injection_without_subprocess(tmp_path: Path) -> None:
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=settings),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen") as popen_mock,
     ):
@@ -305,6 +312,7 @@ def test_fcntl_error_classified_as_runtime_incompatible(tmp_path: Path) -> None:
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
     ):
@@ -325,6 +333,7 @@ def test_resource_error_classified_as_runtime_incompatible_if_fatal(tmp_path: Pa
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
     ):
@@ -343,6 +352,7 @@ def test_bbot_failure_result_shape(tmp_path: Path) -> None:
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
     ):
@@ -357,8 +367,32 @@ def test_bbot_failure_result_shape(tmp_path: Path) -> None:
     assert "elapsed_seconds" in result
 
 
+def test_bbot_failed_run_does_not_harvest_stale_target_output(tmp_path: Path) -> None:
+    stale_output_dir = tmp_path / "example.com" / "run-old" / "scan" / "output"
+    stale_output_dir.mkdir(parents=True)
+    stale_file = stale_output_dir / "output.jsonl"
+    stale_file.write_text('{"type":"DNS_NAME","data":"stale.example.com"}\n', encoding="utf-8")
+    process = FakeBbotProcess(returncode=2, stdout="", stderr="bad target\n")
+
+    with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fresh")),
+        patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
+        patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_bbot_scan("example.com")
+
+    assert result["success"] is False
+    assert result["output"] == ""
+    assert result["json_output_found"] is False
+    assert result["json_output_paths"] == []
+    assert str(stale_file) not in str(result)
+    assert result["output_dir"] == str(tmp_path / "example.com" / "run-fresh")
+
+
 def test_bbot_json_output_is_harvested_after_process_exit(tmp_path: Path) -> None:
-    json_output_dir = tmp_path / "example.com" / "scan" / "output"
+    json_output_dir = tmp_path / "example.com" / "run-fixed" / "scan" / "output"
     json_output_dir.mkdir(parents=True)
     json_file = json_output_dir / "output.jsonl"
     json_file.write_text('{"type":"DNS_NAME","data":"app.example.com"}\n', encoding="utf-8")
@@ -367,6 +401,7 @@ def test_bbot_json_output_is_harvested_after_process_exit(tmp_path: Path) -> Non
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
     ):
@@ -380,7 +415,7 @@ def test_bbot_json_output_is_harvested_after_process_exit(tmp_path: Path) -> Non
 
 
 def test_bbot_json_output_is_bounded(tmp_path: Path) -> None:
-    json_output_dir = tmp_path / "example.com" / "scan" / "output"
+    json_output_dir = tmp_path / "example.com" / "run-fixed" / "scan" / "output"
     json_output_dir.mkdir(parents=True)
     json_file = json_output_dir / "output.jsonl"
     json_file.write_text("x" * 20_000, encoding="utf-8")
@@ -389,6 +424,7 @@ def test_bbot_json_output_is_bounded(tmp_path: Path) -> None:
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None, bbot_max_output_bytes=10)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
     ):

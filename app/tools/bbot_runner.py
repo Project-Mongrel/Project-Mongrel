@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import shutil
+from uuid import uuid4
 
 from app.core.config import get_settings
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
@@ -136,7 +137,7 @@ def check_bbot_readiness() -> dict[str, object]:
 def run_bbot_scan(target: str) -> dict[str, object]:
     validated_target = _validate_target(target)
     settings = get_settings()
-    output_dir = (BBOT_OUTPUT_DIR / _safe_output_name(validated_target)).resolve()
+    output_dir = _run_output_dir(validated_target)
     output_dir.mkdir(parents=True, exist_ok=True)
     executable = _resolve_bbot_executable(settings.bbot_binary)
     if executable is None:
@@ -304,6 +305,10 @@ def _validate_target(target: str) -> str:
 
 def _safe_output_name(target: str) -> str:
     return "".join(character if character.isalnum() or character in {".", "-", "_"} else "_" for character in target)
+
+
+def _run_output_dir(target: str) -> Path:
+    return (BBOT_OUTPUT_DIR / _safe_output_name(target) / f"run-{uuid4().hex}").resolve()
 
 
 def _resolve_bbot_executable(configured_path: str = "bbot") -> str | None:
