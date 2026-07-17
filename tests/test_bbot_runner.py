@@ -5,27 +5,82 @@ from unittest.mock import patch
 
 import pytest
 
+from app.core.config import Settings
 from app.tools import bbot_runner
-from app.tools.bbot_runner import BBOT_RUNTIME_INCOMPATIBLE_ERROR, BBOT_TIMEOUT_SECONDS, is_bbot_available, run_bbot_scan
+from app.tools.bbot_runner import (
+    BBOT_RUNTIME_INCOMPATIBLE_ERROR,
+    BBOT_UNAPPROVED_PROFILE_ERROR,
+    check_bbot_readiness,
+    is_bbot_available,
+    run_bbot_scan,
+)
+
+
+def _expected_bbot_command(executable: str = "bbot", target: str = "example.com", output_dir: Path | None = None) -> list[str]:
+    output_dir = output_dir or Path("data") / "bbot" / target
+    return [
+        executable,
+        "-t",
+        target,
+        "-o",
+        str(output_dir),
+        "-y",
+        "--json",
+        "--no-color",
+        "-om",
+        "json",
+        "stdout",
+        "-eom",
+        "csv",
+        "txt",
+        "-p",
+        "subdomain-enum",
+        "-rf",
+        "passive",
+        "-ef",
+        "loud",
+        "invasive",
+        "deadly",
+        "web-heavy",
+        "web-screenshots",
+        "portscan",
+        "-c",
+        "scope.search_distance=0",
+        "scope.report_distance=0",
+        "dns.threads=10",
+        "dns.brute_threads=100",
+        "dns.timeout=5",
+        "dns.retries=1",
+        "web.http_timeout=10",
+        "web.http_retries=1",
+        "web.spider_distance=0",
+        "web.spider_depth=1",
+        "web.spider_links_per_page=10",
+    ]
 
 
 def test_is_bbot_available_true() -> None:
-    with patch("app.tools.bbot_runner.shutil.which", return_value="bbot"):
+    with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
+    ):
         assert is_bbot_available() is True
 
 
-def test_is_bbot_available_from_windows_venv_fallback() -> None:
-    windows_venv_bbot = str(Path(".venv") / "Scripts" / "bbot.exe")
+def test_is_bbot_available_from_system_fallback() -> None:
+    linux_bbot = Path("/usr/local/bin/bbot")
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.bbot_runner.shutil.which", return_value=None),
-        patch("app.tools.bbot_runner.Path.is_file", autospec=True, side_effect=lambda path: str(path) == windows_venv_bbot),
+        patch("app.tools.bbot_runner.Path.is_file", autospec=True, side_effect=lambda path: path == linux_bbot),
     ):
         assert is_bbot_available() is True
 
 
 def test_is_bbot_available_false() -> None:
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.bbot_runner.shutil.which", return_value=None),
         patch("app.tools.bbot_runner.Path.is_file", return_value=False),
     ):
@@ -47,14 +102,16 @@ def test_bbot_subprocess_called_with_list_args_and_shell_false(tmp_path: Path) -
     process = FakeBbotProcess(returncode=0, stdout="bbot output\n", stderr="")
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process) as popen_mock,
     ):
         result = run_bbot_scan("https://example.com/path")
 
+    expected_command = _expected_bbot_command("bbot", "example.com", tmp_path / "example.com")
     popen_mock.assert_called_once_with(
-        ["bbot", "-t", "example.com", "-p", "subdomain-enum", "-o", str(tmp_path / "example.com"), "-y"],
+        expected_command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -69,14 +126,16 @@ def test_bbot_subprocess_called_with_list_args_and_shell_false(tmp_path: Path) -
     assert result["returncode"] == 0
     assert "elapsed_seconds" in result
     assert result["output_dir"] == str(tmp_path / "example.com")
-    assert result["command"] == ["bbot", "-t", "example.com", "-p", "subdomain-enum", "-o", str(tmp_path / "example.com"), "-y"]
+    assert result["command"] == expected_command
     assert result["working_directory"] == str(Path.cwd().resolve())
+    assert process.wait_timeouts == [600]
 
 
 def test_bbot_timeout_handled(tmp_path: Path) -> None:
     process = FakeBbotProcess(returncode=-9, stdout="partial output\n", stderr="partial error\n", timeout=True)
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
@@ -98,6 +157,7 @@ def test_bbot_timeout_harvests_json_output(tmp_path: Path) -> None:
     process = FakeBbotProcess(returncode=-9, stdout="partial stdout\n", stderr="partial error\n", timeout=True)
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
@@ -114,6 +174,7 @@ def test_bbot_timeout_harvests_json_output(tmp_path: Path) -> None:
 
 def test_bbot_missing_binary_handled(tmp_path: Path) -> None:
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
         patch("app.tools.bbot_runner.shutil.which", return_value=None),
         patch("app.tools.bbot_runner.Path.is_file", return_value=False),
@@ -128,20 +189,19 @@ def test_bbot_missing_binary_handled(tmp_path: Path) -> None:
     assert result["returncode"] is None
 
 
-def test_bbot_subprocess_uses_windows_venv_fallback(tmp_path: Path) -> None:
+def test_bbot_subprocess_uses_configured_external_binary(tmp_path: Path) -> None:
     process = FakeBbotProcess(returncode=0, stdout="bbot output\n", stderr="")
-    windows_venv_bbot = str(Path(".venv") / "Scripts" / "bbot.exe")
+    external_bbot = "/opt/bbot/bin/bbot"
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None, bbot_binary=external_bbot)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
-        patch("app.tools.bbot_runner.shutil.which", return_value=None),
-        patch("app.tools.bbot_runner.Path.is_file", autospec=True, side_effect=lambda path: str(path) == windows_venv_bbot),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process) as popen_mock,
     ):
         result = run_bbot_scan("example.com")
 
     popen_mock.assert_called_once_with(
-        [windows_venv_bbot, "-t", "example.com", "-p", "subdomain-enum", "-o", str(tmp_path / "example.com"), "-y"],
+        _expected_bbot_command(external_bbot, "example.com", tmp_path / "example.com"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -150,7 +210,92 @@ def test_bbot_subprocess_uses_windows_venv_fallback(tmp_path: Path) -> None:
         shell=False,
     )
     assert result["success"] is True
-    assert result["command"][0] == windows_venv_bbot
+    assert result["command"][0] == external_bbot
+
+
+def test_bbot_command_supports_validated_professional_profile(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        bbot_presets="subdomain-enum,email-enum,web-basic",
+        bbot_modules="http,sslcert,wafw00f",
+        bbot_require_flags="safe",
+        bbot_exclude_flags="loud,invasive,deadly",
+        bbot_scope_search_distance=9,
+        bbot_scope_report_distance=9,
+        bbot_dns_threads=999,
+        bbot_dns_brute_threads=999,
+        bbot_dns_timeout_seconds=999,
+        bbot_dns_retries=999,
+        bbot_web_http_timeout_seconds=999,
+        bbot_web_http_retries=999,
+        bbot_web_spider_distance=999,
+        bbot_web_spider_depth=999,
+        bbot_web_spider_links_per_page=999,
+    )
+
+    command = bbot_runner._build_bbot_command("bbot", "example.com", tmp_path, settings)
+
+    assert "-p" in command
+    assert "subdomain-enum" in command
+    assert "email-enum" in command
+    assert "web-basic" in command
+    assert "-m" in command
+    assert "http" in command
+    assert "sslcert" in command
+    assert "wafw00f" in command
+    assert "scope.search_distance=2" in command
+    assert "scope.report_distance=2" in command
+    assert "dns.threads=50" in command
+    assert "dns.brute_threads=500" in command
+    assert "dns.timeout=20" in command
+    assert "dns.retries=5" in command
+    assert "web.http_timeout=30" in command
+    assert "web.http_retries=5" in command
+    assert "web.spider_distance=2" in command
+    assert "web.spider_depth=4" in command
+    assert "web.spider_links_per_page=50" in command
+    assert "--json" in command
+    assert "--no-color" in command
+
+
+def test_bbot_rejects_unknown_and_aggressive_profiles(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsupported value"):
+        bbot_runner._build_bbot_command("bbot", "example.com", tmp_path, Settings(_env_file=None, bbot_presets="unknown"))
+
+    with pytest.raises(ValueError, match=BBOT_UNAPPROVED_PROFILE_ERROR):
+        bbot_runner._build_bbot_command("bbot", "example.com", tmp_path, Settings(_env_file=None, bbot_presets="kitchen-sink"))
+
+
+def test_bbot_rejects_flag_injection_without_subprocess(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, bbot_modules="http;whoami")
+
+    with (
+        patch("app.tools.bbot_runner.get_settings", return_value=settings),
+        patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
+        patch("app.tools.bbot_runner.subprocess.Popen") as popen_mock,
+    ):
+        result = run_bbot_scan("example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_configuration"
+    assert result["command"] is None
+    popen_mock.assert_not_called()
+
+
+def test_bbot_readiness_version_check() -> None:
+    completed = subprocess.CompletedProcess(args=["bbot", "--version"], returncode=0, stdout="bbot 2.8.6\n", stderr="")
+    with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.bbot_runner.shutil.which", return_value="/usr/local/bin/bbot"),
+        patch("app.tools.bbot_runner.subprocess.run", return_value=completed) as run_mock,
+    ):
+        result = check_bbot_readiness()
+
+    assert run_mock.call_args.args[0] == ["/usr/local/bin/bbot", "--version"]
+    assert run_mock.call_args.kwargs["shell"] is False
+    assert result["ready"] is True
+    assert result["version"] == "bbot 2.8.6"
 
 
 def test_fcntl_error_classified_as_runtime_incompatible(tmp_path: Path) -> None:
@@ -158,6 +303,7 @@ def test_fcntl_error_classified_as_runtime_incompatible(tmp_path: Path) -> None:
     process = FakeBbotProcess(returncode=1, stdout="", stderr=traceback)
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
@@ -177,6 +323,7 @@ def test_resource_error_classified_as_runtime_incompatible_if_fatal(tmp_path: Pa
     process = FakeBbotProcess(returncode=1, stdout=traceback, stderr="")
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
@@ -194,6 +341,7 @@ def test_bbot_failure_result_shape(tmp_path: Path) -> None:
     process = FakeBbotProcess(returncode=2, stdout="", stderr="bad target\n")
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
@@ -217,6 +365,7 @@ def test_bbot_json_output_is_harvested_after_process_exit(tmp_path: Path) -> Non
     process = FakeBbotProcess(returncode=0, stdout="bbot complete\n", stderr="")
 
     with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
         patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
         patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
@@ -230,6 +379,26 @@ def test_bbot_json_output_is_harvested_after_process_exit(tmp_path: Path) -> Non
     assert result["json_output_paths"] == [str(json_file)]
 
 
+def test_bbot_json_output_is_bounded(tmp_path: Path) -> None:
+    json_output_dir = tmp_path / "example.com" / "scan" / "output"
+    json_output_dir.mkdir(parents=True)
+    json_file = json_output_dir / "output.jsonl"
+    json_file.write_text("x" * 20_000, encoding="utf-8")
+    process = FakeBbotProcess(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None, bbot_max_output_bytes=10)),
+        patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
+        patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_bbot_scan("example.com")
+
+    assert result["success"] is True
+    assert result["output_truncated"] is True
+    assert "[json truncated at 10000 bytes]" in result["output"]
+
+
 class FakeBbotProcess:
     def __init__(self, returncode: int, stdout: str, stderr: str, timeout: bool = False) -> None:
         self.returncode = returncode
@@ -238,9 +407,12 @@ class FakeBbotProcess:
         self.timeout = timeout
         self.killed = False
         self.wait_calls = 0
+        self.wait_timeouts: list[int] = []
 
     def wait(self, timeout: int | None = None) -> int:
         self.wait_calls += 1
+        if timeout is not None:
+            self.wait_timeouts.append(timeout)
         if self.timeout and self.wait_calls == 1:
             raise subprocess.TimeoutExpired(cmd=["bbot"], timeout=timeout)
         return self.returncode

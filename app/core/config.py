@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen3:4b"
     ai_timeout_seconds: int = 60
     bbot_binary: str = "bbot"
-    bbot_scan_timeout_seconds: int = 180
+    bbot_scan_timeout_seconds: int = 600
     bbot_presets: str = "subdomain-enum"
     bbot_modules: str = ""
     bbot_require_flags: str = "passive"
