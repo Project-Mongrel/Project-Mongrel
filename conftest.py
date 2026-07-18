@@ -15,6 +15,7 @@ PYTEST_TEMP_ROOT = REPO_ROOT / ".pytest_tmp"
 PYTEST_TEMP_FALLBACK_ROOT = REPO_ROOT / ".pytest_tmp_runs"
 PYTEST_TEMP_ROOT_ENV = "MONGREL_PYTEST_TEMP_ROOT"
 PYTEST_TEMP_STALE_SECONDS = 24 * 60 * 60
+_selected_pytest_temp_root: Path | None = None
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -30,6 +31,7 @@ def configure_pytest_basetemp(config: object) -> Path | None:
         return None
 
     temp_root = prepare_pytest_temp_root(current_pytest_temp_root())
+    set_pytest_temp_root(temp_root)
     basetemp = build_unique_basetemp(root=temp_root)
     basetemp.mkdir(parents=True, exist_ok=True)
     setattr(option, "basetemp", str(basetemp))
@@ -42,6 +44,9 @@ def build_unique_basetemp(prefix: str = "run", root: Path | None = None) -> Path
 
 
 def current_pytest_temp_root() -> Path:
+    if _selected_pytest_temp_root is not None:
+        return _selected_pytest_temp_root
+
     configured_root = os.environ.get(PYTEST_TEMP_ROOT_ENV)
     if not configured_root:
         return PYTEST_TEMP_ROOT
@@ -50,6 +55,11 @@ def current_pytest_temp_root() -> Path:
     if not path.is_absolute():
         path = REPO_ROOT / path
     return path.resolve()
+
+
+def set_pytest_temp_root(root: Path) -> None:
+    global _selected_pytest_temp_root
+    _selected_pytest_temp_root = root.resolve()
 
 
 def prepare_pytest_temp_root(root: Path) -> Path:

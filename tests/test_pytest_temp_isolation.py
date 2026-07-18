@@ -40,6 +40,23 @@ def test_pytest_temp_plugin_adds_unique_basetemp_when_missing() -> None:
     assert Path(config.option.basetemp).is_dir()
 
 
+def test_pytest_temp_plugin_records_fallback_as_authoritative_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    primary = tmp_path / ".pytest_tmp"
+    primary.write_text("not a directory", encoding="utf-8")
+    fallback = tmp_path / ".pytest_tmp_runs"
+    monkeypatch.setattr(conftest, "PYTEST_TEMP_ROOT", primary)
+    monkeypatch.setattr(conftest, "PYTEST_TEMP_FALLBACK_ROOT", fallback)
+    monkeypatch.setattr(conftest, "_selected_pytest_temp_root", None)
+    monkeypatch.delenv(conftest.PYTEST_TEMP_ROOT_ENV, raising=False)
+    config = conftest.config_stub()
+
+    applied = conftest.configure_pytest_basetemp(config)
+
+    assert applied is not None
+    assert applied.parent == fallback.resolve()
+    assert conftest.current_pytest_temp_root() == fallback.resolve()
+
+
 def test_pytest_temp_root_falls_back_when_primary_is_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     primary = tmp_path / ".pytest_tmp"
     primary.write_text("not a directory", encoding="utf-8")
