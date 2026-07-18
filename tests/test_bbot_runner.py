@@ -27,13 +27,9 @@ def _expected_bbot_command(executable: str = "bbot", target: str = "example.com"
         str(output_dir),
         "-y",
         "--json",
-        "--no-color",
         "-om",
         "json",
         "stdout",
-        "-eom",
-        "csv",
-        "txt",
         "-p",
         "subdomain-enum",
         "-rf",
@@ -261,7 +257,11 @@ def test_bbot_command_supports_validated_professional_profile(tmp_path: Path) ->
     assert "web.spider_depth=4" in command
     assert "web.spider_links_per_page=50" in command
     assert "--json" in command
-    assert "--no-color" in command
+    assert "-om" in command
+    assert "json" in command
+    assert "stdout" in command
+    assert "--no-color" not in command
+    assert "-eom" not in command
 
 
 def test_bbot_rejects_unknown_and_aggressive_profiles(tmp_path: Path) -> None:
@@ -365,6 +365,23 @@ def test_bbot_failure_result_shape(tmp_path: Path) -> None:
     assert result["error_type"] == "bbot_failed"
     assert result["returncode"] == 2
     assert "elapsed_seconds" in result
+
+
+def test_bbot_failure_stderr_strips_ansi_control_sequences(tmp_path: Path) -> None:
+    process = FakeBbotProcess(returncode=2, stdout="", stderr="\x1b[31mbad target\x1b[0m\r\n\x1b[?25h")
+
+    with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
+        patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
+        patch("app.tools.bbot_runner.subprocess.Popen", return_value=process),
+    ):
+        result = run_bbot_scan("example.com")
+
+    assert result["success"] is False
+    assert result["error"] == "bad target"
+    assert "\x1b" not in str(result["error"])
 
 
 def test_bbot_failed_run_does_not_harvest_stale_target_output(tmp_path: Path) -> None:

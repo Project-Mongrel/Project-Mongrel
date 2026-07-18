@@ -42,6 +42,7 @@ MAX_BBOT_WEB_LINKS_PER_PAGE = 50
 MAX_BBOT_OUTPUT_BYTES = 5_000_000
 MAX_BBOT_JSON_FILES = 100
 SAFE_BBOT_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.:/\\,-]+$")
+ANSI_CONTROL_PATTERN = re.compile(r"(?:\x1B\[[0-?]*[ -/]*[@-~]|\x1B[@-_][0-?]*[ -/]*[@-~]|[\x00-\x08\x0B\x0C\x0E-\x1F\x7F])")
 ALLOWED_BBOT_PRESETS = {
     "subdomain-enum",
     "email-enum",
@@ -368,13 +369,9 @@ def _build_bbot_command(executable: str, target: str, output_dir: Path, settings
         str(output_dir),
         "-y",
         "--json",
-        "--no-color",
         "-om",
         "json",
         "stdout",
-        "-eom",
-        "csv",
-        "txt",
     ]
     if presets:
         command.extend(["-p", *presets])
@@ -476,7 +473,7 @@ def _stream_output(pipe: object, lines: list[str], stream_name: str, max_output_
     truncated = False
     try:
         for line in pipe:
-            cleaned_line = str(line).rstrip("\r\n")
+            cleaned_line = _strip_ansi_control(str(line).rstrip("\r\n"))
             if not truncated:
                 bounded_line, line_truncated = _bounded_text(cleaned_line, max(0, max_output_bytes - current_size), label=stream_name)
                 if bounded_line:
@@ -557,3 +554,7 @@ def _bounded_text(text: str, max_bytes: int, *, label: str) -> tuple[str, bool]:
 
 def _is_truncated(text: str) -> bool:
     return "truncated at" in str(text or "")
+
+
+def _strip_ansi_control(text: object) -> str:
+    return ANSI_CONTROL_PATTERN.sub("", str(text or ""))
