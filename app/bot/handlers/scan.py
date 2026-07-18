@@ -53,7 +53,7 @@ from app.services.active_scan_state import (
     set_active_scan_task,
 )
 from app.services.bbot_ai_assessment import FALLBACK_LINES, generate_bbot_ai_assessment
-from app.services.bbot_summary import build_bbot_recon_summary
+from app.services.bbot_summary import build_bbot_recon_summary, build_bbot_recon_summary_from_observations
 from app.services.chat_state import clear_finding_analysis_context, get_finding_analysis_context, is_ai_waiting
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
@@ -476,12 +476,15 @@ def build_bbot_scan_started_text(target: str) -> str:
     return render_scan_loading_card("BBOT Scan", target, "Launching scan...", 0)
 
 
-def build_bbot_ai_assessment_keyboard(investigation_id: str | None) -> InlineKeyboardMarkup | None:
+def build_bbot_ai_assessment_keyboard(investigation_id: str | None, finding_id: str | None = None) -> InlineKeyboardMarkup | None:
     if not investigation_id:
         return None
 
+    callback_data = f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:{investigation_id}"
+    if finding_id:
+        callback_data = f"{callback_data}:{finding_id}"
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Generate AI Recon Assessment", callback_data=f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:{investigation_id}")]]
+        [[InlineKeyboardButton("Generate AI Recon Assessment", callback_data=callback_data)]]
     )
 
 
@@ -1482,6 +1485,7 @@ def store_bbot_scan_result(user_id: int, result: dict[str, object], observations
             "risk_level": "info",
             "finding_count": len(observations),
             "raw_output": str(result.get("output") or ""),
+            "observations": observations,
             "observation_counts": observation_counts,
             "metadata": {
                 "returncode": result.get("returncode"),
@@ -3151,7 +3155,14 @@ async def _handle_bbot_target(
         if observations:
             add_observations(observations)
     observation_counts = summarize_observations(observations)
-    if result.get("success") is not True and observations:
+    if result.get("success") is True and not observations:
+        result = {
+            **result,
+            "success": False,
+            "error": "BBOT completed but produced no fresh normalized evidence for this run.",
+            "error_type": "no_fresh_evidence",
+        }
+    elif result.get("success") is not True and observations:
         result = {**result, "partial": True, "parser_error": parser_error}
     elif parser_error:
         result = {**result, "parser_error": parser_error}
@@ -3162,9 +3173,8 @@ async def _handle_bbot_target(
     observation_count = len(observations)
     recon_summary = None
     if is_successful_or_partial:
-        recon_summary = build_bbot_recon_summary(
-            user_id=user_id,
-            investigation_id=investigation["id"],
+        recon_summary = build_bbot_recon_summary_from_observations(
+            observations,
             target=str(result.get("target") or display_target),
         )
     add_investigation_event(
@@ -3201,7 +3211,7 @@ async def _handle_bbot_target(
     keyboard = (
         _combine_inline_keyboards(
             build_scan_result_actions(finding.get("id"), "bbot"),
-            build_bbot_ai_assessment_keyboard(investigation["id"]),
+            build_bbot_ai_assessment_keyboard(investigation["id"], finding.get("id")),
         )
         if result.get("success") is True
         or is_partial
@@ -3216,17 +3226,29 @@ async def _handle_bbot_target(
             user_id=user_id,
             investigation_id=investigation["id"],
             target=str(result.get("target") or display_target),
+            observations=observations,
+            recon_summary=recon_summary,
         )
     await _send_assessment_dashboard(update.message, assessment_context)
 
 
-async def _send_bbot_ai_assessment(message: object, *, user_id: int, investigation_id: str, target: str) -> None:
+async def _send_bbot_ai_assessment(
+    message: object,
+    *,
+    user_id: int,
+    investigation_id: str,
+    target: str,
+    observations: list[dict] | None = None,
+    recon_summary: str | None = None,
+) -> None:
     progress_message = await message.reply_text("Generating BBOT AI assessment...")
     assessment_lines = await asyncio.to_thread(
         generate_bbot_ai_assessment,
         user_id,
         investigation_id=investigation_id,
         target=target,
+        observations=observations,
+        recon_summary=recon_summary,
     )
     fallback = assessment_lines == FALLBACK_LINES
     add_investigation_event(
@@ -3251,11 +3273,25 @@ async def _send_bbot_ai_assessment(message: object, *, user_id: int, investigati
 
 async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> None:
     data = str(getattr(query, "data", "") or "")
-    investigation_id = data.removeprefix(f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:")
+    payload = data.removeprefix(f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:")
+    parts = payload.split(":", 1)
+    investigation_id = parts[0]
+    finding_id = parts[1] if len(parts) > 1 else None
     investigation = get_investigation(investigation_id, user_id)
     if investigation is None:
         await query.edit_message_text("Investigation not found for BBOT AI assessment.")
         return
+    finding = get_user_finding(user_id, finding_id) if finding_id else None
+    if finding_id and finding is None:
+        await query.edit_message_text("Stored BBOT scan result not found for AI assessment.")
+        return
+    finding_observations = list(finding.get("observations") or []) if finding else None
+    finding_target = str((finding or {}).get("target") or investigation.get("target") or "")
+    finding_summary = (
+        build_bbot_recon_summary_from_observations(finding_observations, target=finding_target)
+        if finding_observations is not None
+        else None
+    )
 
     message = getattr(query, "message", None)
     progress_message = None
@@ -3282,7 +3318,9 @@ async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> No
             generate_bbot_ai_assessment,
             user_id,
             investigation_id=investigation_id,
-            target=investigation.get("target"),
+            target=finding_target or investigation.get("target"),
+            observations=finding_observations,
+            recon_summary=finding_summary,
         )
     finally:
         if stop_event is not None and progress_task is not None:

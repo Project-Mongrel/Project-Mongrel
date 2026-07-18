@@ -1,5 +1,5 @@
 from app.services.ai_client import ask_ai
-from app.services.bbot_summary import build_bbot_recon_summary
+from app.services.bbot_summary import build_bbot_recon_summary, build_bbot_recon_summary_from_observations
 from app.services.investigation_store import get_investigation
 from app.services.observation_store import get_investigation_observations, get_user_observations
 from app.services.target_normalizer import normalize_target_key
@@ -60,9 +60,16 @@ def generate_bbot_ai_assessment(
     user_id,
     investigation_id=None,
     target=None,
+    observations=None,
+    recon_summary=None,
 ) -> list[str]:
-    observations = _load_bbot_observations(int(user_id), investigation_id=investigation_id, target=target)
-    summary = build_bbot_recon_summary(user_id=user_id, investigation_id=investigation_id, target=target)
+    supplied_observations = observations is not None
+    observations = list(observations) if supplied_observations else _load_bbot_observations(int(user_id), investigation_id=investigation_id, target=target)
+    summary = recon_summary or (
+        build_bbot_recon_summary_from_observations(observations, target=target)
+        if supplied_observations
+        else build_bbot_recon_summary(user_id=user_id, investigation_id=investigation_id, target=target)
+    )
     investigation = get_investigation(str(investigation_id), int(user_id)) if investigation_id else None
 
     if not observations:

@@ -33,6 +33,13 @@ def build_bbot_recon_summary(
     target=None,
 ):
     observations = _load_bbot_observations(user_id, investigation_id=investigation_id, target=target)
+    return build_bbot_recon_summary_from_observations(observations, target=target)
+
+
+def build_bbot_recon_summary_from_observations(
+    observations: list[dict],
+    target=None,
+) -> str:
     target_label = _summary_target(target, observations)
     counts = Counter(str(observation.get("observation_type") or "") for observation in observations)
     discoveries = _interesting_discoveries(observations)

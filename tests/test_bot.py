@@ -3317,20 +3317,135 @@ def test_bbot_scan_zero_observations_handled_cleanly() -> None:
             return_value={
                 "success": True,
                 "target": "example.com",
-                "output": "scan complete",
+                "output": "",
                 "error": "",
                 "returncode": 0,
                 "elapsed_seconds": 1,
             },
         ),
+        patch("app.bot.handlers.scan.generate_bbot_ai_assessment") as generate_bbot_ai_assessment,
     ):
         asyncio.run(scan_target_handler(update, context))
 
-    assert "Observations Collected: 0" in message.reply_text.call_args_list[1].args[0]
-    assert "Continue reconnaissance using additional observation sources." in message.reply_text.call_args_list[1].args[0]
+    generate_bbot_ai_assessment.assert_not_called()
+    assert "Status\nFailed" in message.reply_text.call_args_list[1].args[0]
+    assert "no fresh normalized evidence" in message.reply_text.call_args_list[1].args[0]
     finding = get_user_findings(7206)[0]
-    assert finding["summary"] == "BBOT completed but no structured observations were extracted."
+    assert finding["status"] == "failed"
+    assert finding["summary"] == "BBOT completed but produced no fresh normalized evidence for this run."
     assert get_user_observations(7206) == []
+
+
+def test_bbot_empty_current_run_does_not_reuse_prior_observations() -> None:
+    clear_user_findings(7221)
+    clear_user_investigations(7221)
+    clear_user_observations(7221)
+    clear_user_scan_requests(7221)
+    investigation = create_investigation(user_id=7221, target="example.com")
+    add_observation(
+        user_id=7221,
+        source="bbot",
+        observation_type="subdomain",
+        value="old.example.com",
+        target="example.com",
+        investigation_id=investigation["id"],
+    )
+    scan_request = create_scan_request(user_id=7221, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7221, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7221))
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": True,
+                "target": "example.com",
+                "output": "",
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 0.2,
+                "output_dir": "data/bbot/example.com/run-fresh",
+                "json_output_found": False,
+                "json_output_paths": [],
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_bbot_ai_assessment") as generate_bbot_ai_assessment,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    generate_bbot_ai_assessment.assert_not_called()
+    result_text = message.reply_text.call_args_list[1].args[0]
+    assert "Status\nFailed" in result_text
+    assert "old.example.com" not in result_text
+    finding = get_user_findings(7221)[0]
+    assert finding["status"] == "failed"
+    assert finding["finding_count"] == 0
+    assert finding["metadata"]["observation_count"] == 0
+    assert len(get_user_observations(7221)) == 1
+    assert get_user_observations(7221)[0]["value"] == "old.example.com"
+
+
+def test_bbot_current_run_summary_and_ai_ignore_prior_observations() -> None:
+    clear_user_findings(7222)
+    clear_user_investigations(7222)
+    clear_user_observations(7222)
+    clear_user_scan_requests(7222)
+    investigation = create_investigation(user_id=7222, target="example.com")
+    add_observation(
+        user_id=7222,
+        source="bbot",
+        observation_type="subdomain",
+        value="old.example.com",
+        target="example.com",
+        investigation_id=investigation["id"],
+    )
+    scan_request = create_scan_request(user_id=7222, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7222, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7222))
+
+    def assert_current_ai_context(*args, **kwargs):
+        observations = kwargs["observations"]
+        recon_summary = kwargs["recon_summary"]
+        assert [observation["value"] for observation in observations] == ["fresh.example.com"]
+        assert "Observations Collected: 1" in recon_summary
+        assert "fresh.example.com" in recon_summary
+        assert "old.example.com" not in recon_summary
+        return ["Executive Summary", "- Fresh BBOT evidence was reviewed."]
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": True,
+                "target": "example.com",
+                "output": '{"type":"DNS_NAME","data":"fresh.example.com"}',
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 2,
+                "output_dir": "data/bbot/example.com/run-fresh",
+                "json_output_found": True,
+                "json_output_paths": ["data/bbot/example.com/run-fresh/scan/output/output.jsonl"],
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_bbot_ai_assessment", side_effect=assert_current_ai_context),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    result_text = message.reply_text.call_args_list[1].args[0]
+    assert "Observations Collected: 1" in result_text
+    assert "fresh.example.com" in result_text
+    assert "old.example.com" not in result_text
+    finding = get_user_findings(7222)[0]
+    assert finding["status"] == "completed"
+    assert finding["finding_count"] == 1
+    assert [observation["value"] for observation in finding["observations"]] == ["fresh.example.com"]
+    assert {observation["value"] for observation in get_user_observations(7222)} == {"old.example.com", "fresh.example.com"}
 
 
 def test_bbot_scan_summary_chunks_are_sent() -> None:
