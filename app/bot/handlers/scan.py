@@ -137,6 +137,7 @@ METASPLOIT_CALLBACK_PREFIX = "msf"
 GITLEAKS_EVIDENCE_TOKEN_TTL_SECONDS = 900
 _gitleaks_evidence_action_tokens: dict[str, dict[str, object]] = {}
 _metasploit_pending_context: dict[str, dict[str, object]] = {}
+_bbot_ai_callback_tokens: dict[str, dict[str, object]] = {}
 logger = logging.getLogger(__name__)
 
 
@@ -476,16 +477,31 @@ def build_bbot_scan_started_text(target: str) -> str:
     return render_scan_loading_card("BBOT Scan", target, "Launching scan...", 0)
 
 
-def build_bbot_ai_assessment_keyboard(investigation_id: str | None, finding_id: str | None = None) -> InlineKeyboardMarkup | None:
+def build_bbot_ai_assessment_keyboard(
+    investigation_id: str | None,
+    finding_id: str | None = None,
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup | None:
     if not investigation_id:
         return None
 
-    callback_data = f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:{investigation_id}"
-    if finding_id:
-        callback_data = f"{callback_data}:{finding_id}"
+    token = _register_bbot_ai_callback(user_id=user_id, investigation_id=investigation_id, finding_id=finding_id)
+    callback_data = f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:{token}"
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Generate AI Recon Assessment", callback_data=callback_data)]]
     )
+
+
+def _register_bbot_ai_callback(user_id: int | None, investigation_id: str, finding_id: str | None = None) -> str:
+    token = secrets.token_urlsafe(9)
+    while token in _bbot_ai_callback_tokens:
+        token = secrets.token_urlsafe(9)
+    _bbot_ai_callback_tokens[token] = {
+        "user_id": user_id,
+        "investigation_id": investigation_id,
+        "finding_id": finding_id,
+    }
+    return token
 
 
 def _combine_inline_keyboards(*keyboards: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup | None:
@@ -3212,7 +3228,7 @@ async def _handle_bbot_target(
     keyboard = (
         _combine_inline_keyboards(
             build_scan_result_actions(finding.get("id"), "bbot"),
-            build_bbot_ai_assessment_keyboard(investigation["id"], finding.get("id")),
+            build_bbot_ai_assessment_keyboard(investigation["id"], finding.get("id"), user_id=user_id),
         )
         if result.get("success") is True
         or is_partial
@@ -3274,10 +3290,14 @@ async def _send_bbot_ai_assessment(
 
 async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> None:
     data = str(getattr(query, "data", "") or "")
-    payload = data.removeprefix(f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:")
-    parts = payload.split(":", 1)
-    investigation_id = parts[0]
-    finding_id = parts[1] if len(parts) > 1 else None
+    token = data.removeprefix(f"{BBOT_AI_ASSESSMENT_CALLBACK_PREFIX}:")
+    token_payload = _bbot_ai_callback_tokens.get(token)
+    if not token_payload or token_payload.get("user_id") != user_id:
+        await query.edit_message_text("Stored BBOT AI request was not found or has expired.")
+        return
+
+    investigation_id = str(token_payload.get("investigation_id") or "")
+    finding_id = str(token_payload.get("finding_id") or "") or None
     investigation = get_investigation(investigation_id, user_id)
     if investigation is None:
         await query.edit_message_text("Investigation not found for BBOT AI assessment.")

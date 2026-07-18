@@ -2879,6 +2879,8 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     assert keyboard.inline_keyboard[0][0].callback_data.startswith("ai_summary:bbot:")
     assert keyboard.inline_keyboard[1][0].text == "Generate AI Recon Assessment"
     assert keyboard.inline_keyboard[1][0].callback_data.startswith("bbot_ai:")
+    assert len(keyboard.inline_keyboard[1][0].callback_data) <= 64
+    assert keyboard.inline_keyboard[1][0].callback_data.count(":") == 1
     findings = get_user_findings(7202)
     assert findings[0]["source"] == "bbot"
     assert findings[0]["target"] == "example.com"
@@ -2936,38 +2938,67 @@ def test_bbot_scan_json_output_populates_observation_store_and_summary() -> None
 
 
 def test_bbot_ai_assessment_keyboard_exists() -> None:
-    keyboard = build_bbot_ai_assessment_keyboard("investigation-1")
+    keyboard = build_bbot_ai_assessment_keyboard("investigation-1", "finding-1", user_id=7210)
 
     assert keyboard is not None
     assert keyboard.inline_keyboard[0][0].text == "Generate AI Recon Assessment"
-    assert keyboard.inline_keyboard[0][0].callback_data == "bbot_ai:investigation-1"
+    callback_data = keyboard.inline_keyboard[0][0].callback_data
+    assert callback_data.startswith("bbot_ai:")
+    assert len(callback_data) <= 64
+    assert callback_data.count(":") == 1
 
 
 def test_bbot_ai_assessment_callback_success_sends_assessment_and_timeline_event() -> None:
     clear_user_investigations(7210)
     clear_user_observations(7210)
+    clear_user_findings(7210)
     investigation = create_investigation(user_id=7210, target="example.com")
-    add_observation(
+    old_finding = add_finding(
         user_id=7210,
-        investigation_id=investigation["id"],
-        source="bbot",
-        observation_type="subdomain",
-        value="admin.example.com",
-        target="example.com",
+        finding={
+            "source": "bbot",
+            "target": "example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "status": "completed",
+            "summary": "Old BBOT evidence.",
+            "observations": [{"source": "bbot", "observation_type": "subdomain", "value": "old.example.com", "target": "example.com"}],
+        },
     )
+    finding = add_finding(
+        user_id=7210,
+        finding={
+            "source": "bbot",
+            "target": "example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "status": "completed",
+            "summary": "Current BBOT evidence.",
+            "observations": [{"source": "bbot", "observation_type": "subdomain", "value": "admin.example.com", "target": "example.com"}],
+        },
+    )
+    keyboard = build_bbot_ai_assessment_keyboard(investigation["id"], finding["id"], user_id=7210)
     progress_message = SimpleNamespace(edit_text=AsyncMock())
     query_message = SimpleNamespace(reply_text=AsyncMock(side_effect=[progress_message, None]))
     query = SimpleNamespace(
-        data=f"bbot_ai:{investigation['id']}",
+        data=keyboard.inline_keyboard[0][0].callback_data,
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
         message=query_message,
     )
     update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7210))
 
+    def assert_current_finding_context(*args, **kwargs):
+        assert old_finding["id"] != finding["id"]
+        observations = kwargs["observations"]
+        assert [observation["value"] for observation in observations] == ["admin.example.com"]
+        assert "admin.example.com" in kwargs["recon_summary"]
+        assert "old.example.com" not in kwargs["recon_summary"]
+        return ["Executive Summary", "- Admin host observed.", "", "Confidence:", "Medium"]
+
     with patch(
         "app.bot.handlers.scan.generate_bbot_ai_assessment",
-        return_value=["Executive Summary", "- Admin host observed.", "", "Confidence:", "Medium"],
+        side_effect=assert_current_finding_context,
     ):
         asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
 
@@ -2986,19 +3017,25 @@ def test_bbot_ai_assessment_callback_success_sends_assessment_and_timeline_event
 def test_bbot_ai_assessment_callback_failure_sends_fallback_and_timeline_event() -> None:
     clear_user_investigations(7211)
     clear_user_observations(7211)
+    clear_user_findings(7211)
     investigation = create_investigation(user_id=7211, target="example.com")
-    add_observation(
+    finding = add_finding(
         user_id=7211,
-        investigation_id=investigation["id"],
-        source="bbot",
-        observation_type="subdomain",
-        value="app.example.com",
-        target="example.com",
+        finding={
+            "source": "bbot",
+            "target": "example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "status": "completed",
+            "summary": "Current BBOT evidence.",
+            "observations": [{"source": "bbot", "observation_type": "subdomain", "value": "app.example.com", "target": "example.com"}],
+        },
     )
+    keyboard = build_bbot_ai_assessment_keyboard(investigation["id"], finding["id"], user_id=7211)
     progress_message = SimpleNamespace(edit_text=AsyncMock())
     query_message = SimpleNamespace(reply_text=AsyncMock(side_effect=[progress_message, None]))
     query = SimpleNamespace(
-        data=f"bbot_ai:{investigation['id']}",
+        data=keyboard.inline_keyboard[0][0].callback_data,
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
         message=query_message,
@@ -3019,11 +3056,25 @@ def test_bbot_ai_assessment_callback_failure_sends_fallback_and_timeline_event()
 
 def test_bbot_ai_assessment_callback_chunks_response() -> None:
     clear_user_investigations(7212)
+    clear_user_findings(7212)
     investigation = create_investigation(user_id=7212, target="example.com")
+    finding = add_finding(
+        user_id=7212,
+        finding={
+            "source": "bbot",
+            "target": "example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "status": "completed",
+            "summary": "Current BBOT evidence.",
+            "observations": [{"source": "bbot", "observation_type": "subdomain", "value": "app.example.com", "target": "example.com"}],
+        },
+    )
+    keyboard = build_bbot_ai_assessment_keyboard(investigation["id"], finding["id"], user_id=7212)
     progress_message = SimpleNamespace(edit_text=AsyncMock())
     query_message = SimpleNamespace(reply_text=AsyncMock(side_effect=[progress_message, None, None]))
     query = SimpleNamespace(
-        data=f"bbot_ai:{investigation['id']}",
+        data=keyboard.inline_keyboard[0][0].callback_data,
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
         message=query_message,
@@ -3045,6 +3096,54 @@ def test_bbot_ai_assessment_callback_chunks_response() -> None:
         "chunk one",
         "chunk two",
     ]
+
+
+def test_bbot_ai_assessment_callback_invalid_token_rejected_safely() -> None:
+    query = SimpleNamespace(
+        data="bbot_ai:missing-token",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7214))
+
+    with patch("app.bot.handlers.scan.generate_bbot_ai_assessment") as generate_bbot_ai_assessment:
+        asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
+
+    generate_bbot_ai_assessment.assert_not_called()
+    query.edit_message_text.assert_called_once_with("Stored BBOT AI request was not found or has expired.")
+
+
+def test_bbot_ai_assessment_callback_cross_user_token_rejected() -> None:
+    clear_user_investigations(7215)
+    clear_user_findings(7215)
+    investigation = create_investigation(user_id=7215, target="example.com")
+    finding = add_finding(
+        user_id=7215,
+        finding={
+            "source": "bbot",
+            "target": "example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "status": "completed",
+            "summary": "Current BBOT evidence.",
+            "observations": [{"source": "bbot", "observation_type": "subdomain", "value": "app.example.com", "target": "example.com"}],
+        },
+    )
+    keyboard = build_bbot_ai_assessment_keyboard(investigation["id"], finding["id"], user_id=7215)
+    query = SimpleNamespace(
+        data=keyboard.inline_keyboard[0][0].callback_data,
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9999))
+
+    with patch("app.bot.handlers.scan.generate_bbot_ai_assessment") as generate_bbot_ai_assessment:
+        asyncio.run(scan_callback_handler(update, SimpleNamespace(user_data={})))
+
+    generate_bbot_ai_assessment.assert_not_called()
+    query.edit_message_text.assert_called_once_with("Stored BBOT AI request was not found or has expired.")
 
 
 def test_scan_ai_summary_callback_sends_new_summary_message() -> None:
@@ -3210,6 +3309,9 @@ def test_bbot_scan_nonzero_with_observations_is_partial_and_clean() -> None:
     assert "Partial result:" in result_text
     assert "NOISY BBOT STDOUT" not in result_text
     assert "BBOT exited with code 1" not in result_text
+    keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[1][0].text == "Generate AI Recon Assessment"
+    assert len(keyboard.inline_keyboard[1][0].callback_data) <= 64
     finding = get_user_findings(7205)[0]
     assert finding["status"] == "partial"
     assert finding["raw_output"] == raw_output
