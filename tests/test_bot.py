@@ -2857,6 +2857,10 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     with (
         patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
         patch("app.bot.handlers.scan.run_bbot_scan", return_value=result) as run_bbot_scan,
+        patch(
+            "app.bot.handlers.scan.generate_bbot_ai_assessment",
+            return_value=["Executive Summary", "- BBOT observations were reviewed."],
+        ),
     ):
         asyncio.run(scan_target_handler(update, context))
 
@@ -2885,7 +2889,7 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     assert "Observations:" in findings[0]["summary"]
     investigation = get_user_investigations(7202)[0]
     events = get_investigation_events(investigation["id"], 7202)
-    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_completed", "bbot_ai_assessment_fallback"]
+    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_completed", "bbot_ai_assessment_generated"]
     assert "Recon Summary Generated" in events[1]["summary"]
     observations = get_investigation_observations(investigation["id"], 7202)
     assert observations
@@ -3192,6 +3196,10 @@ def test_bbot_scan_nonzero_with_observations_is_partial_and_clean() -> None:
                 "elapsed_seconds": 7,
             },
         ),
+        patch(
+            "app.bot.handlers.scan.generate_bbot_ai_assessment",
+            return_value=["Executive Summary", "- Partial BBOT observations were reviewed."],
+        ),
     ):
         asyncio.run(scan_target_handler(update, context))
 
@@ -3212,7 +3220,7 @@ def test_bbot_scan_nonzero_with_observations_is_partial_and_clean() -> None:
     assert observations[0]["value"] == "app.example.com"
     investigation = get_user_investigations(7205)[0]
     events = get_investigation_events(investigation["id"], 7205)
-    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_partial", "bbot_ai_assessment_fallback"]
+    assert [event["event_type"] for event in events] == ["bbot_scan_started", "bbot_scan_partial", "bbot_ai_assessment_generated"]
 
 
 def test_bbot_scan_starts_and_stops_progress_auto_refresh() -> None:
