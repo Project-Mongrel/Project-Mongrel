@@ -3336,6 +3336,47 @@ def test_bbot_scan_zero_observations_handled_cleanly() -> None:
     assert get_user_observations(7206) == []
 
 
+def test_bbot_scan_warning_with_no_fresh_evidence_is_failed_without_ai() -> None:
+    clear_user_findings(7223)
+    clear_user_investigations(7223)
+    clear_user_observations(7223)
+    clear_user_scan_requests(7223)
+    scan_request = create_scan_request(user_id=7223, scan_type="bbot")
+    mark_scan_request_awaiting_target(user_id=7223, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7223))
+    warning = 'Could not find flag "loud". Did you mean "cloud-enum"?'
+
+    with (
+        patch("app.bot.handlers.scan.is_bbot_available", return_value=True),
+        patch(
+            "app.bot.handlers.scan.run_bbot_scan",
+            return_value={
+                "success": True,
+                "target": "example.com",
+                "output": "",
+                "error": warning,
+                "returncode": 0,
+                "elapsed_seconds": 1,
+                "json_output_found": False,
+                "json_output_paths": [],
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_bbot_ai_assessment") as generate_bbot_ai_assessment,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    generate_bbot_ai_assessment.assert_not_called()
+    result_text = message.reply_text.call_args_list[1].args[0]
+    assert "Status\nFailed" in result_text
+    assert warning in result_text
+    finding = get_user_findings(7223)[0]
+    assert finding["status"] == "failed"
+    assert finding["summary"] == warning
+    assert get_user_observations(7223) == []
+
+
 def test_bbot_empty_current_run_does_not_reuse_prior_observations() -> None:
     clear_user_findings(7221)
     clear_user_investigations(7221)

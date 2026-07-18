@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     bbot_presets: str = "subdomain-enum"
     bbot_modules: str = ""
     bbot_require_flags: str = "passive"
-    bbot_exclude_flags: str = "loud,invasive,deadly,web-heavy,web-screenshots,portscan"
+    bbot_exclude_flags: str = ""
     bbot_scope_search_distance: int = 0
     bbot_scope_report_distance: int = 0
     bbot_dns_threads: int = 10

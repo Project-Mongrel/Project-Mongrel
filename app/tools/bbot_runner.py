@@ -101,7 +101,7 @@ ALLOWED_BBOT_FLAGS = {
     "web-basic",
     "active",
 }
-AGGRESSIVE_BBOT_FLAGS = {"aggressive", "invasive", "loud", "deadly", "web-heavy", "web-screenshots", "portscan"}
+AGGRESSIVE_BBOT_FLAGS = {"aggressive"}
 logger = logging.getLogger(__name__)
 
 
@@ -356,10 +356,10 @@ def _build_bbot_command(executable: str, target: str, output_dir: Path, settings
         default="passive",
     )
     exclude_flags = _normalize_bbot_values(
-        getattr(settings, "bbot_exclude_flags", "loud,invasive,deadly,web-heavy,web-screenshots,portscan"),
+        getattr(settings, "bbot_exclude_flags", ""),
         field_name="BBOT excluded flags",
-        allowed=ALLOWED_BBOT_FLAGS | AGGRESSIVE_BBOT_FLAGS,
-        default="loud,invasive,deadly,web-heavy,web-screenshots,portscan",
+        allowed=ALLOWED_BBOT_FLAGS,
+        default="",
     )
     command = [
         executable,

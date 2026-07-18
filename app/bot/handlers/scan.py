@@ -3156,10 +3156,11 @@ async def _handle_bbot_target(
             add_observations(observations)
     observation_counts = summarize_observations(observations)
     if result.get("success") is True and not observations:
+        sanitized_error = str(result.get("error") or "").strip()
         result = {
             **result,
             "success": False,
-            "error": "BBOT completed but produced no fresh normalized evidence for this run.",
+            "error": sanitized_error or "BBOT completed but produced no fresh normalized evidence for this run.",
             "error_type": "no_fresh_evidence",
         }
     elif result.get("success") is not True and observations:

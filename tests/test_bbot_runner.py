@@ -34,13 +34,6 @@ def _expected_bbot_command(executable: str = "bbot", target: str = "example.com"
         "subdomain-enum",
         "-rf",
         "passive",
-        "-ef",
-        "loud",
-        "invasive",
-        "deadly",
-        "web-heavy",
-        "web-screenshots",
-        "portscan",
         "-c",
         "scope.search_distance=0",
         "scope.report_distance=0",
@@ -221,7 +214,7 @@ def test_bbot_command_supports_validated_professional_profile(tmp_path: Path) ->
         bbot_presets="subdomain-enum,email-enum,web-basic",
         bbot_modules="http,sslcert,wafw00f",
         bbot_require_flags="safe",
-        bbot_exclude_flags="loud,invasive,deadly",
+        bbot_exclude_flags="active,web",
         bbot_scope_search_distance=9,
         bbot_scope_report_distance=9,
         bbot_dns_threads=999,
@@ -262,6 +255,46 @@ def test_bbot_command_supports_validated_professional_profile(tmp_path: Path) ->
     assert "stdout" in command
     assert "--no-color" not in command
     assert "-eom" not in command
+    assert "-ef" in command
+    assert "active" in command
+    assert "web" in command
+    assert "loud" not in command
+    assert "invasive" not in command
+    assert "deadly" not in command
+
+
+def test_bbot_default_argv_uses_bbot_286_compatible_flags(tmp_path: Path) -> None:
+    command = bbot_runner._build_bbot_command("bbot", "example.com", tmp_path, Settings(_env_file=None))
+
+    assert command[0] == "bbot"
+    assert "--json" in command
+    assert "-om" in command
+    assert "json" in command
+    assert "stdout" in command
+    assert command[command.index("-rf") + 1] == "passive"
+    assert "-ef" not in command
+    assert "--no-color" not in command
+    assert "-eom" not in command
+    for unsupported_flag in ("loud", "invasive", "deadly", "web-heavy", "web-screenshots", "portscan"):
+        assert unsupported_flag not in command
+
+
+def test_bbot_unsupported_286_exclude_flags_rejected_without_subprocess(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, bbot_exclude_flags="loud,invasive,deadly,web-heavy,web-screenshots,portscan")
+
+    with (
+        patch("app.tools.bbot_runner.get_settings", return_value=settings),
+        patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.uuid4", return_value=SimpleNamespace(hex="fixed")),
+        patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
+        patch("app.tools.bbot_runner.subprocess.Popen") as popen_mock,
+    ):
+        result = run_bbot_scan("example.com")
+
+    popen_mock.assert_not_called()
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_configuration"
+    assert "BBOT excluded flags contains unsupported value: loud." in str(result["error"])
 
 
 def test_bbot_rejects_unknown_and_aggressive_profiles(tmp_path: Path) -> None:
