@@ -1718,6 +1718,8 @@ def test_nmap_ai_assessment_failure_does_not_fail_scan() -> None:
 def test_scan_menu_includes_nuclei_scan() -> None:
     keyboard = build_scan_type_keyboard()
     rendered_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+    rendered_layout = [[button.text for button in row] for row in keyboard.inline_keyboard]
+    callbacks = {button.text: button.callback_data for row in keyboard.inline_keyboard for button in row}
 
     assert "Nmap Scan" in rendered_buttons
     assert "Nuclei Scan" in rendered_buttons
@@ -1730,6 +1732,28 @@ def test_scan_menu_includes_nuclei_scan() -> None:
     assert "Gitleaks Secrets" in rendered_buttons
     assert "Prowler Cloud" in rendered_buttons
     assert "Metasploit Validation" in rendered_buttons
+    assert rendered_layout == [
+        ["Nmap Scan", "Nuclei Scan", "BBOT Recon"],
+        ["httpx Fingerprint", "Katana Crawl", "Playwright Observe"],
+        ["ffuf Discovery", "testssl.sh TLS", "Gitleaks Secrets"],
+        ["Prowler Cloud", "Metasploit Validation", "TShark PCAP"],
+        ["Back"],
+    ]
+    assert callbacks == {
+        "Nmap Scan": "scan:nmap",
+        "Nuclei Scan": "scan:nuclei",
+        "BBOT Recon": "scan:bbot",
+        "httpx Fingerprint": "scan:httpx",
+        "Katana Crawl": "scan:katana",
+        "Playwright Observe": "scan:playwright",
+        "ffuf Discovery": "scan:ffuf",
+        "testssl.sh TLS": "scan:testssl",
+        "Gitleaks Secrets": "scan:gitleaks",
+        "Prowler Cloud": "scan:prowler",
+        "Metasploit Validation": "scan:metasploit",
+        "TShark PCAP": "scan:tshark",
+        "Back": "nav:home",
+    }
 
 
 def test_nuclei_scan_callback_prompts_for_target() -> None:
