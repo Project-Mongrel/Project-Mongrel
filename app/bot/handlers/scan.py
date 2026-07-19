@@ -3041,6 +3041,7 @@ async def _handle_httpx_target(
     )
     progress_card = ScanProgressCard(update.message, "httpx Scan", display_target)
     await progress_card.start("Launching scan...")
+    await progress_card.start_auto_refresh("Running scan...", interval_seconds=5)
 
     try:
         result = await asyncio.to_thread(run_httpx_scan, target)
@@ -3058,6 +3059,8 @@ async def _handle_httpx_target(
         await update.message.reply_text(f"Invalid httpx target: {exc}")
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
+    finally:
+        await progress_card.stop_auto_refresh()
 
     complete_scan_request(
         user_id=user_id,
@@ -3080,6 +3083,9 @@ async def _handle_httpx_target(
     assessment_context = _pop_assessment_scan_context(context, "httpx")
     _record_assessment_scan(assessment_context, tool="httpx", result=result, finding=finding)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    elapsed_seconds = _parse_elapsed_seconds(result.get("elapsed_seconds"))
+    if elapsed_seconds is not None:
+        progress_card.started_at = time.monotonic() - elapsed_seconds
     if result.get("success") is True:
         await progress_card.complete()
     else:

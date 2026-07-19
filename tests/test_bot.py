@@ -2669,6 +2669,108 @@ def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     assert '{"url":"raw"}' not in card
 
 
+def test_httpx_scan_starts_timer_stops_on_success_and_renders_result() -> None:
+    clear_user_findings(7230)
+    clear_user_investigations(7230)
+    clear_user_scan_requests(7230)
+    scan_request = create_scan_request(user_id=7230, scan_type="httpx")
+    mark_scan_request_awaiting_target(user_id=7230, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7230))
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_httpx_scan",
+            return_value={
+                "success": True,
+                "target": "https://example.com",
+                "output": '{"url":"https://example.com","status_code":200,"title":"Example"}',
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 40,
+            },
+        ),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock) as start_auto_refresh,
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock) as stop_auto_refresh,
+        patch("app.bot.handlers.scan._send_httpx_ai_assessment", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    start_auto_refresh.assert_awaited_once_with("Running scan...", interval_seconds=5)
+    assert stop_auto_refresh.await_count >= 1
+    final_progress_text = status_message.edit_text.call_args_list[-1].args[0]
+    assert "Status\nComplete" in final_progress_text
+    assert "Elapsed\n40s" in final_progress_text
+    result_text = message.reply_text.call_args_list[1].args[0]
+    assert "httpx Scan Complete" in result_text
+    assert "Time\n40s" in result_text
+
+
+def test_httpx_scan_timer_stops_on_failure_and_renders_failed_result() -> None:
+    clear_user_findings(7231)
+    clear_user_investigations(7231)
+    clear_user_scan_requests(7231)
+    scan_request = create_scan_request(user_id=7231, scan_type="httpx")
+    mark_scan_request_awaiting_target(user_id=7231, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7231))
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_httpx_scan",
+            return_value={
+                "success": False,
+                "target": "https://example.com",
+                "output": "",
+                "error": "httpx timed out.",
+                "returncode": -9,
+                "elapsed_seconds": 13,
+            },
+        ),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock) as start_auto_refresh,
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock) as stop_auto_refresh,
+        patch("app.bot.handlers.scan._send_httpx_ai_assessment", new_callable=AsyncMock) as send_ai,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    start_auto_refresh.assert_awaited_once_with("Running scan...", interval_seconds=5)
+    assert stop_auto_refresh.await_count >= 1
+    send_ai.assert_not_awaited()
+    final_progress_text = status_message.edit_text.call_args_list[-1].args[0]
+    assert "Status\nFailed: httpx timed out." in final_progress_text
+    assert "Elapsed\n13s" in final_progress_text
+    assert "httpx Scan Complete" in message.reply_text.call_args_list[1].args[0]
+    assert "Status\nFailed" in message.reply_text.call_args_list[1].args[0]
+
+
+def test_httpx_scan_timer_stops_on_runner_exception() -> None:
+    clear_user_findings(7232)
+    clear_user_investigations(7232)
+    clear_user_scan_requests(7232)
+    scan_request = create_scan_request(user_id=7232, scan_type="httpx")
+    mark_scan_request_awaiting_target(user_id=7232, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7232))
+
+    with (
+        patch("app.bot.handlers.scan.run_httpx_scan", side_effect=ValueError("bad httpx target")),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock) as start_auto_refresh,
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock) as stop_auto_refresh,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    start_auto_refresh.assert_awaited_once_with("Running scan...", interval_seconds=5)
+    assert stop_auto_refresh.await_count >= 1
+    assert "Status\nFailed: bad httpx target" in status_message.edit_text.call_args_list[-1].args[0]
+    assert message.reply_text.call_args_list[1].args[0] == "Invalid httpx target: bad httpx target"
+
+
 def test_playwright_result_card_summarizes_observation_without_raw_details() -> None:
     result = {"success": True, "target": "https://example.com", "elapsed_seconds": 3, "output": {"raw": "not shown"}}
     observation = {
