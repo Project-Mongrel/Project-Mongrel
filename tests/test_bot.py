@@ -2837,6 +2837,43 @@ def test_katana_result_card_summarizes_observations_without_raw_json() -> None:
     assert '{"url":"raw"}' not in card
 
 
+def test_katana_scan_failure_uses_sanitized_runner_error() -> None:
+    clear_user_findings(7240)
+    clear_user_investigations(7240)
+    clear_user_scan_requests(7240)
+    scan_request = create_scan_request(user_id=7240, scan_type="katana")
+    mark_scan_request_awaiting_target(user_id=7240, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7240))
+    diagnostic = 'invalid value "robotstxt,sitemapxml" for flag -kf: allowed values are all, robotstxt, sitemapxml'
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_katana_scan",
+            return_value={
+                "success": False,
+                "target": "https://example.com",
+                "output": "",
+                "error": diagnostic,
+                "returncode": 2,
+                "elapsed_seconds": 0.08,
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_katana_ai_assessment") as generate_katana_ai_assessment,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    generate_katana_ai_assessment.assert_not_called()
+    progress_text = status_message.edit_text.call_args_list[-1].args[0]
+    result_text = message.reply_text.call_args_list[1].args[0]
+    assert diagnostic in progress_text
+    assert diagnostic in result_text
+    assert "Unknown error" not in progress_text
+    assert "Unknown error" not in result_text
+
+
 def test_ffuf_result_card_summarizes_observations_without_raw_json() -> None:
     result = {
         "success": True,

@@ -42,7 +42,7 @@ def test_katana_runner_success_uses_safe_subprocess_args() -> None:
     assert "-jc" in expected_command
     assert "-fx" in expected_command
     assert expected_command[expected_command.index("-fs") + 1] == "fqdn"
-    assert expected_command[expected_command.index("-kf") + 1] == "robotstxt,sitemapxml"
+    assert _katana_flag_values(expected_command, "-kf") == ["robotstxt", "sitemapxml"]
     assert expected_command[expected_command.index("-ct") + 1] == "90s"
     assert "-ob" in expected_command
 
@@ -73,6 +73,22 @@ def test_katana_timeout_is_clean_failure() -> None:
     assert result["success"] is False
     assert result["error_type"] == "timeout"
     assert result["error"] == "slow"
+
+
+def test_katana_exit_code_two_stdout_diagnostic_is_clean_failure() -> None:
+    diagnostic = 'invalid value "robotstxt,sitemapxml" for flag -kf: allowed values are all, robotstxt, sitemapxml\n'
+    with (
+        patch("app.tools.katana_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.katana_runner.shutil.which", return_value="katana"),
+        patch("app.tools.katana_runner.subprocess.run", return_value=_completed(stdout=f"\x1b[31m{diagnostic}\x1b[0m", stderr="", returncode=2)),
+    ):
+        result = run_katana_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "execution_failed"
+    assert result["returncode"] == 2
+    assert result["error"] == diagnostic.strip()
+    assert "\x1b" not in str(result["error"])
 
 
 @pytest.mark.parametrize("target", ["example.com;whoami", "example.com && whoami", "example.com|whoami"])
@@ -129,10 +145,17 @@ def test_katana_command_can_disable_optional_discovery_without_raw_flags() -> No
     assert "-silent" in command
 
 
+def test_katana_command_uses_repeated_known_file_flags_for_installed_cli() -> None:
+    command = _build_katana_command("katana", "https://example.com", known_files="robotstxt,sitemapxml")
+
+    assert _katana_flag_values(command, "-kf") == ["robotstxt", "sitemapxml"]
+    assert "robotstxt,sitemapxml" not in command
+
+
 def test_katana_scope_and_known_files_are_validated() -> None:
     assert _normalize_field_scope("rdn") == "rdn"
-    assert _normalize_known_files("robotstxt,sitemapxml,robotstxt") == "robotstxt,sitemapxml"
-    assert _normalize_known_files("all,robotstxt") == "all"
+    assert _normalize_known_files("robotstxt,sitemapxml,robotstxt") == ["robotstxt", "sitemapxml"]
+    assert _normalize_known_files("all,robotstxt") == ["all"]
 
     with pytest.raises(ValueError, match="field scope"):
         _normalize_field_scope(".*")
@@ -154,3 +177,7 @@ def test_katana_invalid_configuration_fails_cleanly() -> None:
     assert result["error_type"] == "invalid_configuration"
     assert result["command"] is None
     run_mock.assert_not_called()
+
+
+def _katana_flag_values(command: list[str], flag: str) -> list[str]:
+    return [command[index + 1] for index, value in enumerate(command[:-1]) if value == flag]

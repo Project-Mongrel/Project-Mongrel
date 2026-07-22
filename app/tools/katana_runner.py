@@ -21,6 +21,8 @@ MAX_KATANA_RESPONSE_SIZE_BYTES = 8_388_608
 KATANA_FIELD_SCOPES = frozenset({"fqdn", "dn", "rdn"})
 KATANA_KNOWN_FILE_VALUES = frozenset({"all", "robotstxt", "sitemapxml"})
 SAFE_KATANA_KNOWN_FILE_PATTERN = re.compile(r"^[A-Za-z0-9,]{1,64}$")
+ANSI_CONTROL_PATTERN = re.compile(r"(?:\x1B\[[0-?]*[ -/]*[@-~]|\x1B[@-_][0-?]*[ -/]*[@-~]|[\x00-\x08\x0B\x0C\x0E-\x1F\x7F])")
+MAX_KATANA_ERROR_BYTES = 2_000
 
 
 def run_katana_scan(target: str) -> dict[str, object]:
@@ -151,7 +153,7 @@ def run_katana_scan(target: str) -> dict[str, object]:
         target=validated_target,
         success=completed.returncode == 0,
         output=stdout,
-        error=stderr,
+        error="" if completed.returncode == 0 else _failure_error(stderr, stdout),
         error_type=None if completed.returncode == 0 else "execution_failed",
         returncode=completed.returncode,
         elapsed_seconds=elapsed_seconds,
@@ -236,8 +238,8 @@ def _build_katana_command(
         command.append("-jc")
     if form_extraction:
         command.append("-fx")
-    if safe_known_files:
-        command.extend(["-kf", safe_known_files])
+    for known_file in safe_known_files:
+        command.extend(["-kf", known_file])
     return command
 
 
@@ -256,10 +258,10 @@ def _normalize_field_scope(value: object) -> str:
     return scope
 
 
-def _normalize_known_files(value: object) -> str:
+def _normalize_known_files(value: object) -> list[str]:
     raw = str(value or "").strip().lower()
     if not raw:
-        return ""
+        return []
     if not SAFE_KATANA_KNOWN_FILE_PATTERN.fullmatch(raw):
         raise ValueError("Katana known-files configuration is malformed.")
     values = []
@@ -272,8 +274,20 @@ def _normalize_known_files(value: object) -> str:
         if cleaned not in values:
             values.append(cleaned)
     if "all" in values:
-        return "all"
-    return ",".join(values)
+        return ["all"]
+    return values
+
+
+def _failure_error(stderr: str, stdout: str) -> str:
+    diagnostic = stderr or stdout or "Katana crawl failed."
+    diagnostic = ANSI_CONTROL_PATTERN.sub("", str(diagnostic)).strip()
+    if not diagnostic:
+        return "Katana crawl failed."
+    encoded = diagnostic.encode("utf-8", errors="ignore")
+    if len(encoded) <= MAX_KATANA_ERROR_BYTES:
+        return diagnostic
+    truncated = encoded[:MAX_KATANA_ERROR_BYTES].decode("utf-8", errors="ignore").rstrip()
+    return f"{truncated}...[truncated]"
 
 
 def _result(
