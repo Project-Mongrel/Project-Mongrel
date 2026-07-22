@@ -67,6 +67,7 @@ from app.bot.handlers.scan import (
     build_httpx_target_prompt,
     build_katana_result_text,
     build_katana_target_prompt,
+    build_metasploit_mode_text,
     build_metasploit_request_prompt,
     build_metasploit_readiness_failure_text,
     build_metasploit_result_text,
@@ -701,7 +702,8 @@ def test_assessment_metasploit_launch_routes_only_to_metasploit_prompt() -> None
         )
 
     assert "Launching METASPLOIT" in query.edit_message_text.call_args.args[0]
-    assert message.reply_text.call_args.args[0] == build_metasploit_request_prompt()
+    assert message.reply_text.call_args.args[0] == build_metasploit_mode_text()
+    assert message.reply_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].text == "Guided Validation"
     assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["tool"] == "metasploit"
     prowler_runner.assert_not_called()
 
@@ -2314,7 +2316,7 @@ def _metasploit_request_text() -> str:
     )
 
 
-def test_metasploit_scan_callback_prompts_for_structured_request() -> None:
+def test_metasploit_scan_callback_prompts_for_guided_or_advanced_mode() -> None:
     clear_user_scan_requests(7300)
     query = SimpleNamespace(data="scan:metasploit", answer=AsyncMock(), edit_message_text=AsyncMock())
     update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7300))
@@ -2323,8 +2325,212 @@ def test_metasploit_scan_callback_prompts_for_structured_request() -> None:
     with patch("app.bot.handlers.scan.check_metasploit_readiness", return_value={"ready": True, "resolved_binary": "msfconsole"}):
         asyncio.run(scan_callback_handler(update, context))
 
-    assert query.edit_message_text.call_args.args[0] == build_metasploit_request_prompt()
+    assert query.edit_message_text.call_args.args[0] == build_metasploit_mode_text()
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert buttons == ["Guided Validation", "Advanced Manual Mode", "Back"]
+    assert PENDING_NMAP_REQUEST_KEY not in context.user_data
+
+
+def test_metasploit_advanced_manual_mode_still_prompts_for_structured_request() -> None:
+    clear_user_scan_requests(7330)
+    query = SimpleNamespace(data="scan:metasploit", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7330))
+    context = SimpleNamespace(user_data={})
+
+    with patch("app.bot.handlers.scan.check_metasploit_readiness", return_value={"ready": True, "resolved_binary": "msfconsole"}):
+        asyncio.run(scan_callback_handler(update, context))
+    mode_keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    manual_callback = mode_keyboard.inline_keyboard[1][0].callback_data
+    manual_query = SimpleNamespace(data=manual_callback, answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=manual_query, effective_user=SimpleNamespace(id=7330)), context))
+
+    assert manual_query.edit_message_text.call_args.args[0] == build_metasploit_request_prompt()
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+
+
+def test_metasploit_guided_target_entry_normalizes_url_and_prompts_for_service() -> None:
+    clear_user_scan_requests(7331)
+    context = _start_metasploit_guided_mode(7331)
+    message = SimpleNamespace(text="https://Example.com/app", reply_text=AsyncMock())
+
+    asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7331)), context))
+
+    text = message.reply_text.call_args.args[0]
+    keyboard = message.reply_text.call_args.kwargs["reply_markup"]
+    assert "Target: example.com" in text
+    assert keyboard.inline_keyboard[0][0].text == "HTTP - 80"
+    assert keyboard.inline_keyboard[0][1].text == "HTTPS - 443"
+    assert len(keyboard.inline_keyboard[0][0].callback_data) <= 64
+
+
+def test_metasploit_guided_invalid_target_rejected_without_proposal() -> None:
+    clear_user_scan_requests(7332)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    context = _start_metasploit_guided_mode(7332)
+    message = SimpleNamespace(text="example.com;id", reply_text=AsyncMock())
+
+    asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7332)), context))
+
+    assert "Invalid Metasploit target" in message.reply_text.call_args.args[0]
+    assert _metasploit_pending_context == {}
+
+
+def test_metasploit_guided_service_selection_shows_only_allowlisted_compatible_validation() -> None:
+    clear_user_scan_requests(7333)
+    context, service_keyboard = _metasploit_guided_service_keyboard_for_target(7333, "https://example.com")
+    service_query = SimpleNamespace(
+        data=service_keyboard.inline_keyboard[0][1].callback_data,
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=service_query, effective_user=SimpleNamespace(id=7333)), context))
+
+    text = service_query.edit_message_text.call_args.args[0]
+    keyboard = service_query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert "Service: HTTPS - 443" in text
+    assert "HTTP service fingerprint check" in text
+    assert "struts" not in text.lower()
+    assert keyboard.inline_keyboard[0][0].text == "HTTP service fingerprint check"
+    assert len(keyboard.inline_keyboard[0][0].callback_data) <= 64
+
+
+def test_metasploit_guided_custom_port_entry_is_validated() -> None:
+    clear_user_scan_requests(7337)
+    context, service_keyboard = _metasploit_guided_service_keyboard_for_target(7337, "https://example.com")
+    custom_query = SimpleNamespace(
+        data=service_keyboard.inline_keyboard[1][0].callback_data,
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=custom_query, effective_user=SimpleNamespace(id=7337)), context))
+    assert "Send the authorized service port" in custom_query.edit_message_text.call_args.args[0]
+    port_message = SimpleNamespace(text="8080", reply_text=AsyncMock())
+
+    asyncio.run(scan_target_handler(SimpleNamespace(message=port_message, effective_user=SimpleNamespace(id=7337)), context))
+
+    assert "Service: Custom service - 8080" in port_message.reply_text.call_args.args[0]
+    assert port_message.reply_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].text == "HTTP service fingerprint check"
+
+
+def test_metasploit_guided_review_card_and_approve_executes_exact_request() -> None:
+    clear_user_findings(7334)
+    clear_user_scan_requests(7334)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    context, service_keyboard = _metasploit_guided_service_keyboard_for_target(7334, "https://example.com")
+    service_query = SimpleNamespace(data=service_keyboard.inline_keyboard[0][1].callback_data, answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=service_query, effective_user=SimpleNamespace(id=7334)), context))
+    validation_keyboard = service_query.edit_message_text.call_args.kwargs["reply_markup"]
+    proposal_message = SimpleNamespace(reply_text=AsyncMock())
+    validation_query = SimpleNamespace(data=validation_keyboard.inline_keyboard[0][0].callback_data, answer=AsyncMock(), edit_message_text=AsyncMock(), message=proposal_message)
+
+    with patch("app.bot.handlers.scan.run_metasploit_validation") as runner_mock:
+        asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=validation_query, effective_user=SimpleNamespace(id=7334)), context))
+        runner_mock.assert_not_called()
+
+    review = proposal_message.reply_text.call_args.args[0]
+    proposal_keyboard = proposal_message.reply_text.call_args.kwargs["reply_markup"]
+    assert "Metasploit Validation Review" in review
+    assert "Target:\nexample.com" in review
+    assert "Service:\nHTTPS - 443" in review
+    assert "Validation:\nHTTP service fingerprint check" in review
+    assert "Module: auxiliary/scanner/http/http_version" in review
+    assert "Action: auxiliary_validation" in review
+    assert "Approved options: SSL=true" in review
+    assert "does not create a session" in review
+    assert len(proposal_keyboard.inline_keyboard[0][0].callback_data) <= 64
+    assert len(proposal_keyboard.inline_keyboard[0][1].callback_data) <= 64
+    proposal_id = next(iter(_metasploit_pending_context))
+    proposal = get_metasploit_proposal(proposal_id)
+    assert proposal is not None
+    approve_query = SimpleNamespace(data=f"msf:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=proposal_message)
+    result = {
+        "success": True,
+        "module": "auxiliary/scanner/http/http_version",
+        "action_type": "auxiliary_validation",
+        "target": "example.com",
+        "port": 443,
+        "output": "Server: nginx",
+        "error": "",
+        "elapsed_seconds": 1,
+        "returncode": 0,
+    }
+
+    with (
+        patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result) as runner_mock,
+        patch("app.bot.handlers.scan.generate_metasploit_ai_assessment", return_value=["Executive Summary", "- Metasploit evidence reviewed."]),
+    ):
+        asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=7334)), context))
+
+    request = runner_mock.call_args.kwargs["request"]
+    assert request["module"] == "auxiliary/scanner/http/http_version"
+    assert request["action_type"] == "auxiliary_validation"
+    assert request["target"] == "example.com"
+    assert request["port"] == 443
+    assert request["options"] == {"SSL": "true"}
+
+
+def test_metasploit_guided_token_is_user_bound_and_rejects_cross_user() -> None:
+    clear_user_scan_requests(7335)
+    context, service_keyboard = _metasploit_guided_service_keyboard_for_target(7335, "https://example.com")
+    query = SimpleNamespace(
+        data=service_keyboard.inline_keyboard[0][0].callback_data,
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=9999)), context))
+
+    assert query.edit_message_text.call_args.args[0] == "Metasploit guided selection was not found or has expired."
+
+
+def test_metasploit_guided_details_and_reject_do_not_execute() -> None:
+    clear_user_scan_requests(7336)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    context, service_keyboard = _metasploit_guided_service_keyboard_for_target(7336, "http://example.com")
+    service_query = SimpleNamespace(data=service_keyboard.inline_keyboard[0][0].callback_data, answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=service_query, effective_user=SimpleNamespace(id=7336)), context))
+    validation_keyboard = service_query.edit_message_text.call_args.kwargs["reply_markup"]
+    proposal_message = SimpleNamespace(reply_text=AsyncMock())
+    validation_query = SimpleNamespace(data=validation_keyboard.inline_keyboard[0][0].callback_data, answer=AsyncMock(), edit_message_text=AsyncMock(), message=proposal_message)
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=validation_query, effective_user=SimpleNamespace(id=7336)), context))
+    proposal_id = next(iter(_metasploit_pending_context))
+    details_query = SimpleNamespace(data=f"msf:details:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=proposal_message)
+    reject_query = SimpleNamespace(data=f"msf:reject:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=proposal_message)
+
+    with patch("app.bot.handlers.scan.run_metasploit_validation") as runner_mock:
+        asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=details_query, effective_user=SimpleNamespace(id=7336)), context))
+        asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=reject_query, effective_user=SimpleNamespace(id=7336)), context))
+
+    runner_mock.assert_not_called()
+    assert "Metasploit Validation Proposal Details" in details_query.edit_message_text.call_args.args[0]
+    assert "rejected" in reject_query.edit_message_text.call_args.args[0]
+
+
+def _start_metasploit_guided_mode(user_id: int) -> SimpleNamespace:
+    query = SimpleNamespace(data="scan:metasploit", answer=AsyncMock(), edit_message_text=AsyncMock())
+    context = SimpleNamespace(user_data={})
+    with patch("app.bot.handlers.scan.check_metasploit_readiness", return_value={"ready": True, "resolved_binary": "msfconsole"}):
+        asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=user_id)), context))
+    guided_callback = query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+    guided_query = SimpleNamespace(data=guided_callback, answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=guided_query, effective_user=SimpleNamespace(id=user_id)), context))
+    return context
+
+
+def _metasploit_guided_service_keyboard_for_target(user_id: int, target: str) -> tuple[SimpleNamespace, object]:
+    context = _start_metasploit_guided_mode(user_id)
+    message = SimpleNamespace(text=target, reply_text=AsyncMock())
+    asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id)), context))
+    return context, message.reply_text.call_args.kwargs["reply_markup"]
 
 
 def test_metasploit_scan_callback_missing_binary_shows_clean_readiness_failure() -> None:

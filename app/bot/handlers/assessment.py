@@ -475,7 +475,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         "tool": tool,
     }
     if tool == "metasploit":
-        from app.bot.handlers.scan import build_metasploit_readiness_failure_text, build_metasploit_request_prompt
+        from app.bot.handlers.scan import build_metasploit_mode_keyboard, build_metasploit_mode_text, build_metasploit_readiness_failure_text
         from app.tools.metasploit_runner import check_metasploit_readiness
 
         readiness = check_metasploit_readiness(run_version_check=False)
@@ -503,7 +503,10 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
                 if candidate:
                     known_assets.add(candidate)
         context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["known_assets"] = sorted(known_assets)
-        await message.reply_text(build_metasploit_request_prompt())
+        await message.reply_text(
+            build_metasploit_mode_text(),
+            reply_markup=build_metasploit_mode_keyboard(scan_request.id),
+        )
         return
     synthetic_update = type(
         "AssessmentScanUpdate",

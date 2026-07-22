@@ -1,6 +1,7 @@
 import asyncio
 import ipaddress
 import logging
+import re
 import secrets
 import time
 from datetime import UTC
@@ -79,7 +80,7 @@ from app.services.metasploit_approval import (
 )
 from app.services.metasploit_ai_assessment import FALLBACK_LINES as METASPLOIT_AI_FALLBACK_LINES
 from app.services.metasploit_ai_assessment import generate_metasploit_ai_assessment
-from app.services.metasploit_policy import build_metasploit_action_request
+from app.services.metasploit_policy import MODULE_POLICIES, build_metasploit_action_request
 from app.services.observation_store import add_observations
 from app.services.risk_rules import assess_nmap_ports
 from app.services.scan_manager import (
@@ -110,7 +111,7 @@ from app.services.testssl_ai_assessment import generate_testssl_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
 from app.services.target_normalizer import normalize_for_bbot, normalize_for_ffuf, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_for_playwright, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
-from app.tools.nmap_runner import run_nmap_scan
+from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS, run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
 from app.tools.ffuf_runner import run_ffuf_scan
 from app.tools.gitleaks_runner import run_gitleaks_scan
@@ -135,8 +136,11 @@ GITLEAKS_EVIDENCE_REVEAL_CALLBACK_PREFIX = "glrv"
 GITLEAKS_EVIDENCE_CANCEL_CALLBACK_PREFIX = "glcx"
 METASPLOIT_CALLBACK_PREFIX = "msf"
 GITLEAKS_EVIDENCE_TOKEN_TTL_SECONDS = 900
+METASPLOIT_FLOW_MODE_KEY = "metasploit_flow_mode"
+METASPLOIT_GUIDED_CONTEXT_KEY = "metasploit_guided_context"
 _gitleaks_evidence_action_tokens: dict[str, dict[str, object]] = {}
 _metasploit_pending_context: dict[str, dict[str, object]] = {}
+_metasploit_guided_tokens: dict[str, dict[str, object]] = {}
 _bbot_ai_callback_tokens: dict[str, dict[str, object]] = {}
 logger = logging.getLogger(__name__)
 
@@ -336,6 +340,114 @@ def build_metasploit_request_prompt() -> str:
     )
 
 
+def build_metasploit_mode_text() -> str:
+    return "\n".join(
+        [
+            "Metasploit Validation",
+            "",
+            "Choose how to prepare the controlled validation request.",
+            "",
+            "Guided Validation walks through target, service, and a compatible allowlisted validation.",
+            "Advanced Manual Mode accepts the existing structured key=value request format.",
+            "",
+            "No msfconsole commands, raw resource scripts, sessions, post-exploitation, lateral movement, or brute force are accepted.",
+        ]
+    )
+
+
+def build_metasploit_mode_keyboard(scan_request_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Guided Validation", callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:guided:{scan_request_id}")],
+            [InlineKeyboardButton("Advanced Manual Mode", callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:manual:{scan_request_id}")],
+            [InlineKeyboardButton("Back", callback_data="scan:metasploit")],
+        ]
+    )
+
+
+def build_metasploit_guided_target_prompt() -> str:
+    return "\n".join(
+        [
+            "Metasploit guided validation.",
+            "",
+            "Send the authorized hostname or IP address.",
+            "",
+            "URLs are normalized to hostnames when safe.",
+            "No validation runs until you review and approve the exact action.",
+        ]
+    )
+
+
+def build_metasploit_service_keyboard(user_id: int, scan_request_id: str, target: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "HTTP - 80",
+                    callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:svc:{_register_metasploit_guided_token(user_id, scan_request_id, target=target, service='HTTP', port=80)}",
+                ),
+                InlineKeyboardButton(
+                    "HTTPS - 443",
+                    callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:svc:{_register_metasploit_guided_token(user_id, scan_request_id, target=target, service='HTTPS', port=443)}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Custom Port",
+                    callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:custom:{_register_metasploit_guided_token(user_id, scan_request_id, target=target)}",
+                )
+            ],
+        ]
+    )
+
+
+def build_metasploit_service_prompt(target: str) -> str:
+    return "\n".join(
+        [
+            "Choose the service/port to validate.",
+            "",
+            f"Target: {target}",
+            "",
+            "Only compatible allowlisted Metasploit validations will be shown next.",
+        ]
+    )
+
+
+def build_metasploit_validation_keyboard(user_id: int, scan_request_id: str, target: str, service: str, port: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "HTTP service fingerprint check",
+                    callback_data=f"{METASPLOIT_CALLBACK_PREFIX}:val:{_register_metasploit_guided_token(user_id, scan_request_id, target=target, service=service, port=port, validation='http_version')}",
+                )
+            ]
+        ]
+    )
+
+
+def build_metasploit_validation_prompt(target: str, service: str, port: int) -> str:
+    return "\n".join(
+        [
+            "Choose an allowlisted validation.",
+            "",
+            f"Target: {target}",
+            f"Service: {service} - {port}",
+            "",
+            "Available:",
+            "HTTP service fingerprint check",
+        ]
+    )
+
+
+def _register_metasploit_guided_token(user_id: int, scan_request_id: str, **payload: object) -> str:
+    token = secrets.token_urlsafe(9)
+    while token in _metasploit_guided_tokens:
+        token = secrets.token_urlsafe(9)
+    _metasploit_guided_tokens[token] = {"user_id": int(user_id), "scan_request_id": scan_request_id, **payload}
+    return token
+
+
 def build_metasploit_readiness_failure_text(readiness: dict[str, object] | None = None) -> str:
     readiness = readiness or {}
     configured = str(readiness.get("configured_binary") or "msfconsole")
@@ -355,22 +467,39 @@ def build_metasploit_readiness_failure_text(readiness: dict[str, object] | None 
 def build_metasploit_proposal_text(proposal: object) -> str:
     request = getattr(proposal, "request", {}) or {}
     options = request.get("options") or {}
+    service = _metasploit_service_label(int(request.get("port") or 0))
+    validation = _metasploit_validation_name(str(request.get("module") or ""))
+    risk = str(request.get("risk_tier") or "unknown").title()
     return "\n".join(
         [
-            "Metasploit Validation Proposal",
+            "Metasploit Validation Review",
             "",
             "Controlled offensive validation for explicitly authorized targets only.",
             "",
+            "Target:",
+            str(request.get("target") or "unknown"),
+            "",
+            "Service:",
+            f"{service} - {request.get('port') or 'unknown'}",
+            "",
+            "Validation:",
+            validation,
+            "",
+            "Metasploit Validation Proposal",
             f"Proposal ID: {getattr(proposal, 'id', 'unknown')}",
             f"Module: {request.get('module') or 'unknown'}",
             f"Action: {request.get('action_type') or 'unknown'}",
             f"Target: {request.get('target') or 'unknown'}",
             f"Port: {request.get('port') or 'unknown'}",
+            f"Risk: {risk} - read-only service validation" if risk.lower() == "low" else f"Risk: {risk}",
             f"Risk tier: {str(request.get('risk_tier') or 'unknown').upper()}",
             f"Expected effect: {request.get('expected_effect') or 'unknown'}",
             f"Timeout: {request.get('timeout_seconds') or 'unknown'}s",
             f"Expires: {_format_metasploit_timestamp(getattr(proposal, 'expires_at', None))}",
             "Approved options: " + (_format_metasploit_options(options) if options else "none"),
+            "",
+            "This action does not create a session, upload a payload, perform post-exploitation, or move laterally.",
+            "It does not prove compromise or security by itself.",
             "",
             "Approve only if this exact action is authorized.",
         ]
@@ -1293,6 +1422,16 @@ def _format_metasploit_timestamp(value: object) -> str:
     return "unknown"
 
 
+def _metasploit_service_label(port: int) -> str:
+    return {80: "HTTP", 443: "HTTPS"}.get(int(port or 0), "Custom service")
+
+
+def _metasploit_validation_name(module: str) -> str:
+    if module == "auxiliary/scanner/http/http_version":
+        return "HTTP service fingerprint check"
+    return module or "unknown"
+
+
 def store_prowler_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
     evidence = evidence or {}
     summary = summarize_prowler_evidence(evidence) if evidence else {}
@@ -1893,7 +2032,7 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if user_id is None:
             await query.edit_message_text("Unable to identify Telegram user.")
             return
-        await _handle_metasploit_callback(query, user_id)
+        await _handle_metasploit_callback(query, user_id, context)
         return
 
     if query.data is None or not query.data.startswith("scan:"):
@@ -1969,6 +2108,13 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
         context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
         await query.edit_message_text(build_testssl_target_prompt())
+        return
+
+    if scan_type == "metasploit":
+        await query.edit_message_text(
+            build_metasploit_mode_text(),
+            reply_markup=build_metasploit_mode_keyboard(scan_request.id),
+        )
         return
 
     if scan_type == "gitleaks":
@@ -2690,6 +2836,40 @@ async def _handle_metasploit_request(
 ) -> None:
     if update.message is None:
         return
+    mode = str(context.user_data.get(METASPLOIT_FLOW_MODE_KEY) or "manual")
+    if mode == "guided_target":
+        try:
+            target = _normalize_metasploit_guided_target(update.message.text or "")
+        except ValueError as exc:
+            await update.message.reply_text(f"Invalid Metasploit target: {exc}")
+            context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+            context.user_data.pop(METASPLOIT_FLOW_MODE_KEY, None)
+            context.user_data.pop(METASPLOIT_GUIDED_CONTEXT_KEY, None)
+            return
+        context.user_data[METASPLOIT_GUIDED_CONTEXT_KEY] = {"target": target}
+        context.user_data[METASPLOIT_FLOW_MODE_KEY] = "guided_service"
+        await update.message.reply_text(
+            build_metasploit_service_prompt(target),
+            reply_markup=build_metasploit_service_keyboard(user_id, scan_request_id, target),
+        )
+        return
+    if mode == "guided_custom_port":
+        guided = context.user_data.get(METASPLOIT_GUIDED_CONTEXT_KEY) or {}
+        target = str(guided.get("target") or "")
+        try:
+            port = _normalize_metasploit_guided_port(update.message.text or "")
+        except ValueError as exc:
+            await update.message.reply_text(f"Invalid Metasploit port: {exc}")
+            return
+        service = _metasploit_service_label(port)
+        if not _metasploit_guided_supports_http_version(port):
+            await update.message.reply_text("No allowlisted Metasploit validations are compatible with that service/port in guided mode.")
+            return
+        await update.message.reply_text(
+            build_metasploit_validation_prompt(target, service, port),
+            reply_markup=build_metasploit_validation_keyboard(user_id, scan_request_id, target, service, port),
+        )
+        return
     try:
         request = parse_metasploit_request_text(update.message.text or "")
     except (ValueError, TypeError) as exc:
@@ -2708,17 +2888,39 @@ async def _handle_metasploit_request(
         )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
+    await _create_and_send_metasploit_proposal(
+        update.message,
+        context,
+        user_id,
+        request,
+        scan_request_id,
+        assessment_context=assessment_context if isinstance(assessment_context, dict) else None,
+    )
+
+
+async def _create_and_send_metasploit_proposal(
+    message: object,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    request: dict,
+    scan_request_id: str,
+    *,
+    assessment_context: dict | None = None,
+) -> None:
     proposal = propose_metasploit_action(
         user_id,
         request,
-        assessment_context=assessment_context if isinstance(assessment_context, dict) else None,
+        assessment_context=assessment_context,
+        reason="guided validation" if context.user_data.get(METASPLOIT_FLOW_MODE_KEY, "").startswith("guided") else None,
     )
     _metasploit_pending_context[proposal.id] = {
         "scan_request_id": scan_request_id,
         "assessment_context": assessment_context,
     }
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
-    await update.message.reply_text(
+    context.user_data.pop(METASPLOIT_FLOW_MODE_KEY, None)
+    context.user_data.pop(METASPLOIT_GUIDED_CONTEXT_KEY, None)
+    await message.reply_text(
         build_metasploit_proposal_text(proposal),
         reply_markup=build_metasploit_proposal_keyboard(proposal.id),
     )
@@ -2751,13 +2953,115 @@ def _comparison_host(value: str) -> str:
         return host.rstrip(".")
 
 
-async def _handle_metasploit_callback(query: object, user_id: int) -> None:
+def _normalize_metasploit_guided_target(value: str) -> str:
+    raw = str(value or "").strip()
+    if any(character in raw for character in DANGEROUS_SHELL_CHARACTERS):
+        raise ValueError("target contains unsupported shell characters.")
+    parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+    host = parsed.hostname or raw.split("/", 1)[0].split(":", 1)[0]
+    host = str(host or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError("target must be a hostname or IP address.")
+    try:
+        return ipaddress.ip_address(host).compressed
+    except ValueError:
+        if not re.fullmatch(r"[a-z0-9.-]{1,253}", host) or ".." in host or host.startswith("-") or host.endswith("-"):
+            raise ValueError("target must be a valid hostname or IP address.")
+        return host
+
+
+def _normalize_metasploit_guided_port(value: object) -> int:
+    try:
+        port = int(str(value or "").strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("port must be an integer.") from exc
+    if port < 1 or port > 65535:
+        raise ValueError("port is outside the valid range.")
+    return port
+
+
+def _metasploit_guided_supports_http_version(port: int) -> bool:
+    return (
+        "auxiliary/scanner/http/http_version" in MODULE_POLICIES
+        and int(port or 0) in {80, 443, 8080, 8443}
+    )
+
+
+def _build_guided_metasploit_request(*, target: str, service: str, port: int) -> dict:
+    options = {"SSL": "true"} if int(port) in {443, 8443} or str(service).upper() == "HTTPS" else {}
+    return build_metasploit_action_request(
+        module="auxiliary/scanner/http/http_version",
+        action_type="auxiliary_validation",
+        target=target,
+        port=port,
+        options=options,
+    )
+
+
+async def _handle_metasploit_callback(query: object, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = str(getattr(query, "data", "") or "")
     parts = data.split(":")
     if len(parts) != 3:
         await query.edit_message_text("Unsupported Metasploit action.")
         return
     action, proposal_id = parts[1], parts[2]
+    if action in {"guided", "manual"}:
+        scan_request_id = proposal_id
+        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request_id)
+        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request_id
+        context.user_data[METASPLOIT_FLOW_MODE_KEY] = "guided_target" if action == "guided" else "manual"
+        prompt = build_metasploit_guided_target_prompt() if action == "guided" else build_metasploit_request_prompt()
+        await query.edit_message_text(prompt)
+        return
+    if action in {"svc", "custom", "val"}:
+        token_payload = _metasploit_guided_tokens.get(proposal_id)
+        if not token_payload or token_payload.get("user_id") != user_id:
+            await query.edit_message_text("Metasploit guided selection was not found or has expired.")
+            return
+        scan_request_id = str(token_payload.get("scan_request_id") or "")
+        target = str(token_payload.get("target") or "")
+        if action == "custom":
+            mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request_id)
+            context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request_id
+            context.user_data[METASPLOIT_FLOW_MODE_KEY] = "guided_custom_port"
+            context.user_data[METASPLOIT_GUIDED_CONTEXT_KEY] = {"target": target}
+            await query.edit_message_text(f"Send the authorized service port for {target}.")
+            return
+        port = int(token_payload.get("port") or 0)
+        service = str(token_payload.get("service") or _metasploit_service_label(port))
+        if action == "svc":
+            if not _metasploit_guided_supports_http_version(port):
+                await query.edit_message_text("No allowlisted Metasploit validations are compatible with that service/port in guided mode.")
+                return
+            await query.edit_message_text(
+                build_metasploit_validation_prompt(target, service, port),
+                reply_markup=build_metasploit_validation_keyboard(user_id, scan_request_id, target, service, port),
+            )
+            return
+        request = _build_guided_metasploit_request(target=target, service=service, port=port)
+        assessment_context = _pop_assessment_scan_context(context, "metasploit")
+        if assessment_context and not _metasploit_target_belongs_to_assessment(target, assessment_context):
+            await query.edit_message_text(
+                "Metasploit target is not part of this assessment's known target/assets. "
+                "Add it explicitly or run standalone."
+            )
+            context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+            context.user_data.pop(METASPLOIT_FLOW_MODE_KEY, None)
+            context.user_data.pop(METASPLOIT_GUIDED_CONTEXT_KEY, None)
+            return
+        message = getattr(query, "message", None)
+        if message is None:
+            await query.edit_message_text("Unable to create Metasploit proposal.")
+            return
+        await _create_and_send_metasploit_proposal(
+            message,
+            context,
+            user_id,
+            request,
+            scan_request_id,
+            assessment_context=assessment_context if isinstance(assessment_context, dict) else None,
+        )
+        return
     proposal = get_metasploit_proposal(proposal_id)
     if proposal is None:
         await query.edit_message_text("Metasploit proposal not found.")
