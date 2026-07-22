@@ -47,6 +47,7 @@ def test_testssl_runner_success_uses_safe_subprocess_args() -> None:
     assert command[0] == "testssl.sh"
     assert command[1] == "--jsonfile-pretty"
     assert command[-1] == "example.com:443"
+    assert "--connect-timeout" not in command
     assert run_mock.call_args.kwargs["shell"] is False
     assert run_mock.call_args.kwargs["check"] is False
     assert run_mock.call_args.kwargs["timeout"] == 19
@@ -103,8 +104,6 @@ def test_build_testssl_command_uses_explicit_argv() -> None:
         "out.json",
         "--warnings",
         "batch",
-        "--connect-timeout",
-        "10",
         "--openssl-timeout",
         "5",
         "--quiet",
@@ -130,8 +129,6 @@ def test_build_testssl_command_supports_validated_profile_options() -> None:
         "out.json",
         "--warnings",
         "batch",
-        "--connect-timeout",
-        "30",
         "--openssl-timeout",
         "30",
         "--quiet",
@@ -150,6 +147,24 @@ def test_build_testssl_command_supports_ipv4_and_ipv6_modes() -> None:
 
     assert "-4" in ipv4_command
     assert "-6" in ipv6_command
+    assert "--connect-timeout" not in ipv4_command
+    assert "--connect-timeout" not in ipv6_command
+
+
+def test_testssl_stdout_diagnostic_used_when_stderr_empty() -> None:
+    diagnostic = '/opt/testssl.sh/testssl.sh: unrecognized option "--connect-timeout"\n'
+    with (
+        patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
+        patch("app.tools.testssl_runner.subprocess.run", return_value=_completed(stdout=f"\x1b[31m{diagnostic}\x1b[0m", stderr="", returncode=1)),
+    ):
+        result = run_testssl_scan("https://example.com")
+
+    assert result["success"] is False
+    assert result["error_type"] == "execution_failed"
+    assert result["returncode"] == 1
+    assert result["error"] == diagnostic.strip()
+    assert "\x1b" not in str(result["error"])
 
 
 def test_testssl_rejects_invalid_config_without_subprocess() -> None:

@@ -38,6 +38,8 @@ ALLOWED_TESTSSL_STARTTLS_PROTOCOLS = {
     "mysql",
 }
 SAFE_TESTSSL_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
+ANSI_CONTROL_PATTERN = re.compile(r"(?:\x1B\[[0-?]*[ -/]*[@-~]|\x1B[@-_][0-?]*[ -/]*[@-~]|[\x00-\x08\x0B\x0C\x0E-\x1F\x7F])")
+MAX_TESTSSL_ERROR_BYTES = 2_000
 
 
 def run_testssl_scan(target: str) -> dict[str, object]:
@@ -183,7 +185,7 @@ def run_testssl_scan(target: str) -> dict[str, object]:
             "testssl.sh JSON output exceeded the configured bounded result size."
             if json_truncated
             else stderr if completed.returncode == 0
-            else (stderr or "testssl.sh did not complete successfully.")
+            else _failure_error(stderr, stdout)
         ),
         error_type="output_too_large" if json_truncated else None if completed.returncode == 0 and json_output.strip() else "execution_failed",
         returncode=completed.returncode,
@@ -240,12 +242,6 @@ def _testssl_executable_candidates() -> tuple[Path, Path, Path, Path]:
 
 
 def _build_testssl_command(executable: str, target: str, json_path: Path, settings: object | None = None) -> list[str]:
-    connect_timeout = _bounded_int(
-        getattr(settings, "testssl_connect_timeout_seconds", 10),
-        minimum=1,
-        maximum=MAX_TESTSSL_CONNECT_TIMEOUT_SECONDS,
-        default=10,
-    )
     openssl_timeout = _bounded_int(
         getattr(settings, "testssl_openssl_timeout_seconds", 5),
         minimum=1,
@@ -265,8 +261,6 @@ def _build_testssl_command(executable: str, target: str, json_path: Path, settin
         str(json_path),
         "--warnings",
         "batch",
-        "--connect-timeout",
-        str(connect_timeout),
         "--openssl-timeout",
         str(openssl_timeout),
         "--quiet",
@@ -316,6 +310,18 @@ def _bounded_text(text: str, max_bytes: int, *, label: str) -> tuple[str, bool]:
         return str(text or ""), False
     truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
     return f"{truncated}\n[{label} truncated at {max_bytes} bytes]", True
+
+
+def _failure_error(stderr: str, stdout: str) -> str:
+    diagnostic = stderr or stdout or "testssl.sh did not complete successfully."
+    diagnostic = ANSI_CONTROL_PATTERN.sub("", str(diagnostic)).strip()
+    if not diagnostic:
+        return "testssl.sh did not complete successfully."
+    encoded = diagnostic.encode("utf-8", errors="ignore")
+    if len(encoded) <= MAX_TESTSSL_ERROR_BYTES:
+        return diagnostic
+    truncated = encoded[:MAX_TESTSSL_ERROR_BYTES].decode("utf-8", errors="ignore").rstrip()
+    return f"{truncated}...[truncated]"
 
 
 def _result(

@@ -1976,6 +1976,46 @@ def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> 
     assert finding["testssl_summary"]["supported_protocols"] == ["TLS 1.2", "TLS 1.3"]
 
 
+def test_testssl_scan_failure_uses_sanitized_runner_error() -> None:
+    clear_user_findings(7214)
+    clear_user_investigations(7214)
+    clear_user_scan_requests(7214)
+    scan_request = create_scan_request(user_id=7214, scan_type="testssl")
+    mark_scan_request_awaiting_target(user_id=7214, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7214))
+    diagnostic = '/opt/testssl.sh/testssl.sh: unrecognized option "--connect-timeout"'
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_testssl_scan",
+            return_value={
+                "success": False,
+                "target": "example.com:443",
+                "output": "",
+                "json_output": "",
+                "error": diagnostic,
+                "returncode": 1,
+                "elapsed_seconds": 0.08,
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_testssl_ai_assessment") as generate_testssl_ai_assessment,
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    generate_testssl_ai_assessment.assert_not_called()
+    progress_text = status_message.edit_text.call_args_list[-1].args[0]
+    result_text = message.reply_text.call_args_list[1].args[0]
+    assert diagnostic in progress_text
+    assert diagnostic in result_text
+    assert "Unknown error" not in progress_text
+    assert "Unknown error" not in result_text
+
+
 def _prowler_fixture(records: list[dict]) -> str:
     return json.dumps(records)
 
