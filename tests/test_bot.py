@@ -2438,12 +2438,20 @@ def test_metasploit_guided_review_card_and_approve_executes_exact_request() -> N
     proposal_keyboard = proposal_message.reply_text.call_args.kwargs["reply_markup"]
     assert "Metasploit Validation Review" in review
     assert "Target:\nexample.com" in review
-    assert "Service:\nHTTPS - 443" in review
+    assert "Service:\nHTTPS (443)" in review
     assert "Validation:\nHTTP service fingerprint check" in review
-    assert "Module: auxiliary/scanner/http/http_version" in review
-    assert "Action: auxiliary_validation" in review
+    assert "Module:\nauxiliary/scanner/http/http_version" in review
+    assert "Action:\nauxiliary_validation" in review
+    assert "Risk:\nLOW" in review
+    assert "This action WILL:" in review
+    assert "- Collect HTTP service banner/version metadata from the authorized target." in review
+    assert "This action WILL NOT:" in review
+    assert "- Create a session" in review
+    assert "- Upload a payload" in review
+    assert "- Perform post-exploitation" in review
+    assert "- Move laterally" in review
+    assert "- Execute brute force" in review
     assert "Approved options: SSL=true" in review
-    assert "does not create a session" in review
     assert len(proposal_keyboard.inline_keyboard[0][0].callback_data) <= 64
     assert len(proposal_keyboard.inline_keyboard[0][1].callback_data) <= 64
     proposal_id = next(iter(_metasploit_pending_context))
@@ -2576,8 +2584,9 @@ def test_metasploit_structured_request_creates_proposal_without_execution() -> N
     markup = message.reply_text.call_args.kwargs["reply_markup"]
     buttons = [button.text for row in markup.inline_keyboard for button in row]
     assert "Metasploit Validation Proposal" in sent
-    assert "Module: auxiliary/scanner/http/http_version" in sent
-    assert "Action: auxiliary_validation" in sent
+    assert "Module:\nauxiliary/scanner/http/http_version" in sent
+    assert "Action:\nauxiliary_validation" in sent
+    assert "Target:\nexample.com" in sent
     assert "Target: example.com" in sent
     assert "Risk tier: LOW" in sent
     assert "Expires:" in sent
@@ -2664,8 +2673,11 @@ def test_metasploit_details_callback_shows_exact_proposal() -> None:
     details = query.edit_message_text.call_args.args[0]
     assert "Metasploit Validation Proposal Details" in details
     assert f"Proposal ID: {proposal_id}" in details
-    assert "Module: auxiliary/scanner/http/http_version" in details
-    assert "Action: auxiliary_validation" in details
+    assert "Module:\nauxiliary/scanner/http/http_version" in details
+    assert "Action:\nauxiliary_validation" in details
+    assert "This action WILL:" in details
+    assert "This action WILL NOT:" in details
+    assert "Target:\nexample.com" in details
     assert "Target: example.com" in details
     assert "Port: 80" in details
     assert "Expires:" in details

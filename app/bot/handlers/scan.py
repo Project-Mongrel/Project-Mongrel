@@ -469,7 +469,8 @@ def build_metasploit_proposal_text(proposal: object) -> str:
     options = request.get("options") or {}
     service = _metasploit_service_label(int(request.get("port") or 0))
     validation = _metasploit_validation_name(str(request.get("module") or ""))
-    risk = str(request.get("risk_tier") or "unknown").title()
+    risk = str(request.get("risk_tier") or "unknown").upper()
+    expected_effect = str(request.get("expected_effect") or "Perform the selected controlled validation against the authorized target.")
     return "\n".join(
         [
             "Metasploit Validation Review",
@@ -480,26 +481,39 @@ def build_metasploit_proposal_text(proposal: object) -> str:
             str(request.get("target") or "unknown"),
             "",
             "Service:",
-            f"{service} - {request.get('port') or 'unknown'}",
+            f"{service} ({request.get('port') or 'unknown'})",
             "",
             "Validation:",
             validation,
             "",
+            "Module:",
+            str(request.get("module") or "unknown"),
+            "",
+            "Action:",
+            str(request.get("action_type") or "unknown"),
+            "",
+            "Risk:",
+            risk,
+            "",
+            "This action WILL:",
+            f"- {expected_effect}",
+            "",
+            "This action WILL NOT:",
+            "- Create a session",
+            "- Upload a payload",
+            "- Perform post-exploitation",
+            "- Move laterally",
+            "- Execute brute force",
+            "",
             "Metasploit Validation Proposal",
             f"Proposal ID: {getattr(proposal, 'id', 'unknown')}",
-            f"Module: {request.get('module') or 'unknown'}",
-            f"Action: {request.get('action_type') or 'unknown'}",
             f"Target: {request.get('target') or 'unknown'}",
             f"Port: {request.get('port') or 'unknown'}",
-            f"Risk: {risk} - read-only service validation" if risk.lower() == "low" else f"Risk: {risk}",
-            f"Risk tier: {str(request.get('risk_tier') or 'unknown').upper()}",
-            f"Expected effect: {request.get('expected_effect') or 'unknown'}",
+            f"Risk tier: {risk}",
+            f"Expected effect: {expected_effect}",
             f"Timeout: {request.get('timeout_seconds') or 'unknown'}s",
             f"Expires: {_format_metasploit_timestamp(getattr(proposal, 'expires_at', None))}",
             "Approved options: " + (_format_metasploit_options(options) if options else "none"),
-            "",
-            "This action does not create a session, upload a payload, perform post-exploitation, or move laterally.",
-            "It does not prove compromise or security by itself.",
             "",
             "Approve only if this exact action is authorized.",
         ]
