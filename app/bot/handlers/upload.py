@@ -3,6 +3,7 @@ import base64
 import html
 import json
 import logging
+import secrets
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,15 +18,22 @@ from app.ui.result_cards import render_scan_result_card
 from app.bot.handlers.scan import store_parsed_nmap_finding
 from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
+from app.parsers.metasploit_parser import parse_metasploit_validation_result
 from app.parsers.tshark_parser import normalize_tshark_result
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import add_assessment_artifact, get_assessment, list_assessment_scans, list_assessment_targets, record_assessment_scan
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
 from app.services.icon_helper import section_label
+from app.services.metasploit_approval import get_metasploit_proposal, list_metasploit_proposals, record_metasploit_result_reference
 from app.services.target_normalizer import normalize_target_key
 from app.services.tshark_approval import TSharkApprovalError, approve_tshark_capture, get_tshark_capture_proposal, propose_tshark_capture, reject_tshark_capture
+from app.services.tshark_metasploit_correlation import (
+    build_tshark_metasploit_correlation_record,
+    generate_tshark_metasploit_correlated_assessment,
+)
 from app.services.tshark_policy import build_tshark_capture_request
+from app.services.tshark_validation_capture import DEFAULT_POST_VALIDATION_TAIL_SECONDS, run_tshark_capture_during_validation
 from app.services.verdict_engine import generate_mongrel_verdict
 from app.tools.tshark_live_runner import check_tshark_live_readiness, run_tshark_live_capture
 from app.tools.tshark_runner import check_tshark_readiness, run_tshark_offline_analysis
@@ -43,6 +51,7 @@ NUCLEI_SEVERITIES = ("critical", "high", "medium", "low", "info")
 _upload_states: dict[int, str] = {}
 _tshark_assessment_upload_contexts: dict[int, dict] = {}
 _tshark_live_contexts: dict[str, dict] = {}
+_tshark_capture_validation_tokens: dict[str, dict] = {}
 _latest_upload_scan_summaries: dict[int, dict] = {}
 logger = logging.getLogger(__name__)
 
@@ -76,7 +85,7 @@ def build_tshark_mode_text() -> str:
     return (
         f"{section_label('scan', 'TShark')}\n\n"
         "Choose how to analyze packet metadata.\n\n"
-        "Upload PCAP uses an existing .pcap or .pcapng file. Live Capture requires explicit approval and uses only configured allowlisted interfaces."
+        "Capture During Validation prepares a bounded capture around an approved validation. Analyze PCAP uses an existing .pcap or .pcapng file. Standalone Live Capture requires explicit approval and uses only configured allowlisted interfaces."
     )
 
 
@@ -84,8 +93,9 @@ def build_tshark_mode_keyboard(assessment_id: int | None = None) -> InlineKeyboa
     suffix = f":{int(assessment_id)}" if assessment_id is not None else ""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Upload PCAP", callback_data=f"tshark:upload{suffix}")],
-            [InlineKeyboardButton("Live Capture", callback_data=f"tshark:live{suffix}")],
+            [InlineKeyboardButton("Capture During Validation", callback_data=f"tshark:capture{suffix}")],
+            [InlineKeyboardButton("Analyze PCAP", callback_data=f"tshark:upload{suffix}")],
+            [InlineKeyboardButton("Standalone Live Capture", callback_data=f"tshark:live{suffix}")],
             [InlineKeyboardButton("Back", callback_data="nav:home" if assessment_id is None else f"assessment:dashboard:{int(assessment_id)}")],
         ]
     )
@@ -157,6 +167,149 @@ def build_tshark_live_approval_keyboard(proposal_id: str) -> InlineKeyboardMarku
     )
 
 
+def build_tshark_capture_validation_text(eligible: list[object]) -> str:
+    if not eligible:
+        return (
+            f"{section_label('scan', 'TShark Capture During Validation')}\n\n"
+            "No eligible approved Metasploit HTTP service fingerprint validation was found for this user.\n\n"
+            "Create and approve the guided Metasploit validation first, then return here."
+        )
+    return (
+        f"{section_label('scan', 'TShark Capture During Validation')}\n\n"
+        "Choose an approved validation to run while TShark captures bounded packet metadata.\n\n"
+        "Only the allowlisted Metasploit HTTP service fingerprint validation is eligible in this foundation."
+    )
+
+
+def build_tshark_capture_validation_keyboard(user_id: int, eligible: list[object], assessment_id: int | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for proposal in eligible[:10]:
+        request = getattr(proposal, "request", {}) or {}
+        token = _register_tshark_capture_validation_token(
+            user_id,
+            assessment_id=assessment_id,
+            metasploit_proposal_id=str(getattr(proposal, "id", "")),
+            validation_fingerprint=str(getattr(proposal, "fingerprint", "")),
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"HTTP Service Fingerprint - {request.get('target')}:{request.get('port')}",
+                    callback_data=f"tshark:cv:{token}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("Back", callback_data="tshark:choose" if assessment_id is None else f"tshark:choose:{int(assessment_id)}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_tshark_capture_interface_keyboard(token_payload: dict, interfaces: list[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for interface in interfaces[:12]:
+        token = _register_tshark_capture_validation_token(
+            int(token_payload["user_id"]),
+            assessment_id=_parse_optional_int(token_payload.get("assessment_id")),
+            metasploit_proposal_id=str(token_payload["metasploit_proposal_id"]),
+            validation_fingerprint=str(token_payload["validation_fingerprint"]),
+            interface=interface,
+        )
+        rows.append([InlineKeyboardButton(interface, callback_data=f"tshark:cvi:{token}")])
+    rows.append([InlineKeyboardButton("Back", callback_data="tshark:capture" if token_payload.get("assessment_id") is None else f"tshark:capture:{int(token_payload['assessment_id'])}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_tshark_capture_interface_text(proposal: object, interfaces: list[str]) -> str:
+    request = getattr(proposal, "request", {}) or {}
+    return "\n".join(
+        [
+            f"{section_label('scan', 'TShark Capture Interface')}",
+            "",
+            "Choose an allowlisted capture interface.",
+            "",
+            f"Validation: HTTP Service Fingerprint",
+            f"Target: {_escape(request.get('target') or 'unknown')}",
+            f"Expected Port: {_escape(request.get('port') or 'unknown')}",
+            "",
+            "Interfaces:",
+            *[f"- {_escape(interface)}" for interface in interfaces[:12]],
+        ]
+    )
+
+
+def build_tshark_capture_review_text(proposal: object, validation_proposal: object, *, assessment_id: int | None, post_tail_seconds: int = DEFAULT_POST_VALIDATION_TAIL_SECONDS, details: bool = False) -> str:
+    capture_request = getattr(proposal, "request", {}) or {}
+    validation_request = getattr(validation_proposal, "request", {}) or {}
+    lines = [
+        "TShark Capture Review",
+        "",
+        "Assessment:",
+        str(assessment_id if assessment_id is not None else "Standalone validation"),
+        "",
+        "Validation:",
+        "HTTP Service Fingerprint",
+        "",
+        "Target:",
+        _escape(validation_request.get("target") or "unknown"),
+        "",
+        "Expected Port:",
+        str(validation_request.get("port") or "unknown"),
+        "",
+        "Interface:",
+        _escape(capture_request.get("interface") or "unknown"),
+        "",
+        "Capture Duration:",
+        f"{int(capture_request.get('duration_seconds') or 0)} seconds",
+        "",
+        "Capture Purpose:",
+        "Observe network traffic generated during the approved validation.",
+        "",
+        "This action WILL:",
+        "- Start a bounded TShark capture",
+        "- Execute the exact reviewed Metasploit validation",
+        f"- Stop capture after validation and bounded tail ({post_tail_seconds} seconds)",
+        "- Store packet metadata and provenance",
+        "",
+        "This action WILL NOT:",
+        "- Modify the target beyond the approved validation",
+        "- Run additional tools",
+        "- Continue capturing indefinitely",
+        "- Start sessions, post-exploitation, lateral movement, or brute force",
+        "",
+        "Approval is required before capture or validation starts.",
+    ]
+    if details:
+        lines.extend(
+            [
+                "",
+                "Capture Proposal ID:",
+                _escape(getattr(proposal, "id", "")),
+                "",
+                "Validation Proposal ID:",
+                _escape(getattr(validation_proposal, "id", "")),
+                "",
+                "Module:",
+                _escape(validation_request.get("module") or "unknown"),
+                "",
+                "Action:",
+                _escape(validation_request.get("action_type") or "unknown"),
+                "",
+                "Approved Options:",
+                _escape(_format_options(validation_request.get("options") or {})),
+                "",
+                "Capture Fingerprint:",
+                _escape(str(getattr(proposal, "fingerprint", ""))[:16]),
+                "",
+                "Validation Fingerprint:",
+                _escape(str(getattr(validation_proposal, "fingerprint", ""))[:16]),
+            ]
+        )
+    return "\n".join(lines)
+
+
+def build_tshark_capture_review_keyboard(proposal_id: str) -> InlineKeyboardMarkup:
+    return build_tshark_live_approval_keyboard(proposal_id)
+
+
 def set_upload_state(user_id: int, state: str) -> None:
     _upload_states[user_id] = state
 
@@ -181,6 +334,43 @@ def clear_upload_state(user_id: int) -> None:
 
 def clear_tshark_live_context(proposal_id: str) -> None:
     _tshark_live_contexts.pop(str(proposal_id), None)
+
+
+def _register_tshark_capture_validation_token(user_id: int, **payload: object) -> str:
+    token = secrets.token_urlsafe(9)
+    while token in _tshark_capture_validation_tokens:
+        token = secrets.token_urlsafe(9)
+    _tshark_capture_validation_tokens[token] = {"user_id": int(user_id), **payload}
+    return token
+
+
+def _get_tshark_capture_validation_token(token: str, user_id: int) -> dict | None:
+    payload = _tshark_capture_validation_tokens.get(str(token))
+    if not isinstance(payload, dict) or payload.get("user_id") != int(user_id):
+        return None
+    return dict(payload)
+
+
+def _eligible_metasploit_capture_validations(user_id: int, assessment_id: int | None = None) -> list[object]:
+    eligible: list[object] = []
+    for proposal in list_metasploit_proposals(user_id=user_id, status="approved"):
+        request = getattr(proposal, "request", {}) or {}
+        if request.get("module") != "auxiliary/scanner/http/http_version":
+            continue
+        if request.get("action_type") != "auxiliary_validation":
+            continue
+        if assessment_id is not None:
+            proposal_assessment = getattr(proposal, "assessment_context", None) or {}
+            if _parse_optional_int(proposal_assessment.get("assessment_id")) != assessment_id:
+                continue
+        eligible.append(proposal)
+    return eligible
+
+
+def _format_options(options: dict) -> str:
+    if not options:
+        return "none"
+    return ", ".join(f"{key}={value}" for key, value in sorted(options.items()))
 
 
 def store_latest_upload_scan_summary(user_id: int, finding: dict) -> dict:
@@ -974,6 +1164,109 @@ def _persist_tshark_assessment_evidence(assessment_context: dict, result: dict, 
     )
 
 
+def _persist_tshark_capture_validation_provenance(assessment_id: int, result: dict) -> str | None:
+    provenance = result.get("provenance") if isinstance(result, dict) else {}
+    if not isinstance(provenance, dict) or not provenance:
+        return None
+    artifact = add_assessment_artifact(
+        assessment_id=int(assessment_id),
+        artifact_type="tshark_validation_capture_provenance",
+        title="TShark capture during validation provenance",
+        content=json.dumps(
+            {
+                "source": "tshark_capture_during_validation",
+                "user_id": provenance.get("user_id"),
+                "assessment_id": int(assessment_id),
+                "validation_proposal_id": provenance.get("validation_proposal_id"),
+                "capture_proposal_id": provenance.get("capture_proposal_id"),
+                "target": provenance.get("target"),
+                "module": provenance.get("module"),
+                "action": provenance.get("action"),
+                "port": provenance.get("port"),
+                "interface": provenance.get("interface"),
+                "capture_started_at": provenance.get("capture_started_at"),
+                "capture_ended_at": provenance.get("capture_ended_at"),
+                "validation_started_at": provenance.get("validation_started_at"),
+                "validation_ended_at": provenance.get("validation_ended_at"),
+                "pcap_artifact_path": provenance.get("pcap_artifact_path"),
+                "post_validation_tail_seconds": result.get("post_validation_tail_seconds"),
+            },
+            sort_keys=True,
+        ),
+        file_path=None,
+    )
+    return f"assessment_artifact:{artifact.get('id')}"
+
+
+def _persist_tshark_metasploit_correlation(
+    user_id: int,
+    assessment_id: int,
+    validation_proposal_id: str,
+    capture_provenance_ref: str | None,
+    result: dict,
+    normalized_tshark: dict,
+) -> None:
+    provenance = result.get("provenance") if isinstance(result, dict) else {}
+    if not isinstance(provenance, dict):
+        provenance = {}
+    validation_result = result.get("validation_result") if isinstance(result, dict) else {}
+    if not isinstance(validation_result, dict):
+        validation_result = {"success": False, "error": "Metasploit validation result was not available.", "error_type": "missing_validation_result"}
+    normalized_metasploit = parse_metasploit_validation_result(validation_result)
+    validation_ref = _persist_metasploit_capture_validation_artifact(assessment_id, validation_result, normalized_metasploit, validation_proposal_id)
+    record_metasploit_result_reference(validation_proposal_id, validation_ref)
+    correlation = build_tshark_metasploit_correlation_record(
+        user_id=user_id,
+        assessment_id=assessment_id,
+        validation_result_id=validation_ref,
+        capture_provenance_id=capture_provenance_ref,
+        provenance=provenance,
+        metasploit_evidence=normalized_metasploit,
+        tshark_evidence=normalized_tshark,
+    )
+    correlation_artifact = add_assessment_artifact(
+        assessment_id=int(assessment_id),
+        artifact_type="tshark_metasploit_correlation_record",
+        title="TShark and Metasploit correlation record",
+        content=json.dumps(correlation, sort_keys=True),
+        file_path=None,
+    )
+    ai_lines = generate_tshark_metasploit_correlated_assessment(correlation)
+    add_assessment_artifact(
+        assessment_id=int(assessment_id),
+        artifact_type="tshark_metasploit_correlated_ai_assessment",
+        title="Correlated TShark and Metasploit AI assessment",
+        content="\n".join(ai_lines),
+        file_path=f"assessment_artifact:{correlation_artifact.get('id')}",
+    )
+
+
+def _persist_metasploit_capture_validation_artifact(assessment_id: int, result: dict, normalized: dict, proposal_id: str) -> str:
+    artifact = add_assessment_artifact(
+        assessment_id=int(assessment_id),
+        artifact_type="metasploit_validation_normalized_evidence",
+        title=f"Metasploit validation evidence {normalized.get('target') or result.get('target') or 'target'}",
+        content=json.dumps(
+            {
+                "source": "metasploit",
+                "proposal_id": str(proposal_id),
+                "module": normalized.get("module"),
+                "action_type": normalized.get("action_type"),
+                "target": normalized.get("target"),
+                "port": normalized.get("port"),
+                "validation_state": normalized.get("validation_state"),
+                "summary": normalized.get("summary"),
+                "evidence_confidence": normalized.get("evidence_confidence"),
+                "limitations": normalized.get("limitations") or [],
+                "raw_evidence_excerpt": normalized.get("raw_evidence_excerpt"),
+            },
+            sort_keys=True,
+        ),
+        file_path=None,
+    )
+    return f"assessment_artifact:{artifact.get('id')}"
+
+
 def _bounded_tshark_artifact_payload(normalized: dict) -> dict:
     return {
         "source": "tshark",
@@ -1127,6 +1420,78 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text(prompt)
         return
 
+    if action == "capture":
+        assessment_id = _parse_optional_int(parts[2] if len(parts) > 2 else None)
+        eligible = _eligible_metasploit_capture_validations(user_id, assessment_id)
+        await query.edit_message_text(
+            build_tshark_capture_validation_text(eligible),
+            reply_markup=build_tshark_capture_validation_keyboard(user_id, eligible, assessment_id) if eligible else build_tshark_mode_keyboard(assessment_id),
+        )
+        return
+
+    if action == "cv":
+        token_payload = _get_tshark_capture_validation_token(parts[2] if len(parts) > 2 else "", user_id)
+        if token_payload is None:
+            await query.edit_message_text("TShark capture validation selection was not found or has expired.")
+            return
+        validation_proposal = get_metasploit_proposal(str(token_payload.get("metasploit_proposal_id") or ""))
+        if validation_proposal is None or validation_proposal.user_id != user_id:
+            await query.edit_message_text("Metasploit validation proposal is not available for this user.")
+            return
+        readiness = await asyncio.to_thread(check_tshark_live_readiness)
+        if readiness.get("ready") is not True:
+            await query.edit_message_text(_escape(str(readiness.get("error") or "TShark live capture is not ready.")))
+            return
+        interfaces = [str(interface) for interface in readiness.get("allowed_interfaces") or []]
+        await query.edit_message_text(
+            build_tshark_capture_interface_text(validation_proposal, interfaces),
+            reply_markup=build_tshark_capture_interface_keyboard(token_payload, interfaces),
+        )
+        return
+
+    if action == "cvi":
+        token_payload = _get_tshark_capture_validation_token(parts[2] if len(parts) > 2 else "", user_id)
+        if token_payload is None:
+            await query.edit_message_text("TShark capture validation interface selection was not found or has expired.")
+            return
+        validation_proposal = get_metasploit_proposal(str(token_payload.get("metasploit_proposal_id") or ""))
+        if validation_proposal is None or validation_proposal.user_id != user_id:
+            await query.edit_message_text("Metasploit validation proposal is not available for this user.")
+            return
+        if validation_proposal.status != "approved":
+            await query.edit_message_text("Metasploit validation proposal is not approved.")
+            return
+        if str(validation_proposal.fingerprint) != str(token_payload.get("validation_fingerprint") or ""):
+            await query.edit_message_text("Metasploit validation details changed.")
+            return
+        try:
+            request = _build_default_live_request(str(token_payload.get("interface") or ""))
+            proposal = propose_tshark_capture(user_id, request)
+        except (ValueError, TSharkApprovalError) as exc:
+            await query.edit_message_text(_escape(str(exc)))
+            return
+        assessment_id = _parse_optional_int(token_payload.get("assessment_id"))
+        _tshark_live_contexts[proposal.id] = {
+            "request": request,
+            "user_id": user_id,
+            "assessment_id": assessment_id,
+            "mode": "capture_validation",
+            "metasploit_proposal_id": validation_proposal.id,
+            "metasploit_request": dict(validation_proposal.request),
+            "validation_fingerprint": validation_proposal.fingerprint,
+            "post_validation_tail_seconds": DEFAULT_POST_VALIDATION_TAIL_SECONDS,
+        }
+        await query.edit_message_text(
+            build_tshark_capture_review_text(
+                proposal,
+                validation_proposal,
+                assessment_id=assessment_id,
+                post_tail_seconds=DEFAULT_POST_VALIDATION_TAIL_SECONDS,
+            ),
+            reply_markup=build_tshark_capture_review_keyboard(proposal.id),
+        )
+        return
+
     if action == "live":
         assessment_id = _parse_optional_int(parts[2] if len(parts) > 2 else None)
         readiness = await asyncio.to_thread(check_tshark_live_readiness)
@@ -1167,6 +1532,23 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         if proposal.user_id != user_id:
             await query.edit_message_text("TShark live capture proposal is not available for this user.")
             return
+        live_context = _tshark_live_contexts.get(proposal_id) or {}
+        if live_context.get("mode") == "capture_validation":
+            validation_proposal = get_metasploit_proposal(str(live_context.get("metasploit_proposal_id") or ""))
+            if validation_proposal is None:
+                await query.edit_message_text("Metasploit validation proposal is not available for this user.")
+                return
+            await query.edit_message_text(
+                build_tshark_capture_review_text(
+                    proposal,
+                    validation_proposal,
+                    assessment_id=_parse_optional_int(live_context.get("assessment_id")),
+                    post_tail_seconds=int(live_context.get("post_validation_tail_seconds") or DEFAULT_POST_VALIDATION_TAIL_SECONDS),
+                    details=True,
+                ),
+                reply_markup=build_tshark_capture_review_keyboard(proposal.id),
+            )
+            return
         await query.edit_message_text(
             build_tshark_live_proposal_text(proposal, details=True),
             reply_markup=build_tshark_live_approval_keyboard(proposal.id),
@@ -1200,6 +1582,52 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             clear_tshark_live_context(proposal_id)
             clear_upload_state(user_id)
             await query.edit_message_text("TShark live capture context is no longer available.")
+            return
+
+        if live_context.get("mode") == "capture_validation":
+            validation_proposal_id = str(live_context.get("metasploit_proposal_id") or "")
+            validation_proposal = get_metasploit_proposal(validation_proposal_id)
+            metasploit_request = dict(live_context.get("metasploit_request") or {})
+            if (
+                validation_proposal is None
+                or validation_proposal.user_id != user_id
+                or validation_proposal.status != "approved"
+                or validation_proposal.fingerprint != str(live_context.get("validation_fingerprint") or "")
+            ):
+                clear_tshark_live_context(proposal_id)
+                clear_upload_state(user_id)
+                await query.edit_message_text("Metasploit validation proposal is no longer available or has changed.")
+                return
+            await query.edit_message_text("TShark capture approved. Running bounded capture during validation...")
+            result = await asyncio.to_thread(
+                run_tshark_capture_during_validation,
+                user_id=user_id,
+                capture_proposal_id=proposal_id,
+                capture_request=request,
+                metasploit_proposal_id=validation_proposal_id,
+                metasploit_request=metasploit_request,
+                post_validation_tail_seconds=int(live_context.get("post_validation_tail_seconds") or DEFAULT_POST_VALIDATION_TAIL_SECONDS),
+            )
+            normalized = _normalized_tshark_live_evidence(result)
+            assessment_id = _parse_optional_int(live_context.get("assessment_id"))
+            if assessment_id is not None:
+                _persist_tshark_assessment_evidence({"assessment_id": assessment_id}, result, normalized)
+                provenance_ref = _persist_tshark_capture_validation_provenance(assessment_id, result)
+                await asyncio.to_thread(
+                    _persist_tshark_metasploit_correlation,
+                    user_id,
+                    assessment_id,
+                    validation_proposal_id,
+                    provenance_ref,
+                    result,
+                    normalized,
+                )
+            if query.message is not None:
+                await query.message.reply_text(build_tshark_result_text(normalized, result.get("offline_result") or result))
+                if assessment_id is not None:
+                    await _send_tshark_assessment_dashboard(query.message, assessment_id)
+            clear_tshark_live_context(proposal_id)
+            clear_upload_state(user_id)
             return
 
         await query.edit_message_text("TShark live capture approved. Running bounded capture...")

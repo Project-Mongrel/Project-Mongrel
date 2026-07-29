@@ -1,0 +1,163 @@
+import json
+from unittest.mock import patch
+
+import pytest
+
+from app.services.findings_store import close_findings_database, configure_findings_database
+from app.services.tshark_metasploit_correlation import (
+    build_tshark_metasploit_correlated_prompt,
+    build_tshark_metasploit_correlation_record,
+    generate_tshark_metasploit_correlated_assessment,
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path):
+    configure_findings_database(tmp_path / "mongrel.db")
+    yield
+    close_findings_database()
+    configure_findings_database(None)
+
+
+def _provenance(port: int = 443) -> dict:
+    return {
+        "user_id": 100,
+        "validation_proposal_id": "msf-proposal-1",
+        "capture_proposal_id": "cap-proposal-1",
+        "target": "example.com",
+        "module": "auxiliary/scanner/http/http_version",
+        "action": "auxiliary_validation",
+        "port": port,
+        "capture_started_at": "2026-07-23T10:00:00+00:00",
+        "capture_ended_at": "2026-07-23T10:00:05+00:00",
+        "validation_started_at": "2026-07-23T10:00:01+00:00",
+        "validation_ended_at": "2026-07-23T10:00:02+00:00",
+    }
+
+
+def _metasploit(state: str = "DETECTED") -> dict:
+    return {
+        "source": "metasploit",
+        "module": "auxiliary/scanner/http/http_version",
+        "action_type": "auxiliary_validation",
+        "target": "example.com",
+        "port": 443,
+        "validation_state": state,
+        "summary": "Metasploit reported service or version metadata.",
+        "evidence_confidence": "tool_reported",
+        "raw_evidence_excerpt": "Server: nginx",
+        "limitations": [],
+    }
+
+
+def _tshark(*, conversation_port: str = "443", success: bool = True, packet_count: int = 4) -> dict:
+    return {
+        "source": "tshark",
+        "execution_status": "completed" if success else "failed",
+        "success": success,
+        "packet_count": packet_count,
+        "capture_start": "1710000000.1",
+        "capture_end": "1710000001.2",
+        "observed_protocols": [{"protocol": "tcp", "packet_count": 2}, {"protocol": "tls", "packet_count": 1}, {"protocol": "http", "packet_count": 1}],
+        "observed_endpoints": [{"address": "192.0.2.10", "packet_count": 2}, {"address": "93.184.216.34", "packet_count": 2}],
+        "observed_conversations": [
+            {"src": "192.0.2.10", "dst": "93.184.216.34", "src_port": "53000", "dst_port": conversation_port, "transport": "tcp", "packet_count": 2}
+        ],
+        "dns_observations": [{"query_name": "example.com", "response_address": "93.184.216.34", "src": "192.0.2.10", "dst": "198.51.100.53"}],
+        "http_observations": [{"method": "GET", "host": "example.com", "uri": "/", "response_code": "200", "src": "192.0.2.10", "dst": "93.184.216.34"}],
+        "tls_observations": [{"sni": "example.com", "version": "0x0303", "src": "192.0.2.10", "dst": "93.184.216.34"}],
+        "parser_warnings": [],
+        "truncation": {},
+        "evidence_limitations": [],
+    }
+
+
+def _record(provenance=None, metasploit=None, tshark=None) -> dict:
+    return build_tshark_metasploit_correlation_record(
+        user_id=100,
+        assessment_id=7,
+        validation_result_id="assessment_artifact:1",
+        capture_provenance_id="assessment_artifact:2",
+        provenance=provenance or _provenance(),
+        metasploit_evidence=metasploit or _metasploit(),
+        tshark_evidence=tshark or _tshark(),
+    )
+
+
+def test_exact_target_ip_port_time_aligned_corroboration() -> None:
+    record = _record()
+
+    assert record["target_resolved_ips_observed"] == ["93.184.216.34"]
+    assert record["tshark"]["relevant_conversations"][0]["dst_port"] == "443"
+    assert record["correlation_outcome"] == "corroborated"
+    assert record["correlation_confidence"] == "high"
+    assert record["agreement_disagreement_state"] == "agreement"
+
+
+def test_partial_corroboration_from_dns_without_expected_port_conversation() -> None:
+    tshark = _tshark(conversation_port="8443")
+
+    record = _record(tshark=tshark)
+
+    assert record["correlation_outcome"] == "partially_corroborated"
+    assert record["correlation_confidence"] == "medium"
+    assert record["agreement_disagreement_state"] == "partial_agreement"
+
+
+def test_no_matching_packet_evidence_is_not_corroborated() -> None:
+    tshark = _tshark()
+    tshark["observed_endpoints"] = [{"address": "203.0.113.5", "packet_count": 2}]
+    tshark["observed_conversations"] = [{"src": "192.0.2.10", "dst": "203.0.113.5", "src_port": "53000", "dst_port": "443", "transport": "tcp"}]
+    tshark["dns_observations"] = []
+    tshark["http_observations"] = []
+    tshark["tls_observations"] = []
+
+    record = _record(tshark=tshark)
+
+    assert record["correlation_outcome"] == "not_corroborated"
+    assert record["agreement_disagreement_state"] == "no_packet_agreement"
+
+
+def test_failed_capture_is_inconclusive_not_fabricated_support() -> None:
+    record = _record(tshark=_tshark(success=False, packet_count=0))
+
+    assert record["correlation_outcome"] == "inconclusive"
+    assert record["correlation_confidence"] == "low"
+    assert any("failed" in limitation.lower() for limitation in record["limitations"])
+
+
+def test_failed_validation_is_inconclusive_not_fabricated_support() -> None:
+    record = _record(metasploit=_metasploit("FAILED"))
+
+    assert record["correlation_outcome"] == "inconclusive"
+    assert record["agreement_disagreement_state"] == "inconclusive"
+
+
+def test_no_false_tls_handshake_or_http_service_response_claim_in_record_and_prompt() -> None:
+    record = _record()
+    prompt = build_tshark_metasploit_correlated_prompt(record)
+
+    assert record["tshark"]["tls_handshake_evidence"]["successful_handshake_observed"] is False
+    assert record["tshark"]["http_evidence"]["responses"][0]["response_code"] == "200"
+    assert "Never claim a successful TLS handshake unless successful_handshake_observed is true." in prompt
+    assert "Never claim an HTTP response identified a service unless packet metadata explicitly proves that service identification." in prompt
+
+
+def test_ai_prompt_receives_only_structured_current_run_evidence_without_history() -> None:
+    record = _record()
+    prompt = build_tshark_metasploit_correlated_prompt(record)
+
+    payload = prompt.split("Normalized Current-Run Correlation Record:\n", 1)[1]
+    parsed = json.loads(payload)
+    assert parsed["schema_version"] == "tshark_metasploit_correlation.v1"
+    assert "observed_conversations" not in prompt
+    assert "historical" not in payload.lower()
+    assert "prior" not in payload.lower()
+
+
+def test_ai_generation_uses_structured_record() -> None:
+    record = _record()
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value="Executive Summary\nCorrelated."):
+        lines = generate_tshark_metasploit_correlated_assessment(record)
+
+    assert lines == ["Executive Summary", "Correlated."]

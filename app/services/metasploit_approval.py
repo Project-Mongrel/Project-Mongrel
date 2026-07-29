@@ -143,6 +143,33 @@ def get_metasploit_proposal(proposal_id: str) -> MetasploitProposal | None:
     return _refresh_expiry(proposal) if proposal else None
 
 
+def list_metasploit_proposals(*, user_id: int | None = None, status: str | None = None) -> list[MetasploitProposal]:
+    _ensure_schema()
+    if user_id is not None and status is not None:
+        rows = _get_connection().execute(
+            "SELECT id FROM metasploit_proposals WHERE user_id = ? AND status = ? ORDER BY created_at DESC",
+            (int(user_id), str(status).strip().lower()),
+        ).fetchall()
+    elif user_id is not None:
+        rows = _get_connection().execute(
+            "SELECT id FROM metasploit_proposals WHERE user_id = ? ORDER BY created_at DESC",
+            (int(user_id),),
+        ).fetchall()
+    elif status is not None:
+        rows = _get_connection().execute(
+            "SELECT id FROM metasploit_proposals WHERE status = ? ORDER BY created_at DESC",
+            (str(status).strip().lower(),),
+        ).fetchall()
+    else:
+        rows = _get_connection().execute("SELECT id FROM metasploit_proposals ORDER BY created_at DESC").fetchall()
+    proposals: list[MetasploitProposal] = []
+    for row in rows:
+        proposal = get_metasploit_proposal(row["id"])
+        if proposal is not None:
+            proposals.append(proposal)
+    return proposals
+
+
 def clear_metasploit_proposals() -> None:
     _proposals.clear()
     _ensure_schema()

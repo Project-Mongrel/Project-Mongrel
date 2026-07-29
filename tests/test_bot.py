@@ -154,7 +154,8 @@ from app.services.investigation_store import (
     get_investigation_events,
     get_user_investigations,
 )
-from app.services.metasploit_approval import clear_metasploit_proposals, get_metasploit_proposal
+from app.services.metasploit_approval import approve_metasploit_proposal, clear_metasploit_proposals, get_metasploit_proposal, propose_metasploit_action
+from app.services.metasploit_policy import build_metasploit_action_request
 from app.services.observation_store import add_observation, clear_user_observations, get_investigation_observations, get_user_observations
 from app.services.tshark_approval import clear_tshark_capture_proposals, get_tshark_capture_proposal
 from app.services.chat_state import (
@@ -735,8 +736,9 @@ def test_assessment_tshark_button_shows_separate_upload_live_choice_and_clears_s
     assert query.message.reply_text.call_args.args[0] == build_tshark_mode_text()
     keyboard = query.message.reply_text.call_args.kwargs["reply_markup"]
     callbacks = {button.text: button.callback_data for row in keyboard.inline_keyboard for button in row}
-    assert callbacks["Upload PCAP"] == f"tshark:upload:{assessment['id']}"
-    assert callbacks["Live Capture"] == f"tshark:live:{assessment['id']}"
+    assert callbacks["Capture During Validation"] == f"tshark:capture:{assessment['id']}"
+    assert callbacks["Analyze PCAP"] == f"tshark:upload:{assessment['id']}"
+    assert callbacks["Standalone Live Capture"] == f"tshark:live:{assessment['id']}"
 
 
 def test_assessment_dashboard_shows_tshark_button_and_status() -> None:
@@ -5521,6 +5523,39 @@ def _tshark_normalized(success: bool = True) -> dict:
     }
 
 
+def _approved_metasploit_http_proposal(user_id: int, *, assessment_id: int | None = None, target: str = "example.com", port: int = 80):
+    request = build_metasploit_action_request(
+        module="auxiliary/scanner/http/http_version",
+        action_type="auxiliary_validation",
+        target=target,
+        port=port,
+        options={"SSL": "true"} if port in {443, 8443} else {},
+    )
+    context = {"assessment_id": assessment_id} if assessment_id is not None else None
+    return approve_metasploit_proposal(propose_metasploit_action(user_id, request, assessment_context=context).id, user_id=user_id)
+
+
+def _build_tshark_capture_validation_review(*, user_id: int, settings: Settings, assessment_id: int | None = None) -> SimpleNamespace:
+    capture_query = SimpleNamespace(
+        data="tshark:capture" if assessment_id is None else f"tshark:capture:{assessment_id}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=capture_query, effective_user=SimpleNamespace(id=user_id)), SimpleNamespace()))
+    validation_callback = capture_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+    validation_query = SimpleNamespace(data=validation_callback, answer=AsyncMock(), edit_message_text=AsyncMock())
+    with patch("app.bot.handlers.upload.check_tshark_live_readiness", return_value={"ready": True, "allowed_interfaces": ["eth0"], "resolved_binary": "tshark"}):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=validation_query, effective_user=SimpleNamespace(id=user_id)), SimpleNamespace()))
+    interface_callback = validation_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+    review_query = SimpleNamespace(data=interface_callback, answer=AsyncMock(), edit_message_text=AsyncMock())
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=review_query, effective_user=SimpleNamespace(id=user_id)), SimpleNamespace()))
+    return review_query
+
+
 def test_tshark_live_result_card_polishes_source_time_duration_protocols_and_warnings() -> None:
     normalized = _tshark_normalized()
     normalized["source_file"] = {"name": "mongrel-tshark-live-secret-temp.pcapng", "extension": ".pcapng", "size_bytes": 160}
@@ -5613,9 +5648,187 @@ def test_tshark_scan_callback_prompts_for_upload_or_live_choice() -> None:
 
     assert query.edit_message_text.call_args.args[0] == build_tshark_mode_text()
     callbacks = {button.text: button.callback_data for row in query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard for button in row}
-    assert callbacks["Upload PCAP"] == "tshark:upload"
-    assert callbacks["Live Capture"] == "tshark:live"
+    assert callbacks["Capture During Validation"] == "tshark:capture"
+    assert callbacks["Analyze PCAP"] == "tshark:upload"
+    assert callbacks["Standalone Live Capture"] == "tshark:live"
     assert get_upload_state(5300) is None
+
+
+def test_tshark_capture_during_validation_lists_only_eligible_approved_metasploit_validation() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    assessment = create_assessment("TShark Capture Validation")
+    http_proposal = _approved_metasploit_http_proposal(5920, assessment_id=assessment["id"], target="example.com", port=443)
+    ssh_request = build_metasploit_action_request(
+        module="auxiliary/scanner/ssh/ssh_version",
+        action_type="auxiliary_validation",
+        target="example.com",
+        port=22,
+    )
+    approve_metasploit_proposal(propose_metasploit_action(5920, ssh_request, assessment_context={"assessment_id": assessment["id"]}).id, user_id=5920)
+    query = SimpleNamespace(data=f"tshark:capture:{assessment['id']}", answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5920)), SimpleNamespace()))
+
+    text = query.edit_message_text.call_args.args[0]
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert "Capture During Validation" in text
+    assert buttons[0] == "HTTP Service Fingerprint - example.com:443"
+    assert all("SSH" not in button for button in buttons)
+    assert keyboard.inline_keyboard[0][0].callback_data.startswith("tshark:cv:")
+    assert len(keyboard.inline_keyboard[0][0].callback_data) <= 64
+    assert get_metasploit_proposal(http_proposal.id) is not None
+
+
+def test_tshark_capture_validation_interface_selection_enforces_allowlist_and_shows_review_card() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0,lo", tshark_live_max_duration_seconds=6, tshark_live_max_packet_count=20, tshark_live_max_file_size_kb=256)
+    _approved_metasploit_http_proposal(5921, target="example.com", port=443)
+    capture_query = SimpleNamespace(data="tshark:capture", answer=AsyncMock(), edit_message_text=AsyncMock())
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=capture_query, effective_user=SimpleNamespace(id=5921)), SimpleNamespace()))
+    validation_callback = capture_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+    validation_query = SimpleNamespace(data=validation_callback, answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    with patch("app.bot.handlers.upload.check_tshark_live_readiness", return_value={"ready": True, "allowed_interfaces": ["eth0", "lo"], "resolved_binary": "tshark"}):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=validation_query, effective_user=SimpleNamespace(id=5921)), SimpleNamespace()))
+
+    interface_text = validation_query.edit_message_text.call_args.args[0]
+    interface_keyboard = validation_query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert "Choose an allowlisted capture interface" in interface_text
+    assert [button.text for row in interface_keyboard.inline_keyboard[:-1] for button in row] == ["eth0", "lo"]
+    assert all("wlan0" not in button.text for row in interface_keyboard.inline_keyboard for button in row)
+    review_query = SimpleNamespace(data=interface_keyboard.inline_keyboard[0][0].callback_data, answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    with (
+        patch("app.bot.handlers.upload.get_settings", return_value=settings),
+        patch("app.services.tshark_policy.get_settings", return_value=settings),
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=review_query, effective_user=SimpleNamespace(id=5921)), SimpleNamespace()))
+
+    review = review_query.edit_message_text.call_args.args[0]
+    review_keyboard = review_query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert "TShark Capture Review" in review
+    assert "Validation:\nHTTP Service Fingerprint" in review
+    assert "Target:\nexample.com" in review
+    assert "Expected Port:\n443" in review
+    assert "Interface:\neth0" in review
+    assert "Capture Duration:\n6 seconds" in review
+    assert "This action WILL:" in review
+    assert "- Execute the exact reviewed Metasploit validation" in review
+    assert "This action WILL NOT:" in review
+    assert "- Continue capturing indefinitely" in review
+    assert len(review_keyboard.inline_keyboard[0][0].callback_data) <= 64
+
+
+def test_tshark_capture_validation_approve_invokes_orchestrator_and_persists_provenance() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    assessment = create_assessment("TShark Capture Provenance")
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0", tshark_live_max_duration_seconds=5, tshark_live_max_packet_count=25, tshark_live_max_file_size_kb=512)
+    validation_proposal = _approved_metasploit_http_proposal(5922, assessment_id=assessment["id"], target="example.com", port=80)
+    review_query = _build_tshark_capture_validation_review(user_id=5922, settings=settings, assessment_id=assessment["id"])
+    proposal_id = review_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    approve_query = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    normalized = _tshark_normalized()
+    normalized["observed_endpoints"] = [{"address": "192.0.2.10", "packet_count": 2}, {"address": "93.184.216.34", "packet_count": 2}]
+    normalized["observed_conversations"] = [{"src": "192.0.2.10", "dst": "93.184.216.34", "src_port": "53000", "dst_port": "80", "transport": "tcp", "packet_count": 2}]
+    result = {
+        "source": "tshark_capture_during_validation",
+        "success": True,
+        "elapsed_seconds": 2.0,
+        "offline_result": {"success": True, "source": "tshark_live"},
+        "validation_result": {
+            "success": True,
+            "module": "auxiliary/scanner/http/http_version",
+            "action_type": "auxiliary_validation",
+            "target": "example.com",
+            "port": 80,
+            "output": "Server: nginx",
+            "error": "",
+        },
+        "normalized_evidence": normalized,
+        "post_validation_tail_seconds": 3,
+        "provenance": {
+            "user_id": 5922,
+            "validation_proposal_id": validation_proposal.id,
+            "capture_proposal_id": proposal_id,
+            "target": "example.com",
+            "module": "auxiliary/scanner/http/http_version",
+            "action": "auxiliary_validation",
+            "port": 80,
+            "interface": "eth0",
+            "capture_started_at": "2026-07-23T10:00:00+00:00",
+            "capture_ended_at": "2026-07-23T10:00:05+00:00",
+            "validation_started_at": "2026-07-23T10:00:01+00:00",
+            "validation_ended_at": "2026-07-23T10:00:02+00:00",
+            "pcap_artifact_path": "C:/tmp/mongrel-tshark-validation.pcapng",
+        },
+    }
+
+    with (
+        patch("app.bot.handlers.upload.run_tshark_capture_during_validation", return_value=result) as orchestrator,
+        patch("app.bot.handlers.upload.generate_tshark_metasploit_correlated_assessment", return_value=["Executive Summary", "Correlated evidence reviewed."]) as correlated_ai,
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5922)), SimpleNamespace()))
+
+    orchestrator.assert_called_once()
+    assert orchestrator.call_args.kwargs["capture_proposal_id"] == proposal_id
+    assert orchestrator.call_args.kwargs["metasploit_proposal_id"] == validation_proposal.id
+    assert orchestrator.call_args.kwargs["metasploit_request"]["module"] == "auxiliary/scanner/http/http_version"
+    assert orchestrator.call_args.kwargs["metasploit_request"]["target"] == "example.com"
+    assert "Running bounded capture during validation" in approve_query.edit_message_text.call_args.args[0]
+    assert "TShark PCAP Analysis" in approve_query.message.reply_text.call_args_list[0].args[0]
+    artifacts = list_assessment_artifacts(assessment["id"])
+    assert any(artifact["artifact_type"] == "tshark_normalized_evidence" for artifact in artifacts)
+    provenance_artifact = [artifact for artifact in artifacts if artifact["artifact_type"] == "tshark_validation_capture_provenance"][-1]
+    provenance = json.loads(provenance_artifact["content"])
+    assert provenance["validation_proposal_id"] == validation_proposal.id
+    assert provenance["capture_proposal_id"] == proposal_id
+    assert provenance["interface"] == "eth0"
+    correlation_artifact = [artifact for artifact in artifacts if artifact["artifact_type"] == "tshark_metasploit_correlation_record"][-1]
+    correlation = json.loads(correlation_artifact["content"])
+    assert correlation["validation_proposal_id"] == validation_proposal.id
+    assert correlation["capture_provenance_id"].startswith("assessment_artifact:")
+    assert correlation["validation_result_id"].startswith("assessment_artifact:")
+    assert correlation["correlation_outcome"] == "corroborated"
+    assert correlation["agreement_disagreement_state"] == "agreement"
+    assert any(artifact["artifact_type"] == "tshark_metasploit_correlated_ai_assessment" for artifact in artifacts)
+    correlated_ai.assert_called_once()
+
+
+def test_tshark_capture_validation_reject_and_details_do_not_execute() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0", tshark_live_max_duration_seconds=5, tshark_live_max_packet_count=25, tshark_live_max_file_size_kb=512)
+    _approved_metasploit_http_proposal(5923, target="example.com", port=80)
+    review_query = _build_tshark_capture_validation_review(user_id=5923, settings=settings)
+    proposal_id = review_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    details_query = SimpleNamespace(data=f"tshark:details:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock())
+    reject_query = SimpleNamespace(data=f"tshark:reject:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    with patch("app.bot.handlers.upload.run_tshark_capture_during_validation") as orchestrator:
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=details_query, effective_user=SimpleNamespace(id=5923)), SimpleNamespace()))
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=reject_query, effective_user=SimpleNamespace(id=5923)), SimpleNamespace()))
+
+    orchestrator.assert_not_called()
+    assert "Validation Proposal ID:" in details_query.edit_message_text.call_args.args[0]
+    assert "rejected" in reject_query.edit_message_text.call_args.args[0]
+
+
+def test_tshark_capture_validation_token_is_user_bound() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    _approved_metasploit_http_proposal(5924, target="example.com", port=443)
+    capture_query = SimpleNamespace(data="tshark:capture", answer=AsyncMock(), edit_message_text=AsyncMock())
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=capture_query, effective_user=SimpleNamespace(id=5924)), SimpleNamespace()))
+    validation_callback = capture_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+    wrong_user = SimpleNamespace(data=validation_callback, answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=wrong_user, effective_user=SimpleNamespace(id=9999)), SimpleNamespace()))
+
+    assert wrong_user.edit_message_text.call_args.args[0] == "TShark capture validation selection was not found or has expired."
 
 
 def test_scan_menu_includes_tshark_pcap_button() -> None:

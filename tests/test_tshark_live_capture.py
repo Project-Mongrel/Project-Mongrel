@@ -15,15 +15,20 @@ from app.services.tshark_approval import (
     propose_tshark_capture,
     require_approved_tshark_capture,
 )
+from app.services.metasploit_approval import approve_metasploit_proposal, clear_metasploit_proposals, propose_metasploit_action
+from app.services.metasploit_policy import build_metasploit_action_request
 from app.services.tshark_policy import build_tshark_capture_request
+from app.services.tshark_validation_capture import run_tshark_capture_during_validation
 from app.tools.tshark_live_runner import build_tshark_live_capture_command, check_tshark_live_readiness, run_tshark_live_capture
 
 
 @pytest.fixture(autouse=True)
 def clear_tshark_capture_store() -> None:
     clear_tshark_capture_proposals()
+    clear_metasploit_proposals()
     yield
     clear_tshark_capture_proposals()
+    clear_metasploit_proposals()
 
 
 def _settings() -> Settings:
@@ -223,3 +228,136 @@ def test_tshark_live_readiness_requires_binary_and_interface_allowlist() -> None
     assert no_allowlist["error_type"] == "missing_interface_allowlist"
     assert ready["ready"] is True
     assert ready["allowed_interfaces"] == ["eth0", "lo"]
+
+
+def test_tshark_capture_during_validation_starts_capture_before_validation_stops_and_returns_provenance(tmp_path) -> None:
+    capture_request = _request()
+    capture_proposal_id = _approved(capture_request)
+    metasploit_request = build_metasploit_action_request(
+        module="auxiliary/scanner/http/http_version",
+        action_type="auxiliary_validation",
+        target="example.com",
+        port=80,
+    )
+    metasploit_proposal_id = approve_metasploit_proposal(propose_metasploit_action(100, metasploit_request).id, user_id=100).id
+    order: list[str] = []
+
+    class FakeProcess:
+        returncode = None
+
+        def __init__(self, command, **kwargs):
+            assert kwargs["shell"] is False
+            assert "-i" in command
+            assert "-w" in command
+            order.append("capture_started")
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            order.append("capture_stopped")
+            self.returncode = -15
+
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    def fake_validation(**kwargs):
+        assert order == ["capture_started"]
+        order.append("validation_ran")
+        return {"success": True, "elapsed_seconds": 1, "output": "Server: nginx", "error": ""}
+
+    with (
+        patch("app.services.tshark_validation_capture.check_tshark_live_readiness", return_value={"ready": True, "resolved_binary": "tshark"}),
+        patch("app.services.tshark_validation_capture.subprocess.Popen", side_effect=FakeProcess),
+        patch("app.services.tshark_validation_capture.run_metasploit_validation", side_effect=fake_validation) as validation_mock,
+        patch("app.services.tshark_validation_capture.time.sleep", side_effect=lambda seconds: order.append(f"tail:{seconds}")),
+        patch("app.services.tshark_validation_capture.run_tshark_offline_analysis", return_value={"success": True, "output": "structured"}) as offline_mock,
+        patch("app.services.tshark_validation_capture.normalize_tshark_result", return_value={"success": True, "packet_count": 1}) as parser_mock,
+    ):
+        result = run_tshark_capture_during_validation(
+            user_id=100,
+            capture_proposal_id=capture_proposal_id,
+            capture_request=capture_request,
+            metasploit_proposal_id=metasploit_proposal_id,
+            metasploit_request=metasploit_request,
+            post_validation_tail_seconds=3,
+            work_dir=tmp_path,
+        )
+
+    assert order == ["capture_started", "validation_ran", "tail:3", "capture_stopped"]
+    assert result["success"] is True
+    assert result["normalized_evidence"] == {"success": True, "packet_count": 1}
+    assert result["post_validation_tail_seconds"] == 3
+    provenance = result["provenance"]
+    assert provenance["user_id"] == 100
+    assert provenance["validation_proposal_id"] == metasploit_proposal_id
+    assert provenance["capture_proposal_id"] == capture_proposal_id
+    assert provenance["target"] == "example.com"
+    assert provenance["module"] == "auxiliary/scanner/http/http_version"
+    assert provenance["interface"] == "eth0"
+    assert provenance["capture_started_at"]
+    assert provenance["capture_ended_at"]
+    assert provenance["validation_started_at"]
+    assert provenance["validation_ended_at"]
+    assert provenance["pcap_artifact_path"].endswith(".pcapng")
+    assert not list(tmp_path.glob("mongrel-tshark-validation-*.pcapng"))
+    validation_mock.assert_called_once()
+    offline_mock.assert_called_once()
+    parser_mock.assert_called_once_with({"success": True, "output": "structured"})
+
+
+def test_tshark_capture_during_validation_stops_capture_on_validation_exception(tmp_path) -> None:
+    capture_request = _request()
+    capture_proposal_id = _approved(capture_request)
+    metasploit_request = build_metasploit_action_request(
+        module="auxiliary/scanner/http/http_version",
+        action_type="auxiliary_validation",
+        target="example.com",
+        port=80,
+    )
+    metasploit_proposal_id = approve_metasploit_proposal(propose_metasploit_action(100, metasploit_request).id, user_id=100).id
+    stopped = []
+
+    class FakeProcess:
+        returncode = None
+
+        def __init__(self, command, **kwargs):
+            pass
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            stopped.append("terminated")
+            self.returncode = -15
+
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            stopped.append("killed")
+
+    with (
+        patch("app.services.tshark_validation_capture.check_tshark_live_readiness", return_value={"ready": True, "resolved_binary": "tshark"}),
+        patch("app.services.tshark_validation_capture.subprocess.Popen", side_effect=FakeProcess),
+        patch("app.services.tshark_validation_capture.run_metasploit_validation", side_effect=RuntimeError("boom")),
+    ):
+        result = run_tshark_capture_during_validation(
+            user_id=100,
+            capture_proposal_id=capture_proposal_id,
+            capture_request=capture_request,
+            metasploit_proposal_id=metasploit_proposal_id,
+            metasploit_request=metasploit_request,
+            work_dir=tmp_path,
+        )
+
+    assert result["success"] is False
+    assert result["error_type"] == "execution_failed"
+    assert stopped == ["terminated"]
+    assert not list(tmp_path.glob("mongrel-tshark-validation-*.pcapng"))
