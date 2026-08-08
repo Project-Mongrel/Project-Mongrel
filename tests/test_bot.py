@@ -154,7 +154,14 @@ from app.services.investigation_store import (
     get_investigation_events,
     get_user_investigations,
 )
-from app.services.metasploit_approval import approve_metasploit_proposal, clear_metasploit_proposals, get_metasploit_proposal, propose_metasploit_action
+from app.services.metasploit_approval import (
+    approve_metasploit_proposal,
+    clear_metasploit_proposals,
+    get_metasploit_proposal,
+    mark_metasploit_proposal_status,
+    propose_metasploit_action,
+    record_metasploit_result_reference,
+)
 from app.services.metasploit_policy import build_metasploit_action_request
 from app.services.observation_store import add_observation, clear_user_observations, get_investigation_observations, get_user_observations
 from app.services.tshark_approval import clear_tshark_capture_proposals, get_tshark_capture_proposal
@@ -5674,11 +5681,30 @@ def test_tshark_capture_during_validation_lists_only_eligible_approved_metasploi
     keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
     buttons = [button.text for row in keyboard.inline_keyboard for button in row]
     assert "Capture During Validation" in text
-    assert buttons[0] == "HTTP Service Fingerprint - example.com:443"
+    assert buttons[0] == "HTTP Service Fingerprint - example.com:443 (approved)"
     assert all("SSH" not in button for button in buttons)
     assert keyboard.inline_keyboard[0][0].callback_data.startswith("tshark:cv:")
     assert len(keyboard.inline_keyboard[0][0].callback_data) <= 64
     assert get_metasploit_proposal(http_proposal.id) is not None
+
+
+def test_tshark_capture_during_validation_lists_completed_guided_http_validation() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    assessment = create_assessment("TShark Completed Validation Lookup")
+    http_proposal = _approved_metasploit_http_proposal(5925, assessment_id=assessment["id"], target="example.com", port=443)
+    mark_metasploit_proposal_status(http_proposal.id, "executed")
+    record_metasploit_result_reference(http_proposal.id, "assessment_artifact:42")
+    query = SimpleNamespace(data=f"tshark:capture:{assessment['id']}", answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5925)), SimpleNamespace()))
+
+    text = query.edit_message_text.call_args.args[0]
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert "Completed validations are used as exact re-run templates" in text
+    assert buttons[0] == "HTTP Service Fingerprint - example.com:443 (completed)"
+    assert "No eligible approved" not in text
 
 
 def test_tshark_capture_validation_interface_selection_enforces_allowlist_and_shows_review_card() -> None:
@@ -5796,6 +5822,38 @@ def test_tshark_capture_validation_approve_invokes_orchestrator_and_persists_pro
     assert correlation["agreement_disagreement_state"] == "agreement"
     assert any(artifact["artifact_type"] == "tshark_metasploit_correlated_ai_assessment" for artifact in artifacts)
     correlated_ai.assert_called_once()
+
+
+def test_tshark_capture_validation_completed_validation_uses_fresh_approved_rerun_proposal() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0", tshark_live_max_duration_seconds=5, tshark_live_max_packet_count=25, tshark_live_max_file_size_kb=512)
+    completed_validation = _approved_metasploit_http_proposal(5926, target="example.com", port=80)
+    mark_metasploit_proposal_status(completed_validation.id, "executed")
+    record_metasploit_result_reference(completed_validation.id, "assessment_artifact:42")
+    review_query = _build_tshark_capture_validation_review(user_id=5926, settings=settings)
+    proposal_id = review_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    approve_query = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    result = {
+        "source": "tshark_capture_during_validation",
+        "success": True,
+        "elapsed_seconds": 1.0,
+        "offline_result": {"success": True},
+        "normalized_evidence": _tshark_normalized(),
+        "provenance": {"validation_proposal_id": "filled-by-orchestrator"},
+    }
+
+    with patch("app.bot.handlers.upload.run_tshark_capture_during_validation", return_value=result) as orchestrator:
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5926)), SimpleNamespace()))
+
+    assert "The selected validation already ran" in review_query.edit_message_text.call_args.args[0]
+    runner_kwargs = orchestrator.call_args.kwargs
+    assert runner_kwargs["metasploit_proposal_id"] != completed_validation.id
+    assert runner_kwargs["metasploit_request"] == completed_validation.request
+    fresh_proposal = get_metasploit_proposal(runner_kwargs["metasploit_proposal_id"])
+    assert fresh_proposal.status == "approved"
+    assert fresh_proposal.approved_by_user_id == 5926
+    assert fresh_proposal.source_evidence_refs == ["assessment_artifact:42"]
 
 
 def test_tshark_capture_validation_reject_and_details_do_not_execute() -> None:

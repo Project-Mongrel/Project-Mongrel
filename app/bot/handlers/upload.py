@@ -25,7 +25,14 @@ from app.services.assessment_store import add_assessment_artifact, get_assessmen
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
 from app.services.icon_helper import section_label
-from app.services.metasploit_approval import get_metasploit_proposal, list_metasploit_proposals, record_metasploit_result_reference
+from app.services.metasploit_approval import (
+    MetasploitApprovalError,
+    approve_metasploit_proposal,
+    get_metasploit_proposal,
+    list_metasploit_proposals,
+    propose_metasploit_action,
+    record_metasploit_result_reference,
+)
 from app.services.target_normalizer import normalize_target_key
 from app.services.tshark_approval import TSharkApprovalError, approve_tshark_capture, get_tshark_capture_proposal, propose_tshark_capture, reject_tshark_capture
 from app.services.tshark_metasploit_correlation import (
@@ -171,13 +178,13 @@ def build_tshark_capture_validation_text(eligible: list[object]) -> str:
     if not eligible:
         return (
             f"{section_label('scan', 'TShark Capture During Validation')}\n\n"
-            "No eligible approved Metasploit HTTP service fingerprint validation was found for this user.\n\n"
-            "Create and approve the guided Metasploit validation first, then return here."
+            "No eligible approved or completed Metasploit HTTP service fingerprint validation was found for this user.\n\n"
+            "Create the guided HTTP service fingerprint validation first, then return here before or after it runs."
         )
     return (
         f"{section_label('scan', 'TShark Capture During Validation')}\n\n"
         "Choose an approved validation to run while TShark captures bounded packet metadata.\n\n"
-        "Only the allowlisted Metasploit HTTP service fingerprint validation is eligible in this foundation."
+        "Only the allowlisted Metasploit HTTP service fingerprint validation is eligible in this foundation. Completed validations are used as exact re-run templates because past traffic cannot be captured retroactively."
     )
 
 
@@ -194,7 +201,7 @@ def build_tshark_capture_validation_keyboard(user_id: int, eligible: list[object
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"HTTP Service Fingerprint - {request.get('target')}:{request.get('port')}",
+                    f"HTTP Service Fingerprint - {request.get('target')}:{request.get('port')} ({_metasploit_capture_status_label(proposal)})",
                     callback_data=f"tshark:cv:{token}",
                 )
             ]
@@ -277,6 +284,14 @@ def build_tshark_capture_review_text(proposal: object, validation_proposal: obje
         "",
         "Approval is required before capture or validation starts.",
     ]
+    if getattr(validation_proposal, "status", "") == "executed":
+        lines.extend(
+            [
+                "",
+                "Completed Validation Handling:",
+                "The selected validation already ran. Approval will create a fresh exact Metasploit re-run approval for capture correlation; past traffic cannot be captured retroactively.",
+            ]
+        )
     if details:
         lines.extend(
             [
@@ -353,11 +368,13 @@ def _get_tshark_capture_validation_token(token: str, user_id: int) -> dict | Non
 
 def _eligible_metasploit_capture_validations(user_id: int, assessment_id: int | None = None) -> list[object]:
     eligible: list[object] = []
-    for proposal in list_metasploit_proposals(user_id=user_id, status="approved"):
+    for proposal in list_metasploit_proposals(user_id=user_id):
         request = getattr(proposal, "request", {}) or {}
         if request.get("module") != "auxiliary/scanner/http/http_version":
             continue
         if request.get("action_type") != "auxiliary_validation":
+            continue
+        if not _is_capture_validation_selectable(proposal):
             continue
         if assessment_id is not None:
             proposal_assessment = getattr(proposal, "assessment_context", None) or {}
@@ -365,6 +382,41 @@ def _eligible_metasploit_capture_validations(user_id: int, assessment_id: int | 
                 continue
         eligible.append(proposal)
     return eligible
+
+
+def _is_capture_validation_selectable(proposal: object) -> bool:
+    status = str(getattr(proposal, "status", "") or "").lower()
+    if status == "approved":
+        return True
+    return status == "executed" and str(getattr(proposal, "execution_state", "") or "").lower() == "executed" and getattr(proposal, "approved_at", None) is not None
+
+
+def _metasploit_capture_status_label(proposal: object) -> str:
+    status = str(getattr(proposal, "status", "") or "").lower()
+    if status == "executed":
+        return "completed"
+    if status == "approved":
+        return "approved"
+    return status or "unknown"
+
+
+def _prepare_metasploit_proposal_for_capture_execution(validation_proposal: object, *, user_id: int) -> object:
+    if str(getattr(validation_proposal, "status", "") or "").lower() == "approved":
+        return validation_proposal
+    if not _is_capture_validation_selectable(validation_proposal):
+        raise MetasploitApprovalError("Metasploit validation proposal is not eligible for capture.")
+    source_refs = list(getattr(validation_proposal, "source_evidence_refs", None) or [])
+    result_ref = getattr(validation_proposal, "result_artifact_ref", None)
+    if result_ref:
+        source_refs.append(str(result_ref))
+    proposal = propose_metasploit_action(
+        user_id,
+        dict(getattr(validation_proposal, "request", {}) or {}),
+        assessment_context=getattr(validation_proposal, "assessment_context", None),
+        source_evidence_refs=source_refs,
+        reason=f"TShark capture re-run from completed validation {getattr(validation_proposal, 'id', '')}",
+    )
+    return approve_metasploit_proposal(proposal.id, user_id=user_id, actor="human")
 
 
 def _format_options(options: dict) -> str:
@@ -1458,8 +1510,8 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         if validation_proposal is None or validation_proposal.user_id != user_id:
             await query.edit_message_text("Metasploit validation proposal is not available for this user.")
             return
-        if validation_proposal.status != "approved":
-            await query.edit_message_text("Metasploit validation proposal is not approved.")
+        if not _is_capture_validation_selectable(validation_proposal):
+            await query.edit_message_text("Metasploit validation proposal is not eligible for capture.")
             return
         if str(validation_proposal.fingerprint) != str(token_payload.get("validation_fingerprint") or ""):
             await query.edit_message_text("Metasploit validation details changed.")
@@ -1477,6 +1529,7 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             "assessment_id": assessment_id,
             "mode": "capture_validation",
             "metasploit_proposal_id": validation_proposal.id,
+            "metasploit_proposal_status": validation_proposal.status,
             "metasploit_request": dict(validation_proposal.request),
             "validation_fingerprint": validation_proposal.fingerprint,
             "post_validation_tail_seconds": DEFAULT_POST_VALIDATION_TAIL_SECONDS,
@@ -1591,13 +1644,22 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             if (
                 validation_proposal is None
                 or validation_proposal.user_id != user_id
-                or validation_proposal.status != "approved"
+                or not _is_capture_validation_selectable(validation_proposal)
                 or validation_proposal.fingerprint != str(live_context.get("validation_fingerprint") or "")
             ):
                 clear_tshark_live_context(proposal_id)
                 clear_upload_state(user_id)
                 await query.edit_message_text("Metasploit validation proposal is no longer available or has changed.")
                 return
+            try:
+                executable_validation = _prepare_metasploit_proposal_for_capture_execution(validation_proposal, user_id=user_id)
+            except (MetasploitApprovalError, ValueError) as exc:
+                clear_tshark_live_context(proposal_id)
+                clear_upload_state(user_id)
+                await query.edit_message_text(_escape(str(exc)))
+                return
+            validation_proposal_id = str(executable_validation.id)
+            metasploit_request = dict(executable_validation.request)
             await query.edit_message_text("TShark capture approved. Running bounded capture during validation...")
             result = await asyncio.to_thread(
                 run_tshark_capture_during_validation,
