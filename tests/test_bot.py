@@ -5806,6 +5806,8 @@ def test_tshark_capture_validation_approve_invokes_orchestrator_and_persists_pro
     assert orchestrator.call_args.kwargs["metasploit_request"]["target"] == "example.com"
     assert "Running bounded capture during validation" in approve_query.edit_message_text.call_args.args[0]
     assert "TShark PCAP Analysis" in approve_query.message.reply_text.call_args_list[0].args[0]
+    assert "TShark + Metasploit Correlated Assessment" in approve_query.message.reply_text.call_args_list[1].args[0]
+    assert "Correlated evidence reviewed." in approve_query.message.reply_text.call_args_list[1].args[0]
     artifacts = list_assessment_artifacts(assessment["id"])
     assert any(artifact["artifact_type"] == "tshark_normalized_evidence" for artifact in artifacts)
     provenance_artifact = [artifact for artifact in artifacts if artifact["artifact_type"] == "tshark_validation_capture_provenance"][-1]

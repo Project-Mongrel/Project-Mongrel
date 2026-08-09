@@ -1257,7 +1257,7 @@ def _persist_tshark_metasploit_correlation(
     capture_provenance_ref: str | None,
     result: dict,
     normalized_tshark: dict,
-) -> None:
+) -> dict:
     provenance = result.get("provenance") if isinstance(result, dict) else {}
     if not isinstance(provenance, dict):
         provenance = {}
@@ -1290,6 +1290,22 @@ def _persist_tshark_metasploit_correlation(
         title="Correlated TShark and Metasploit AI assessment",
         content="\n".join(ai_lines),
         file_path=f"assessment_artifact:{correlation_artifact.get('id')}",
+    )
+    return {
+        "correlation": correlation,
+        "ai_lines": ai_lines,
+        "correlation_artifact_ref": f"assessment_artifact:{correlation_artifact.get('id')}",
+    }
+
+
+def build_tshark_metasploit_correlated_assessment_text(ai_lines: list[str]) -> str:
+    body = "\n".join(str(line) for line in ai_lines).strip()
+    return "\n".join(
+        [
+            f"{section_label('mongrel_ai', 'TShark + Metasploit Correlated Assessment')}",
+            "",
+            body or "Correlated assessment was unavailable.",
+        ]
     )
 
 
@@ -1672,10 +1688,11 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
             normalized = _normalized_tshark_live_evidence(result)
             assessment_id = _parse_optional_int(live_context.get("assessment_id"))
+            correlation_result = None
             if assessment_id is not None:
                 _persist_tshark_assessment_evidence({"assessment_id": assessment_id}, result, normalized)
                 provenance_ref = _persist_tshark_capture_validation_provenance(assessment_id, result)
-                await asyncio.to_thread(
+                correlation_result = await asyncio.to_thread(
                     _persist_tshark_metasploit_correlation,
                     user_id,
                     assessment_id,
@@ -1686,6 +1703,8 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 )
             if query.message is not None:
                 await query.message.reply_text(build_tshark_result_text(normalized, result.get("offline_result") or result))
+                if isinstance(correlation_result, dict):
+                    await query.message.reply_text(build_tshark_metasploit_correlated_assessment_text(list(correlation_result.get("ai_lines") or [])))
                 if assessment_id is not None:
                     await _send_tshark_assessment_dashboard(query.message, assessment_id)
             clear_tshark_live_context(proposal_id)
