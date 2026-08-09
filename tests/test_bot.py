@@ -5608,6 +5608,20 @@ def test_tshark_result_card_keeps_endpoint_and_conversation_lists_bounded() -> N
 def test_tshark_offline_result_card_uses_uploaded_filename_readable_time_duration_dns_tls_and_escaping() -> None:
     normalized = _tshark_normalized()
     normalized["source_file"] = {"name": "mongrel-tshark-temp-123.pcap", "extension": ".pcap", "size_bytes": 160}
+    normalized["observed_protocols"] = [
+        {"protocol": "dns", "packet_count": 1},
+        {"protocol": "tcp", "packet_count": 9},
+        {"protocol": "tls", "packet_count": 4},
+    ]
+    normalized["observed_endpoints"] = [
+        {"address": "192.0.2.10", "packet_count": 2},
+        {"address": "198.51.100.20", "packet_count": 8},
+        {"address": "203.0.113.30", "packet_count": 5},
+    ]
+    normalized["observed_conversations"] = [
+        {"src": "192.0.2.10", "dst": "198.51.100.20", "src_port": "53000", "dst_port": "443", "transport": "tcp", "packet_count": 2},
+        {"src": "192.0.2.10", "dst": "203.0.113.30", "src_port": "53001", "dst_port": "80", "transport": "tcp", "packet_count": 7},
+    ]
     normalized["dns_observations"] = [
         {"query_name": "<Root>", "response_address": "192.0.2.10"},
         {"query_name": "<Root>", "response_address": "192.0.2.10"},
@@ -5615,13 +5629,17 @@ def test_tshark_offline_result_card_uses_uploaded_filename_readable_time_duratio
     ]
     normalized["tls_observations"] = [{"sni": "<Root>", "version": "0x0303"}]
 
-    card = build_tshark_result_text(normalized, {"uploaded_filename": "../Client <Root>.pcap"})
+    card = build_tshark_result_text(normalized, {"uploaded_filename": "../Client <Root>.pcap", "elapsed_seconds": 99.0})
 
     assert "Client &lt;Root&gt;.pcap" in card
     assert "mongrel-tshark-temp-123.pcap" not in card
     assert "Start: 2024-03-09 16:00:00 UTC" in card
     assert "End: 2024-03-09 16:00:01 UTC" in card
     assert "Duration: 1.1s" in card
+    assert "Duration: 99.0s" not in card
+    assert card.index("- tcp: 9") < card.index("- tls: 4") < card.index("- dns: 1")
+    assert card.index("198.51.100.20 packets=8") < card.index("203.0.113.30 packets=5") < card.index("192.0.2.10 packets=2")
+    assert card.index("203.0.113.30:80 tcp packets=7") < card.index("198.51.100.20:443 tcp packets=2")
     assert card.count("query=&lt;Root&gt; response=192.0.2.10") == 1
     assert "sni=&lt;Root&gt; version=TLS 1.2" in card
     assert normalized["tls_observations"][0]["version"] == "0x0303"

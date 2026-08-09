@@ -549,6 +549,7 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
     truncation = normalized.get("truncation") or {}
     status = "Complete" if normalized.get("success") else "Failed"
     live_capture = _is_tshark_live_result(result)
+    offline_upload = not live_capture
     source_label = "Live Capture" if live_capture else _escape(result.get("uploaded_filename") or source_file.get("name") or "uploaded capture")
     lines = [
         section_label("scan", "TShark PCAP Analysis"),
@@ -569,13 +570,13 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
         *_format_tshark_duration(result, normalized, live_capture=live_capture),
         "",
         "Protocols:",
-        *_format_tshark_protocols(normalized.get("observed_protocols") or []),
+        *_format_tshark_protocols(normalized.get("observed_protocols") or [], sort_by_count=offline_upload),
         "",
         "Endpoints:",
-        *_format_tshark_endpoints(normalized.get("observed_endpoints") or []),
+        *_format_tshark_endpoints(normalized.get("observed_endpoints") or [], sort_by_count=offline_upload),
         "",
         "Conversations:",
-        *_format_tshark_conversations(normalized.get("observed_conversations") or []),
+        *_format_tshark_conversations(normalized.get("observed_conversations") or [], sort_by_count=offline_upload),
         "",
         "DNS Metadata:",
         *_format_tshark_dns(normalized.get("dns_observations") or []),
@@ -1824,24 +1825,29 @@ async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.message.reply_text(ai_response)
 
 
-def _format_tshark_protocols(protocols: list[dict]) -> list[str]:
+def _format_tshark_protocols(protocols: list[dict], *, sort_by_count: bool = False) -> list[str]:
     if not protocols:
         return ["- none observed"]
-    ordered = sorted(enumerate(protocols), key=lambda indexed: (_tshark_protocol_rank(indexed[1].get("protocol")), indexed[0]))
+    if sort_by_count:
+        ordered = sorted(enumerate(protocols), key=lambda indexed: (-int(indexed[1].get("packet_count") or 0), indexed[0]))
+    else:
+        ordered = sorted(enumerate(protocols), key=lambda indexed: (_tshark_protocol_rank(indexed[1].get("protocol")), indexed[0]))
     return [f"- {_escape(item.get('protocol'))}: {int(item.get('packet_count') or 0)}" for _, item in ordered[:8]]
 
 
-def _format_tshark_endpoints(endpoints: list[dict]) -> list[str]:
+def _format_tshark_endpoints(endpoints: list[dict], *, sort_by_count: bool = False) -> list[str]:
     if not endpoints:
         return ["- none observed"]
-    return [f"- {_escape(item.get('address'))} packets={int(item.get('packet_count') or 0)}" for item in endpoints[:8]]
+    ordered = sorted(enumerate(endpoints), key=lambda indexed: (-int(indexed[1].get("packet_count") or 0), indexed[0])) if sort_by_count else list(enumerate(endpoints))
+    return [f"- {_escape(item.get('address'))} packets={int(item.get('packet_count') or 0)}" for _, item in ordered[:8]]
 
 
-def _format_tshark_conversations(conversations: list[dict]) -> list[str]:
+def _format_tshark_conversations(conversations: list[dict], *, sort_by_count: bool = False) -> list[str]:
     if not conversations:
         return ["- none observed"]
     lines = []
-    for item in conversations[:6]:
+    ordered = sorted(enumerate(conversations), key=lambda indexed: (-int(indexed[1].get("packet_count") or 0), indexed[0])) if sort_by_count else list(enumerate(conversations))
+    for _, item in ordered[:6]:
         src = _escape(item.get("src"))
         dst = _escape(item.get("dst"))
         src_port = _escape(item.get("src_port") or "")
@@ -1914,10 +1920,13 @@ def _format_tshark_timestamp(value: object) -> str:
 
 
 def _format_tshark_duration(result: dict, normalized: dict, *, live_capture: bool) -> list[str]:
-    value = result.get("elapsed_seconds")
-    if value in (None, "") and live_capture:
-        value = result.get("duration_seconds")
-    if value in (None, ""):
+    if live_capture:
+        value = result.get("elapsed_seconds")
+        if value in (None, ""):
+            value = result.get("duration_seconds")
+        if value in (None, ""):
+            value = _capture_duration_from_timestamps(normalized.get("capture_start"), normalized.get("capture_end"))
+    else:
         value = _capture_duration_from_timestamps(normalized.get("capture_start"), normalized.get("capture_end"))
     try:
         seconds = max(0.0, float(str(value).strip()))
