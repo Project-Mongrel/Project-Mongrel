@@ -24,7 +24,7 @@ from app.services.ai_client import ask_ai
 from app.services.assessment_store import add_assessment_artifact, get_assessment, list_assessment_scans, list_assessment_targets, record_assessment_scan
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
-from app.services.icon_helper import section_label
+from app.services.icon_helper import icon_label, section_label
 from app.services.metasploit_approval import (
     MetasploitApprovalError,
     approve_metasploit_proposal,
@@ -1283,18 +1283,33 @@ def _persist_tshark_metasploit_correlation(
         content=json.dumps(correlation, sort_keys=True),
         file_path=None,
     )
+    correlation_artifact_ref = f"assessment_artifact:{correlation_artifact.get('id')}"
+    logger.info(
+        "TShark/Metasploit correlation record created: artifact_ref=%s validation_proposal_id=%s capture_provenance_ref=%s outcome=%s",
+        correlation_artifact_ref,
+        validation_proposal_id,
+        capture_provenance_ref,
+        correlation.get("correlation_outcome"),
+    )
+    logger.info("TShark/Metasploit correlated AI generation invoked: correlation_artifact_ref=%s", correlation_artifact_ref)
     ai_lines = generate_tshark_metasploit_correlated_assessment(correlation)
+    ai_text = "\n".join(ai_lines)
+    logger.info(
+        "TShark/Metasploit correlated AI generation completed: correlation_artifact_ref=%s text_length=%s",
+        correlation_artifact_ref,
+        len(ai_text),
+    )
     add_assessment_artifact(
         assessment_id=int(assessment_id),
         artifact_type="tshark_metasploit_correlated_ai_assessment",
         title="Correlated TShark and Metasploit AI assessment",
-        content="\n".join(ai_lines),
-        file_path=f"assessment_artifact:{correlation_artifact.get('id')}",
+        content=ai_text,
+        file_path=correlation_artifact_ref,
     )
     return {
         "correlation": correlation,
         "ai_lines": ai_lines,
-        "correlation_artifact_ref": f"assessment_artifact:{correlation_artifact.get('id')}",
+        "correlation_artifact_ref": correlation_artifact_ref,
     }
 
 
@@ -1302,7 +1317,7 @@ def build_tshark_metasploit_correlated_assessment_text(ai_lines: list[str]) -> s
     body = "\n".join(str(line) for line in ai_lines).strip()
     return "\n".join(
         [
-            f"{section_label('mongrel_ai', 'TShark + Metasploit Correlated Assessment')}",
+            f"{icon_label('mongrel_ai', 'TShark + Metasploit Correlated Assessment')}",
             "",
             body or "Correlated assessment was unavailable.",
         ]
@@ -1704,7 +1719,13 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             if query.message is not None:
                 await query.message.reply_text(build_tshark_result_text(normalized, result.get("offline_result") or result))
                 if isinstance(correlation_result, dict):
-                    await query.message.reply_text(build_tshark_metasploit_correlated_assessment_text(list(correlation_result.get("ai_lines") or [])))
+                    correlated_message = build_tshark_metasploit_correlated_assessment_text(list(correlation_result.get("ai_lines") or []))
+                    logger.info(
+                        "Sending Telegram message: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s text_length=%s",
+                        correlation_result.get("correlation_artifact_ref"),
+                        len(correlated_message),
+                    )
+                    await query.message.reply_text(correlated_message)
                 if assessment_id is not None:
                     await _send_tshark_assessment_dashboard(query.message, assessment_id)
             clear_tshark_live_context(proposal_id)
