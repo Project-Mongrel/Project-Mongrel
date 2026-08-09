@@ -5826,6 +5826,70 @@ def test_tshark_capture_validation_approve_invokes_orchestrator_and_persists_pro
     correlated_ai.assert_called_once()
 
 
+def test_tshark_capture_validation_tool_mode_sends_correlated_assessment_without_assessment_context() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    settings = Settings(_env_file=None, tshark_live_interface_allowlist="eth0", tshark_live_max_duration_seconds=5, tshark_live_max_packet_count=25, tshark_live_max_file_size_kb=512)
+    validation_proposal = _approved_metasploit_http_proposal(5930, target="example.com", port=80)
+    review_query = _build_tshark_capture_validation_review(user_id=5930, settings=settings)
+    proposal_id = review_query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.removeprefix("tshark:approve:")
+    approve_query = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    normalized = _tshark_normalized()
+    normalized["observed_endpoints"] = [{"address": "192.0.2.10", "packet_count": 2}, {"address": "93.184.216.34", "packet_count": 2}]
+    normalized["observed_conversations"] = [{"src": "192.0.2.10", "dst": "93.184.216.34", "src_port": "53000", "dst_port": "80", "transport": "tcp", "packet_count": 2}]
+    result = {
+        "source": "tshark_capture_during_validation",
+        "success": True,
+        "elapsed_seconds": 2.0,
+        "offline_result": {"success": True, "source": "tshark_live"},
+        "validation_result": {
+            "success": True,
+            "module": "auxiliary/scanner/http/http_version",
+            "action_type": "auxiliary_validation",
+            "target": "example.com",
+            "port": 80,
+            "output": "Server: nginx",
+            "error": "",
+        },
+        "normalized_evidence": normalized,
+        "post_validation_tail_seconds": 3,
+        "provenance": {
+            "user_id": 5930,
+            "validation_proposal_id": validation_proposal.id,
+            "capture_proposal_id": proposal_id,
+            "target": "example.com",
+            "module": "auxiliary/scanner/http/http_version",
+            "action": "auxiliary_validation",
+            "port": 80,
+            "interface": "eth0",
+            "capture_started_at": "2026-07-23T10:00:00+00:00",
+            "capture_ended_at": "2026-07-23T10:00:05+00:00",
+            "validation_started_at": "2026-07-23T10:00:01+00:00",
+            "validation_ended_at": "2026-07-23T10:00:02+00:00",
+        },
+    }
+
+    with (
+        patch("app.bot.handlers.upload.run_tshark_capture_during_validation", return_value=result) as orchestrator,
+        patch("app.bot.handlers.upload.generate_tshark_metasploit_correlated_assessment", return_value=["Executive Summary", "Tool mode correlated evidence reviewed."]) as correlated_ai,
+    ):
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5930)), SimpleNamespace()))
+
+    orchestrator.assert_called_once()
+    assert orchestrator.call_args.kwargs["metasploit_proposal_id"] == validation_proposal.id
+    sent_messages = [call.args[0] for call in approve_query.message.reply_text.call_args_list]
+    assert "TShark PCAP Analysis" in sent_messages[0]
+    assert sent_messages[1].startswith(f"{icon('mongrel_ai')} TShark + Metasploit Correlated Assessment")
+    assert "Tool mode correlated evidence reviewed." in sent_messages[1]
+    assert len(sent_messages) == 2
+    correlation = correlated_ai.call_args.args[0]
+    assert correlation["assessment_id"] == 0
+    assert correlation["validation_proposal_id"] == validation_proposal.id
+    assert correlation["capture_proposal_id"] == proposal_id
+    assert correlation["validation_result_id"] == "current_run.validation_result"
+    assert correlation["capture_provenance_id"] == ""
+
+
 def test_tshark_capture_validation_completed_validation_uses_fresh_approved_rerun_proposal() -> None:
     clear_metasploit_proposals()
     clear_tshark_capture_proposals()

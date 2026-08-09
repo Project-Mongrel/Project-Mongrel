@@ -1252,12 +1252,19 @@ def _persist_tshark_capture_validation_provenance(assessment_id: int, result: di
 
 def _persist_tshark_metasploit_correlation(
     user_id: int,
-    assessment_id: int,
+    assessment_id: int | None,
     validation_proposal_id: str,
     capture_provenance_ref: str | None,
     result: dict,
     normalized_tshark: dict,
 ) -> dict:
+    logger.info(
+        "Start TShark/Metasploit correlation persistence: user_id=%s assessment_id=%s validation_proposal_id=%s capture_provenance_ref=%s",
+        user_id,
+        assessment_id,
+        validation_proposal_id,
+        capture_provenance_ref,
+    )
     provenance = result.get("provenance") if isinstance(result, dict) else {}
     if not isinstance(provenance, dict):
         provenance = {}
@@ -1265,25 +1272,29 @@ def _persist_tshark_metasploit_correlation(
     if not isinstance(validation_result, dict):
         validation_result = {"success": False, "error": "Metasploit validation result was not available.", "error_type": "missing_validation_result"}
     normalized_metasploit = parse_metasploit_validation_result(validation_result)
-    validation_ref = _persist_metasploit_capture_validation_artifact(assessment_id, validation_result, normalized_metasploit, validation_proposal_id)
-    record_metasploit_result_reference(validation_proposal_id, validation_ref)
+    validation_ref = "current_run.validation_result"
+    if assessment_id is not None:
+        validation_ref = _persist_metasploit_capture_validation_artifact(assessment_id, validation_result, normalized_metasploit, validation_proposal_id)
+        record_metasploit_result_reference(validation_proposal_id, validation_ref)
     correlation = build_tshark_metasploit_correlation_record(
         user_id=user_id,
-        assessment_id=assessment_id,
+        assessment_id=int(assessment_id or 0),
         validation_result_id=validation_ref,
         capture_provenance_id=capture_provenance_ref,
         provenance=provenance,
         metasploit_evidence=normalized_metasploit,
         tshark_evidence=normalized_tshark,
     )
-    correlation_artifact = add_assessment_artifact(
-        assessment_id=int(assessment_id),
-        artifact_type="tshark_metasploit_correlation_record",
-        title="TShark and Metasploit correlation record",
-        content=json.dumps(correlation, sort_keys=True),
-        file_path=None,
-    )
-    correlation_artifact_ref = f"assessment_artifact:{correlation_artifact.get('id')}"
+    correlation_artifact_ref = "current_run.correlation_record"
+    if assessment_id is not None:
+        correlation_artifact = add_assessment_artifact(
+            assessment_id=int(assessment_id),
+            artifact_type="tshark_metasploit_correlation_record",
+            title="TShark and Metasploit correlation record",
+            content=json.dumps(correlation, sort_keys=True),
+            file_path=None,
+        )
+        correlation_artifact_ref = f"assessment_artifact:{correlation_artifact.get('id')}"
     logger.info(
         "TShark/Metasploit correlation record created: artifact_ref=%s validation_proposal_id=%s capture_provenance_ref=%s outcome=%s",
         correlation_artifact_ref,
@@ -1299,12 +1310,19 @@ def _persist_tshark_metasploit_correlation(
         correlation_artifact_ref,
         len(ai_text),
     )
-    add_assessment_artifact(
-        assessment_id=int(assessment_id),
-        artifact_type="tshark_metasploit_correlated_ai_assessment",
-        title="Correlated TShark and Metasploit AI assessment",
-        content=ai_text,
-        file_path=correlation_artifact_ref,
+    if assessment_id is not None:
+        add_assessment_artifact(
+            assessment_id=int(assessment_id),
+            artifact_type="tshark_metasploit_correlated_ai_assessment",
+            title="Correlated TShark and Metasploit AI assessment",
+            content=ai_text,
+            file_path=correlation_artifact_ref,
+        )
+    logger.info(
+        "TShark/Metasploit correlation helper returning: artifact_ref=%s has_record=%s ai_line_count=%s",
+        correlation_artifact_ref,
+        bool(correlation),
+        len(ai_lines),
     )
     return {
         "correlation": correlation,
@@ -1703,33 +1721,55 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
             normalized = _normalized_tshark_live_evidence(result)
             assessment_id = _parse_optional_int(live_context.get("assessment_id"))
-            correlation_result = None
+            logger.info(
+                "Entered Capture During Validation post-capture branch: user_id=%s assessment_id=%s validation_proposal_id=%s capture_proposal_id=%s success=%s packet_count=%s",
+                user_id,
+                assessment_id,
+                validation_proposal_id,
+                proposal_id,
+                result.get("success") if isinstance(result, dict) else None,
+                normalized.get("packet_count") if isinstance(normalized, dict) else None,
+            )
+            provenance_ref = None
             if assessment_id is not None:
                 _persist_tshark_assessment_evidence({"assessment_id": assessment_id}, result, normalized)
                 provenance_ref = _persist_tshark_capture_validation_provenance(assessment_id, result)
-                correlation_result = await asyncio.to_thread(
-                    _persist_tshark_metasploit_correlation,
-                    user_id,
-                    assessment_id,
-                    validation_proposal_id,
-                    provenance_ref,
-                    result,
-                    normalized,
-                )
+            correlation_result = await asyncio.to_thread(
+                _persist_tshark_metasploit_correlation,
+                user_id,
+                assessment_id,
+                validation_proposal_id,
+                provenance_ref,
+                result,
+                normalized,
+            )
+            logger.info(
+                "Capture During Validation caller received correlation result: has_record=%s has_ai_lines=%s ai_line_count=%s artifact_ref=%s",
+                isinstance(correlation_result, dict) and bool(correlation_result.get("correlation")),
+                isinstance(correlation_result, dict) and bool(correlation_result.get("ai_lines")),
+                len(correlation_result.get("ai_lines") or []) if isinstance(correlation_result, dict) else 0,
+                correlation_result.get("correlation_artifact_ref") if isinstance(correlation_result, dict) else None,
+            )
             if query.message is not None:
                 await query.message.reply_text(build_tshark_result_text(normalized, result.get("offline_result") or result))
                 if isinstance(correlation_result, dict):
                     correlated_message = build_tshark_metasploit_correlated_assessment_text(list(correlation_result.get("ai_lines") or []))
                     logger.info(
-                        "Sending Telegram message: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s text_length=%s",
+                        "About to send Telegram message: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s text_length=%s",
                         correlation_result.get("correlation_artifact_ref"),
                         len(correlated_message),
                     )
                     await query.message.reply_text(correlated_message)
+                    logger.info(
+                        "Telegram send completed: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s",
+                        correlation_result.get("correlation_artifact_ref"),
+                    )
                 if assessment_id is not None:
                     await _send_tshark_assessment_dashboard(query.message, assessment_id)
+                    logger.info("Capture During Validation dashboard sent: assessment_id=%s", assessment_id)
             clear_tshark_live_context(proposal_id)
             clear_upload_state(user_id)
+            logger.info("Capture During Validation handler exits normally: user_id=%s capture_proposal_id=%s", user_id, proposal_id)
             return
 
         await query.edit_message_text("TShark live capture approved. Running bounded capture...")
