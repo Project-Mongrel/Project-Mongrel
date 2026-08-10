@@ -550,6 +550,7 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
     status = "Complete" if normalized.get("success") else "Failed"
     live_capture = _is_tshark_live_result(result)
     offline_upload = not live_capture
+    polished_result = offline_upload or _is_tshark_standalone_live_result(result)
     source_label = "Live Capture" if live_capture else _escape(result.get("uploaded_filename") or source_file.get("name") or "uploaded capture")
     lines = [
         section_label("scan", "TShark PCAP Analysis"),
@@ -569,23 +570,46 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
         f"End: {_format_tshark_timestamp(normalized.get('capture_end'))}",
         *_format_tshark_duration(result, normalized, live_capture=live_capture),
         "",
+        *(
+            [
+                "Capture Summary:",
+                *_format_tshark_capture_summary(normalized, result, live_capture=live_capture),
+                "",
+            ]
+            if polished_result
+            else []
+        ),
         "Protocols:",
-        *_format_tshark_protocols(normalized.get("observed_protocols") or [], sort_by_count=offline_upload),
+        *(
+            _format_tshark_protocol_groups(normalized.get("observed_protocols") or [])
+            if polished_result
+            else _format_tshark_protocols(normalized.get("observed_protocols") or [], sort_by_count=offline_upload)
+        ),
+        "",
+        *(
+            [
+                "Top Talkers:",
+                *_format_tshark_top_talkers(normalized.get("observed_endpoints") or []),
+                "",
+            ]
+            if polished_result
+            else []
+        ),
         "",
         "Endpoints:",
         *_format_tshark_endpoints(normalized.get("observed_endpoints") or [], sort_by_count=offline_upload),
         "",
         "Conversations:",
-        *_format_tshark_conversations(normalized.get("observed_conversations") or [], sort_by_count=offline_upload),
+        *_format_tshark_conversations(normalized.get("observed_conversations") or [], sort_by_count=offline_upload, compact=polished_result),
         "",
         "DNS Metadata:",
-        *_format_tshark_dns(normalized.get("dns_observations") or []),
+        *_format_tshark_dns(normalized.get("dns_observations") or [], arrow=polished_result),
         "",
         "HTTP Metadata:",
         *_format_tshark_http(normalized.get("http_observations") or []),
         "",
         "TLS Metadata:",
-        *_format_tshark_tls(normalized.get("tls_observations") or []),
+        *_format_tshark_tls(normalized.get("tls_observations") or [], suppress_duplicate_na_sni=polished_result),
         "",
         "Warnings:",
         *_format_tshark_warnings(normalized.get("parser_warnings") or [], result),
@@ -1828,11 +1852,70 @@ async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 def _format_tshark_protocols(protocols: list[dict], *, sort_by_count: bool = False) -> list[str]:
     if not protocols:
         return ["- none observed"]
+    protocols = [item for item in protocols if not _is_redundant_tshark_protocol(item.get("protocol"))]
+    if not protocols:
+        return ["- none observed"]
     if sort_by_count:
         ordered = sorted(enumerate(protocols), key=lambda indexed: (-int(indexed[1].get("packet_count") or 0), indexed[0]))
     else:
         ordered = sorted(enumerate(protocols), key=lambda indexed: (_tshark_protocol_rank(indexed[1].get("protocol")), indexed[0]))
     return [f"- {_escape(item.get('protocol'))}: {int(item.get('packet_count') or 0)}" for _, item in ordered[:8]]
+
+
+def _format_tshark_protocol_groups(protocols: list[dict]) -> list[str]:
+    if not protocols:
+        return ["- none observed"]
+    ordered = sorted(
+        enumerate(item for item in protocols if not _is_redundant_tshark_protocol(item.get("protocol"))),
+        key=lambda indexed: (-int(indexed[1].get("packet_count") or 0), indexed[0]),
+    )
+    groups = {
+        "Application": [],
+        "Transport": [],
+        "Network": [],
+        "Link": [],
+    }
+    for _, item in ordered:
+        groups[_tshark_protocol_group(item.get("protocol"))].append(f"- {_escape(item.get('protocol'))}: {int(item.get('packet_count') or 0)}")
+    lines: list[str] = []
+    for group_name in ("Application", "Transport", "Network", "Link"):
+        lines.append(f"{group_name}:")
+        lines.extend(groups[group_name][:5] or ["- none observed"])
+    return lines
+
+
+def _format_tshark_capture_summary(normalized: dict, result: dict, *, live_capture: bool) -> list[str]:
+    duration = _format_tshark_duration(result, normalized, live_capture=live_capture)
+    return [
+        duration[0] if duration else "Duration: not available",
+        f"Packet Count: {int(normalized.get('packet_count') or 0)}",
+        f"Main Protocols: {_format_tshark_main_protocols(normalized.get('observed_protocols') or [])}",
+        f"Top Talker: {_format_tshark_top_talker(normalized.get('observed_endpoints') or [])}",
+    ]
+
+
+def _format_tshark_main_protocols(protocols: list[dict]) -> str:
+    ordered = sorted(
+        enumerate(item for item in protocols if not _is_redundant_tshark_protocol(item.get("protocol"))),
+        key=lambda indexed: (-int(indexed[1].get("packet_count") or 0), indexed[0]),
+    )
+    names = [_escape(item.get("protocol")) for _, item in ordered[:3] if item.get("protocol")]
+    return ", ".join(names) if names else "none observed"
+
+
+def _format_tshark_top_talker(endpoints: list[dict]) -> str:
+    ordered = _ordered_tshark_endpoints(endpoints)
+    if not ordered:
+        return "none observed"
+    item = ordered[0]
+    return f"{_escape(item.get('address'))} ({int(item.get('packet_count') or 0)} packets)"
+
+
+def _format_tshark_top_talkers(endpoints: list[dict]) -> list[str]:
+    ordered = _ordered_tshark_endpoints(endpoints)
+    if not ordered:
+        return ["- none observed"]
+    return [f"- {_escape(item.get('address'))} ({int(item.get('packet_count') or 0)} packets)" for item in ordered[:5]]
 
 
 def _format_tshark_endpoints(endpoints: list[dict], *, sort_by_count: bool = False) -> list[str]:
@@ -1842,7 +1925,7 @@ def _format_tshark_endpoints(endpoints: list[dict], *, sort_by_count: bool = Fal
     return [f"- {_escape(item.get('address'))} packets={int(item.get('packet_count') or 0)}" for _, item in ordered[:8]]
 
 
-def _format_tshark_conversations(conversations: list[dict], *, sort_by_count: bool = False) -> list[str]:
+def _format_tshark_conversations(conversations: list[dict], *, sort_by_count: bool = False, compact: bool = False) -> list[str]:
     if not conversations:
         return ["- none observed"]
     lines = []
@@ -1850,23 +1933,29 @@ def _format_tshark_conversations(conversations: list[dict], *, sort_by_count: bo
     for _, item in ordered[:6]:
         src = _escape(item.get("src"))
         dst = _escape(item.get("dst"))
+        packet_count = int(item.get("packet_count") or 0)
+        if compact:
+            lines.append(f"- {src} ↔ {dst} ({packet_count} packets)")
+            continue
         src_port = _escape(item.get("src_port") or "")
         dst_port = _escape(item.get("dst_port") or "")
         transport = _escape(item.get("transport") or "unknown")
         src_label = f"{src}:{src_port}" if src_port else src
         dst_label = f"{dst}:{dst_port}" if dst_port else dst
-        lines.append(f"- {src_label} -> {dst_label} {transport} packets={int(item.get('packet_count') or 0)}")
+        lines.append(f"- {src_label} -> {dst_label} {transport} packets={packet_count}")
     return lines
 
 
-def _format_tshark_dns(observations: list[dict]) -> list[str]:
+def _format_tshark_dns(observations: list[dict], *, arrow: bool = False) -> list[str]:
     if not observations:
         return ["- none observed"]
     deduped = _dedupe_tshark_dns(observations)
-    return [
-        f"- query={_escape(item.get('query_name') or 'n/a')} response={_escape(item.get('response_name') or item.get('response_address') or 'n/a')}"
-        for item in deduped[:6]
-    ]
+    if not arrow:
+        return [
+            f"- query={_escape(item.get('query_name') or 'n/a')} response={_escape(item.get('response_name') or item.get('response_address') or 'n/a')}"
+            for item in deduped[:6]
+        ]
+    return [f"- {_escape(item.get('query_name') or 'n/a')}\n  →\n  {_escape(item.get('response_name') or item.get('response_address') or 'n/a')}" for item in deduped[:6]]
 
 
 def _format_tshark_http(observations: list[dict]) -> list[str]:
@@ -1878,10 +1967,23 @@ def _format_tshark_http(observations: list[dict]) -> list[str]:
     ]
 
 
-def _format_tshark_tls(observations: list[dict]) -> list[str]:
+def _format_tshark_tls(observations: list[dict], *, suppress_duplicate_na_sni: bool = False) -> list[str]:
     if not observations:
         return ["- none observed"]
-    return [f"- sni={_escape(item.get('sni') or 'n/a')} version={_escape(_format_tshark_tls_version(item.get('version')))}" for item in observations[:6]]
+    lines = []
+    seen_na_sni: set[str] = set()
+    for item in observations:
+        sni = str(item.get("sni") or "").strip() or "n/a"
+        version = _format_tshark_tls_version(item.get("version"))
+        if suppress_duplicate_na_sni and sni.lower() == "n/a":
+            key = version.lower()
+            if key in seen_na_sni:
+                continue
+            seen_na_sni.add(key)
+        lines.append(f"- sni={_escape(sni)} version={_escape(version)}")
+        if len(lines) >= 6:
+            break
+    return lines or ["- none observed"]
 
 
 def _format_tshark_warnings(warnings: list[str], result: dict) -> list[str]:
@@ -1907,6 +2009,12 @@ def _escape(value: object) -> str:
 
 def _is_tshark_live_result(result: dict) -> bool:
     return str(result.get("source") or "") == "tshark_live" or bool(result.get("interface") and result.get("duration_seconds"))
+
+
+def _is_tshark_standalone_live_result(result: dict) -> bool:
+    if not _is_tshark_live_result(result):
+        return False
+    return any(result.get(key) not in (None, "") for key in ("interface", "duration_seconds", "packet_count_limit", "file_size_kb_limit"))
 
 
 def _format_tshark_timestamp(value: object) -> str:
@@ -1950,6 +2058,31 @@ def _tshark_protocol_rank(protocol: object) -> int:
     if any(item in lowered for item in link):
         return 3
     return 4
+
+
+def _tshark_protocol_group(protocol: object) -> str:
+    rank = _tshark_protocol_rank(protocol)
+    if rank == 0:
+        return "Application"
+    if rank == 1:
+        return "Transport"
+    if rank == 2:
+        return "Network"
+    return "Link"
+
+
+def _is_redundant_tshark_protocol(protocol: object) -> bool:
+    return "ethertype" in str(protocol or "").strip().lower()
+
+
+def _ordered_tshark_endpoints(endpoints: list[dict]) -> list[dict]:
+    return [
+        item
+        for _, item in sorted(
+            enumerate(endpoints or []),
+            key=lambda indexed: (-int(indexed[1].get("packet_count") or 0), indexed[0]),
+        )
+    ]
 
 
 def _dedupe_tshark_warnings(warnings: list[str]) -> list[str]:
