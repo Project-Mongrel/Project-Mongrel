@@ -42,6 +42,25 @@ def test_report_generation_from_nmap_findings() -> None:
     assert "## Appendix / Scan History" in report
 
 
+def test_report_generation_from_inconclusive_nmap_does_not_claim_no_open_ports() -> None:
+    add_finding(
+        user_id=9020,
+        finding={
+            "source": "nmap",
+            "target": "this-host-does-not-exist-123456.example",
+            "assessment_result": "inconclusive",
+            "risk_level": "unknown",
+            "open_ports": [],
+        },
+    )
+
+    report = generate_markdown_report(user_id=9020, target="this-host-does-not-exist-123456.example")
+
+    assert "did not establish an assessable target state" in report
+    assert "No conclusion about exposed ports or vulnerabilities can be drawn from that run." in report
+    assert "Nmap found no open ports" not in report
+
+
 def test_report_generation_from_nuclei_findings() -> None:
     add_finding(
         user_id=9002,
@@ -217,6 +236,8 @@ def test_report_ai_prompt_is_grounded() -> None:
     assert "Do not invent CVEs." in prompt
     assert "git-config-exposure" in prompt
     assert "Never recommend closing ports blindly." in prompt
+    assert "without inferring safety from absence of findings" in prompt
+    assert "appears clean" not in prompt
     assert "Review whether the service is required" in prompt or "reviewing whether the service is required" in prompt
 
 

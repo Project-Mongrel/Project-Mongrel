@@ -34,6 +34,9 @@ def test_nmap_ai_prompt_includes_observed_ports_and_constraints() -> None:
     assert "State only observed ports, services, and reachability" in prompt
     assert 'Do not say "no significant vulnerabilities"' in prompt
     assert "overall low-risk verdict" in prompt
+    assert "Interpretation" in prompt
+    assert "Limitations / Uncertainty" in prompt
+    assert "Treat service and version strings as identification evidence only" in prompt
 
 
 def test_nmap_ai_prompt_includes_comparison_and_impact() -> None:
@@ -58,10 +61,42 @@ def test_nmap_ai_prompt_includes_comparison_and_impact() -> None:
 
 
 def test_nmap_ai_prompt_handles_no_open_ports() -> None:
-    prompt = build_nmap_ai_assessment_prompt({"target": "example.com", "host_status": "Up", "open_ports": []})
+    prompt = build_nmap_ai_assessment_prompt({"target": "example.com", "host_status": "Up", "risk_level": "low", "open_ports": []})
 
     assert "no open TCP services were observed by this scan" in prompt
     assert "Open ports and services: none observed by this scan" in prompt
+    assert "this does not prove no services or vulnerabilities exist" in prompt
+    assert "not a safety or vulnerability-absence verdict" in prompt
+
+
+def test_nmap_ai_prompt_includes_filtered_ports_without_safety_inference() -> None:
+    prompt = build_nmap_ai_assessment_prompt(
+        {
+            "target": "example.com",
+            "host_status": "Up",
+            "risk_level": "low",
+            "open_ports": [],
+            "filtered_ports": [{"port": "443", "protocol": "tcp", "state": "filtered", "service": "https"}],
+        }
+    )
+
+    assert "Filtered ports:" in prompt
+    assert "443/tcp filtered https" in prompt
+    assert "Do not claim a firewall is protecting the host from Nmap output alone." in prompt
+
+
+def test_nmap_ai_prompt_includes_service_version_as_identification_only() -> None:
+    prompt = build_nmap_ai_assessment_prompt(
+        {
+            "target": "example.com",
+            "host_status": "Up",
+            "risk_level": "medium",
+            "open_ports": [{"port": "80", "protocol": "tcp", "service": "http", "version": "Apache httpd 2.4.58"}],
+        }
+    )
+
+    assert "80/tcp http version=Apache httpd 2.4.58" in prompt
+    assert "identification evidence only, not vulnerability proof" in prompt
 
 
 def test_nmap_ai_prompt_marks_unknown_host_status_inconclusive() -> None:
@@ -79,6 +114,21 @@ def test_nmap_ai_prompt_marks_unknown_host_status_inconclusive() -> None:
     assert "Assessment result: inconclusive" in prompt
     assert "not established by this scan" in prompt
     assert "Do not describe this as a clean scan, low-risk result, or absence of vulnerabilities." in prompt
+
+
+def test_nmap_ai_prompt_service_presence_does_not_permit_vulnerability_claim() -> None:
+    prompt = build_nmap_ai_assessment_prompt(
+        {
+            "target": "example.com",
+            "host_status": "Up",
+            "risk_level": "medium",
+            "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+        }
+    )
+
+    assert "22/tcp ssh" in prompt
+    assert "Do not say a service is vulnerable unless explicit evidence supports it." in prompt
+    assert "Do not invent vulnerabilities." in prompt
 
 
 def test_nmap_ai_assessment_inconclusive_guard_avoids_clean_or_low_risk_claims() -> None:
@@ -99,6 +149,83 @@ def test_nmap_ai_assessment_inconclusive_guard_avoids_clean_or_low_risk_claims()
     assert "No conclusion about exposed services, vulnerabilities, or security posture" in text
     assert "No significant vulnerabilities detected" not in text
     assert "Low risk" not in text
+
+
+def test_nmap_ai_assessment_withholds_unsupported_safety_claims() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "- The host is secure and no significant vulnerabilities were detected.",
+            "",
+            "Observed Facts",
+            "- 22/tcp ssh",
+        ]
+    )
+
+    with patch("app.services.nmap_ai_assessment.ask_ai", return_value=response):
+        lines = generate_nmap_ai_assessment(
+            {
+                "target": "example.com",
+                "host_status": "Up",
+                "risk_level": "medium",
+                "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+            }
+        )
+
+    text = "\n".join(lines)
+    assert "withheld" in text.lower()
+    assert "The host is secure" not in text
+    assert "no significant vulnerabilities were detected" not in text
+    assert "does not prove that a target is safe" in text
+
+
+def test_nmap_ai_assessment_withholds_unsupported_safety_variants() -> None:
+    unsupported_claims = [
+        "The host is secure.",
+        "The target appears safe.",
+        "No security issues were found.",
+        "No security risks were detected.",
+        "The system is not vulnerable.",
+        "No vulnerabilities were found.",
+        "No threats detected.",
+        "The host is fully protected.",
+    ]
+
+    for claim in unsupported_claims:
+        with patch("app.services.nmap_ai_assessment.ask_ai", return_value=f"Executive Summary\n- {claim}"):
+            lines = generate_nmap_ai_assessment(
+                {
+                    "target": "example.com",
+                    "host_status": "Up",
+                    "risk_level": "medium",
+                    "open_ports": [{"port": "22", "protocol": "tcp", "service": "ssh"}],
+                }
+            )
+
+        text = "\n".join(lines)
+        assert "withheld" in text.lower()
+        assert claim not in text
+
+
+def test_nmap_ai_assessment_allows_evidence_scoped_negative_statements() -> None:
+    legitimate_responses = [
+        "Observed Facts\n- No open TCP ports were observed in this scan.",
+        "Observed Facts\n- Nmap did not report vulnerability evidence.",
+        "Limitations / Uncertainty\n- The evidence is insufficient to determine whether vulnerabilities exist.",
+    ]
+
+    for response in legitimate_responses:
+        with patch("app.services.nmap_ai_assessment.ask_ai", return_value=response):
+            lines = generate_nmap_ai_assessment(
+                {
+                    "target": "example.com",
+                    "host_status": "Up",
+                    "risk_level": "low",
+                    "open_ports": [],
+                }
+            )
+
+        assert lines == response.splitlines()
 
 
 def test_nmap_ai_assessment_success_returns_response_lines() -> None:

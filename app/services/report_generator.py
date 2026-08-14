@@ -105,7 +105,7 @@ def build_report_ai_assessment_prompt(scan_runs: list[dict], target: str | None 
         "- Most important findings",
         "- Likely business/security impact",
         "- Recommended priority actions",
-        "- Whether the target appears clean, low risk, medium risk, high risk, or critical based on available evidence",
+        "- Observed risk level from supplied evidence, without inferring safety from absence of findings",
         "",
         f"Target: {target or _infer_report_target(scan_runs) or 'All targets'}",
         f"Scan count: {len(scan_runs)}",
@@ -364,6 +364,11 @@ def _format_deduplicated_nmap_findings(scan_runs: list[dict]) -> list[str]:
 def _format_nmap_findings(scan_run: dict) -> list[str]:
     open_ports = scan_run.get("open_ports") or []
     if not open_ports:
+        if str(scan_run.get("assessment_result") or "").lower() == "inconclusive":
+            return [
+                f"- Nmap did not establish an assessable target state for {scan_run.get('target') or 'unknown target'}.",
+                "  - No conclusion about exposed ports or vulnerabilities can be drawn from that run.",
+            ]
         return [f"- Nmap found no open ports on {scan_run.get('target') or 'unknown target'}."]
 
     lines = [f"- Nmap identified {len(open_ports)} open port(s) on {scan_run.get('target') or 'unknown target'}:"]
