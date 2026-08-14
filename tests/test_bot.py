@@ -1727,6 +1727,38 @@ def test_nmap_ai_assessment_failure_does_not_fail_scan() -> None:
     assert get_user_findings(7010)
 
 
+def test_nmap_inconclusive_scan_preserves_recovery_actions() -> None:
+    clear_user_findings(7011)
+    clear_user_investigations(7011)
+    clear_user_scan_requests(7011)
+    scan_request = create_scan_request(user_id=7011, scan_type="nmap")
+    mark_scan_request_awaiting_target(user_id=7011, scan_request_id=scan_request.id)
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="this-host-does-not-exist-123456.example", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7011))
+
+    with patch(
+        "app.bot.handlers.scan.run_nmap_scan",
+        return_value={
+            "success": True,
+            "target": "this-host-does-not-exist-123456.example",
+            "output": "Failed to resolve \"this-host-does-not-exist-123456.example\".\n",
+            "error": "",
+        },
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    result_call = message.reply_text.call_args_list[1]
+    assert "Status\nInconclusive" in result_call.args[0]
+    assert "Risk\nUNKNOWN / INCONCLUSIVE" in result_call.args[0]
+    buttons = [row[0].text for row in result_call.kwargs["reply_markup"].inline_keyboard]
+    assert buttons == ["AI Summary", "Re-run Scan", "✏️ Edit Target", "Scan Menu"]
+    ai_text = "\n".join(call.args[0] for call in message.reply_text.call_args_list[3:])
+    assert "this-host-does-not-exist-123456.example" in ai_text
+    assert "No significant vulnerabilities detected" not in ai_text
+
+
 def test_scan_menu_includes_nuclei_scan() -> None:
     keyboard = build_scan_type_keyboard()
     rendered_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
@@ -4763,6 +4795,47 @@ def test_nmap_result_text_uses_clean_parser_output() -> None:
     assert "Risk\nMEDIUM" in result_text
     assert "SSH service exposed." in result_text
     assert "https://nmap.org" not in result_text
+
+
+def test_nmap_unresolved_hostname_result_is_inconclusive_not_low_risk() -> None:
+    result_text = build_nmap_scan_result_text(
+        {
+            "success": True,
+            "target": "this-host-does-not-exist-123456.example",
+            "returncode": 0,
+            "output": "Failed to resolve \"this-host-does-not-exist-123456.example\".\n",
+            "error": "",
+        }
+    )
+
+    assert "Target\nthis-host-does-not-exist-123456.example" in result_text
+    assert "Status\nInconclusive" in result_text
+    assert "Risk\nUNKNOWN / INCONCLUSIVE" in result_text
+    assert "Assessment Result: Inconclusive" in result_text
+    assert "No conclusion about exposed ports, services, vulnerabilities, or security posture can be made from this run." in result_text
+    assert "No open ports found." not in result_text
+    assert "Risk\nLOW" not in result_text
+
+
+def test_successful_nmap_unresolved_hostname_finding_preserves_target_and_unknown_risk() -> None:
+    clear_user_findings(3002)
+
+    finding = store_successful_nmap_finding(
+        user_id=3002,
+        result={
+            "success": True,
+            "target": "this-host-does-not-exist-123456.example",
+            "output": "Failed to resolve \"this-host-does-not-exist-123456.example\".\n",
+            "error": "",
+        },
+    )
+
+    assert finding is not None
+    assert finding["target"] == "this-host-does-not-exist-123456.example"
+    assert finding["assessment_result"] == "inconclusive"
+    assert finding["risk_level"] == "unknown"
+    assert finding["risk_notes"] == ["Target status could not be established"]
+    assert finding["open_ports"] == []
 
 
 def test_findings_text_summarizes_latest_findings() -> None:

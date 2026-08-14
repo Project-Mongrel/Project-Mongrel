@@ -92,6 +92,7 @@ from app.services.scan_manager import (
 from app.services.scan_ai_summary import FALLBACK_SUMMARY_LINES, generate_scan_ai_summary
 from app.services.nmap_ai_assessment import FALLBACK_LINES as NMAP_AI_FALLBACK_LINES
 from app.services.nmap_ai_assessment import generate_nmap_ai_assessment
+from app.services.nmap_interpretation import apply_nmap_assessment_interpretation, is_nmap_assessment_inconclusive
 from app.services.nuclei_ai_assessment import FALLBACK_LINES as NUCLEI_AI_FALLBACK_LINES
 from app.services.nuclei_ai_assessment import generate_nuclei_ai_assessment
 from app.services.ffuf_ai_assessment import FALLBACK_LINES as FFUF_AI_FALLBACK_LINES
@@ -1792,6 +1793,7 @@ def build_nmap_scan_result_text(result: dict[str, object]) -> str:
     parsed_output = parse_nmap_result(result)
     target = str(parsed_output.get("target") or result.get("target") or "unknown")
     open_ports = parsed_output.get("open_ports") or []
+    is_inconclusive = is_nmap_assessment_inconclusive(parsed_output, result)
     if not parsed_output.get("target") and not parsed_output.get("host_status") and not open_ports and not parsed_output.get("duration"):
         summary = _safe_truncated_text(fallback_output)
         return render_scan_result_card(
@@ -1801,22 +1803,36 @@ def build_nmap_scan_result_text(result: dict[str, object]) -> str:
             summary=summary,
         )
 
-    findings = (
-        [f"{open_port.get('port')}/{open_port.get('protocol')} {open_port.get('service')}" for open_port in open_ports]
-        if open_ports
-        else ["No open ports found."]
-    )
+    if is_inconclusive:
+        findings = [
+            "Target status could not be established.",
+            "No conclusion about exposed ports, services, vulnerabilities, or security posture can be made from this run.",
+        ]
+    else:
+        findings = (
+            [f"{open_port.get('port')}/{open_port.get('protocol')} {open_port.get('service')}" for open_port in open_ports]
+            if open_ports
+            else ["No open ports found."]
+        )
     host_status = parsed_output.get("host_status") or "Unknown"
     notes = parsed_output.get("risk_notes") or []
-    summary_lines = [_format_nmap_host_status(host_status)]
-    if notes:
+    summary_lines = (
+        [
+            "Assessment Result: Inconclusive",
+            "Target status could not be established.",
+            "No conclusion about exposed ports, services, vulnerabilities, or security posture can be made from this run.",
+        ]
+        if is_inconclusive
+        else [_format_nmap_host_status(host_status)]
+    )
+    if notes and not is_inconclusive:
         summary_lines.extend(_format_nmap_notes(notes))
     return render_scan_result_card(
         tool_name="Nmap",
         target=target,
-        status="Complete" if result.get("success") is True else "Failed",
+        status="Inconclusive" if is_inconclusive else ("Complete" if result.get("success") is True else "Failed"),
         elapsed=str(parsed_output.get("duration") or "") or None,
-        risk=str(parsed_output.get("risk_level") or "").upper() or None,
+        risk="UNKNOWN / INCONCLUSIVE" if is_inconclusive else (str(parsed_output.get("risk_level") or "").upper() or None),
         summary="\n".join(summary_lines),
         findings=findings,
         assets=[target],
@@ -2009,7 +2025,7 @@ def parse_nmap_result(result: dict[str, object]) -> dict:
         parsed_output["target"] = result["target"]
 
     parsed_output.update(assess_nmap_ports(parsed_output.get("open_ports", [])))
-    return parsed_output
+    return apply_nmap_assessment_interpretation(parsed_output, result)
 
 
 def store_successful_nmap_finding(user_id: int, result: dict[str, object]) -> dict | None:
@@ -2023,6 +2039,7 @@ def store_successful_nmap_finding(user_id: int, result: dict[str, object]) -> di
 def store_parsed_nmap_finding(user_id: int, parsed_output: dict, source: str) -> dict:
     assessed_output = dict(parsed_output)
     assessed_output.update(assess_nmap_ports(assessed_output.get("open_ports", [])))
+    assessed_output = apply_nmap_assessment_interpretation(assessed_output)
     enriched_open_ports = enrich_open_ports(assessed_output.get("open_ports", []))
     previous_finding = get_latest_user_finding_for_target(
         user_id,
@@ -2046,6 +2063,7 @@ def store_parsed_nmap_finding(user_id: int, parsed_output: dict, source: str) ->
             "host_status": assessed_output.get("host_status"),
             "open_ports": enriched_open_ports,
             "duration": assessed_output.get("duration"),
+            "assessment_result": assessed_output.get("assessment_result"),
             "risk_level": assessed_output.get("risk_level"),
             "risk_notes": assessed_output.get("risk_notes", []),
             "comparison": comparison,
@@ -2518,7 +2536,11 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             user_id=user_id,
             tool="nmap",
             target=target,
-            outcome="success" if result.get("success") is True else "failed",
+            outcome=(
+                "failed"
+                if (finding and is_nmap_assessment_inconclusive(finding, result))
+                else ("success" if result.get("success") is True else "failed")
+            ),
             finding_id=finding.get("id") if finding else None,
             assessment_context=assessment_context,
         ),
