@@ -125,7 +125,7 @@ from app.tools.bbot_runner import is_bbot_available, run_bbot_scan
 from app.core.config import get_settings
 from app.ui.ai_summary import render_ai_summary_card
 from app.ui.scan_progress import ScanProgressCard, render_scan_loading_card
-from app.ui.scan_actions import AI_SUMMARY_CALLBACK_PREFIX, build_scan_result_actions
+from app.ui.scan_actions import AI_SUMMARY_CALLBACK_PREFIX, SCAN_RECOVERY_CALLBACK_PREFIX, build_scan_recovery_actions, build_scan_result_actions
 from app.ui.result_cards import render_scan_result_card, render_section
 
 PENDING_NMAP_REQUEST_KEY = "pending_nmap_scan_request_id"
@@ -138,10 +138,12 @@ METASPLOIT_CALLBACK_PREFIX = "msf"
 GITLEAKS_EVIDENCE_TOKEN_TTL_SECONDS = 900
 METASPLOIT_FLOW_MODE_KEY = "metasploit_flow_mode"
 METASPLOIT_GUIDED_CONTEXT_KEY = "metasploit_guided_context"
+SCAN_RECOVERY_TOKEN_TTL_SECONDS = 3600
 _gitleaks_evidence_action_tokens: dict[str, dict[str, object]] = {}
 _metasploit_pending_context: dict[str, dict[str, object]] = {}
 _metasploit_guided_tokens: dict[str, dict[str, object]] = {}
 _bbot_ai_callback_tokens: dict[str, dict[str, object]] = {}
+_scan_recovery_tokens: dict[str, dict[str, object]] = {}
 logger = logging.getLogger(__name__)
 
 
@@ -654,6 +656,85 @@ def _combine_inline_keyboards(*keyboards: InlineKeyboardMarkup | None) -> Inline
             rows.extend(keyboard.inline_keyboard)
 
     return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _assessment_id_from_context(assessment_context: dict | None) -> int | None:
+    if not isinstance(assessment_context, dict) or assessment_context.get("assessment_id") is None:
+        return None
+    try:
+        return int(assessment_context["assessment_id"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _register_scan_recovery_context(
+    *,
+    user_id: int,
+    tool: str,
+    target: str,
+    assessment_context: dict | None = None,
+) -> str:
+    token = secrets.token_urlsafe(9)
+    while token in _scan_recovery_tokens:
+        token = secrets.token_urlsafe(9)
+    _scan_recovery_tokens[token] = {
+        "user_id": user_id,
+        "tool": str(tool or "").strip().lower(),
+        "target": str(target or ""),
+        "assessment_context": dict(assessment_context) if isinstance(assessment_context, dict) else None,
+        "created_at": time.time(),
+    }
+    return token
+
+
+def _get_scan_recovery_context(token: str, user_id: int) -> dict[str, object] | None:
+    now = time.time()
+    for stored_token, payload in list(_scan_recovery_tokens.items()):
+        if now - float(payload.get("created_at") or 0) > SCAN_RECOVERY_TOKEN_TTL_SECONDS:
+            _scan_recovery_tokens.pop(stored_token, None)
+
+    payload = _scan_recovery_tokens.get(token)
+    if not payload or payload.get("user_id") != user_id:
+        return None
+    return payload
+
+
+def _build_scan_outcome_actions(
+    *,
+    user_id: int,
+    tool: str,
+    target: str,
+    outcome: str,
+    finding_id: str | None = None,
+    assessment_context: dict | None = None,
+) -> InlineKeyboardMarkup | None:
+    token = _register_scan_recovery_context(
+        user_id=user_id,
+        tool=tool,
+        target=target,
+        assessment_context=assessment_context,
+    )
+    assessment_id = _assessment_id_from_context(assessment_context)
+    if finding_id:
+        return build_scan_result_actions(
+            finding_id,
+            tool,
+            recovery_token=token,
+            outcome=outcome,
+            assessment_id=assessment_id,
+        )
+    return build_scan_recovery_actions(token, outcome, assessment_id=assessment_id)
+
+
+def _restore_recovery_scan_request(user_id: int, context: ContextTypes.DEFAULT_TYPE, payload: dict[str, object]) -> str:
+    tool = str(payload.get("tool") or "").strip().lower()
+    scan_request = create_scan_request(user_id=user_id, scan_type=tool)
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+    context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+    assessment_context = payload.get("assessment_context")
+    if isinstance(assessment_context, dict):
+        context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY] = dict(assessment_context)
+    return scan_request.id
 
 
 def _bbot_result_findings_from_counts(counts: dict[str, int]) -> list[str]:
@@ -1389,6 +1470,21 @@ def parse_metasploit_request_text(text: str) -> dict:
     )
 
 
+def _format_metasploit_recovery_request(request: dict | None) -> str:
+    request = request or {}
+    lines = [
+        f"module={request.get('module') or ''}",
+        f"action={request.get('action_type') or request.get('action') or ''}",
+        f"target={request.get('target') or ''}",
+        f"port={request.get('port') or ''}",
+    ]
+    if request.get("timeout_seconds"):
+        lines.append(f"timeout={request.get('timeout_seconds')}")
+    for key, value in sorted((request.get("options") or {}).items()):
+        lines.append(f"option.{key}={value}")
+    return "\n".join(lines)
+
+
 def store_metasploit_scan_result(
     user_id: int,
     result: dict[str, object],
@@ -1763,6 +1859,18 @@ def _pop_assessment_scan_context(context: ContextTypes.DEFAULT_TYPE, tool: str) 
     return user_data.pop(ASSESSMENT_SCAN_CONTEXT_KEY)
 
 
+def _current_assessment_scan_context(context: ContextTypes.DEFAULT_TYPE, tool: str) -> dict | None:
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        return None
+    assessment_context = user_data.get(ASSESSMENT_SCAN_CONTEXT_KEY)
+    if not isinstance(assessment_context, dict):
+        return None
+    if str(assessment_context.get("tool") or "").lower() != tool:
+        return None
+    return dict(assessment_context)
+
+
 def _record_assessment_scan(
     assessment_context: dict | None,
     *,
@@ -2025,6 +2133,14 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _handle_bbot_ai_assessment_callback(query, user_id)
         return
 
+    if query.data and query.data.startswith(f"{SCAN_RECOVERY_CALLBACK_PREFIX}:"):
+        user_id = update.effective_user.id if update.effective_user is not None else None
+        if user_id is None:
+            await query.edit_message_text("Unable to identify Telegram user.")
+            return
+        await _handle_scan_recovery_callback(query, user_id, context)
+        return
+
     if query.data and query.data.startswith(f"{AI_SUMMARY_CALLBACK_PREFIX}:"):
         user_id = update.effective_user.id if update.effective_user is not None else None
         if user_id is None:
@@ -2152,6 +2268,64 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(build_scan_created_text(scan_type))
 
 
+async def _handle_scan_recovery_callback(query: object, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = str(getattr(query, "data", "") or "")
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        await query.edit_message_text("Unsupported scan recovery action.")
+        return
+
+    action, token = parts[1], parts[2]
+    payload = _get_scan_recovery_context(token, user_id)
+    if payload is None:
+        await query.edit_message_text("Scan recovery action was not found or has expired.")
+        return
+
+    tool = str(payload.get("tool") or "").strip().lower()
+    if tool not in SUPPORTED_SCAN_TYPES:
+        await query.edit_message_text("Unsupported scan type.")
+        return
+
+    if action == "menu":
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        await query.edit_message_text(build_scan_text(), reply_markup=build_scan_type_keyboard())
+        return
+
+    if action in {"edit_target", "edit_input"}:
+        _restore_recovery_scan_request(user_id, context, payload)
+        target = str(payload.get("target") or "").strip()
+        prompt = "Send corrected input." if action == "edit_input" else f"Current target:\n\n{target or 'unknown'}\n\nSend a replacement target."
+        await query.edit_message_text(prompt)
+        return
+
+    if action != "rerun":
+        await query.edit_message_text("Unsupported scan recovery action.")
+        return
+
+    message = getattr(query, "message", None)
+    reply_text = getattr(message, "reply_text", None)
+    if reply_text is None:
+        await query.edit_message_text("Unable to re-run scan from this message.")
+        return
+
+    _restore_recovery_scan_request(user_id, context, payload)
+    target = str(payload.get("target") or "")
+    await query.edit_message_text(f"Re-running {tool.upper()} scan...")
+    synthetic_update = type(
+        "ScanRecoveryUpdate",
+        (),
+        {
+            "message": type(
+                "ScanRecoveryMessage",
+                (),
+                {"text": target, "reply_text": reply_text},
+            )(),
+            "effective_user": type("ScanRecoveryUser", (), {"id": user_id})(),
+        },
+    )()
+    await scan_target_handler(synthetic_update, context)
+
+
 async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -2268,7 +2442,16 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         normalized_target = normalize_for_nmap(target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid NMAP target: {exc}")
+        await update.message.reply_text(
+            f"Invalid NMAP target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="nmap",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "nmap"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -2289,7 +2472,16 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         result = await asyncio.to_thread(run_nmap_scan, target)
     except ValueError as exc:
         await progress_card.fail(str(exc))
-        await update.message.reply_text(f"Invalid NMAP target: {exc}")
+        await update.message.reply_text(
+            f"Invalid NMAP target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="nmap",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "nmap"),
+            ),
+        )
         return
 
     complete_scan_request(
@@ -2322,7 +2514,14 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             finding.get("comparison") if finding else None,
             finding.get("impact") if finding else None,
         ),
-        reply_markup=build_scan_result_actions(finding.get("id") if finding else None, "nmap"),
+        reply_markup=_build_scan_outcome_actions(
+            user_id=user_id,
+            tool="nmap",
+            target=target,
+            outcome="success" if result.get("success") is True else "failed",
+            finding_id=finding.get("id") if finding else None,
+            assessment_context=assessment_context,
+        ),
     )
     if result.get("success") is True and finding:
         await _send_nmap_ai_assessment(update.message, finding)
@@ -2492,7 +2691,16 @@ async def _handle_ffuf_target(
     try:
         display_target = normalize_for_ffuf(target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid ffuf target: {exc}")
+        await update.message.reply_text(
+            f"Invalid ffuf target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="ffuf",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "ffuf"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -2522,7 +2730,16 @@ async def _handle_ffuf_target(
             status="failed",
             summary="ffuf hidden-content discovery failed",
         )
-        await update.message.reply_text(f"Invalid ffuf target: {exc}")
+        await update.message.reply_text(
+            f"Invalid ffuf target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="ffuf",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "ffuf"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -2553,7 +2770,14 @@ async def _handle_ffuf_target(
         await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         build_ffuf_result_text(result, observations),
-        reply_markup=build_scan_result_actions(finding.get("id"), "ffuf") if result.get("success") is True else None,
+        reply_markup=_build_scan_outcome_actions(
+            user_id=user_id,
+            tool="ffuf",
+            target=target,
+            outcome="success" if result.get("success") is True else "failed",
+            finding_id=finding.get("id") if result.get("success") is True else None,
+            assessment_context=assessment_context,
+        ),
     )
     if result.get("success") is True:
         await _send_ffuf_ai_assessment(update.message, finding)
@@ -2573,7 +2797,16 @@ async def _handle_testssl_target(
     try:
         display_target = normalize_for_httpx(target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid testssl.sh target: {exc}")
+        await update.message.reply_text(
+            f"Invalid testssl.sh target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="testssl",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "testssl"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -2596,7 +2829,16 @@ async def _handle_testssl_target(
         result = await asyncio.to_thread(run_testssl_scan, target)
     except ValueError as exc:
         await progress_card.fail(str(exc))
-        await update.message.reply_text(f"Invalid testssl.sh target: {exc}")
+        await update.message.reply_text(
+            f"Invalid testssl.sh target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="testssl",
+                target=target,
+                outcome="invalid",
+                assessment_context=assessment_context,
+            ),
+        )
         _record_assessment_scan(
             assessment_context,
             tool="testssl",
@@ -2641,7 +2883,14 @@ async def _handle_testssl_target(
         await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         build_testssl_result_text(result, evidence),
-        reply_markup=build_scan_result_actions(finding.get("id"), "testssl") if result.get("success") is True else None,
+        reply_markup=_build_scan_outcome_actions(
+            user_id=user_id,
+            tool="testssl",
+            target=target,
+            outcome="success" if result.get("success") is True else "failed",
+            finding_id=finding.get("id") if result.get("success") is True else None,
+            assessment_context=assessment_context,
+        ),
     )
     if result.get("success") is True:
         await _send_testssl_ai_assessment(update.message, finding)
@@ -2687,7 +2936,16 @@ async def _handle_gitleaks_target(
             status="failed",
             summary="Gitleaks secret scan failed",
         )
-        await update.message.reply_text(f"Invalid Gitleaks scope: {exc}")
+        await update.message.reply_text(
+            f"Invalid Gitleaks scope: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="gitleaks",
+                target=scope,
+                outcome="invalid",
+                assessment_context=assessment_context,
+            ),
+        )
         _record_assessment_scan(
             assessment_context,
             tool="gitleaks",
@@ -2743,7 +3001,26 @@ async def _handle_gitleaks_target(
         await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         build_gitleaks_result_text(result, evidence),
-        reply_markup=build_gitleaks_result_actions(finding, assessment_context, user_id=user_id) if result.get("success") is True else None,
+        reply_markup=(
+            _combine_inline_keyboards(
+                build_gitleaks_result_actions(finding, assessment_context, user_id=user_id),
+                _build_scan_outcome_actions(
+                    user_id=user_id,
+                    tool="gitleaks",
+                    target=scope,
+                    outcome="success",
+                    assessment_context=assessment_context,
+                ),
+            )
+            if result.get("success") is True
+            else _build_scan_outcome_actions(
+                user_id=user_id,
+                tool="gitleaks",
+                target=scope,
+                outcome="failed",
+                assessment_context=assessment_context,
+            )
+        ),
     )
     if result.get("success") is True:
         await _send_gitleaks_ai_assessment(update.message, finding)
@@ -2766,7 +3043,16 @@ async def _handle_prowler_provider(
     except ValueError as exc:
         assessment_context = _pop_assessment_scan_context(context, "prowler")
         error_text = _prowler_assessment_provider_limitation(exc) if assessment_context else f"Invalid Prowler provider: {exc}"
-        await update.message.reply_text(error_text)
+        await update.message.reply_text(
+            error_text,
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="prowler",
+                target=provider_input,
+                outcome="invalid",
+                assessment_context=assessment_context,
+            ),
+        )
         _record_assessment_scan(
             assessment_context,
             tool="prowler",
@@ -2834,7 +3120,14 @@ async def _handle_prowler_provider(
         await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         build_prowler_result_text(result, evidence),
-        reply_markup=build_scan_result_actions(finding.get("id"), "prowler") if result.get("success") is True else None,
+        reply_markup=_build_scan_outcome_actions(
+            user_id=user_id,
+            tool="prowler",
+            target=provider_input,
+            outcome="success" if result.get("success") is True else "failed",
+            finding_id=finding.get("id") if result.get("success") is True else None,
+            assessment_context=assessment_context,
+        ),
     )
     if result.get("success") is True:
         await _send_prowler_ai_assessment(update.message, finding)
@@ -2855,7 +3148,16 @@ async def _handle_metasploit_request(
         try:
             target = _normalize_metasploit_guided_target(update.message.text or "")
         except ValueError as exc:
-            await update.message.reply_text(f"Invalid Metasploit target: {exc}")
+            await update.message.reply_text(
+                f"Invalid Metasploit target: {exc}",
+                reply_markup=_build_scan_outcome_actions(
+                    user_id=user_id,
+                    tool="metasploit",
+                    target=update.message.text or "",
+                    outcome="invalid",
+                    assessment_context=_current_assessment_scan_context(context, "metasploit"),
+                ),
+            )
             context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
             context.user_data.pop(METASPLOIT_FLOW_MODE_KEY, None)
             context.user_data.pop(METASPLOIT_GUIDED_CONTEXT_KEY, None)
@@ -2873,7 +3175,16 @@ async def _handle_metasploit_request(
         try:
             port = _normalize_metasploit_guided_port(update.message.text or "")
         except ValueError as exc:
-            await update.message.reply_text(f"Invalid Metasploit port: {exc}")
+            await update.message.reply_text(
+                f"Invalid Metasploit port: {exc}",
+                reply_markup=_build_scan_outcome_actions(
+                    user_id=user_id,
+                    tool="metasploit",
+                    target=update.message.text or "",
+                    outcome="invalid",
+                    assessment_context=_current_assessment_scan_context(context, "metasploit"),
+                ),
+            )
             return
         service = _metasploit_service_label(port)
         if not _metasploit_guided_supports_http_version(port):
@@ -2887,7 +3198,16 @@ async def _handle_metasploit_request(
     try:
         request = parse_metasploit_request_text(update.message.text or "")
     except (ValueError, TypeError) as exc:
-        await update.message.reply_text(f"Invalid Metasploit validation request: {exc}")
+        await update.message.reply_text(
+            f"Invalid Metasploit validation request: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="metasploit",
+                target=update.message.text or "",
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "metasploit"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -3135,7 +3455,17 @@ async def _handle_metasploit_callback(query: object, user_id: int, context: Cont
     message = getattr(query, "message", None)
     reply_text = getattr(message, "reply_text", None)
     if reply_text is not None:
-        await reply_text(build_metasploit_result_text(finding))
+        await reply_text(
+            build_metasploit_result_text(finding),
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="metasploit",
+                target=_format_metasploit_recovery_request(approved.request),
+                outcome="success" if result.get("success") is True else "failed",
+                finding_id=finding.get("id") if result.get("success") is True else None,
+                assessment_context=assessment_context if isinstance(assessment_context, dict) else None,
+            ),
+        )
         if normalized:
             await _send_metasploit_ai_assessment(message, finding)
         else:
@@ -3181,7 +3511,16 @@ async def _handle_playwright_target(
     try:
         display_target = normalize_for_playwright(target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid Playwright target: {exc}")
+        await update.message.reply_text(
+            f"Invalid Playwright target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="playwright",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "playwright"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -3211,7 +3550,16 @@ async def _handle_playwright_target(
             status="failed",
             summary="Playwright passive browser observation failed",
         )
-        await update.message.reply_text(f"Invalid Playwright target: {exc}")
+        await update.message.reply_text(
+            f"Invalid Playwright target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="playwright",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "playwright"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -3242,7 +3590,14 @@ async def _handle_playwright_target(
         await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         build_playwright_result_text(result, observation),
-        reply_markup=build_scan_result_actions(finding.get("id"), "playwright") if result.get("success") is True else None,
+        reply_markup=_build_scan_outcome_actions(
+            user_id=user_id,
+            tool="playwright",
+            target=target,
+            outcome="success" if result.get("success") is True else "failed",
+            finding_id=finding.get("id") if result.get("success") is True else None,
+            assessment_context=assessment_context,
+        ),
     )
     if result.get("success") is True:
         await _send_playwright_ai_assessment(update.message, finding)
@@ -3262,7 +3617,16 @@ async def _handle_katana_target(
     try:
         display_target = normalize_for_katana(target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid Katana target: {exc}")
+        await update.message.reply_text(
+            f"Invalid Katana target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="katana",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "katana"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -3292,7 +3656,16 @@ async def _handle_katana_target(
             status="failed",
             summary="Katana crawl failed",
         )
-        await update.message.reply_text(f"Invalid Katana target: {exc}")
+        await update.message.reply_text(
+            f"Invalid Katana target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="katana",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "katana"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -3323,7 +3696,14 @@ async def _handle_katana_target(
         await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         build_katana_result_text(result, observations),
-        reply_markup=build_scan_result_actions(finding.get("id"), "katana") if result.get("success") is True else None,
+        reply_markup=_build_scan_outcome_actions(
+            user_id=user_id,
+            tool="katana",
+            target=target,
+            outcome="success" if result.get("success") is True else "failed",
+            finding_id=finding.get("id") if result.get("success") is True else None,
+            assessment_context=assessment_context,
+        ),
     )
     if result.get("success") is True:
         await _send_katana_ai_assessment(update.message, finding)
@@ -3343,7 +3723,16 @@ async def _handle_httpx_target(
     try:
         display_target = normalize_for_httpx(target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid httpx target: {exc}")
+        await update.message.reply_text(
+            f"Invalid httpx target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="httpx",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "httpx"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -3374,7 +3763,16 @@ async def _handle_httpx_target(
             status="failed",
             summary="httpx fingerprinting failed",
         )
-        await update.message.reply_text(f"Invalid httpx target: {exc}")
+        await update.message.reply_text(
+            f"Invalid httpx target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="httpx",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "httpx"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
     finally:
@@ -3410,7 +3808,14 @@ async def _handle_httpx_target(
         await progress_card.fail(str(result.get("error") or "Unknown error."))
     await update.message.reply_text(
         build_httpx_result_text(result, services),
-        reply_markup=build_scan_result_actions(finding.get("id"), "httpx") if result.get("success") is True else None,
+        reply_markup=_build_scan_outcome_actions(
+            user_id=user_id,
+            tool="httpx",
+            target=target,
+            outcome="success" if result.get("success") is True else "failed",
+            finding_id=finding.get("id") if result.get("success") is True else None,
+            assessment_context=assessment_context,
+        ),
     )
     if result.get("success") is True:
         await _send_httpx_ai_assessment(update.message, finding)
@@ -3430,12 +3835,30 @@ async def _handle_bbot_target(
     try:
         display_target = normalize_for_bbot(target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid BBOT target: {exc}")
+        await update.message.reply_text(
+            f"Invalid BBOT target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="bbot",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "bbot"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
     if not is_bbot_available():
-        await update.message.reply_text("BBOT is not installed or not available on PATH.")
+        await update.message.reply_text(
+            "BBOT is not installed or not available on PATH.",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="bbot",
+                target=target,
+                outcome="failed",
+                assessment_context=_current_assessment_scan_context(context, "bbot"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -3466,7 +3889,16 @@ async def _handle_bbot_target(
             status="failed",
             summary="BBOT recon failed",
         )
-        await update.message.reply_text(f"Invalid BBOT target: {exc}")
+        await update.message.reply_text(
+            f"Invalid BBOT target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="bbot",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "bbot"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
     finally:
@@ -3553,10 +3985,23 @@ async def _handle_bbot_target(
         _combine_inline_keyboards(
             build_scan_result_actions(finding.get("id"), "bbot"),
             build_bbot_ai_assessment_keyboard(investigation["id"], finding.get("id"), user_id=user_id),
+            _build_scan_outcome_actions(
+                user_id=user_id,
+                tool="bbot",
+                target=target,
+                outcome="success" if result.get("success") is True else "failed",
+                assessment_context=assessment_context,
+            ),
         )
         if result.get("success") is True
         or is_partial
-        else None
+        else _build_scan_outcome_actions(
+            user_id=user_id,
+            tool="bbot",
+            target=target,
+            outcome="failed",
+            assessment_context=assessment_context,
+        )
     )
     for index, chunk in enumerate(chunks):
         kwargs = {"reply_markup": keyboard} if keyboard is not None and index == len(chunks) - 1 else {}
@@ -4019,7 +4464,16 @@ async def _handle_nuclei_target(
     try:
         display_target = normalize_for_nuclei(target)
     except ValueError as exc:
-        await update.message.reply_text(f"Invalid Nuclei target: {exc}")
+        await update.message.reply_text(
+            f"Invalid Nuclei target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="nuclei",
+                target=target,
+                outcome="invalid",
+                assessment_context=_current_assessment_scan_context(context, "nuclei"),
+            ),
+        )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
@@ -4094,7 +4548,17 @@ async def _run_nuclei_scan_background(
             status="failed",
             summary="Nuclei scan failed",
         )
-        await _send_scan_message(message, f"Invalid Nuclei target: {exc}")
+        await _send_scan_message(
+            message,
+            f"Invalid Nuclei target: {exc}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="nuclei",
+                target=target,
+                outcome="invalid",
+                assessment_context=assessment_context,
+            ),
+        )
         _record_assessment_scan(
             assessment_context,
             tool="nuclei",
@@ -4140,7 +4604,17 @@ async def _run_nuclei_scan_background(
             status="failed",
             summary="Nuclei scan failed",
         )
-        await _send_scan_message(message, f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}")
+        await _send_scan_message(
+            message,
+            f"Nuclei scan failed: {result.get('error') or 'Unknown error.'}",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="nuclei",
+                target=target,
+                outcome="failed",
+                assessment_context=assessment_context,
+            ),
+        )
         _record_assessment_scan(assessment_context, tool="nuclei", result=result)
         await _send_assessment_dashboard(message, assessment_context)
         return
@@ -4165,7 +4639,14 @@ async def _run_nuclei_scan_background(
         await _send_scan_message(
             message,
             build_clean_nuclei_verdict_text(clean_target, elapsed=elapsed_label),
-            reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="nuclei",
+                target=target,
+                outcome="success",
+                finding_id=finding.get("id"),
+                assessment_context=assessment_context,
+            ),
         )
         finding.setdefault("metadata", {})
         finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
@@ -4177,7 +4658,17 @@ async def _run_nuclei_scan_background(
     try:
         nuclei_findings = parse_nuclei_results(output)
     except NucleiParserError:
-        await _send_scan_message(message, "Unable to parse Nuclei scan output.")
+        await _send_scan_message(
+            message,
+            "Unable to parse Nuclei scan output.",
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="nuclei",
+                target=target,
+                outcome="failed",
+                assessment_context=assessment_context,
+            ),
+        )
         _record_assessment_scan(
             assessment_context,
             tool="nuclei",
@@ -4188,7 +4679,17 @@ async def _run_nuclei_scan_background(
 
     if not nuclei_findings:
         if is_partial_timeout:
-            await _send_scan_message(message, "Nuclei scan partial: execution time limit reached before any parseable findings were collected.")
+            await _send_scan_message(
+                message,
+                "Nuclei scan partial: execution time limit reached before any parseable findings were collected.",
+                reply_markup=_build_scan_outcome_actions(
+                    user_id=user_id,
+                    tool="nuclei",
+                    target=target,
+                    outcome="failed",
+                    assessment_context=assessment_context,
+                ),
+            )
             _record_assessment_scan(assessment_context, tool="nuclei", result=result)
             await _send_assessment_dashboard(message, assessment_context)
             return
@@ -4207,7 +4708,14 @@ async def _run_nuclei_scan_background(
         await _send_scan_message(
             message,
             build_clean_nuclei_verdict_text(clean_target, elapsed=elapsed_label),
-            reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
+            reply_markup=_build_scan_outcome_actions(
+                user_id=user_id,
+                tool="nuclei",
+                target=target,
+                outcome="success",
+                finding_id=finding.get("id"),
+                assessment_context=assessment_context,
+            ),
         )
         finding.setdefault("metadata", {})
         finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
@@ -4240,7 +4748,14 @@ async def _run_nuclei_scan_background(
     await _send_scan_message(
         message,
         build_nuclei_import_success_text(finding, elapsed=elapsed_label),
-        reply_markup=build_scan_result_actions(finding.get("id"), "nuclei"),
+        reply_markup=_build_scan_outcome_actions(
+            user_id=user_id,
+            tool="nuclei",
+            target=target,
+            outcome="success",
+            finding_id=finding.get("id"),
+            assessment_context=assessment_context,
+        ),
     )
     _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
     await _send_nuclei_ai_assessment(message, finding)

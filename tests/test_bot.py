@@ -54,6 +54,7 @@ from app.bot.handlers.scan import (
     PENDING_NMAP_REQUEST_KEY,
     _finalize_nuclei_status,
     _metasploit_pending_context,
+    _scan_recovery_tokens,
     _send_metasploit_ai_assessment,
     _update_nuclei_status_card,
     append_change_summary,
@@ -173,7 +174,7 @@ from app.services.chat_state import (
     set_ai_waiting,
     set_finding_analysis_context,
 )
-from app.services.scan_manager import clear_user_scan_requests, create_scan_request, mark_scan_request_awaiting_target
+from app.services.scan_manager import clear_user_scan_requests, create_scan_request, get_user_scan_requests, mark_scan_request_awaiting_target
 from app.services.verdict_engine import generate_mongrel_verdict
 from app.ui.ai_summary import render_ai_summary_card
 from app.ui.icons import icon
@@ -1923,10 +1924,76 @@ def test_scan_callback_pattern_routes_tshark_button() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scan:tshark")
 
 
+def test_scan_callback_pattern_routes_scan_recovery_actions() -> None:
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scanrx:rerun:shorttoken")
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scanrx:edit_target:shorttoken")
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scanrx:edit_input:shorttoken")
+
+
 def test_scan_callback_pattern_routes_evidence_vault_actions() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "glev:shorttoken")
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "glrv:shorttoken")
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "glcx:shorttoken")
+
+
+def test_scan_recovery_edit_target_keeps_current_tool_flow() -> None:
+    user_id = 7340
+    clear_user_scan_requests(user_id)
+    _scan_recovery_tokens.clear()
+    _scan_recovery_tokens["tok123"] = {
+        "user_id": user_id,
+        "tool": "httpx",
+        "target": "https://example.com",
+        "assessment_context": None,
+        "created_at": time.time(),
+    }
+    query = SimpleNamespace(data="scanrx:edit_target:tok123", answer=AsyncMock(), edit_message_text=AsyncMock())
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=user_id)), context))
+
+    assert query.edit_message_text.call_args.args[0] == "Current target:\n\nhttps://example.com\n\nSend a replacement target."
+    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+    requests = get_user_scan_requests(user_id)
+    assert requests[-1].scan_type == "httpx"
+    assert requests[-1].status == "awaiting_target"
+
+
+def test_scan_recovery_rerun_uses_saved_request_and_dispatcher() -> None:
+    user_id = 7341
+    clear_user_scan_requests(user_id)
+    clear_user_findings(user_id)
+    clear_user_investigations(user_id)
+    _scan_recovery_tokens.clear()
+    _scan_recovery_tokens["tok456"] = {
+        "user_id": user_id,
+        "tool": "nmap",
+        "target": "127.0.0.1",
+        "assessment_context": None,
+        "created_at": time.time(),
+    }
+    message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(data="scanrx:rerun:tok456", answer=AsyncMock(), edit_message_text=AsyncMock(), message=message)
+    context = SimpleNamespace(user_data={})
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_nmap_scan",
+            return_value={
+                "success": True,
+                "target": "127.0.0.1",
+                "output": "Nmap scan report for 127.0.0.1\nHost is up.\n",
+                "error": "",
+            },
+        ) as run_nmap_scan,
+        patch("app.bot.handlers.scan._send_nmap_ai_assessment", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=user_id)), context))
+
+    assert query.edit_message_text.call_args.args[0] == "Re-running NMAP scan..."
+    run_nmap_scan.assert_called_once_with("127.0.0.1")
+    assert "Nmap Scan Complete" in message.reply_text.call_args_list[1].args[0]
+    assert message.reply_text.call_args_list[1].kwargs["reply_markup"].inline_keyboard[1][0].text == "Re-run Scan"
 
 
 def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> None:
@@ -3658,7 +3725,13 @@ def test_bbot_scan_missing_binary_does_not_crash() -> None:
         asyncio.run(scan_target_handler(update, context))
 
     run_bbot_scan.assert_not_called()
-    message.reply_text.assert_called_once_with("BBOT is not installed or not available on PATH.")
+    message.reply_text.assert_called_once()
+    assert message.reply_text.call_args.args[0] == "BBOT is not installed or not available on PATH."
+    assert [row[0].text for row in message.reply_text.call_args.kwargs["reply_markup"].inline_keyboard] == [
+        "Re-run Scan",
+        "✏️ Edit Target",
+        "Scan Menu",
+    ]
     assert context.user_data == {}
 
 
