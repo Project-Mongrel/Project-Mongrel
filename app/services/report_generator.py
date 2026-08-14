@@ -334,6 +334,8 @@ def _format_technical_findings(scan_runs: list[dict]) -> list[str]:
             finding_lines.extend(_format_prowler_findings(scan_run))
         elif source == "metasploit":
             finding_lines.extend(_format_metasploit_findings(scan_run))
+        elif source == "bbot":
+            finding_lines.append(f"- BBOT reconnaissance observation for {scan_run.get('target') or 'unknown target'}.")
         else:
             finding_lines.append(f"- {_source_label(source)} finding for {scan_run.get('target') or 'unknown target'}.")
 

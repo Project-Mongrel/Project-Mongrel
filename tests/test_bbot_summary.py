@@ -30,7 +30,7 @@ def test_subdomains_summary() -> None:
 
     assert "1 subdomains" in summary
     assert "app.example.com" in summary
-    assert "Run Nuclei against discovered web services." in summary
+    assert "Run Nuclei against discovered domains or URLs where authorized." in summary
 
 
 def test_urls_summary() -> None:
@@ -40,7 +40,7 @@ def test_urls_summary() -> None:
 
     assert "1 URLs" in summary
     assert "https://app.example.com/login" in summary
-    assert "Run Nuclei against discovered web services." in summary
+    assert "Run Nuclei against discovered domains or URLs where authorized." in summary
 
 
 def test_ips_summary() -> None:
@@ -59,7 +59,7 @@ def test_technologies_summary() -> None:
 
     assert "1 technologies" in summary
     assert "nginx" in summary
-    assert "Review software versions for known vulnerabilities." in summary
+    assert "Review observed technologies and versions against current advisories where version evidence exists." in summary
 
 
 def test_certificates_summary() -> None:
@@ -69,7 +69,7 @@ def test_certificates_summary() -> None:
 
     assert "1 certificates" in summary
     assert "CN=example.com" in summary
-    assert "Review certificate validity and exposure." in summary
+    assert "Review certificate validity and intended exposure." in summary
 
 
 def test_emails_summary() -> None:
@@ -107,7 +107,7 @@ def test_admin_like_host_detection() -> None:
 
     summary = build_bbot_recon_summary(user_id=1009, target="example.com")
 
-    assert "Review authentication and internet exposure for admin-like hosts." in summary
+    assert "Review authentication requirements and intended exposure for admin-like hostnames." in summary
 
 
 def test_recommendation_generation_is_deterministic() -> None:
@@ -119,8 +119,8 @@ def test_recommendation_generation_is_deterministic() -> None:
     second = build_bbot_recon_summary(user_id=1010, target="example.com")
 
     assert first == second
-    assert first.index("Run Nuclei") < first.index("Review software versions")
-    assert first.index("Review software versions") < first.index("Review certificate")
+    assert first.index("Run Nuclei") < first.index("Review observed technologies")
+    assert first.index("Review observed technologies") < first.index("Review certificate")
     assert first.index("Review certificate") < first.index("Review authentication")
 
 

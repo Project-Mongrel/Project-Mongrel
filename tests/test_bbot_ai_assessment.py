@@ -45,7 +45,13 @@ def test_prompt_is_grounded() -> None:
     assert "Never speculate." in prompt
     assert "Never infer compromise." in prompt
     assert "Never imply a vulnerability without explicit supporting evidence." in prompt
-    assert "No confirmed vulnerabilities were identified during reconnaissance" in prompt
+    assert "Do not infer target ownership from IP associations or DNS data." in prompt
+    assert "Do not infer active services from discovered domains, URLs, or technology names alone." in prompt
+    assert "Technology identification is not vulnerability evidence." in prompt
+    assert "Reconnaissance is not exploitation." in prompt
+    assert "Interpretation" in prompt
+    assert "Limitations" in prompt
+    assert "No confirmed vulnerabilities were identified during reconnaissance" not in prompt
 
 
 def test_prompt_uses_normalized_evidence_not_raw_output() -> None:
@@ -162,10 +168,11 @@ def test_empty_observations_returns_limited_evidence_assessment() -> None:
     assert "Observed Facts" in text
     assert "Observed Assets" in text
     assert "Potential Risks" in text
-    assert "Confidence:\nLow" in text
+    assert "Confidence\nLow" in text
     assert "Recommended Next Actions" in text
     assert "Evidence is limited" in text
-    assert "No confirmed vulnerabilities were identified during reconnaissance." in text
+    assert "No vulnerability or compromise conclusion can be drawn" in text
+    assert "Limited reconnaissance output does not prove the target is secure or that no vulnerabilities exist." in text
     assert "BBOT" not in text
     assert "Observation Store" not in text
 
@@ -173,7 +180,7 @@ def test_empty_observations_returns_limited_evidence_assessment() -> None:
 def test_confidence_section_exists() -> None:
     lines = generate_bbot_ai_assessment(11005, target="example.com")
 
-    assert "Confidence:" in lines
+    assert "Confidence" in lines
 
 
 def test_ai_response_scanner_internals_are_removed() -> None:
@@ -204,7 +211,6 @@ def test_ai_response_scanner_internals_are_removed() -> None:
     text = "\n".join(lines)
     assert "app.example.com was observed" in text
     assert "Enumerate discovered web applications" in text
-    assert "BBOT" not in text
     assert "spasmodic_melvin" not in text
     assert "stdout" not in text
 
@@ -293,7 +299,7 @@ def test_ai_response_distinguishes_observations_from_recommendations() -> None:
             "Potential Risks",
             "- Public-facing services should undergo vulnerability assessment.",
             "Recommended Next Actions",
-            "- Run Nuclei against discovered web services.",
+            "- Run Nuclei against discovered domains or URLs where authorized.",
             "- Enumerate identified web applications.",
         ]
     )
@@ -304,7 +310,104 @@ def test_ai_response_distinguishes_observations_from_recommendations() -> None:
     text = "\n".join(lines)
     assert text.index("Observed Facts") < text.index("Recommended Next Actions")
     assert "- Public HTTP endpoint discovered." in text
-    assert "- Run Nuclei against discovered web services." in text
+    assert "- Run Nuclei against discovered domains or URLs where authorized." in text
+
+
+def test_prompt_includes_discovered_subdomains_and_urls() -> None:
+    prompt = build_bbot_ai_assessment_prompt(
+        observations=[
+            _observation("subdomain", "app.example.com"),
+            _observation("url", "https://app.example.com/login"),
+        ],
+        recon_summary="BBOT Recon Summary",
+        target="example.com",
+    )
+
+    assert "DNS names: app.example.com" in prompt
+    assert "URLs: https://app.example.com/login" in prompt
+
+
+def test_prompt_includes_technology_and_dns_without_vulnerability_shortcut() -> None:
+    prompt = build_bbot_ai_assessment_prompt(
+        observations=[
+            _observation("technology", "nginx"),
+            _observation("dns_record", "app.example.com A 192.0.2.10"),
+        ],
+        recon_summary="BBOT Recon Summary",
+        target="example.com",
+    )
+
+    assert "Technologies: nginx" in prompt
+    assert "DNS records: app.example.com A 192.0.2.10" in prompt
+    assert "Technology identification is not vulnerability evidence." in prompt
+
+
+def test_prompt_includes_ip_and_email_without_ownership_or_breach_claims() -> None:
+    prompt = build_bbot_ai_assessment_prompt(
+        observations=[
+            _observation("ip_address", "192.0.2.10"),
+            _observation("email", "security@example.com"),
+        ],
+        recon_summary="BBOT Recon Summary",
+        target="example.com",
+    )
+
+    assert "IP addresses: 192.0.2.10" in prompt
+    assert "Email addresses: security@example.com" in prompt
+    assert "Do not infer target ownership from IP associations or DNS data." in prompt
+    assert "Do not infer sensitive data exposure, breach, or insecure configuration from discovery evidence alone." in prompt
+
+
+@pytest.mark.parametrize(
+    "unsupported_claim",
+    [
+        "The target is insecure.",
+        "These subdomains are vulnerable.",
+    ],
+)
+def test_unsupported_recon_security_claims_are_withheld(unsupported_claim: str) -> None:
+    investigation = create_investigation(user_id=11010, target="example.com")
+    add_observation(
+        user_id=11010,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="subdomain",
+        value="app.example.com",
+        target="example.com",
+    )
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=f"Executive Summary\n- {unsupported_claim}"):
+        lines = generate_bbot_ai_assessment(11010, investigation_id=investigation["id"], target="example.com")
+
+    text = "\n".join(lines)
+    assert "unsupported security conclusion" in text
+    assert unsupported_claim not in text
+
+
+@pytest.mark.parametrize(
+    "legitimate_statement",
+    [
+        "BBOT discovered 12 subdomains.",
+        "This discovery does not establish a vulnerability.",
+    ],
+)
+def test_evidence_scoped_recon_statements_are_allowed(legitimate_statement: str) -> None:
+    investigation = create_investigation(user_id=11011, target="example.com")
+    add_observation(
+        user_id=11011,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="subdomain",
+        value="app.example.com",
+        target="example.com",
+    )
+
+    ai_response = f"Executive Summary\n- {legitimate_statement}\nConfidence\nMedium"
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=ai_response):
+        lines = generate_bbot_ai_assessment(11011, investigation_id=investigation["id"], target="example.com")
+
+    assert legitimate_statement in "\n".join(lines)
 
 
 def _observation(observation_type: str, value: str) -> dict:

@@ -124,13 +124,13 @@ def _recommended_actions(observations: list[dict]) -> list[str]:
     values = [str(observation.get("value") or "") for observation in observations]
     recommendations = []
     if "subdomain" in types or "url" in types:
-        recommendations.append("Run Nuclei against discovered web services.")
+        recommendations.append("Run Nuclei against discovered domains or URLs where authorized.")
     if "technology" in types:
-        recommendations.append("Review software versions for known vulnerabilities.")
+        recommendations.append("Review observed technologies and versions against current advisories where version evidence exists.")
     if "certificate" in types:
-        recommendations.append("Review certificate validity and exposure.")
+        recommendations.append("Review certificate validity and intended exposure.")
     if any(_is_admin_like_host(value) for value in values):
-        recommendations.append("Review authentication and internet exposure for admin-like hosts.")
+        recommendations.append("Review authentication requirements and intended exposure for admin-like hostnames.")
     if not recommendations:
         recommendations.append("Continue reconnaissance using additional observation sources.")
     return recommendations

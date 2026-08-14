@@ -88,6 +88,24 @@ def test_report_generation_from_nuclei_findings() -> None:
     assert "- Patch or reconfigure affected services identified by Nuclei." in report
 
 
+def test_report_generation_from_bbot_uses_reconnaissance_wording() -> None:
+    add_finding(
+        user_id=9021,
+        finding={
+            "source": "bbot",
+            "target": "example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "observation_counts": {"subdomain": 1},
+        },
+    )
+
+    report = generate_markdown_report(user_id=9021, target="example.com")
+
+    assert "BBOT reconnaissance observation for example.com" in report
+    assert "BBOT finding for example.com" not in report
+
+
 def test_report_generation_with_clean_nuclei_scan() -> None:
     add_finding(
         user_id=9003,
