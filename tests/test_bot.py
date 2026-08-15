@@ -3172,12 +3172,36 @@ def test_playwright_result_card_summarizes_observation_without_raw_details() -> 
     assert "Title: Example" in card
     assert "Load status: loaded" in card
     assert "Status code: 200" in card
-    assert "Forms/inputs: 1 forms / 4 inputs" in card
-    assert "Links: 12" in card
+    assert "Forms/inputs observed in returned state: 1 forms / 4 inputs" in card
+    assert "Links observed in returned state: 12" in card
     assert "Console/network issues: 2 console / 1 network / 0 page errors" in card
     assert "Screenshot/artifact: not captured" in card
+    assert "passive browser observation does not test XSS, SQL injection, CSRF" in card
     assert "Passive browser observation only." in card
     assert "raw" not in card
+
+
+def test_playwright_result_card_preserves_429_uncertainty() -> None:
+    result = {"success": True, "target": "https://example.com", "elapsed_seconds": 3, "output": {}}
+    observation = {
+        "requested_url": "https://example.com",
+        "final_url": "https://example.com",
+        "load_status": "domcontentloaded",
+        "status_code": 429,
+        "forms_count": 0,
+        "inputs_count": 0,
+        "links_count": 0,
+    }
+
+    card = build_playwright_result_text(result, observation)
+
+    assert "Status code: 429" in card
+    assert "HTTP 429 was observed as a rate-limited response; cause is unknown" in card
+    assert "Restricted or partial browser state limited visibility" in card
+    assert "too many requests were sent" not in card.lower()
+    assert "functioning normally" not in card.lower()
+    assert "Forms/inputs observed in returned state: 0 forms / 0 inputs" in card
+    assert "Links observed in returned state: 0" in card
 
 
 def test_katana_result_card_summarizes_observations_without_raw_json() -> None:
@@ -3202,15 +3226,27 @@ def test_katana_result_card_summarizes_observations_without_raw_json() -> None:
     card = build_katana_result_text(result, observations)
 
     assert "Katana Scan Complete" in card
-    assert "URLs/endpoints discovered: 2" in card
+    assert "URLs/endpoints observed during crawl: 2" in card
     assert "Unique hosts: 1" in card
-    assert "JavaScript files: 1" in card
-    assert "Query parameters: 1" in card
-    assert "Forms/actions: 1" in card
+    assert "JavaScript files observed during crawl: 1" in card
+    assert "Query parameters observed during crawl: 1" in card
+    assert "Forms/actions observed during crawl: 1" in card
     assert "Max observed crawl depth: 2" in card
     assert "Observed parameters: q" in card
     assert "JavaScript: https://example.com/app.js" in card
+    assert "Katana crawl observations do not prove vulnerability, exploitability, sensitive exposure" in card
     assert '{"url":"raw"}' not in card
+
+
+def test_katana_result_card_empty_crawl_preserves_coverage_uncertainty() -> None:
+    result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": ""}
+
+    card = build_katana_result_text(result, [])
+
+    assert "URLs/endpoints observed during crawl: 0" in card
+    assert "No structured Katana JSON observations were stored." in card
+    assert "does not prove forms, endpoints, parameters, scripts, paths, or hidden content do not exist" in card
+    assert "crawl found all" not in card.lower()
 
 
 def test_katana_scan_failure_uses_sanitized_runner_error() -> None:
@@ -3275,12 +3311,24 @@ def test_ffuf_result_card_summarizes_observations_without_raw_json() -> None:
 
     assert "ffuf Scan Complete" in card
     assert "Wordlist entries: 19" in card
-    assert "Discovered paths: 3" in card
+    assert "ffuf response observations: 3" in card
     assert "Status codes: 200: 1, 302: 1, 403: 1" in card
     assert "Interesting paths: /admin; /login; /config" in card
     assert "Redirects: /login -> https://example.com/sso" in card
     assert "Forbidden/auth-gated responses: 1" in card
+    assert "ffuf response observations do not prove vulnerability, exploitability, sensitive exposure" in card
     assert '{"results"' not in card
+
+
+def test_ffuf_result_card_empty_fuzzing_preserves_uncertainty() -> None:
+    result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": "", "wordlist_count": 19}
+
+    card = build_ffuf_result_text(result, [])
+
+    assert "ffuf response observations: 0" in card
+    assert "No structured ffuf JSON observations were stored." in card
+    assert "does not prove hidden content, endpoints, directories, files, parameters, virtual hosts, or vulnerabilities do not exist" in card
+    assert "no hidden content exists" not in card.lower()
 
 
 def test_store_httpx_scan_result_persists_structured_evidence() -> None:

@@ -275,10 +275,11 @@ def _format_finding(finding: dict) -> list[str]:
             if observation.get("source"):
                 parts.append(f"source={_clean(observation.get('source'))}")
             if observation.get("query_parameters"):
-                parts.append("params=" + ", ".join(_clean(value) for value in observation.get("query_parameters")[:8]))
+                parts.append("params_observed_during_crawl=" + ", ".join(_clean(value) for value in observation.get("query_parameters")[:8]))
             if observation.get("forms"):
-                parts.append(f"forms={len(observation.get('forms') or [])}")
+                parts.append(f"forms_observed_during_crawl={len(observation.get('forms') or [])}")
             lines.append("    - " + " ".join(parts))
+        lines.append("    - boundary=Katana crawl observations only; does not prove vulnerability, exploitability, sensitive exposure, ownership, public availability at all times, or complete coverage")
     playwright_observation = finding.get("playwright_observation") or {}
     if playwright_observation:
         lines.append("    Playwright observation:")
@@ -291,15 +292,16 @@ def _format_finding(finding: dict) -> list[str]:
             parts.append(f"status={_clean(playwright_observation.get('status_code'))}")
         if playwright_observation.get("title"):
             parts.append(f"title={_clean(playwright_observation.get('title'))}")
-        parts.append(f"forms={int(playwright_observation.get('forms_count') or 0)}")
-        parts.append(f"inputs={int(playwright_observation.get('inputs_count') or 0)}")
-        parts.append(f"links={int(playwright_observation.get('links_count') or 0)}")
+        parts.append(f"forms_observed_in_returned_state={int(playwright_observation.get('forms_count') or 0)}")
+        parts.append(f"inputs_observed_in_returned_state={int(playwright_observation.get('inputs_count') or 0)}")
+        parts.append(f"links_observed_in_returned_state={int(playwright_observation.get('links_count') or 0)}")
         parts.append(f"console_issues={int(playwright_observation.get('console_issue_count') or 0)}")
         parts.append(f"network_issues={int(playwright_observation.get('network_issue_count') or 0)}")
         lines.append("    - " + " ".join(parts))
+        lines.append("    - boundary=passive returned browser state only; does not test XSS, SQL injection, CSRF, authentication flaws, vulnerability absence, or complete application behavior")
     ffuf_results = finding.get("ffuf_results") or []
     if ffuf_results:
-        lines.append("    ffuf results:")
+        lines.append("    ffuf response observations:")
         for result in ffuf_results[:20]:
             parts = [
                 f"url={_clean(result.get('url') or 'unknown')}",
@@ -317,6 +319,7 @@ def _format_finding(finding: dict) -> list[str]:
             if result.get("input_word"):
                 parts.append(f"word={_clean(result.get('input_word'))}")
             lines.append("    - " + " ".join(parts))
+        lines.append("    - boundary=ffuf fuzzing response metadata only; does not prove vulnerability, exploitability, sensitive exposure, authentication bypass, or complete discovery coverage")
     testssl_evidence = finding.get("testssl_evidence") or {}
     if testssl_evidence:
         lines.append("    testssl.sh TLS evidence:")

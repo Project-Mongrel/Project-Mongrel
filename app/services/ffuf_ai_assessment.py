@@ -1,3 +1,5 @@
+import re
+
 from app.services.ai_client import ask_ai
 
 AI_UNAVAILABLE_MESSAGES = (
@@ -16,6 +18,55 @@ FALLBACK_LINES = [
     "ffuf AI assessment unavailable.",
     "Use the deterministic ffuf result for hidden-content observations and next actions.",
 ]
+TRUTHFULNESS_FALLBACK_LINES = [
+    "Executive Summary",
+    "- The ffuf AI assessment was withheld because the generated response contained an unsupported fuzzing-evidence security conclusion.",
+    "",
+    "Observed Facts",
+    "- Use the deterministic ffuf result for response URLs, paths, status codes, redirects, response sizes, words, lines, and matched input words observed in this run.",
+    "",
+    "Interpretation",
+    "- ffuf evidence is fuzzing response metadata only; it does not prove vulnerability, exploitability, sensitive exposure, authentication bypass, or complete discovery coverage.",
+    "",
+    "Limitations",
+    "- Undiscovered directories, files, parameters, virtual hosts, endpoints, or hidden content may still exist outside this fuzzing run's visibility.",
+    "",
+    "Recommended Next Actions",
+    "- Validate observed ffuf responses with authorized follow-up testing before drawing security conclusions.",
+]
+EVIDENCE_SCOPED_MARKERS = (
+    "does not establish",
+    "does not prove",
+    "did not establish",
+    "not observed during this fuzzing run",
+    "were not observed during this fuzzing run",
+    "was not observed during this fuzzing run",
+    "observed during this fuzzing run",
+    "fuzzing observation",
+    "fuzzing evidence",
+    "response metadata",
+    "insufficient evidence",
+    "cannot determine",
+    "may warrant further",
+    "coverage was limited",
+    "visibility was limited",
+    "did not discover matching responses",
+    "undiscovered content may still exist",
+)
+UNSUPPORTED_FFUF_CLAIM_PATTERNS = (
+    re.compile(r"\b(?:target|site|system|application|app|host|endpoint|url|path|directory|file|parameter|vhost|virtual\s+host)\b[^.!?]{0,80}\b(?:is|are|was|were|appears|seems|looks)\s+(?:to\s+be\s+)?(?:safe|secure|insecure|vulnerable|exploitable|compromised)\b"),
+    re.compile(r"\b(?:parameter|param)\b[^.!?]{0,80}\b(?:is|are|was|were|appears|seems|looks)\s+(?:to\s+be\s+)?(?:injectable|vulnerable|exploitable)\b"),
+    re.compile(r"\b(?:parameter|param)\b[^.!?]{0,100}\b(?:sql\s+injection|xss|command\s+injection)\b"),
+    re.compile(r"\b(?:directory|folder|path|endpoint)\b[^.!?]{0,80}\b(?:is|are|was|were)\s+(?:sensitive|vulnerable|exploitable)\b"),
+    re.compile(r"\bsensitive\s+files?\b[^.!?]{0,80}\b(?:is|are|was|were)?\s*(?:exposed|leaked|disclosed|found)\b"),
+    re.compile(r"\b(?:file|backup|config|admin)\b[^.!?]{0,80}\b(?:contains?|exposes?|leaks?|reveals?)\s+(?:sensitive\s+)?(?:data|secrets?|credentials?)\b"),
+    re.compile(r"\b(?:sensitive\s+data|secrets?|credentials?)\b[^.!?]{0,80}\b(?:exposed|leaked|disclosed|found)\b"),
+    re.compile(r"\bauthentication\s+bypass\b"),
+    re.compile(r"\b(?:found|discovered|identified)\s+(?:all|every)\s+(?:application\s+)?(?:routes?|endpoints?|paths?|directories|files|content)\b"),
+    re.compile(r"\b(?:fuzzing|ffuf|scan)\b[^.!?]{0,80}\b(?:complete|full\s+coverage|covered\s+all|found\s+all)\b"),
+    re.compile(r"\b(?:no\s+hidden\s+content|no\s+hidden\s+(?:directories|files|endpoints|paths)|undiscovered\s+content\s+does\s+not\s+exist)\b"),
+    re.compile(r"\bno\s+(?:exploitable\s+)?vulnerabilities\s+(?:exist|were\s+found|were\s+detected|found|detected)\b"),
+)
 
 
 def generate_ffuf_ai_assessment(finding: dict) -> list[str]:
@@ -29,7 +80,8 @@ def generate_ffuf_ai_assessment(finding: dict) -> list[str]:
         return list(FALLBACK_LINES)
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
-    return lines or list(FALLBACK_LINES)
+    lines = lines or list(FALLBACK_LINES)
+    return _guard_truthfulness_response(lines)
 
 
 def build_ffuf_ai_assessment_prompt(finding: dict) -> str:
@@ -42,12 +94,15 @@ def build_ffuf_ai_assessment_prompt(finding: dict) -> str:
             "- Do not invent vulnerabilities.",
             "- Do not invent paths, URLs, status codes, redirects, response sizes, words, or lines.",
             "- Do not claim discovered admin, backup, API, or config-looking paths are exploitable.",
-            "- Phrase discovered paths as observations and follow-up candidates, not confirmed risk.",
+            "- Phrase discovered paths, files, directories, parameters, and virtual hosts as fuzzing observations and follow-up candidates, not confirmed risk.",
+            "- Do not infer that a parameter is injectable or vulnerable from a differing response.",
+            "- Do not infer that a directory is sensitive, a file contains sensitive data, or authentication bypass exists.",
+            "- Do not infer complete discovery coverage or that undiscovered content does not exist.",
             "- Do not claim compromise.",
             "- Do not recommend exploitation.",
-            "- Do not claim the target is safe or secure.",
+            "- Do not claim the target is safe, secure, insecure, or vulnerable from ffuf evidence alone.",
             "- Zero discoveries means no paths were discovered with the selected wordlist/profile.",
-            "- Zero discoveries does not imply a static site, no exploitable paths, or resistance to injection.",
+            "- Zero discoveries does not imply a static site, no hidden content, no vulnerabilities, no exploitable paths, or resistance to injection.",
             "- Explain what the hidden-content observations suggest and what follow-up actions are reasonable.",
             "- Separate observed facts from potential risks and recommendations.",
             "- Mention uncertainty clearly when evidence is limited.",
@@ -57,7 +112,9 @@ def build_ffuf_ai_assessment_prompt(finding: dict) -> str:
             "Executive Summary",
             "Observed Facts",
             "Hidden Content Notes",
+            "Interpretation",
             "Potential Risks",
+            "Limitations / Uncertainty",
             "Confidence",
             "Recommended Next Actions",
             "",
@@ -74,16 +131,18 @@ def _format_ffuf_evidence(finding: dict) -> str:
     lines = [
         f"- Target: {_clean(finding.get('target') or 'unknown')}",
         f"- Status: {_clean(finding.get('status') or 'unknown')}",
-        f"- Discovered path count: {int(finding.get('finding_count') or len(results) or 0)}",
+        f"- ffuf response observations during this fuzzing run: {int(finding.get('finding_count') or len(results) or 0)}",
         f"- Wordlist entries: {int(metadata.get('wordlist_count') or 0)}",
         f"- Fuzz URL: {_clean(metadata.get('fuzz_url') or 'not supplied')}",
         f"- Status codes: {_clean(_format_status_codes(summary.get('status_codes') or {}))}",
         f"- Redirects: {int(summary.get('redirect_count') or 0)}",
         f"- Forbidden/auth-gated responses: {int(summary.get('forbidden_count') or 0)}",
         f"- Server-error responses: {int(summary.get('server_error_count') or 0)}",
+        "- Evidence boundary: ffuf response observations do not prove vulnerability, exploitability, sensitive exposure, authentication bypass, or complete discovery coverage.",
     ]
     if not results:
         lines.append("- Limitation: No structured ffuf observations were stored.")
+        lines.append("- Limitation: This does not prove hidden content, endpoints, directories, files, parameters, virtual hosts, or vulnerabilities do not exist.")
         return "\n".join(lines)
 
     lines.append("- Observed ffuf records:")
@@ -113,6 +172,34 @@ def _format_status_codes(status_codes: dict) -> str:
 
 def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").strip()[:500]
+
+
+def _guard_truthfulness_response(lines: list[str]) -> list[str]:
+    if _contains_unsupported_ffuf_claim(lines):
+        return list(TRUTHFULNESS_FALLBACK_LINES)
+    return lines
+
+
+def _contains_unsupported_ffuf_claim(lines: list[str]) -> bool:
+    for sentence in _claim_sentences(lines):
+        if _is_evidence_scoped_statement(sentence):
+            continue
+        if any(pattern.search(sentence) for pattern in UNSUPPORTED_FFUF_CLAIM_PATTERNS):
+            return True
+    return False
+
+
+def _claim_sentences(lines: list[str]) -> list[str]:
+    text = " ".join(str(line or "").strip() for line in lines)
+    return [
+        re.sub(r"\s+", " ", sentence).strip().lower()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+
+
+def _is_evidence_scoped_statement(sentence: str) -> bool:
+    return any(marker in sentence for marker in EVIDENCE_SCOPED_MARKERS)
 
 
 def _is_unavailable_response(response: object) -> bool:

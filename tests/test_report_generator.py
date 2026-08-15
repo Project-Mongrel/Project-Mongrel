@@ -179,6 +179,161 @@ def test_report_generation_from_empty_httpx_preserves_uncertainty() -> None:
     assert "No conclusion about host availability, web application existence, vulnerabilities, or security posture" in report
 
 
+def test_report_generation_from_katana_uses_crawl_observation_wording() -> None:
+    add_finding(
+        user_id=9027,
+        finding={
+            "source": "katana",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "finding_count": 2,
+            "katana_summary": {
+                "host_count": 1,
+                "javascript_count": 1,
+                "query_parameter_count": 1,
+                "form_count": 1,
+                "max_depth": 2,
+            },
+            "katana_observations": [
+                {
+                    "url": "https://example.com/app.js",
+                    "endpoint_type": "javascript",
+                    "depth": 1,
+                },
+                {
+                    "url": "https://example.com/search?id=1",
+                    "endpoint_type": "parameterized_url",
+                    "status_code": 200,
+                    "depth": 2,
+                    "query_parameters": ["id"],
+                    "forms": [{"action": "/login"}],
+                },
+            ],
+        },
+    )
+
+    report = generate_markdown_report(user_id=9027, target="https://example.com")
+
+    assert "Katana recorded 2 URL/endpoint crawl observation(s)" in report
+    assert "crawl-summary: hosts=1 scripts=1 parameters=1 forms=1 max_depth=2" in report
+    assert "params_observed=id forms_observed=1" in report
+    assert "Katana crawl observations do not prove vulnerability, exploitability, sensitive exposure" in report
+    assert "Katana finding for https://example.com" not in report
+    assert "vulnerable to SQL injection" not in report
+
+
+def test_report_generation_from_empty_katana_preserves_coverage_uncertainty() -> None:
+    add_finding(
+        user_id=9028,
+        finding={
+            "source": "katana",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "finding_count": 0,
+            "katana_observations": [],
+        },
+    )
+
+    report = generate_markdown_report(user_id=9028, target="https://example.com")
+
+    assert "Katana recorded no usable structured crawl observations" in report
+    assert "No conclusion about forms, endpoints, parameters, scripts, hidden content, vulnerabilities, or coverage" in report
+
+
+def test_report_generation_from_playwright_uses_passive_observation_wording() -> None:
+    add_finding(
+        user_id=9026,
+        finding={
+            "source": "playwright",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "playwright_observation": {
+                "requested_url": "https://example.com",
+                "final_url": "https://example.com",
+                "title": "Example",
+                "load_status": "domcontentloaded",
+                "status_code": 429,
+                "forms_count": 0,
+                "inputs_count": 0,
+                "links_count": 0,
+            },
+        },
+    )
+
+    report = generate_markdown_report(user_id=9026, target="https://example.com")
+
+    assert "Playwright recorded passive browser-state observation" in report
+    assert "status=429 load=domcontentloaded title=Example" in report
+    assert "returned-state counts: forms=0 inputs=0 links=0" in report
+    assert "HTTP 429 was observed as a rate-limited response; cause is unknown" in report
+    assert "does not test XSS, SQL injection, CSRF" in report
+    assert "Playwright finding for https://example.com" not in report
+    assert "too many requests were sent" not in report.lower()
+
+
+def test_report_generation_from_ffuf_uses_fuzzing_observation_wording() -> None:
+    add_finding(
+        user_id=9029,
+        finding={
+            "source": "ffuf",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "finding_count": 2,
+            "ffuf_summary": {
+                "status_codes": {"200": 1, "403": 1},
+                "redirect_count": 0,
+                "forbidden_count": 1,
+                "server_error_count": 0,
+            },
+            "ffuf_results": [
+                {
+                    "url": "https://example.com/admin",
+                    "path": "/admin",
+                    "status_code": 200,
+                    "content_length": 120,
+                    "classification": "public",
+                    "input_word": "admin",
+                },
+                {
+                    "url": "https://example.com/config",
+                    "path": "/config",
+                    "status_code": 403,
+                    "classification": "forbidden",
+                    "input_word": "config",
+                },
+            ],
+        },
+    )
+
+    report = generate_markdown_report(user_id=9029, target="https://example.com")
+
+    assert "ffuf recorded 2 fuzzing response observation(s)" in report
+    assert "fuzz-summary: statuses=200:1, 403:1 redirects=0 forbidden=1 server_errors=0" in report
+    assert "/admin status=200 classification=public length=120 word=admin" in report
+    assert "ffuf response observations do not prove vulnerability, exploitability, sensitive exposure" in report
+    assert "ffuf finding for https://example.com" not in report
+    assert "Sensitive files are exposed" not in report
+
+
+def test_report_generation_from_empty_ffuf_preserves_coverage_uncertainty() -> None:
+    add_finding(
+        user_id=9030,
+        finding={
+            "source": "ffuf",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "finding_count": 0,
+            "ffuf_results": [],
+        },
+    )
+
+    report = generate_markdown_report(user_id=9030, target="https://example.com")
+
+    assert "ffuf recorded no usable structured fuzzing response observations" in report
+    assert "No conclusion about hidden content, endpoints, directories, files, parameters, virtual hosts, vulnerabilities, or coverage" in report
+
+
 def test_report_generation_with_clean_nuclei_scan() -> None:
     add_finding(
         user_id=9003,

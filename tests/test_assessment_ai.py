@@ -88,6 +88,104 @@ def test_assessment_ai_secure_question_prompt_is_cautious_and_evidence_based() -
     assert "22/tcp ssh" in prompt
 
 
+def test_assessment_ai_prompt_scopes_playwright_counts_to_returned_browser_state() -> None:
+    prompt = build_assessment_ai_prompt(
+        "What did Playwright observe?",
+        {
+            "assessment": {"name": "Playwright Assessment", "status": "active"},
+            "targets": [{"address": "example.com"}],
+            "scans": [{"tool": "playwright", "status": "completed"}],
+            "findings": [
+                {
+                    "source": "playwright",
+                    "target": "https://example.com",
+                    "playwright_observation": {
+                        "requested_url": "https://example.com",
+                        "final_url": "https://example.com",
+                        "load_status": "domcontentloaded",
+                        "status_code": 429,
+                        "forms_count": 0,
+                        "inputs_count": 0,
+                        "links_count": 0,
+                    },
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        },
+    )
+
+    assert "forms_observed_in_returned_state=0" in prompt
+    assert "links_observed_in_returned_state=0" in prompt
+    assert "does not test XSS, SQL injection, CSRF" in prompt
+    assert "too many requests were sent" not in prompt.lower()
+
+
+def test_assessment_ai_prompt_scopes_katana_evidence_to_crawl_observations() -> None:
+    prompt = build_assessment_ai_prompt(
+        "What did Katana observe?",
+        {
+            "assessment": {"name": "Katana Assessment", "status": "active"},
+            "targets": [{"address": "example.com"}],
+            "scans": [{"tool": "katana", "status": "completed"}],
+            "findings": [
+                {
+                    "source": "katana",
+                    "target": "https://example.com",
+                    "katana_observations": [
+                        {
+                            "url": "https://example.com/search?id=1",
+                            "endpoint_type": "parameterized_url",
+                            "query_parameters": ["id"],
+                            "forms": [{"action": "/login"}],
+                        }
+                    ],
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        },
+    )
+
+    assert "params_observed_during_crawl=id" in prompt
+    assert "forms_observed_during_crawl=1" in prompt
+    assert "Katana crawl observations only; does not prove vulnerability" in prompt
+    assert "parameter is vulnerable" not in prompt.lower()
+
+
+def test_assessment_ai_prompt_scopes_ffuf_evidence_to_fuzzing_observations() -> None:
+    prompt = build_assessment_ai_prompt(
+        "What did ffuf observe?",
+        {
+            "assessment": {"name": "ffuf Assessment", "status": "active"},
+            "targets": [{"address": "example.com"}],
+            "scans": [{"tool": "ffuf", "status": "completed"}],
+            "findings": [
+                {
+                    "source": "ffuf",
+                    "target": "https://example.com",
+                    "ffuf_results": [
+                        {
+                            "url": "https://example.com/admin",
+                            "path": "/admin",
+                            "status_code": 403,
+                            "classification": "forbidden",
+                            "input_word": "admin",
+                        }
+                    ],
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        },
+    )
+
+    assert "ffuf response observations:" in prompt
+    assert "classification=forbidden" in prompt
+    assert "ffuf fuzzing response metadata only; does not prove vulnerability" in prompt
+    assert "admin directory is vulnerable" not in prompt.lower()
+
+
 def test_assessment_ai_report_prompt_includes_required_sections_and_limitations() -> None:
     context = {
         "assessment": {"name": "Report Assessment", "status": "active"},

@@ -338,6 +338,12 @@ def _format_technical_findings(scan_runs: list[dict]) -> list[str]:
             finding_lines.append(f"- BBOT reconnaissance observation for {scan_run.get('target') or 'unknown target'}.")
         elif source == "httpx":
             finding_lines.extend(_format_httpx_observations(scan_run))
+        elif source == "katana":
+            finding_lines.extend(_format_katana_observations(scan_run))
+        elif source == "playwright":
+            finding_lines.extend(_format_playwright_observations(scan_run))
+        elif source == "ffuf":
+            finding_lines.extend(_format_ffuf_observations(scan_run))
         else:
             finding_lines.append(f"- {_source_label(source)} finding for {scan_run.get('target') or 'unknown target'}.")
 
@@ -467,6 +473,108 @@ def _format_httpx_observations(scan_run: dict) -> list[str]:
             detail = f"{detail} technologies={', '.join(_clean(value) for value in (service.get('technologies') or [])[:5])}"
         lines.append(detail)
     lines.append("  - Limitation: httpx fingerprinting metadata is not proof of vulnerability, compromise, application health, or full service availability.")
+    return lines
+
+
+def _format_katana_observations(scan_run: dict) -> list[str]:
+    observations = scan_run.get("katana_observations") or []
+    summary = scan_run.get("katana_summary") or {}
+    if not observations:
+        return [
+            f"- Katana recorded no usable structured crawl observations for {scan_run.get('target') or 'unknown target'}.",
+            "  - No conclusion about forms, endpoints, parameters, scripts, hidden content, vulnerabilities, or coverage can be drawn from that result.",
+        ]
+
+    target = scan_run.get("target") or "unknown target"
+    lines = [f"- Katana recorded {len(observations)} URL/endpoint crawl observation(s) for {target}:"]
+    lines.append(
+        "  - crawl-summary: "
+        f"hosts={int(summary.get('host_count') or 0)} "
+        f"scripts={int(summary.get('javascript_count') or 0)} "
+        f"parameters={int(summary.get('query_parameter_count') or 0)} "
+        f"forms={int(summary.get('form_count') or 0)} "
+        f"max_depth={int(summary.get('max_depth') or 0)}"
+    )
+    for observation in observations[:10]:
+        detail = f"  - {_clean(observation.get('url') or 'unknown')} type={_clean(observation.get('endpoint_type') or 'url')}"
+        if observation.get("status_code"):
+            detail = f"{detail} status={_clean(observation.get('status_code'))}"
+        if observation.get("depth") is not None:
+            detail = f"{detail} depth={_clean(observation.get('depth'))}"
+        if observation.get("query_parameters"):
+            detail = f"{detail} params_observed={', '.join(_clean(value) for value in (observation.get('query_parameters') or [])[:5])}"
+        if observation.get("forms"):
+            detail = f"{detail} forms_observed={len(observation.get('forms') or [])}"
+        lines.append(detail)
+    lines.append("  - Limitation: Katana crawl observations do not prove vulnerability, exploitability, sensitive exposure, ownership, public availability at all times, or complete coverage.")
+    return lines
+
+
+def _format_playwright_observations(scan_run: dict) -> list[str]:
+    observation = scan_run.get("playwright_observation") or {}
+    if not observation:
+        return [
+            f"- Playwright recorded no usable structured browser-state observation for {scan_run.get('target') or 'unknown target'}.",
+            "  - No conclusion about application behavior, vulnerabilities, authentication strength, or security posture can be drawn from that result.",
+        ]
+
+    target = scan_run.get("target") or observation.get("requested_url") or "unknown target"
+    lines = [f"- Playwright recorded passive browser-state observation for {target}:"]
+    detail = (
+        f"  - final={_clean(observation.get('final_url') or 'unknown')} "
+        f"status={_clean(observation.get('status_code') or 'not observed')} "
+        f"load={_clean(observation.get('load_status') or 'unknown')} "
+        f"title={_clean(observation.get('title') or 'not observed')}"
+    )
+    lines.append(detail)
+    lines.append(
+        "  - returned-state counts: "
+        f"forms={int(observation.get('forms_count') or 0)} "
+        f"inputs={int(observation.get('inputs_count') or 0)} "
+        f"links={int(observation.get('links_count') or 0)}"
+    )
+    lines.append(
+        "  - console/network/page issues: "
+        f"{int(observation.get('console_issue_count') or 0)} console / "
+        f"{int(observation.get('network_issue_count') or 0)} network / "
+        f"{int(observation.get('page_error_count') or 0)} page errors"
+    )
+    status_code = observation.get("status_code")
+    if status_code == 429 or str(status_code) == "429":
+        lines.append("  - Limitation: HTTP 429 was observed as a rate-limited response; cause is unknown from Playwright evidence.")
+    if status_code in {401, 403, 429} or str(status_code) in {"401", "403", "429"} or str(observation.get("load_status") or "").lower() in {"domcontentloaded", "timeout", "failed", "navigation_failed"}:
+        lines.append("  - Limitation: Restricted or partial browser state limited visibility into the application.")
+    lines.append("  - Limitation: Passive Playwright observation does not test XSS, SQL injection, CSRF, authentication flaws, vulnerability absence, or complete application behavior.")
+    return lines
+
+
+def _format_ffuf_observations(scan_run: dict) -> list[str]:
+    results = scan_run.get("ffuf_results") or []
+    summary = scan_run.get("ffuf_summary") or {}
+    if not results:
+        return [
+            f"- ffuf recorded no usable structured fuzzing response observations for {scan_run.get('target') or 'unknown target'}.",
+            "  - No conclusion about hidden content, endpoints, directories, files, parameters, virtual hosts, vulnerabilities, or coverage can be drawn from that result.",
+        ]
+
+    target = scan_run.get("target") or "unknown target"
+    lines = [f"- ffuf recorded {len(results)} fuzzing response observation(s) for {target}:"]
+    status_codes = summary.get("status_codes") or {}
+    lines.append(
+        "  - fuzz-summary: "
+        f"statuses={_clean(', '.join(f'{code}:{count}' for code, count in sorted(status_codes.items())) or 'none')} "
+        f"redirects={int(summary.get('redirect_count') or 0)} "
+        f"forbidden={int(summary.get('forbidden_count') or 0)} "
+        f"server_errors={int(summary.get('server_error_count') or 0)}"
+    )
+    for result in results[:10]:
+        detail = f"  - {_clean(result.get('path') or result.get('url') or 'unknown')} status={_clean(result.get('status_code') or 'unknown')} classification={_clean(result.get('classification') or 'observed')}"
+        if result.get("content_length") is not None:
+            detail = f"{detail} length={_clean(result.get('content_length'))}"
+        if result.get("input_word"):
+            detail = f"{detail} word={_clean(result.get('input_word'))}"
+        lines.append(detail)
+    lines.append("  - Limitation: ffuf response observations do not prove vulnerability, exploitability, sensitive exposure, authentication bypass, or complete discovery coverage.")
     return lines
 
 

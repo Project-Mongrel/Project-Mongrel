@@ -919,13 +919,15 @@ def build_katana_result_text(result: dict[str, object], observations: list[dict]
         limitations.append(str(result.get("error") or "Katana did not complete successfully."))
     if not observations:
         limitations.append("No structured Katana JSON observations were stored.")
+        limitations.append("This does not prove forms, endpoints, parameters, scripts, paths, or hidden content do not exist.")
     findings = [
-        f"URLs/endpoints discovered: {summary.get('url_count', 0)}",
+        f"URLs/endpoints observed during crawl: {summary.get('url_count', 0)}",
         f"Unique hosts: {summary.get('host_count', 0)}",
-        f"JavaScript files: {summary.get('javascript_count', 0)}",
-        f"Query parameters: {summary.get('query_parameter_count', 0)}",
-        f"Forms/actions: {summary.get('form_count', 0)}",
+        f"JavaScript files observed during crawl: {summary.get('javascript_count', 0)}",
+        f"Query parameters observed during crawl: {summary.get('query_parameter_count', 0)}",
+        f"Forms/actions observed during crawl: {summary.get('form_count', 0)}",
         f"Max observed crawl depth: {summary.get('max_depth', 0)}",
+        "Evidence boundary: Katana crawl observations do not prove vulnerability, exploitability, sensitive exposure, public availability at all times, or complete coverage.",
     ]
     parameters = [str(value) for value in summary.get("query_parameters") or []]
     if parameters:
@@ -949,7 +951,7 @@ def build_katana_result_text(result: dict[str, object], observations: list[dict]
         status="Complete" if result.get("success") is True else "Failed",
         elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
         risk="INFO" if result.get("success") is True else None,
-        summary=f"{summary.get('url_count', 0)} URL/endpoint observation(s) recorded.",
+        summary=f"{summary.get('url_count', 0)} URL/endpoint crawl observation(s) recorded.",
         findings=findings_text,
         assets=[str(observation.get("url")) for observation in observations if observation.get("url")],
     )
@@ -1005,18 +1007,24 @@ def build_playwright_result_text(result: dict[str, object], observation: dict | 
         limitations.append(str(result.get("error") or "Playwright observation did not complete successfully."))
     if not observation:
         limitations.append("No structured Playwright browser observation was stored.")
+    status_code = summary.get("status_code")
+    if status_code == 429:
+        limitations.append("HTTP 429 was observed as a rate-limited response; cause is unknown from Playwright evidence.")
+    if status_code in {401, 403, 429} or str(summary.get("load_status") or "").lower() in {"domcontentloaded", "timeout", "failed", "navigation_failed"}:
+        limitations.append("Restricted or partial browser state limited visibility into the application.")
     screenshot_status = "present" if summary.get("screenshot_present") else "not captured"
     findings = [
         f"Final URL: {summary.get('final_url') or 'unknown'}",
         f"Title: {summary.get('title') or 'not observed'}",
         f"Load status: {summary.get('load_status') or 'unknown'}",
         f"Status code: {summary.get('status_code') or 'not observed'}",
-        f"Forms/inputs: {summary.get('forms_count', 0)} forms / {summary.get('inputs_count', 0)} inputs",
-        f"Links: {summary.get('links_count', 0)}",
+        f"Forms/inputs observed in returned state: {summary.get('forms_count', 0)} forms / {summary.get('inputs_count', 0)} inputs",
+        f"Links observed in returned state: {summary.get('links_count', 0)}",
         f"Observed samples: {summary.get('form_samples_count', 0)} forms / {summary.get('input_samples_count', 0)} inputs / {summary.get('network_events_count', 0)} network events",
         f"Out-of-scope redirect: {'yes' if summary.get('redirected_out_of_scope') else 'no'}",
         f"Console/network issues: {summary.get('console_issue_count', 0)} console / {summary.get('network_issue_count', 0)} network / {summary.get('page_error_count', 0)} page errors",
         f"Screenshot/artifact: {screenshot_status}",
+        "Evidence boundary: passive browser observation does not test XSS, SQL injection, CSRF, authentication flaws, vulnerability absence, or complete application behavior.",
     ]
     if limitations:
         findings.append("Limitations: " + " ".join(str(limitation) for limitation in limitations[:3]))
@@ -1074,6 +1082,7 @@ def build_ffuf_result_text(result: dict[str, object], observations: list[dict] |
         limitations.append(str(result.get("error") or "ffuf did not complete successfully."))
     if not observations:
         limitations.append("No structured ffuf JSON observations were stored.")
+        limitations.append("This does not prove hidden content, endpoints, directories, files, parameters, virtual hosts, or vulnerabilities do not exist.")
     status_codes = summary.get("status_codes") or {}
     interesting_paths = [str(value) for value in summary.get("interesting_paths") or []]
     redirects = [
@@ -1083,10 +1092,11 @@ def build_ffuf_result_text(result: dict[str, object], observations: list[dict] |
     ]
     findings = [
         f"Wordlist entries: {int(result.get('wordlist_count') or 0)}",
-        f"Discovered paths: {summary.get('result_count', 0)}",
+        f"ffuf response observations: {summary.get('result_count', 0)}",
         "Status codes: " + (", ".join(f"{code}: {count}" for code, count in sorted(status_codes.items())) if status_codes else "none"),
         f"Forbidden/auth-gated responses: {summary.get('forbidden_count', 0)}",
         f"Server-error responses: {summary.get('server_error_count', 0)}",
+        "Evidence boundary: ffuf response observations do not prove vulnerability, exploitability, sensitive exposure, authentication bypass, or complete discovery coverage.",
     ]
     if interesting_paths:
         findings.append("Interesting paths: " + "; ".join(interesting_paths[:8]))

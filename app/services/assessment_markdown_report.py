@@ -269,11 +269,11 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     if httpx_services:
         actions.append("- Validate observed HTTP responses, redirects, page titles, headers, and technology fingerprints against intended exposure.")
     if katana_observations:
-        actions.append("- Review crawled URLs, JavaScript files, forms, and query parameters to prioritize manual web testing.")
+        actions.append("- Review Katana-observed URLs, JavaScript files, forms, and query parameters to prioritize manual validation.")
     if playwright_observations:
-        actions.append("- Review browser-observed forms, links, console issues, and network failures before deeper manual testing.")
+        actions.append("- Review returned browser-state forms, links, console issues, and network failures before deeper manual testing.")
     if ffuf_results:
-        actions.append("- Review discovered hidden-content paths and status codes as follow-up candidates before manual validation.")
+        actions.append("- Review ffuf-observed response paths and status codes as follow-up candidates before manual validation.")
     if testssl_evidence:
         actions.append("- Review TLS protocols, certificate expiry, cipher observations, and testssl.sh-reported misconfigurations with the service owner.")
     if gitleaks_evidence:
@@ -381,12 +381,13 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
     if katana_observations:
         summary = finding.get("katana_summary") or {}
         lines = [
-            f"- URLs/endpoints: {len(katana_observations)}",
+            f"- URLs/endpoints observed during crawl: {len(katana_observations)}",
             f"- Unique hosts: {int(summary.get('host_count') or len(_unique([_clean(item.get('host') or '') for item in katana_observations])))}",
-            f"- JavaScript files: {int(summary.get('javascript_count') or len([item for item in katana_observations if item.get('endpoint_type') == 'javascript']))}",
-            f"- Query parameters: {int(summary.get('query_parameter_count') or len(_unique([_clean(parameter) for item in katana_observations for parameter in (item.get('query_parameters') or [])])))}",
-            f"- Forms/actions: {int(summary.get('form_count') or sum(len(item.get('forms') or []) for item in katana_observations))}",
+            f"- JavaScript files observed during crawl: {int(summary.get('javascript_count') or len([item for item in katana_observations if item.get('endpoint_type') == 'javascript']))}",
+            f"- Query parameters observed during crawl: {int(summary.get('query_parameter_count') or len(_unique([_clean(parameter) for item in katana_observations for parameter in (item.get('query_parameters') or [])])))}",
+            f"- Forms/actions observed during crawl: {int(summary.get('form_count') or sum(len(item.get('forms') or []) for item in katana_observations))}",
             f"- Max observed crawl depth: {int(summary.get('max_depth') or max([int(item.get('depth') or 0) for item in katana_observations] or [0]))}",
+            "- Limitation: Katana crawl observations do not prove vulnerability, exploitability, sensitive exposure, ownership, public availability at all times, or complete coverage.",
         ]
         for observation in katana_observations[:10]:
             detail = f"- {_clean(observation.get('url') or 'unknown')} type={_clean(observation.get('endpoint_type') or 'url')}"
@@ -411,15 +412,21 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             f"- Title: {_clean(playwright_observation.get('title') or 'not observed')}",
             f"- Load status: {_clean(playwright_observation.get('load_status') or 'unknown')}",
             f"- Status code: {_clean(playwright_observation.get('status_code') or 'not observed')}",
-            f"- Forms/inputs: {int(playwright_observation.get('forms_count') or 0)} forms / {int(playwright_observation.get('inputs_count') or 0)} inputs",
-            f"- Links: {int(playwright_observation.get('links_count') or 0)}",
+            f"- Forms/inputs observed in returned state: {int(playwright_observation.get('forms_count') or 0)} forms / {int(playwright_observation.get('inputs_count') or 0)} inputs",
+            f"- Links observed in returned state: {int(playwright_observation.get('links_count') or 0)}",
             (
                 f"- Console/network summary: {int(playwright_observation.get('console_issue_count') or 0)} console / "
                 f"{int(playwright_observation.get('network_issue_count') or 0)} network / "
                 f"{int(playwright_observation.get('page_error_count') or 0)} page errors"
             ),
             f"- Screenshot/artifact metadata: {'present' if playwright_observation.get('screenshot') else 'not captured'}",
+            "- Limitation: Passive Playwright observation does not test XSS, SQL injection, CSRF, authentication flaws, vulnerability absence, or complete application behavior.",
         ]
+        status_code = playwright_observation.get("status_code")
+        if status_code == 429 or str(status_code) == "429":
+            lines.append("- Limitation: HTTP 429 was observed as a rate-limited response; cause is unknown from Playwright evidence.")
+        if status_code in {401, 403, 429} or str(status_code) in {"401", "403", "429"} or str(playwright_observation.get("load_status") or "").lower() in {"domcontentloaded", "timeout", "failed", "navigation_failed"}:
+            lines.append("- Limitation: Restricted or partial browser state limited visibility into the application.")
         for limitation in playwright_observation.get("limitations") or []:
             lines.append(f"- Limitation: {_clean(limitation)}")
         return lines
@@ -430,12 +437,12 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
         status_codes = summary.get("status_codes") or {}
         lines = [
             f"- Target/base URL: {_clean(finding.get('target') or 'unknown')}",
-            f"- Discovered paths: {len(ffuf_results)}",
+            f"- ffuf response observations: {len(ffuf_results)}",
             "- Status codes: " + (", ".join(f"{_clean(code)}={int(count or 0)}" for code, count in sorted(status_codes.items())) if status_codes else "none"),
             f"- Redirects: {int(summary.get('redirect_count') or 0)}",
             f"- Forbidden/auth-gated responses: {int(summary.get('forbidden_count') or 0)}",
             f"- Server-error responses: {int(summary.get('server_error_count') or 0)}",
-            "- Limitation: Conservative bounded wordlist discovery only. Observed paths are not confirmed vulnerabilities.",
+            "- Limitation: Conservative bounded wordlist discovery only. ffuf response observations are not confirmed vulnerabilities, exploitability, sensitive exposure, authentication bypass, or complete discovery coverage.",
         ]
         for result in ffuf_results[:10]:
             detail = f"- {_clean(result.get('url') or result.get('path') or 'unknown')} status={_clean(result.get('status_code') or 'unknown')}"

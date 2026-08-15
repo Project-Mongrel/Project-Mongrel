@@ -301,15 +301,16 @@ def test_assessment_markdown_report_includes_katana_section() -> None:
 
     assert "### Katana" in report
     assert "Scan status\nCompleted" in report
-    assert "- URLs/endpoints: 3" in report
+    assert "- URLs/endpoints observed during crawl: 3" in report
     assert "- Unique hosts: 1" in report
-    assert "- JavaScript files: 1" in report
-    assert "- Query parameters: 1" in report
-    assert "- Forms/actions: 1" in report
+    assert "- JavaScript files observed during crawl: 1" in report
+    assert "- Query parameters observed during crawl: 1" in report
+    assert "- Forms/actions observed during crawl: 1" in report
     assert "- Max observed crawl depth: 2" in report
+    assert "- Limitation: Katana crawl observations do not prove vulnerability, exploitability, sensitive exposure" in report
     assert "https://example.com/search?q=test type=parameterized_url depth=2 params=q forms=1" in report
     assert "- Katana: 3 crawled URL/endpoint observation(s) recorded." in report
-    assert "- Review crawled URLs, JavaScript files, forms, and query parameters to prioritize manual web testing." in report
+    assert "- Review Katana-observed URLs, JavaScript files, forms, and query parameters to prioritize manual validation." in report
 
 
 def test_assessment_markdown_report_includes_playwright_section() -> None:
@@ -375,12 +376,13 @@ def test_assessment_markdown_report_includes_playwright_section() -> None:
     assert "- Final URL: https://www.example.com" in report
     assert "- Title: Example" in report
     assert "- Load status: loaded" in report
-    assert "- Forms/inputs: 1 forms / 4 inputs" in report
-    assert "- Links: 12" in report
+    assert "- Forms/inputs observed in returned state: 1 forms / 4 inputs" in report
+    assert "- Links observed in returned state: 12" in report
     assert "- Console/network summary: 2 console / 1 network / 0 page errors" in report
     assert "- Screenshot/artifact metadata: not captured" in report
+    assert "- Limitation: Passive Playwright observation does not test XSS, SQL injection, CSRF" in report
     assert "- Playwright: passive browser observation recorded for https://www.example.com." in report
-    assert "- Review browser-observed forms, links, console issues, and network failures before deeper manual testing." in report
+    assert "- Review returned browser-state forms, links, console issues, and network failures before deeper manual testing." in report
 
 
 def test_assessment_markdown_report_includes_ffuf_section() -> None:
@@ -453,12 +455,13 @@ def test_assessment_markdown_report_includes_ffuf_section() -> None:
     assert "### ffuf" in report
     assert "Scan status\nCompleted" in report
     assert "- Target/base URL: https://example.com" in report
-    assert "- Discovered paths: 3" in report
+    assert "- ffuf response observations: 3" in report
     assert "- Status codes: 200=1, 302=1, 403=1" in report
     assert "- Redirects: 1" in report
     assert "https://example.com/login status=302 classification=redirect redirect=https://example.com/sso" in report
+    assert "- Limitation: Conservative bounded wordlist discovery only. ffuf response observations are not confirmed vulnerabilities" in report
     assert "- ffuf: 3 hidden-content path observation(s) recorded." in report
-    assert "- Review discovered hidden-content paths and status codes as follow-up candidates before manual validation." in report
+    assert "- Review ffuf-observed response paths and status codes as follow-up candidates before manual validation." in report
 
 
 def test_assessment_markdown_report_includes_metasploit_validation() -> None:
