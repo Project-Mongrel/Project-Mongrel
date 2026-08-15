@@ -336,6 +336,8 @@ def _format_technical_findings(scan_runs: list[dict]) -> list[str]:
             finding_lines.extend(_format_metasploit_findings(scan_run))
         elif source == "bbot":
             finding_lines.append(f"- BBOT reconnaissance observation for {scan_run.get('target') or 'unknown target'}.")
+        elif source == "httpx":
+            finding_lines.extend(_format_httpx_observations(scan_run))
         else:
             finding_lines.append(f"- {_source_label(source)} finding for {scan_run.get('target') or 'unknown target'}.")
 
@@ -383,12 +385,12 @@ def _format_nuclei_findings(scan_run: dict) -> list[str]:
     if not nuclei_findings:
         return [f"- Nuclei recorded {scan_run.get('finding_count', 0)} finding(s)."]
 
-    lines = [f"- Nuclei identified {len(nuclei_findings)} finding(s) on {scan_run.get('target') or 'unknown target'}:"]
+    lines = [f"- Nuclei reported {len(nuclei_findings)} scanner finding(s) on {scan_run.get('target') or 'unknown target'}:"]
     for finding in nuclei_findings[:10]:
         name = finding.get("name") or finding.get("template_id") or "Unnamed finding"
         severity = str(finding.get("severity") or "info").upper()
         template = finding.get("template_id") or "unknown-template"
-        lines.append(f"  - {name} ({severity}) - {template}")
+        lines.append(f"  - {name} (scanner severity: {severity}) - template={template}")
     if len(nuclei_findings) > 10:
         lines.append(f"  - ...and {len(nuclei_findings) - 10} more finding(s).")
     return lines
@@ -447,6 +449,27 @@ def _format_metasploit_findings(scan_run: dict) -> list[str]:
     return lines
 
 
+def _format_httpx_observations(scan_run: dict) -> list[str]:
+    services = scan_run.get("httpx_services") or []
+    if not services:
+        return [
+            f"- httpx recorded no usable structured response observations for {scan_run.get('target') or 'unknown target'}.",
+            "  - No conclusion about host availability, web application existence, vulnerabilities, or security posture can be drawn from that result.",
+        ]
+    lines = [f"- httpx reported {len(services)} HTTP response/URL observation(s) on {scan_run.get('target') or 'unknown target'}:"]
+    for service in services[:10]:
+        detail = f"  - {_clean(service.get('url') or service.get('host') or 'unknown')} status={_clean(service.get('status_code') or 'unknown')}"
+        if service.get("title"):
+            detail = f"{detail} title={_clean(service.get('title'))}"
+        if service.get("web_server"):
+            detail = f"{detail} server={_clean(service.get('web_server'))}"
+        if service.get("technologies"):
+            detail = f"{detail} technologies={', '.join(_clean(value) for value in (service.get('technologies') or [])[:5])}"
+        lines.append(detail)
+    lines.append("  - Limitation: httpx fingerprinting metadata is not proof of vulnerability, compromise, application health, or full service availability.")
+    return lines
+
+
 def _format_clean_scan_notes(scan_runs: list[dict]) -> list[str]:
     clean_scans = [scan_run for scan_run in scan_runs if _is_clean_scan(scan_run)]
     if not clean_scans:
@@ -468,7 +491,7 @@ def _format_recommendations(scan_runs: list[dict]) -> list[str]:
     if sources.intersection({"nmap", "nmap_xml"}):
         recommendations.append("- Review exposed services and restrict administrative ports to trusted networks.")
     if "nuclei" in sources:
-        recommendations.append("- Patch or reconfigure affected services identified by Nuclei.")
+        recommendations.append("- Manually validate matched Nuclei findings before remediation planning.")
     if "prowler" in sources:
         recommendations.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
     if "metasploit" in sources:
@@ -578,7 +601,7 @@ def _format_deduplicated_clean_scan_notes(clean_scans: list[dict]) -> list[str]:
         if len(group) > 1 and current.get("source") == "nuclei":
             lines.extend(
                 [
-                    f"{_number_word(len(group))} consecutive Nuclei Fast Scans completed with no findings.",
+                    f"{_number_word(len(group))} consecutive Nuclei scans completed with no matching findings.",
                     "",
                     "Latest:",
                     _format_human_timestamp(group[-1].get("created_at")),
@@ -590,7 +613,7 @@ def _format_deduplicated_clean_scan_notes(clean_scans: list[dict]) -> list[str]:
         else:
             lines.append(
                 f"- {_source_label(current.get('source'))} clean result for {current.get('target') or 'unknown target'}: "
-                f"{current.get('summary') or 'No matching findings were identified.'}"
+                f"{_format_clean_scan_summary(current)}"
             )
 
         if index < len(clean_scans):
@@ -605,6 +628,18 @@ def _clean_scan_signature(scan_run: dict) -> tuple[str, str, str]:
         str(scan_run.get("target_key") or normalize_target_key(scan_run.get("target")) or scan_run.get("target") or ""),
         str(scan_run.get("summary") or ""),
     )
+
+
+def _format_clean_scan_summary(scan_run: dict) -> str:
+    summary = str(scan_run.get("summary") or "No matching findings were identified.")
+    metadata = scan_run.get("metadata") or {}
+    if (
+        scan_run.get("source") == "nuclei"
+        and "fast scan profile" in summary.lower()
+        and not (metadata.get("scan_profile") or metadata.get("profile"))
+    ):
+        return "No matching Nuclei findings were observed using the selected template/profile."
+    return summary
 
 
 def _number_word(value: int) -> str:
@@ -637,7 +672,7 @@ def _format_finding_aware_recommendations(scan_runs: list[dict]) -> list[str]:
     if {"3306", "5432", "1433", "27017", "6379"}.intersection(ports):
         recommendations.append("- Databases: restrict network access, require authentication, and keep database services patched.")
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
-        recommendations.append("- Clean Nuclei: treat the result as point-in-time evidence, not proof that no issues exist.")
+        recommendations.append("- Clean Nuclei: treat the result as point-in-time evidence that no selected templates matched, not proof that no vulnerabilities exist.")
     if any(scan_run.get("source") == "prowler" for scan_run in scan_runs):
         recommendations.append("- Prowler: treat FAIL results as scanner-reported failed checks requiring cloud-context validation.")
     if any(scan_run.get("source") == "metasploit" for scan_run in scan_runs):

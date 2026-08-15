@@ -221,8 +221,9 @@ def test_assessment_markdown_report_includes_httpx_section() -> None:
     assert "Scan status\nCompleted" in report
     assert "https://example.com status=301 title=Example server=nginx technologies=nginx redirect=https://www.example.com" in report
     assert "Technologies\n- nginx\n- React" in report
-    assert "- httpx: 2 HTTP service/URL observation(s) recorded." in report
-    assert "- Validate observed HTTP services, redirects, page titles, and technology fingerprints against intended exposure." in report
+    assert "- httpx: 2 HTTP response/URL observation(s) recorded." in report
+    assert "- Limitation: httpx response metadata is not proof of vulnerability, compromise, application health, or full service availability." in report
+    assert "- Validate observed HTTP responses, redirects, page titles, headers, and technology fingerprints against intended exposure." in report
 
 
 def test_assessment_markdown_report_includes_katana_section() -> None:

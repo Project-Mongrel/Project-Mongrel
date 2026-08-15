@@ -46,6 +46,31 @@ def test_extracts_observations_from_json_lines() -> None:
     assert all(observation["investigation_id"] == "inv-1" for observation in observations)
 
 
+def test_extracts_professional_recon_evidence_types_without_sensitive_fields() -> None:
+    raw_output = "\n".join(
+        [
+            '{"type":"IPV6_ADDRESS","data":"2001:db8::10","api_key":"secret-token"}',
+            '{"type":"EMAIL_ADDRESS","data":"security@example.com","headers":{"authorization":"Bearer secret"}}',
+            '{"type":"SSL_CERTIFICATE","data":"CN=www.example.com","cookie":"session=secret"}',
+            '{"type":"WEB_TECHNOLOGY","data":"nginx"}',
+            '{"type":"DNS_RECORD","data":"www.example.com A 192.0.2.10"}',
+        ]
+    )
+
+    observations = normalize_bbot_output(raw_output, "example.com", 1001)
+    values = _types_and_values(observations)
+    metadata = " ".join(str(observation.get("metadata", {})) for observation in observations)
+
+    assert ("ip_address", "2001:db8::10") in values
+    assert ("email", "security@example.com") in values
+    assert ("certificate", "CN=www.example.com") in values
+    assert ("technology", "nginx") in values
+    assert ("dns_record", "www.example.com A 192.0.2.10") in values
+    assert "secret-token" not in metadata
+    assert "Bearer secret" not in metadata
+    assert "session=secret" not in metadata
+
+
 def test_deduplicates_repeated_observations() -> None:
     observations = normalize_bbot_output("app.example.com\napp.example.com", "example.com", 1001)
 

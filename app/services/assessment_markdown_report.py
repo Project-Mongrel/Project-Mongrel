@@ -191,7 +191,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         elif nuclei_findings:
             lines.append(f"- {tool}: {len(nuclei_findings)} matched finding(s) observed.")
         elif httpx_services:
-            lines.append(f"- {tool}: {len(httpx_services)} HTTP service/URL observation(s) recorded.")
+            lines.append(f"- {tool}: {len(httpx_services)} HTTP response/URL observation(s) recorded.")
         elif katana_observations:
             lines.append(f"- {tool}: {len(katana_observations)} crawled URL/endpoint observation(s) recorded.")
         elif playwright_observation:
@@ -267,7 +267,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     if any(counts.get("technology") for counts in observation_counts):
         actions.append("- Review detected technologies and versions against current advisories.")
     if httpx_services:
-        actions.append("- Validate observed HTTP services, redirects, page titles, and technology fingerprints against intended exposure.")
+        actions.append("- Validate observed HTTP responses, redirects, page titles, headers, and technology fingerprints against intended exposure.")
     if katana_observations:
         actions.append("- Review crawled URLs, JavaScript files, forms, and query parameters to prioritize manual web testing.")
     if playwright_observations:
@@ -311,7 +311,7 @@ def _scan_summary(scan: dict) -> str:
         return f"{len(open_ports)} open service(s) observed." if open_ports else "No open TCP services were observed by this scan."
     if tool == "httpx":
         services = finding.get("httpx_services") or []
-        return f"{len(services)} HTTP service/URL observation(s) recorded." if services else "httpx completed with no structured HTTP observations."
+        return f"{len(services)} HTTP response/URL observation(s) recorded." if services else "httpx completed with no usable structured HTTP response observations."
     if tool == "katana":
         observations = finding.get("katana_observations") or []
         return f"{len(observations)} crawled URL/endpoint observation(s) recorded." if observations else "Katana completed with no structured crawl observations."
@@ -361,7 +361,9 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
 
     httpx_services = finding.get("httpx_services") or []
     if httpx_services:
-        lines = []
+        lines = [
+            "- Limitation: httpx response metadata is not proof of vulnerability, compromise, application health, or full service availability."
+        ]
         for service in httpx_services[:10]:
             detail = f"- {_clean(service.get('url') or service.get('host') or 'unknown')} status={_clean(service.get('status_code') or 'unknown')}"
             if service.get("title"):

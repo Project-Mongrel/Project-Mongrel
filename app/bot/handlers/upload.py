@@ -523,7 +523,7 @@ def build_nuclei_import_success_text(finding: dict, elapsed: str | None = None) 
             "Recommended Actions:",
             "- Prioritize critical and high findings first.",
             "- Validate findings manually before remediation.",
-            "- Patch or mitigate affected services.",
+            "- Apply configuration or code changes only after confirming the scanner-reported observation.",
             "",
             "Technical Details:",
             *_format_nuclei_technical_details(nuclei_findings),
@@ -644,7 +644,9 @@ def _score_nuclei_risk(severity_summary: dict[str, int]) -> str:
         return "high"
     if severity_summary.get("medium", 0) > 0:
         return "medium"
-    return "low"
+    if severity_summary.get("low", 0) > 0:
+        return "low"
+    return "info"
 
 
 def _extract_nuclei_target(nuclei_findings: list[dict]) -> str | None:

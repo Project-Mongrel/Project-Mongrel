@@ -17,6 +17,7 @@ def test_scan_ai_summary_prompt_is_evidence_based() -> None:
 
     assert "Use only the supplied stored scan evidence." in prompt
     assert "Do not invent vulnerabilities." in prompt
+    assert "Do not infer safety or absence of vulnerabilities from missing or empty scan findings." in prompt
     assert "Executive Summary" in prompt
     assert "Observed Facts" in prompt
     assert "22/tcp ssh" in prompt

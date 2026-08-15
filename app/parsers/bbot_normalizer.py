@@ -10,19 +10,28 @@ SUBDOMAIN_RE = re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b")
 URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-TECH_KEYS = {"technology", "technologies", "tech", "wappalyzer", "product"}
-CERT_KEYS = {"certificate", "cert", "ssl", "tls"}
-DNS_KEYS = {"dns", "dns_record", "record", "resolved_hosts"}
+TECH_KEYS = {"technology", "technologies", "tech", "wappalyzer", "product", "fingerprint", "service"}
+CERT_KEYS = {"certificate", "cert", "ssl", "tls", "ssl_certificate", "certificate_subject", "certificate_issuer"}
+DNS_KEYS = {"dns", "dns_record", "record", "resolved_hosts", "resolved_host", "a", "aaaa", "mx", "cname", "txt"}
+SENSITIVE_KEYS = {"api_key", "apikey", "token", "secret", "password", "authorization", "cookie", "set-cookie", "headers"}
 TYPE_MAP = {
     "dns_name": "subdomain",
     "subdomain": "subdomain",
     "url": "url",
     "ip": "ip_address",
     "ip_address": "ip_address",
+    "ipv4_address": "ip_address",
+    "ipv6_address": "ip_address",
     "email": "email",
+    "email_address": "email",
     "technology": "technology",
+    "technology_fingerprint": "technology",
     "certificate": "certificate",
+    "ssl_certificate": "certificate",
+    "x509_certificate": "certificate",
     "dns_record": "dns_record",
+    "open_tcp_port": "ip_address",
+    "web_technology": "technology",
 }
 
 
@@ -122,6 +131,8 @@ def _extract_from_mapping(
 
     for key, item in event.items():
         normalized_key = str(key).lower()
+        if normalized_key in SENSITIVE_KEYS:
+            continue
         if normalized_key in TECH_KEYS:
             for value in _iter_values(item):
                 _add_observation(observations, seen, "technology", value, target, target_key, user_id, investigation_id, event)
@@ -134,11 +145,12 @@ def _extract_from_mapping(
         elif isinstance(item, str):
             _extract_from_text(item, observations, seen, target, target_key, user_id, investigation_id)
 
-    if not any(observation.get("metadata", {}).get("raw_event") == event for observation in observations):
+    safe_event = _sanitize_event(event)
+    if not any(observation.get("metadata", {}).get("raw_event") == safe_event for observation in observations):
         if event_type is None and value is not None:
-            _add_observation(observations, seen, "raw_event", str(value), target, target_key, user_id, investigation_id, event)
+            _add_observation(observations, seen, "raw_event", str(value), target, target_key, user_id, investigation_id, safe_event)
         elif event_type is None and value is None and event:
-            _add_observation(observations, seen, "raw_event", json.dumps(event, sort_keys=True), target, target_key, user_id, investigation_id, event)
+            _add_observation(observations, seen, "raw_event", json.dumps(safe_event, sort_keys=True), target, target_key, user_id, investigation_id, safe_event)
 
 
 def _extract_from_text(
@@ -173,7 +185,7 @@ def _normalize_event_type(event: dict) -> str | None:
 
 
 def _extract_event_value(event: dict) -> str | None:
-    for key in ("data", "value", "host", "url", "email", "ip", "name"):
+    for key in ("data", "value", "host", "url", "email", "ip", "name", "address", "resolved_host"):
         value = event.get(key)
         if isinstance(value, (str, int, float)):
             return str(value)
@@ -209,6 +221,8 @@ def _add_observation(
     cleaned_value = value.strip()
     if not cleaned_value:
         return
+    if _looks_sensitive(cleaned_value):
+        return
 
     key = ("bbot", observation_type, cleaned_value.lower(), target_key)
     if key in seen:
@@ -227,7 +241,7 @@ def _add_observation(
             "confidence": "medium",
             "risk_level": "info",
             "summary": _summary_for_observation(observation_type, cleaned_value),
-            "metadata": {"raw_event": raw_event} if raw_event is not None else {},
+            "metadata": {"raw_event": _sanitize_event(raw_event)} if raw_event is not None else {},
         }
     )
 
@@ -252,3 +266,29 @@ def _is_ip_address(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _sanitize_event(event: dict | None) -> dict | None:
+    if event is None:
+        return None
+    sanitized: dict[str, object] = {}
+    for key, value in event.items():
+        cleaned_key = str(key)
+        if cleaned_key.lower() in SENSITIVE_KEYS:
+            continue
+        if isinstance(value, dict):
+            nested = _sanitize_event(value)
+            if nested:
+                sanitized[cleaned_key] = nested
+        elif isinstance(value, list):
+            cleaned_values = [str(item)[:500] for item in value[:20] if not _looks_sensitive(str(item))]
+            if cleaned_values:
+                sanitized[cleaned_key] = cleaned_values
+        elif not _looks_sensitive(str(value)):
+            sanitized[cleaned_key] = str(value)[:500]
+    return sanitized
+
+
+def _looks_sensitive(value: str) -> bool:
+    lowered = str(value or "").lower()
+    return any(marker in lowered for marker in ("api_key=", "apikey=", "authorization:", "bearer ", "set-cookie:", "password=", "secret="))

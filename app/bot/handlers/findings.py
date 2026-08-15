@@ -26,9 +26,9 @@ def build_findings_text(findings: list[dict] | None = None) -> str:
             lines.extend(
                 [
                     "",
-                    section_label("nuclei", "Nuclei Fast Scan"),
+                    section_label("nuclei", "Nuclei Clean Scan"),
                     f"Target: {finding.get('target', 'unknown')}",
-                    "Result: Clean",
+                    "Result: No selected templates matched",
                     f"Findings: {finding.get('finding_count', 0)}",
                     f"Risk Level: {_format_risk_level(finding.get('risk_level'))}",
                 ]
@@ -74,16 +74,16 @@ def build_finding_detail_text(finding: dict | None, display_number: int | None =
         return _truncate_message(
             "\n".join(
                 [
-                    section_label("nuclei", "Nuclei Fast Scan"),
+                    section_label("nuclei", "Nuclei Clean Scan"),
                     "",
                     f"Target: {finding.get('target', 'unknown')}",
-                    "Result: Clean",
+                    "Result: No selected templates matched",
                     f"Findings: {finding.get('finding_count', 0)}",
                     f"Risk Level: {_format_risk_level(finding.get('risk_level'))}",
                     f"Created At: {finding.get('created_at', 'unknown')}",
                     "",
                     "Summary:",
-                    str(finding.get("summary", "No matching Nuclei findings were identified using the fast scan profile.")),
+                    _format_clean_nuclei_summary(finding),
                 ]
             )
         )
@@ -200,6 +200,8 @@ def build_finding_followup_ai_prompt(context: dict, question: str) -> str:
         "- Never invent services.",
         "- Never invent CVEs.",
         "- Never invent vulnerabilities.",
+        "- Never claim Nuclei assessed compromise.",
+        "- Never imply a clean Nuclei result means the target is safe, secure, or free of vulnerabilities.",
         "- Base answers only on stored finding plus user question.",
         "- If information is unknown, explicitly say so.",
         "- Keep the answer concise and practical.",
@@ -282,7 +284,7 @@ def _source_with_icon(source: object) -> str:
 
 def _summarize_finding_for_context(finding: dict) -> str:
     if _is_clean_nuclei_scan(finding):
-        return str(finding.get("summary") or "No matching Nuclei findings were identified using the fast scan profile.")
+        return _format_clean_nuclei_summary(finding)
 
     if finding.get("source") == "nuclei":
         return (
@@ -316,6 +318,9 @@ def _prompt_guardrails() -> list[str]:
         "- Do not invent services.",
         "- Do not invent CVEs.",
         "- Do not invent vulnerabilities.",
+        "- Do not claim compromise.",
+        "- Do not claim the target is safe or secure.",
+        "- Preserve scanner-reported severity exactly.",
         "- Do not reassign services to ports.",
         "- Accuracy is more important than completeness.",
         "- Keep output concise.",
@@ -385,7 +390,7 @@ def _build_nuclei_ai_prompt(finding: dict) -> str:
 def _build_clean_nuclei_ai_prompt(finding: dict) -> str:
     return "\n".join(
         [
-            "Explain this stored clean Nuclei fast scan result in plain English.",
+            "Explain this stored clean Nuclei result in plain English.",
             *_prompt_guardrails(),
             "",
             "Use these sections:",
@@ -399,9 +404,17 @@ def _build_clean_nuclei_ai_prompt(finding: dict) -> str:
             "Status: clean",
             "Risk level: INFO",
             "Finding count: 0",
-            f"Summary: {finding.get('summary', 'No matching Nuclei findings were identified using the fast scan profile.')}",
+            f"Summary: {_format_clean_nuclei_summary(finding)}",
         ]
     )
+
+
+def _format_clean_nuclei_summary(finding: dict) -> str:
+    summary = str(finding.get("summary") or "No matching Nuclei findings were observed using the selected template/profile.")
+    metadata = finding.get("metadata") or {}
+    if "fast scan profile" in summary.lower() and not (metadata.get("scan_profile") or metadata.get("profile")):
+        return "No matching Nuclei findings were observed using the selected template/profile."
+    return summary
 
 
 def _format_port_for_prompt(open_port: dict) -> str:

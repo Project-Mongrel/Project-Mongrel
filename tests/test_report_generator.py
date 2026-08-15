@@ -83,9 +83,9 @@ def test_report_generation_from_nuclei_findings() -> None:
 
     assert "- Nuclei" in report
     assert "- Highest Risk: HIGH" in report
-    assert "Nuclei identified 1 finding(s)" in report
-    assert "Exposed Git Repository (HIGH) - git-config-exposure" in report
-    assert "- Patch or reconfigure affected services identified by Nuclei." in report
+    assert "Nuclei reported 1 scanner finding(s)" in report
+    assert "Exposed Git Repository (scanner severity: HIGH) - template=git-config-exposure" in report
+    assert "- Manually validate matched Nuclei findings before remediation planning." in report
 
 
 def test_report_generation_from_bbot_uses_reconnaissance_wording() -> None:
@@ -106,6 +106,79 @@ def test_report_generation_from_bbot_uses_reconnaissance_wording() -> None:
     assert "BBOT finding for example.com" not in report
 
 
+def test_report_generation_preserves_nuclei_info_severity() -> None:
+    add_finding(
+        user_id=9022,
+        finding={
+            "source": "nuclei",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "severity_summary": {"info": 1},
+            "nuclei_findings": [
+                {
+                    "template_id": "graphql-detect",
+                    "severity": "info",
+                    "name": "GraphQL Endpoint Detection",
+                    "host": "https://example.com/graphql",
+                }
+            ],
+        },
+    )
+
+    report = generate_markdown_report(user_id=9022, target="https://example.com")
+
+    assert "GraphQL Endpoint Detection (scanner severity: INFO) - template=graphql-detect" in report
+    assert "scanner severity: LOW" not in report
+    assert "low and info" not in report.lower()
+
+
+def test_report_generation_from_httpx_uses_response_observation_wording() -> None:
+    add_finding(
+        user_id=9024,
+        finding={
+            "source": "httpx",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "httpx_services": [
+                {
+                    "url": "https://example.com",
+                    "status_code": 200,
+                    "title": "Example",
+                    "web_server": "nginx",
+                    "technologies": ["nginx"],
+                }
+            ],
+        },
+    )
+
+    report = generate_markdown_report(user_id=9024, target="https://example.com")
+
+    assert "httpx reported 1 HTTP response/URL observation(s)" in report
+    assert "status=200 title=Example server=nginx technologies=nginx" in report
+    assert "httpx finding for https://example.com" not in report
+    assert "not proof of vulnerability, compromise, application health, or full service availability" in report
+
+
+def test_report_generation_from_empty_httpx_preserves_uncertainty() -> None:
+    add_finding(
+        user_id=9025,
+        finding={
+            "source": "httpx",
+            "target": "https://example.com",
+            "risk_level": "info",
+            "finding_count": 1,
+            "httpx_services": [],
+        },
+    )
+
+    report = generate_markdown_report(user_id=9025, target="https://example.com")
+
+    assert "httpx recorded no usable structured response observations" in report
+    assert "No conclusion about host availability, web application existence, vulnerabilities, or security posture" in report
+
+
 def test_report_generation_with_clean_nuclei_scan() -> None:
     add_finding(
         user_id=9003,
@@ -115,7 +188,7 @@ def test_report_generation_with_clean_nuclei_scan() -> None:
             "risk_level": "info",
             "finding_count": 0,
             "status": "clean",
-            "summary": "No matching Nuclei findings were identified using the fast scan profile.",
+            "summary": "No matching Nuclei findings were observed using the selected template/profile.",
         },
     )
 
@@ -124,8 +197,27 @@ def test_report_generation_with_clean_nuclei_scan() -> None:
     assert "Clean scan results recorded: 1." in report
     assert "## Clean Scan Notes" in report
     assert "Nuclei clean result for hellosundaykids.com" in report
-    assert "No matching Nuclei findings were identified using the fast scan profile." in report
+    assert "No matching Nuclei findings were observed using the selected template/profile." in report
     assert "- Treat clean scans as point-in-time evidence, not proof that no vulnerabilities exist." in report
+
+
+def test_report_sanitizes_legacy_clean_nuclei_fast_profile_without_metadata() -> None:
+    add_finding(
+        user_id=9023,
+        finding={
+            "source": "nuclei",
+            "target": "legacy.example",
+            "risk_level": "info",
+            "finding_count": 0,
+            "status": "clean",
+            "summary": "No matching Nuclei findings were identified using the fast scan profile.",
+        },
+    )
+
+    report = generate_markdown_report(user_id=9023, target="legacy.example")
+
+    assert "No matching Nuclei findings were observed using the selected template/profile." in report
+    assert "fast scan profile" not in report
 
 
 def test_report_generation_with_mixed_scan_history() -> None:
@@ -334,17 +426,17 @@ def test_repeated_clean_nuclei_scans_are_deduplicated() -> None:
         "risk_level": "info",
         "finding_count": 0,
         "status": "clean",
-        "summary": "No matching Nuclei findings were identified using the fast scan profile.",
+        "summary": "No matching Nuclei findings were observed using the selected template/profile.",
     }
     add_finding(user_id=9015, finding=clean_finding)
     add_finding(user_id=9015, finding=clean_finding)
 
     report = generate_markdown_report(user_id=9015, target="example.com")
 
-    assert "Two consecutive Nuclei Fast Scans completed with no findings." in report
+    assert "Two consecutive Nuclei scans completed with no matching findings." in report
     assert "Latest:" in report
     assert "Previous:" in report
-    assert report.count("No matching Nuclei findings were identified using the fast scan profile.") < 3
+    assert report.count("No matching Nuclei findings were observed using the selected template/profile.") < 3
 
 
 def test_report_appendix_groups_history_by_tool() -> None:

@@ -243,7 +243,7 @@ def _format_finding(finding: dict) -> list[str]:
         )
     httpx_services = finding.get("httpx_services") or []
     if httpx_services:
-        lines.append("    httpx services:")
+        lines.append("    httpx response observations:")
         for service in httpx_services[:20]:
             parts = [
                 f"url={_clean(service.get('url') or service.get('host') or 'unknown')}",

@@ -70,7 +70,20 @@ python -m pip install -r requirements.txt
 python -m pip check
 ```
 
-BBOT scan execution should run as an external tool in a Linux-compatible runtime such as Linux, Kali, or WSL. Install the BBOT CLI outside the Mongrel app virtual environment, for example in a tool-specific environment or system tool path, and point Mongrel at that executable. Windows development remains supported, but BBOT scan modes that import Linux-only modules may not run directly in native Windows Python.
+BBOT scan execution should run as an external tool in a Linux-compatible runtime such as Linux, Kali, or WSL. Install the BBOT CLI outside the Mongrel app virtual environment, for example with `pipx install bbot` or in a tool-specific environment, and set `BBOT_BINARY` if it is not on `PATH`.
+
+Recommended VPS model:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip check
+pipx install bbot
+export BBOT_BINARY="$HOME/.local/bin/bbot"
+```
+
+Mongrel passes only validated BBOT presets/modules/config values. Do not put BBOT, Semgrep, or their conflicting Python dependency trees into the Mongrel app venv.
+
+Windows development remains supported, but BBOT scan modes that import Linux-only modules may not run directly in native Windows Python.
 
 ## Verification
 

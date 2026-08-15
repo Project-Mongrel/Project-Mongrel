@@ -3024,15 +3024,25 @@ def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     card = build_httpx_result_text(result, services)
 
     assert "httpx Scan Complete" in card
-    assert "HTTP services/URLs observed: 2" in card
+    assert "HTTP response/URL observations: 2" in card
     assert "Status codes: 200: 1, 301: 1" in card
     assert "Titles: https://example.com: Example" in card
     assert "Technologies: nginx, React" in card
     assert "Content types: text/html" in card
     assert "Metadata: IPs: 1, CDN observations: 1, CNAME observations: 1, TLS/certificate metadata: 1" in card
     assert "Redirects: https://example.com -> https://www.example.com" in card
-    assert "not vulnerability findings" in card
+    assert "not vulnerability, compromise, or availability conclusions" in card
     assert '{"url":"raw"}' not in card
+
+
+def test_httpx_result_card_no_usable_response_preserves_uncertainty() -> None:
+    result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": ""}
+
+    card = build_httpx_result_text(result, [])
+
+    assert "HTTP response/URL observations: 0" in card
+    assert "No usable structured httpx response observations were stored for this run" in card
+    assert "does not prove the host is down, no web application exists, or the target is safe" in card
 
 
 def test_httpx_scan_starts_timer_stops_on_success_and_renders_result() -> None:
@@ -4446,8 +4456,9 @@ def test_nuclei_scan_no_findings_output() -> None:
     assert "Risk\nINFO" in verdict_text
     assert "Findings\n- 0 findings" in verdict_text
     assert "No matching Nuclei findings were observed using the selected template/profile." in verdict_text
-    assert "- The target was reachable." in verdict_text
-    assert "- Nuclei executed successfully." in verdict_text
+    assert "- Nuclei execution completed." in verdict_text
+    assert "- No selected templates matched." in verdict_text
+    assert "- This does not prove the target is secure or free of vulnerabilities." in verdict_text
     assert "- Continue regular patching and monitoring." in verdict_text
     keyboard = message.reply_text.call_args_list[1].kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].text == "AI Summary"
@@ -4460,7 +4471,7 @@ def test_nuclei_scan_no_findings_output() -> None:
     assert clean_record["status"] == "clean"
     assert clean_record["risk_level"] == "info"
     assert clean_record["finding_count"] == 0
-    assert clean_record["summary"] == "No matching Nuclei findings were identified using the fast scan profile."
+    assert clean_record["summary"] == "No matching Nuclei findings were observed using the selected template/profile."
 
 
 def test_nuclei_ai_assessment_failure_does_not_fail_scan() -> None:
@@ -4511,9 +4522,9 @@ def test_clean_nuclei_scan_record_appears_in_findings_view() -> None:
 
     findings_text = build_findings_text([finding])
 
-    assert "Nuclei Fast Scan" in findings_text
+    assert "Nuclei Clean Scan" in findings_text
     assert "Target: hellosundaykids.com" in findings_text
-    assert "Result: Clean" in findings_text
+    assert "Result: No selected templates matched" in findings_text
     assert "Findings: 0" in findings_text
     assert "Risk Level: INFO" in findings_text
 
@@ -4523,11 +4534,27 @@ def test_clean_nuclei_scan_detail_view() -> None:
 
     detail_text = build_finding_detail_text(finding)
 
-    assert "Nuclei Fast Scan" in detail_text
-    assert "Result: Clean" in detail_text
+    assert "Nuclei Clean Scan" in detail_text
+    assert "Result: No selected templates matched" in detail_text
     assert "Findings: 0" in detail_text
     assert "Risk Level: INFO" in detail_text
-    assert "No matching Nuclei findings were identified using the fast scan profile." in detail_text
+    assert "No matching Nuclei findings were observed using the selected template/profile." in detail_text
+
+
+def test_clean_nuclei_detail_sanitizes_legacy_fast_profile_without_metadata() -> None:
+    detail_text = build_finding_detail_text(
+        {
+            "source": "nuclei",
+            "target": "hellosundaykids.com",
+            "status": "clean",
+            "risk_level": "info",
+            "finding_count": 0,
+            "summary": "No matching Nuclei findings were identified using the fast scan profile.",
+        }
+    )
+
+    assert "selected template/profile" in detail_text
+    assert "fast scan profile" not in detail_text
 
 
 def test_nuclei_scan_runner_failure_message() -> None:
@@ -5071,12 +5098,12 @@ def test_clean_nuclei_ai_prompt_includes_clean_scan_context() -> None:
             "status": "clean",
             "risk_level": "info",
             "finding_count": 0,
-            "summary": "No matching Nuclei findings were identified using the fast scan profile.",
+            "summary": "No matching Nuclei findings were observed using the selected template/profile.",
         }
     )
 
     assert prompt is not None
-    assert "clean Nuclei fast scan" in prompt
+    assert "clean Nuclei result" in prompt
     assert "Status: clean" in prompt
     assert "Finding count: 0" in prompt
     assert "What it does not prove" in prompt
@@ -6792,6 +6819,24 @@ def test_nuclei_medium_only_scores_medium() -> None:
 
     assert finding["risk_level"] == "medium"
     assert "Risk\nMEDIUM" in build_nuclei_import_success_text(finding)
+
+
+def test_nuclei_info_only_scores_info_and_preserves_severity() -> None:
+    finding = store_nuclei_finding(
+        5023,
+        [
+            {"template_id": "tech-one", "severity": "info", "name": "Technology Detection", "host": "https://example.com"},
+            {"template_id": "graphql-detect", "severity": "info", "name": "GraphQL Endpoint Detection", "host": "https://example.com/graphql"},
+        ],
+    )
+
+    report = build_nuclei_import_success_text(finding)
+
+    assert finding["risk_level"] == "info"
+    assert "Risk\nINFO" in report
+    assert "Info: 2" in report
+    assert "Low: 0" in report
+    assert "low and info" not in report.lower()
 
 
 def test_malformed_nuclei_upload_handling() -> None:

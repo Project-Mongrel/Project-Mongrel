@@ -210,6 +210,7 @@ def build_httpx_target_prompt() -> str:
             "",
             "Bounded web-service probing covers configured ports/schemes, redirects, TLS/certificate, IP/CDN/CNAME, timing, and technology metadata.",
             "No response bodies, cookies, auth headers, credentials, or secrets are collected for Telegram output.",
+            "Responses, redirects, headers, TLS metadata, and technology fingerprints are observations only, not vulnerability or availability conclusions.",
             "",
             "Examples:",
             "https://example.com",
@@ -610,9 +611,9 @@ def build_clean_nuclei_verdict_text(target: str | None, elapsed: str | None = No
         ),
         findings=[
             "0 findings",
-            "The target was reachable.",
-            "Nuclei executed successfully.",
-            "No exposures, misconfigurations, or known issues matched the selected template set.",
+            "Nuclei execution completed.",
+            "No selected templates matched.",
+            "This does not prove the target is secure or free of vulnerabilities.",
         ],
         assets=[str(target)] if target else None,
         ai_assessment=None,
@@ -822,7 +823,7 @@ def build_httpx_result_text(result: dict[str, object], services: list[dict] | No
     if result.get("success") is not True:
         limitations.append(str(result.get("error") or "httpx did not complete successfully."))
     if not services:
-        limitations.append("No structured httpx JSON observations were stored.")
+        limitations.append("No usable structured httpx response observations were stored for this run; this does not prove the host is down, no web application exists, or the target is safe.")
     status_codes = summary.get("status_codes") or {}
     titles = [
         f"{service.get('url') or service.get('host')}: {service.get('title')}"
@@ -837,7 +838,7 @@ def build_httpx_result_text(result: dict[str, object], services: list[dict] | No
         if service.get("redirect_location") or service.get("final_url")
     ]
     findings = [
-        f"HTTP services/URLs observed: {summary.get('service_count', 0)}",
+        f"HTTP response/URL observations: {summary.get('service_count', 0)}",
         "Status codes: " + (", ".join(f"{code}: {count}" for code, count in sorted(status_codes.items())) if status_codes else "none"),
     ]
     if titles:
@@ -867,8 +868,8 @@ def build_httpx_result_text(result: dict[str, object], services: list[dict] | No
         elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
         risk="INFO" if result.get("success") is True else None,
         summary=(
-            f"{summary.get('service_count', 0)} HTTP service/URL observation(s) recorded. "
-            "HTTP status, CDN/challenge, and technology metadata are observations only, not vulnerability findings."
+            f"{summary.get('service_count', 0)} HTTP response/URL observation(s) recorded. "
+            "HTTP status, redirects, headers, CDN/challenge, TLS, and technology metadata are observations only, not vulnerability, compromise, or availability conclusions."
         ),
         findings=findings,
         assets=[str(service.get("url") or service.get("host")) for service in services if service.get("url") or service.get("host")],
@@ -880,7 +881,7 @@ def store_httpx_scan_result(user_id: int, result: dict[str, object], services: l
     status = "completed" if result.get("success") is True else "failed"
     summary = summarize_httpx_services(services)
     if result.get("success") is True:
-        finding_summary = f"httpx observed {len(services)} HTTP service/URL record(s)."
+        finding_summary = f"httpx observed {len(services)} HTTP response/URL record(s)."
     else:
         finding_summary = str(result.get("error") or "httpx fingerprinting failed.")
     target = str(result.get("target") or "")
@@ -1771,7 +1772,7 @@ def store_bbot_scan_result(user_id: int, result: dict[str, object], observations
 
 
 def store_clean_nuclei_scan(user_id: int, target: str | None) -> dict:
-    summary = "No matching Nuclei findings were identified using the fast scan profile."
+    summary = "No matching Nuclei findings were observed using the selected template/profile."
     return add_finding(
         user_id=user_id,
         finding={

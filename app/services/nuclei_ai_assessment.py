@@ -1,3 +1,5 @@
+import re
+
 from app.services.ai_client import ask_ai
 
 AI_UNAVAILABLE_MESSAGES = (
@@ -16,12 +18,52 @@ FALLBACK_LINES = [
     "Nuclei AI assessment unavailable.",
     "Use the deterministic Nuclei result for observed findings and next actions.",
 ]
+TRUTHFULNESS_FALLBACK_LINES = [
+    "Executive Summary",
+    "- The Nuclei AI assessment was withheld because the generated response contained an unsupported security conclusion.",
+    "",
+    "Observed Findings",
+    "- Use the deterministic Nuclei result for scanner-reported template matches and severities.",
+    "",
+    "Interpretation",
+    "- Nuclei template matches are evidence of scanner observations; they do not automatically prove compromise, exploitability, or confirmed vulnerability.",
+    "",
+    "Limitations",
+    "- Empty or clean Nuclei output means no selected templates matched; it does not prove target security or absence of vulnerabilities.",
+    "",
+    "Recommended Next Actions",
+    "- Manually validate relevant findings and preserve the original scanner severity when prioritizing follow-up.",
+]
 
 CLEAN_SCAN_LIMITATION = (
     "The assessment is limited to the templates that were executed and should not be interpreted as confirmation "
     "that the target is free of vulnerabilities."
 )
 CLEAN_SCAN_FACT = "No matching Nuclei findings were observed using the selected template/profile."
+EVIDENCE_SCOPED_MARKERS = (
+    "does not establish",
+    "does not prove",
+    "should not be interpreted as",
+    "did not assess",
+    "does not assess",
+    "not evidence of",
+    "insufficient evidence",
+    "cannot determine",
+    "no selected templates matched",
+    "no matching nuclei findings",
+    "scanner did not report",
+    "nuclei did not report",
+)
+UNSUPPORTED_NUCLEI_CLAIM_PATTERNS = (
+    re.compile(r"\b(?:target|site|system|application|app|host)\b[^.!?]{0,80}\b(?:is|are|was|were|appears|seems|looks)\s+(?:safe|secure|clean)\b"),
+    re.compile(r"\bno\s+(?:exploitable\s+)?vulnerabilities\s+(?:exist|were\s+found|were\s+detected|detected|found)\b"),
+    re.compile(r"\b(?:free\s+of|without)\s+vulnerabilities\b"),
+    re.compile(r"\bnot\s+indicative\s+of\s+(?:a\s+)?compromised\s+system\b"),
+    re.compile(r"\b(?:no\s+)?compromise\s+(?:was\s+)?(?:detected|observed|identified|found)\b"),
+    re.compile(r"\b(?:graphql|alias\s+batching|batching)\b[^.!?]{0,100}\b(?:exploitable|confirmed\s+vulnerab|can\s+be\s+exploited)\b"),
+    re.compile(r"\b(?:missing|deprecated)\s+(?:security\s+)?headers?\b[^.!?]{0,100}\b(?:confirmed\s+vulnerab|required\s+by\s+browsers?)\b"),
+    re.compile(r"\bx-xss-protection\b[^.!?]{0,100}\b(?:proves?|enables?|causes?|directly\s+enables?)\s+xss\b"),
+)
 
 
 def generate_nuclei_ai_assessment(finding: dict) -> list[str]:
@@ -36,7 +78,8 @@ def generate_nuclei_ai_assessment(finding: dict) -> list[str]:
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
     lines = lines or list(FALLBACK_LINES)
-    return _guard_partial_timeout_response(finding, lines)
+    lines = _guard_partial_timeout_response(finding, lines)
+    return _guard_truthfulness_response(finding, lines)
 
 
 def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
@@ -61,9 +104,15 @@ def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
             "- Do not invent vulnerabilities.",
             "- Do not invent assets, URLs, technologies, CVEs, templates, or findings.",
             "- Do not claim compromise.",
+            "- Never claim or imply findings are not indicative of a compromised system; Nuclei did not assess compromise.",
             "- Do not recommend exploitation.",
             "- Do not claim the target is safe or secure.",
             "- Do not say a finding is confirmed vulnerable unless the supplied evidence explicitly supports it.",
+            "- Preserve scanner-reported severity exactly; do not upgrade, downgrade, or summarize severities that are not present.",
+            "- Do not invent scan-profile labels unless execution metadata explicitly supplies them.",
+            "- Missing security headers are contextual configuration observations, not automatically confirmed vulnerabilities or universally required by browsers.",
+            "- A deprecated X-XSS-Protection header does not prove or directly enable XSS.",
+            "- GraphQL alias batching or similar template findings must preserve the scanner's actual meaning and must not automatically become exploitable vulnerability claims.",
             "- Separate observed facts from potential risks and recommendations.",
             *clean_scan_rules,
             "- If the scan is partial or timed out, state that the assessment did not complete.",
@@ -77,9 +126,12 @@ def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
             "",
             "Required sections:",
             "Executive Summary",
+            "Observed Findings",
             "Observed Facts",
             "Observed Assets",
+            "Interpretation",
             "Potential Risks",
+            "Limitations",
             "Confidence",
             "Recommended Next Actions",
             "",
@@ -232,6 +284,51 @@ def _contradicts_partial_findings(line: str) -> bool:
         "zero matches",
     )
     return any(phrase in lowered for phrase in contradictory_phrases)
+
+
+def _guard_truthfulness_response(finding: dict, lines: list[str]) -> list[str]:
+    if _contains_unsupported_nuclei_claim(finding, lines):
+        return list(TRUTHFULNESS_FALLBACK_LINES)
+    return lines
+
+
+def _contains_unsupported_nuclei_claim(finding: dict, lines: list[str]) -> bool:
+    sentences = _claim_sentences(lines)
+    all_info = _all_recorded_severities_are_info(finding)
+    profile_supplied = bool((finding.get("metadata") or {}).get("scan_profile") or (finding.get("metadata") or {}).get("profile"))
+    for sentence in sentences:
+        if _is_evidence_scoped_statement(sentence):
+            continue
+        if all_info and re.search(r"\blow\s+and\s+info(?:rmational)?\b|\blow\s+and\s+informational\b", sentence):
+            return True
+        if not profile_supplied and re.search(r"\bfast\s+(?:scan|profile)\b", sentence):
+            return True
+        if any(pattern.search(sentence) for pattern in UNSUPPORTED_NUCLEI_CLAIM_PATTERNS):
+            return True
+    return False
+
+
+def _claim_sentences(lines: list[str]) -> list[str]:
+    text = " ".join(str(line or "").strip() for line in lines)
+    return [
+        re.sub(r"\s+", " ", sentence).strip().lower()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+
+
+def _is_evidence_scoped_statement(sentence: str) -> bool:
+    return any(marker in sentence for marker in EVIDENCE_SCOPED_MARKERS)
+
+
+def _all_recorded_severities_are_info(finding: dict) -> bool:
+    nuclei_findings = finding.get("nuclei_findings") or []
+    severities = [str(item.get("severity") or "info").lower() for item in nuclei_findings]
+    severity_summary = finding.get("severity_summary") or {}
+    for severity, count in severity_summary.items():
+        if int(count or 0) > 0:
+            severities.append(str(severity or "info").lower())
+    return bool(severities) and set(severities) <= {"info", "informational"}
 
 
 def _is_unavailable_response(response: object) -> bool:
