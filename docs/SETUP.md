@@ -85,6 +85,18 @@ Mongrel passes only validated BBOT presets/modules/config values. Do not put BBO
 
 Windows development remains supported, but BBOT scan modes that import Linux-only modules may not run directly in native Windows Python.
 
+## ffuf Wordlist
+
+Mongrel ships `app/resources/wordlists/ffuf_default.txt` as the Quick profile wordlist. It is a small smoke-test/minimal fallback list. For competition or production deployments, configure vetted external wordlists that fit the authorized scope and timeout budget:
+
+- `FFUF_WORDLIST_STANDARD_PATH`: medium normal-assessment list, approximately 2,000-5,000 entries.
+- `FFUF_WORDLIST_DEEP_PATH`: broader list, approximately 20,000 entries.
+- `FFUF_WORDLIST_PATH`: custom profile path, preserving the existing override behavior.
+
+Example SecLists candidates include `Discovery/Web-Content/directory-list-2.3-small.txt` for Standard and a bounded raft/directory list for Deep.
+
+Do not rely on the bundled fallback for meaningful hidden-content discovery.
+
 ## Verification
 
 Run:

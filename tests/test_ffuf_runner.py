@@ -9,11 +9,15 @@ from app.parsers.ffuf_parser import parse_ffuf_output, summarize_ffuf_results
 from app.tools.ffuf_runner import (
     DEFAULT_FFUF_WORDLIST,
     FFUF_MATCH_STATUS_CODES,
+    FFUF_PROFILE_DEEP,
+    FFUF_PROFILE_QUICK,
+    FFUF_PROFILE_STANDARD,
     _build_ffuf_command,
     _build_fuzz_url,
     _count_wordlist_entries,
     _normalize_ffuf_extensions,
     _resolve_ffuf_executable,
+    resolve_ffuf_profile_wordlist,
     run_ffuf_scan,
 )
 
@@ -51,6 +55,7 @@ def test_ffuf_runner_success_uses_safe_subprocess_args(tmp_path: Path) -> None:
     assert result["output"] == output
     assert result["wordlist_count"] == 2
     assert result["fuzz_url"] == "https://example.com/FUZZ"
+    assert result["ffuf_profile"] == "custom"
     assert expected_command[expected_command.index("-mc") + 1] == FFUF_MATCH_STATUS_CODES
 
 
@@ -83,6 +88,84 @@ def test_ffuf_missing_wordlist_is_clean_failure(tmp_path: Path) -> None:
 
     assert result["success"] is False
     assert result["error_type"] == "missing_wordlist"
+    run_mock.assert_not_called()
+
+
+def test_ffuf_quick_profile_uses_bundled_wordlist() -> None:
+    info = resolve_ffuf_profile_wordlist(FFUF_PROFILE_QUICK, settings=Settings(_env_file=None))
+
+    assert info["available"] is True
+    assert info["profile"] == FFUF_PROFILE_QUICK
+    assert info["wordlist_path"] == DEFAULT_FFUF_WORDLIST
+    assert info["wordlist_count"] == 19
+
+
+def test_ffuf_standard_profile_uses_configured_standard_wordlist(tmp_path: Path) -> None:
+    wordlist = tmp_path / "standard.txt"
+    wordlist.write_text("admin\napi\nlogin\n", encoding="utf-8")
+    settings = Settings(_env_file=None, ffuf_wordlist_standard_path=wordlist)
+    output = '{"results":[]}'
+
+    with (
+        patch("app.tools.ffuf_runner.get_settings", return_value=settings),
+        patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
+        patch("app.tools.ffuf_runner.subprocess.run", return_value=_completed(stdout=output)) as run_mock,
+    ):
+        result = run_ffuf_scan("example.com", FFUF_PROFILE_STANDARD)
+
+    command = run_mock.call_args.args[0]
+    assert command[command.index("-w") + 1] == str(wordlist)
+    assert result["success"] is True
+    assert result["ffuf_profile"] == FFUF_PROFILE_STANDARD
+    assert result["wordlist_count"] == 3
+
+
+def test_ffuf_deep_profile_uses_configured_deep_wordlist(tmp_path: Path) -> None:
+    wordlist = tmp_path / "deep.txt"
+    wordlist.write_text("admin\nbackup\nportal\napi\n", encoding="utf-8")
+    settings = Settings(_env_file=None, ffuf_wordlist_deep_path=wordlist)
+
+    with (
+        patch("app.tools.ffuf_runner.get_settings", return_value=settings),
+        patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
+        patch("app.tools.ffuf_runner.subprocess.run", return_value=_completed(stdout='{"results":[]}')) as run_mock,
+    ):
+        result = run_ffuf_scan("example.com", FFUF_PROFILE_DEEP)
+
+    command = run_mock.call_args.args[0]
+    assert command[command.index("-w") + 1] == str(wordlist)
+    assert result["success"] is True
+    assert result["ffuf_profile"] == FFUF_PROFILE_DEEP
+    assert result["wordlist_count"] == 4
+
+
+def test_ffuf_standard_profile_missing_wordlist_fails_cleanly(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-standard.txt"
+    with (
+        patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_standard_path=missing)),
+        patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
+        patch("app.tools.ffuf_runner.subprocess.run") as run_mock,
+    ):
+        result = run_ffuf_scan("https://example.com", FFUF_PROFILE_STANDARD)
+
+    assert result["success"] is False
+    assert result["error_type"] == "missing_wordlist"
+    assert "Standard profile" in str(result["error"])
+    run_mock.assert_not_called()
+
+
+def test_ffuf_deep_profile_missing_wordlist_fails_cleanly(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-deep.txt"
+    with (
+        patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_deep_path=missing)),
+        patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
+        patch("app.tools.ffuf_runner.subprocess.run") as run_mock,
+    ):
+        result = run_ffuf_scan("https://example.com", FFUF_PROFILE_DEEP)
+
+    assert result["success"] is False
+    assert result["error_type"] == "missing_wordlist"
+    assert "Deep profile" in str(result["error"])
     run_mock.assert_not_called()
 
 
@@ -152,6 +235,23 @@ def test_ffuf_fuzz_url_preserves_base_path_without_query_unless_fuzz_is_explicit
     assert _build_fuzz_url("https://example.com/app?x=1") == "https://example.com/app/FUZZ"
     assert _build_fuzz_url("https://example.com/api/FUZZ") == "https://example.com/api/FUZZ"
     assert _build_fuzz_url("https://example.com/search?q=FUZZ") == "https://example.com/search?q=FUZZ"
+
+
+def test_ffuf_profile_selection_does_not_change_fuzz_placement(tmp_path: Path) -> None:
+    wordlist = tmp_path / "standard.txt"
+    wordlist.write_text("admin\n", encoding="utf-8")
+    settings = Settings(_env_file=None, ffuf_wordlist_standard_path=wordlist)
+
+    with (
+        patch("app.tools.ffuf_runner.get_settings", return_value=settings),
+        patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
+        patch("app.tools.ffuf_runner.subprocess.run", return_value=_completed(stdout='{"results":[]}')) as run_mock,
+    ):
+        result = run_ffuf_scan("https://example.com/search?q=FUZZ", FFUF_PROFILE_STANDARD)
+
+    command = run_mock.call_args.args[0]
+    assert command[command.index("-u") + 1] == "https://example.com/search?q=FUZZ"
+    assert result["fuzz_url"] == "https://example.com/search?q=FUZZ"
 
 
 def test_ffuf_command_supports_safe_configured_extensions(tmp_path: Path) -> None:

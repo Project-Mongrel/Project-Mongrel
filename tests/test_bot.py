@@ -53,6 +53,7 @@ from app.bot.handlers.scan import (
     NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS,
     PENDING_NMAP_REQUEST_KEY,
     _finalize_nuclei_status,
+    _ffuf_scan_profiles,
     _metasploit_pending_context,
     _scan_recovery_tokens,
     _send_metasploit_ai_assessment,
@@ -61,6 +62,8 @@ from app.bot.handlers.scan import (
     build_bbot_ai_assessment_keyboard,
     build_bbot_result_text,
     build_bbot_target_prompt,
+    build_ffuf_profile_keyboard,
+    build_ffuf_profile_text,
     build_ffuf_result_text,
     build_ffuf_target_prompt,
     build_gitleaks_target_prompt,
@@ -219,7 +222,8 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "authorized target" in build_nmap_target_prompt()
     assert "JavaScript endpoint discovery" in build_katana_target_prompt()
     assert "No clicks, form submissions, credential entry" in build_playwright_target_prompt()
-    assert "ffuf discovery request created" in build_ffuf_target_prompt()
+    assert "Choose an ffuf discovery profile" in build_ffuf_profile_text()
+    assert "ffuf Custom discovery request created" in build_ffuf_target_prompt()
     assert "https://example.com/search?q=FUZZ" in build_ffuf_target_prompt()
     assert "Nmap XML" in build_upload_text()
     assert "- Nuclei JSON (supported)" in build_upload_text()
@@ -1864,7 +1868,7 @@ def test_playwright_scan_callback_prompts_for_target() -> None:
     assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
 
 
-def test_ffuf_scan_callback_prompts_for_target() -> None:
+def test_ffuf_scan_callback_prompts_for_profile_selection() -> None:
     clear_user_scan_requests(7209)
     query = SimpleNamespace(data="scan:ffuf", answer=AsyncMock(), edit_message_text=AsyncMock())
     update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7209))
@@ -1872,8 +1876,109 @@ def test_ffuf_scan_callback_prompts_for_target() -> None:
 
     asyncio.run(scan_callback_handler(update, context))
 
-    assert query.edit_message_text.call_args.args[0] == build_ffuf_target_prompt()
-    assert isinstance(context.user_data[PENDING_NMAP_REQUEST_KEY], str)
+    assert query.edit_message_text.call_args.args[0] == build_ffuf_profile_text()
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert [button.text for row in keyboard.inline_keyboard for button in row] == ["⚡ Quick", "Standard", "Deep", "⚙ Custom"]
+    assert PENDING_NMAP_REQUEST_KEY not in context.user_data
+
+
+def test_ffuf_profile_callback_prompts_for_target() -> None:
+    clear_user_scan_requests(7210)
+    _ffuf_scan_profiles.clear()
+    start_query = SimpleNamespace(data="scan:ffuf", answer=AsyncMock(), edit_message_text=AsyncMock())
+    context = SimpleNamespace(user_data={})
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=start_query, effective_user=SimpleNamespace(id=7210)), context))
+    scan_request_id = get_user_scan_requests(7210)[-1].id
+    profile_query = SimpleNamespace(data=f"ffufp:standard:{scan_request_id}", answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=profile_query, effective_user=SimpleNamespace(id=7210)), context))
+
+    assert profile_query.edit_message_text.call_args.args[0] == build_ffuf_target_prompt("standard")
+    assert context.user_data[PENDING_NMAP_REQUEST_KEY] == scan_request_id
+    assert _ffuf_scan_profiles[scan_request_id] == "standard"
+
+
+def test_ffuf_profile_selection_review_and_execution_context(tmp_path: Path) -> None:
+    user_id = 17212
+    clear_user_scan_requests(user_id)
+    clear_user_findings(user_id)
+    clear_user_investigations(user_id)
+    _ffuf_scan_profiles.clear()
+    _scan_recovery_tokens.clear()
+    wordlist = tmp_path / "standard.txt"
+    wordlist.write_text("admin\nlogin\n", encoding="utf-8")
+    scan_request = create_scan_request(user_id=user_id, scan_type="ffuf")
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+    _ffuf_scan_profiles[scan_request.id] = "standard"
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="https://example.com/api/FUZZ", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id))
+    result = {
+        "success": True,
+        "target": "https://example.com/api/FUZZ",
+        "output": '{"results":[{"url":"https://example.com/api/admin","status":200,"input":{"FUZZ":"admin"}}]}',
+        "error": "",
+        "returncode": 0,
+        "elapsed_seconds": 1,
+        "wordlist_count": 2,
+        "wordlist_path": str(wordlist),
+        "wordlist_source": "Configured Standard external wordlist",
+        "wordlist_configured_path": str(wordlist),
+        "ffuf_profile": "standard",
+        "ffuf_profile_label": "Standard",
+        "fuzz_url": "https://example.com/api/FUZZ",
+    }
+
+    with (
+        patch("app.bot.handlers.scan.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_standard_path=wordlist, ffuf_threads=7, ffuf_rate_limit=13, ffuf_scan_timeout_seconds=31)),
+        patch("app.bot.handlers.scan.run_ffuf_scan", return_value=result) as run_ffuf_scan,
+        patch("app.bot.handlers.scan.generate_ffuf_ai_assessment", return_value=["Executive Summary", "- ffuf observations were reviewed."]),
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    run_ffuf_scan.assert_called_once_with("https://example.com/api/FUZZ", "standard")
+    review_text = message.reply_text.call_args_list[0].args[0]
+    result_text = message.reply_text.call_args_list[2].args[0]
+    keyboard = message.reply_text.call_args_list[2].kwargs["reply_markup"]
+    assert "ffuf Discovery Review" in review_text
+    assert "Profile: Standard" in review_text
+    assert f"Path: {wordlist}" in review_text
+    assert "Approx entries: 2" in review_text
+    assert "FUZZ placement: https://example.com/api/FUZZ" in review_text
+    assert "Threads: 7" in review_text
+    assert "Rate limit: 13/s" in review_text
+    assert "Profile: Standard" in result_text
+    assert "Wordlist source: Configured Standard external wordlist" in result_text
+    assert any(button.text == "Re-run Scan" for row in keyboard.inline_keyboard for button in row)
+    recovery_tokens = [payload for payload in _scan_recovery_tokens.values() if payload.get("tool") == "ffuf"]
+    assert recovery_tokens[-1]["options"] == {"ffuf_profile": "standard"}
+    assert _ffuf_scan_profiles == {}
+
+
+def test_ffuf_missing_standard_profile_path_offers_profile_selection_again(tmp_path: Path) -> None:
+    user_id = 17214
+    clear_user_scan_requests(user_id)
+    _ffuf_scan_profiles.clear()
+    missing = tmp_path / "missing-standard.txt"
+    scan_request = create_scan_request(user_id=user_id, scan_type="ffuf")
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+    _ffuf_scan_profiles[scan_request.id] = "standard"
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock())
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id))
+
+    with (
+        patch("app.bot.handlers.scan.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_standard_path=missing)),
+        patch("app.bot.handlers.scan.run_ffuf_scan") as run_ffuf_scan,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    run_ffuf_scan.assert_not_called()
+    text = message.reply_text.call_args.args[0]
+    keyboard = message.reply_text.call_args.kwargs["reply_markup"]
+    assert "ffuf Standard profile wordlist is unavailable." in text
+    assert str(missing) in text
+    assert [button.text for row in keyboard.inline_keyboard for button in row] == ["⚡ Quick", "Standard", "Deep", "⚙ Custom"]
 
 
 def test_testssl_scan_callback_prompts_for_target() -> None:
@@ -1960,6 +2065,10 @@ def test_scan_callback_pattern_routes_scan_recovery_actions() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scanrx:rerun:shorttoken")
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scanrx:edit_target:shorttoken")
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "scanrx:edit_input:shorttoken")
+
+
+def test_scan_callback_pattern_routes_ffuf_profile_selection() -> None:
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "ffufp:quick:request-id")
 
 
 def test_scan_callback_pattern_routes_evidence_vault_actions() -> None:

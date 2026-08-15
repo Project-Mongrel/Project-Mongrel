@@ -114,7 +114,17 @@ from app.services.target_normalizer import normalize_for_bbot, normalize_for_ffu
 from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS, run_nmap_scan
 from app.tools.nuclei_runner import run_nuclei_scan
-from app.tools.ffuf_runner import run_ffuf_scan
+from app.tools.ffuf_runner import (
+    FFUF_PROFILE_CUSTOM,
+    FFUF_PROFILE_DEEP,
+    FFUF_PROFILE_LABELS,
+    FFUF_PROFILE_QUICK,
+    FFUF_PROFILE_STANDARD,
+    _build_fuzz_url,
+    normalize_ffuf_profile,
+    resolve_ffuf_profile_wordlist,
+    run_ffuf_scan,
+)
 from app.tools.gitleaks_runner import run_gitleaks_scan
 from app.tools.httpx_runner import run_httpx_scan
 from app.tools.katana_runner import run_katana_scan
@@ -139,12 +149,14 @@ METASPLOIT_CALLBACK_PREFIX = "msf"
 GITLEAKS_EVIDENCE_TOKEN_TTL_SECONDS = 900
 METASPLOIT_FLOW_MODE_KEY = "metasploit_flow_mode"
 METASPLOIT_GUIDED_CONTEXT_KEY = "metasploit_guided_context"
+FFUF_PROFILE_CALLBACK_PREFIX = "ffufp"
 SCAN_RECOVERY_TOKEN_TTL_SECONDS = 3600
 _gitleaks_evidence_action_tokens: dict[str, dict[str, object]] = {}
 _metasploit_pending_context: dict[str, dict[str, object]] = {}
 _metasploit_guided_tokens: dict[str, dict[str, object]] = {}
 _bbot_ai_callback_tokens: dict[str, dict[str, object]] = {}
 _scan_recovery_tokens: dict[str, dict[str, object]] = {}
+_ffuf_scan_profiles: dict[str, str] = {}
 logger = logging.getLogger(__name__)
 
 
@@ -249,10 +261,39 @@ def build_playwright_target_prompt() -> str:
     )
 
 
-def build_ffuf_target_prompt() -> str:
+def build_ffuf_profile_text() -> str:
     return "\n".join(
         [
-            "ffuf discovery request created. Send the authorized HTTP target URL or hostname.",
+            "Choose an ffuf discovery profile.",
+            "",
+            "Quick: Fast smoke test with minimal coverage.",
+            "Standard: Recommended default for normal discovery.",
+            "Deep: Broader discovery with more requests and longer runtime.",
+            "Custom: Use FFUF_WORDLIST_PATH.",
+        ]
+    )
+
+
+def build_ffuf_profile_keyboard(scan_request_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⚡ Quick", callback_data=f"{FFUF_PROFILE_CALLBACK_PREFIX}:{FFUF_PROFILE_QUICK}:{scan_request_id}"),
+                InlineKeyboardButton("Standard", callback_data=f"{FFUF_PROFILE_CALLBACK_PREFIX}:{FFUF_PROFILE_STANDARD}:{scan_request_id}"),
+            ],
+            [
+                InlineKeyboardButton("Deep", callback_data=f"{FFUF_PROFILE_CALLBACK_PREFIX}:{FFUF_PROFILE_DEEP}:{scan_request_id}"),
+                InlineKeyboardButton("⚙ Custom", callback_data=f"{FFUF_PROFILE_CALLBACK_PREFIX}:{FFUF_PROFILE_CUSTOM}:{scan_request_id}"),
+            ],
+        ]
+    )
+
+
+def build_ffuf_target_prompt(profile: str | None = None) -> str:
+    profile_label = FFUF_PROFILE_LABELS.get(normalize_ffuf_profile(profile), FFUF_PROFILE_LABELS[FFUF_PROFILE_CUSTOM])
+    return "\n".join(
+        [
+            f"ffuf {profile_label} discovery request created. Send the authorized HTTP target URL or hostname.",
             "",
             "Hidden-content discovery uses the configured wordlist and bounded ffuf settings.",
             "Optional: include FUZZ in an authorized URL to control the fuzz position.",
@@ -262,6 +303,43 @@ def build_ffuf_target_prompt() -> str:
             "https://example.com/api/FUZZ",
             "https://example.com/search?q=FUZZ",
             "example.com",
+        ]
+    )
+
+
+def build_ffuf_profile_unavailable_text(profile_info: dict[str, object]) -> str:
+    profile_label = str(profile_info.get("profile_label") or "Selected")
+    configured_path = str(profile_info.get("configured_path") or "not configured")
+    env_var = str(profile_info.get("env_var") or "wordlist setting")
+    return "\n".join(
+        [
+            f"ffuf {profile_label} profile wordlist is unavailable.",
+            "",
+            f"Configured path: {configured_path}",
+            f"Setting: {env_var}",
+            "",
+            "Choose another profile or update the configured path, then try again.",
+        ]
+    )
+
+
+def build_ffuf_review_text(*, target: str, profile_info: dict[str, object], fuzz_url: str, timeout: int, threads: int, rate_limit: int) -> str:
+    wordlist_count = int(profile_info.get("wordlist_count") or 0)
+    count_label = str(wordlist_count) if wordlist_count > 0 else "unknown"
+    path_label = str(profile_info.get("wordlist_path") or profile_info.get("configured_path") or "not configured")
+    return "\n".join(
+        [
+            "ffuf Discovery Review",
+            "",
+            f"Profile: {profile_info.get('profile_label')}",
+            f"Wordlist: {profile_info.get('source_label')}",
+            f"Path: {path_label}",
+            f"Approx entries: {count_label}",
+            f"Target: {target}",
+            f"FUZZ placement: {fuzz_url}",
+            f"Timeout: {timeout}s",
+            f"Threads: {threads}",
+            f"Rate limit: {rate_limit}/s",
         ]
     )
 
@@ -675,6 +753,7 @@ def _register_scan_recovery_context(
     tool: str,
     target: str,
     assessment_context: dict | None = None,
+    options: dict[str, object] | None = None,
 ) -> str:
     token = secrets.token_urlsafe(9)
     while token in _scan_recovery_tokens:
@@ -684,6 +763,7 @@ def _register_scan_recovery_context(
         "tool": str(tool or "").strip().lower(),
         "target": str(target or ""),
         "assessment_context": dict(assessment_context) if isinstance(assessment_context, dict) else None,
+        "options": dict(options) if isinstance(options, dict) else {},
         "created_at": time.time(),
     }
     return token
@@ -709,12 +789,14 @@ def _build_scan_outcome_actions(
     outcome: str,
     finding_id: str | None = None,
     assessment_context: dict | None = None,
+    options: dict[str, object] | None = None,
 ) -> InlineKeyboardMarkup | None:
     token = _register_scan_recovery_context(
         user_id=user_id,
         tool=tool,
         target=target,
         assessment_context=assessment_context,
+        options=options,
     )
     assessment_id = _assessment_id_from_context(assessment_context)
     if finding_id:
@@ -733,6 +815,9 @@ def _restore_recovery_scan_request(user_id: int, context: ContextTypes.DEFAULT_T
     scan_request = create_scan_request(user_id=user_id, scan_type=tool)
     mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
     context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+    options = payload.get("options")
+    if tool == "ffuf" and isinstance(options, dict):
+        _ffuf_scan_profiles[scan_request.id] = normalize_ffuf_profile(str(options.get("ffuf_profile") or ""))
     assessment_context = payload.get("assessment_context")
     if isinstance(assessment_context, dict):
         context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY] = dict(assessment_context)
@@ -1091,6 +1176,7 @@ def build_ffuf_result_text(result: dict[str, object], observations: list[dict] |
         if observation.get("redirect_location")
     ]
     findings = [
+        f"Profile: {result.get('ffuf_profile_label') or FFUF_PROFILE_LABELS[FFUF_PROFILE_CUSTOM]}",
         f"Wordlist entries: {int(result.get('wordlist_count') or 0)}",
         f"ffuf response observations: {summary.get('result_count', 0)}",
         "Status codes: " + (", ".join(f"{code}: {count}" for code, count in sorted(status_codes.items())) if status_codes else "none"),
@@ -1104,6 +1190,8 @@ def build_ffuf_result_text(result: dict[str, object], observations: list[dict] |
         findings.append("Redirects: " + "; ".join(redirects[:5]))
     if result.get("wordlist_path"):
         findings.append(f"Wordlist used: {str(result.get('wordlist_path')).split('/')[-1].split(chr(92))[-1]}")
+    if result.get("wordlist_source"):
+        findings.append(f"Wordlist source: {result.get('wordlist_source')}")
     if limitations:
         findings.append("Limitations: " + " ".join(limitations))
     findings_text = "\n".join(f"- {finding}" for finding in findings)
@@ -1151,6 +1239,10 @@ def store_ffuf_scan_result(user_id: int, result: dict[str, object], observations
                 "parser": "json",
                 "wordlist_path": result.get("wordlist_path"),
                 "wordlist_count": result.get("wordlist_count"),
+                "wordlist_source": result.get("wordlist_source"),
+                "wordlist_configured_path": result.get("wordlist_configured_path"),
+                "ffuf_profile": result.get("ffuf_profile"),
+                "ffuf_profile_label": result.get("ffuf_profile_label"),
                 "fuzz_url": result.get("fuzz_url"),
             },
         },
@@ -2170,6 +2262,14 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _handle_scan_recovery_callback(query, user_id, context)
         return
 
+    if query.data and query.data.startswith(f"{FFUF_PROFILE_CALLBACK_PREFIX}:"):
+        user_id = update.effective_user.id if update.effective_user is not None else None
+        if user_id is None:
+            await query.edit_message_text("Unable to identify Telegram user.")
+            return
+        await _handle_ffuf_profile_callback(query, user_id, context)
+        return
+
     if query.data and query.data.startswith(f"{AI_SUMMARY_CALLBACK_PREFIX}:"):
         user_id = update.effective_user.id if update.effective_user is not None else None
         if user_id is None:
@@ -2258,9 +2358,7 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if scan_type == "ffuf":
-        mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
-        context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
-        await query.edit_message_text(build_ffuf_target_prompt())
+        await query.edit_message_text(build_ffuf_profile_text(), reply_markup=build_ffuf_profile_keyboard(scan_request.id))
         return
 
     if scan_type == "testssl":
@@ -2295,6 +2393,24 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await query.edit_message_text(build_scan_created_text(scan_type))
+
+
+async def _handle_ffuf_profile_callback(query: object, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = str(getattr(query, "data", "") or "")
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        await query.edit_message_text("Unsupported ffuf profile selection.")
+        return
+    profile = normalize_ffuf_profile(parts[1])
+    scan_request_id = parts[2]
+    scan_request = get_scan_request(user_id=user_id, scan_request_id=scan_request_id)
+    if scan_request is None or scan_request.scan_type != "ffuf":
+        await query.edit_message_text("ffuf scan request was not found or has expired.")
+        return
+    _ffuf_scan_profiles[scan_request_id] = profile
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request_id)
+    context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request_id
+    await query.edit_message_text(build_ffuf_target_prompt(profile))
 
 
 async def _handle_scan_recovery_callback(query: object, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2721,6 +2837,7 @@ async def _handle_ffuf_target(
         return
 
     target = update.message.text or ""
+    profile = normalize_ffuf_profile(_ffuf_scan_profiles.get(scan_request_id))
     try:
         display_target = normalize_for_ffuf(target)
     except ValueError as exc:
@@ -2732,10 +2849,32 @@ async def _handle_ffuf_target(
                 target=target,
                 outcome="invalid",
                 assessment_context=_current_assessment_scan_context(context, "ffuf"),
+                options={"ffuf_profile": profile},
             ),
         )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        _ffuf_scan_profiles.pop(scan_request_id, None)
         return
+
+    settings = get_settings()
+    wordlist_info = resolve_ffuf_profile_wordlist(profile, settings=settings)
+    if wordlist_info.get("available") is not True:
+        await update.message.reply_text(
+            build_ffuf_profile_unavailable_text(wordlist_info),
+            reply_markup=build_ffuf_profile_keyboard(scan_request_id),
+        )
+        return
+
+    await update.message.reply_text(
+        build_ffuf_review_text(
+            target=display_target,
+            profile_info=wordlist_info,
+            fuzz_url=_build_fuzz_url(display_target),
+            timeout=settings.ffuf_scan_timeout_seconds,
+            threads=settings.ffuf_threads,
+            rate_limit=settings.ffuf_rate_limit,
+        )
+    )
 
     investigation = get_or_create_latest_open_investigation(user_id=user_id, target=display_target)
     add_investigation_event(
@@ -2751,7 +2890,7 @@ async def _handle_ffuf_target(
     await progress_card.start("Launching discovery...")
 
     try:
-        result = await asyncio.to_thread(run_ffuf_scan, target)
+        result = await asyncio.to_thread(run_ffuf_scan, target, profile)
     except ValueError as exc:
         await progress_card.fail(str(exc))
         add_investigation_event(
@@ -2771,9 +2910,11 @@ async def _handle_ffuf_target(
                 target=target,
                 outcome="invalid",
                 assessment_context=_current_assessment_scan_context(context, "ffuf"),
+                options={"ffuf_profile": profile},
             ),
         )
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        _ffuf_scan_profiles.pop(scan_request_id, None)
         return
 
     complete_scan_request(
@@ -2797,6 +2938,7 @@ async def _handle_ffuf_target(
     assessment_context = _pop_assessment_scan_context(context, "ffuf")
     _record_assessment_scan(assessment_context, tool="ffuf", result=result, finding=finding)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+    _ffuf_scan_profiles.pop(scan_request_id, None)
     if result.get("success") is True:
         await progress_card.complete()
     else:
@@ -2810,6 +2952,7 @@ async def _handle_ffuf_target(
             outcome="success" if result.get("success") is True else "failed",
             finding_id=finding.get("id") if result.get("success") is True else None,
             assessment_context=assessment_context,
+            options={"ffuf_profile": profile},
         ),
     )
     if result.get("success") is True:

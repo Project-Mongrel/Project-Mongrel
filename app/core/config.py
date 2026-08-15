@@ -98,6 +98,8 @@ class Settings(BaseSettings):
     ffuf_path: str = "ffuf"
     ffuf_scan_timeout_seconds: int = 120
     ffuf_wordlist_path: Path = Path("app/resources/wordlists/ffuf_default.txt")
+    ffuf_wordlist_standard_path: Path | None = None
+    ffuf_wordlist_deep_path: Path | None = None
     ffuf_threads: int = 5
     ffuf_rate_limit: int = 25
     ffuf_extensions: str = ""
