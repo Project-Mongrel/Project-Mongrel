@@ -93,6 +93,8 @@ Mongrel ships `app/resources/wordlists/ffuf_default.txt` as the Quick profile wo
 - `FFUF_WORDLIST_DEEP_PATH`: broader list, approximately 20,000 entries.
 - `FFUF_WORDLIST_PATH`: custom profile path, preserving the existing override behavior.
 
+Timeouts are profile-aware: `FFUF_QUICK_SCAN_TIMEOUT_SECONDS` caps Quick, `FFUF_SCAN_TIMEOUT_SECONDS` caps Standard and Custom, and `FFUF_DEEP_SCAN_TIMEOUT_SECONDS` caps Deep.
+
 Example SecLists candidates include `Discovery/Web-Content/directory-list-2.3-small.txt` for Standard and a bounded raft/directory list for Deep.
 
 Do not rely on the bundled fallback for meaningful hidden-content discovery.

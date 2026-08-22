@@ -122,6 +122,7 @@ from app.tools.ffuf_runner import (
     FFUF_PROFILE_STANDARD,
     _build_fuzz_url,
     normalize_ffuf_profile,
+    resolve_ffuf_profile_timeout,
     resolve_ffuf_profile_wordlist,
     run_ffuf_scan,
 )
@@ -1177,6 +1178,7 @@ def build_ffuf_result_text(result: dict[str, object], observations: list[dict] |
     ]
     findings = [
         f"Profile: {result.get('ffuf_profile_label') or FFUF_PROFILE_LABELS[FFUF_PROFILE_CUSTOM]}",
+        f"Timeout: {int(result.get('timeout_seconds') or 0)}s",
         f"Wordlist entries: {int(result.get('wordlist_count') or 0)}",
         f"ffuf response observations: {summary.get('result_count', 0)}",
         "Status codes: " + (", ".join(f"{code}: {count}" for code, count in sorted(status_codes.items())) if status_codes else "none"),
@@ -1232,6 +1234,7 @@ def store_ffuf_scan_result(user_id: int, result: dict[str, object], observations
             "metadata": {
                 "returncode": result.get("returncode"),
                 "elapsed_seconds": result.get("elapsed_seconds"),
+                "timeout_seconds": result.get("timeout_seconds"),
                 "command": result.get("command"),
                 "working_directory": result.get("working_directory"),
                 "error": result.get("error"),
@@ -2870,7 +2873,7 @@ async def _handle_ffuf_target(
             target=display_target,
             profile_info=wordlist_info,
             fuzz_url=_build_fuzz_url(display_target),
-            timeout=settings.ffuf_scan_timeout_seconds,
+            timeout=resolve_ffuf_profile_timeout(profile, settings=settings),
             threads=settings.ffuf_threads,
             rate_limit=settings.ffuf_rate_limit,
         )
@@ -2888,6 +2891,7 @@ async def _handle_ffuf_target(
     )
     progress_card = ScanProgressCard(update.message, "ffuf Discovery", display_target)
     await progress_card.start("Launching discovery...")
+    await progress_card.start_auto_refresh("Running discovery...", interval_seconds=5)
 
     try:
         result = await asyncio.to_thread(run_ffuf_scan, target, profile)
@@ -2916,6 +2920,8 @@ async def _handle_ffuf_target(
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         _ffuf_scan_profiles.pop(scan_request_id, None)
         return
+    finally:
+        await progress_card.stop_auto_refresh()
 
     complete_scan_request(
         user_id=user_id,

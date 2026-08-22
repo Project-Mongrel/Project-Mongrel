@@ -17,6 +17,7 @@ from app.tools.ffuf_runner import (
     _count_wordlist_entries,
     _normalize_ffuf_extensions,
     _resolve_ffuf_executable,
+    resolve_ffuf_profile_timeout,
     resolve_ffuf_profile_wordlist,
     run_ffuf_scan,
 )
@@ -56,6 +57,7 @@ def test_ffuf_runner_success_uses_safe_subprocess_args(tmp_path: Path) -> None:
     assert result["wordlist_count"] == 2
     assert result["fuzz_url"] == "https://example.com/FUZZ"
     assert result["ffuf_profile"] == "custom"
+    assert result["timeout_seconds"] == 17
     assert expected_command[expected_command.index("-mc") + 1] == FFUF_MATCH_STATUS_CODES
 
 
@@ -103,7 +105,7 @@ def test_ffuf_quick_profile_uses_bundled_wordlist() -> None:
 def test_ffuf_standard_profile_uses_configured_standard_wordlist(tmp_path: Path) -> None:
     wordlist = tmp_path / "standard.txt"
     wordlist.write_text("admin\napi\nlogin\n", encoding="utf-8")
-    settings = Settings(_env_file=None, ffuf_wordlist_standard_path=wordlist)
+    settings = Settings(_env_file=None, ffuf_scan_timeout_seconds=111, ffuf_wordlist_standard_path=wordlist)
     output = '{"results":[]}'
 
     with (
@@ -118,12 +120,14 @@ def test_ffuf_standard_profile_uses_configured_standard_wordlist(tmp_path: Path)
     assert result["success"] is True
     assert result["ffuf_profile"] == FFUF_PROFILE_STANDARD
     assert result["wordlist_count"] == 3
+    assert result["timeout_seconds"] == 111
+    assert run_mock.call_args.kwargs["timeout"] == 111
 
 
 def test_ffuf_deep_profile_uses_configured_deep_wordlist(tmp_path: Path) -> None:
     wordlist = tmp_path / "deep.txt"
     wordlist.write_text("admin\nbackup\nportal\napi\n", encoding="utf-8")
-    settings = Settings(_env_file=None, ffuf_wordlist_deep_path=wordlist)
+    settings = Settings(_env_file=None, ffuf_deep_scan_timeout_seconds=1501, ffuf_wordlist_deep_path=wordlist)
 
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=settings),
@@ -137,6 +141,17 @@ def test_ffuf_deep_profile_uses_configured_deep_wordlist(tmp_path: Path) -> None
     assert result["success"] is True
     assert result["ffuf_profile"] == FFUF_PROFILE_DEEP
     assert result["wordlist_count"] == 4
+    assert result["timeout_seconds"] == 1501
+    assert run_mock.call_args.kwargs["timeout"] == 1501
+
+
+def test_ffuf_profile_timeout_resolution_is_profile_aware() -> None:
+    settings = Settings(_env_file=None, ffuf_scan_timeout_seconds=120, ffuf_quick_scan_timeout_seconds=30, ffuf_deep_scan_timeout_seconds=1500)
+
+    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_QUICK, settings=settings) == 30
+    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_STANDARD, settings=settings) == 120
+    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_DEEP, settings=settings) == 1500
+    assert resolve_ffuf_profile_timeout(None, settings=settings) == 120
 
 
 def test_ffuf_standard_profile_missing_wordlist_fails_cleanly(tmp_path: Path) -> None:
@@ -182,6 +197,7 @@ def test_ffuf_timeout_is_clean_failure(tmp_path: Path) -> None:
     assert result["success"] is False
     assert result["error_type"] == "timeout"
     assert result["error"] == "slow"
+    assert result["timeout_seconds"] == 1
 
 
 @pytest.mark.parametrize("target", ["example.com;whoami", "example.com && whoami", "example.com|whoami"])

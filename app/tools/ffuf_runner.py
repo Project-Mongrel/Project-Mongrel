@@ -51,6 +51,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
     wordlist_info = resolve_ffuf_profile_wordlist(profile, settings=settings, working_directory=working_directory)
     wordlist_path = wordlist_info["wordlist_path"]
     wordlist_count = int(wordlist_info["wordlist_count"] or 0)
+    timeout_seconds = resolve_ffuf_profile_timeout(profile, settings=settings)
 
     if executable is None:
         logger.warning("ffuf executable missing. Checked PATH and candidate paths: %s", [str(candidate) for candidate in _ffuf_executable_candidates()])
@@ -66,6 +67,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
             wordlist_count=wordlist_count,
             fuzz_url=None,
             profile_info=wordlist_info,
+            timeout_seconds=timeout_seconds,
         )
     if wordlist_path is None:
         logger.warning("ffuf wordlist missing: profile=%s configured=%s", wordlist_info["profile"], wordlist_info["configured_path"])
@@ -81,6 +83,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
             wordlist_count=0,
             fuzz_url=None,
             profile_info=wordlist_info,
+            timeout_seconds=timeout_seconds,
         )
 
     fuzz_url = _build_fuzz_url(validated_target)
@@ -106,9 +109,10 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
             wordlist_count=wordlist_count,
             fuzz_url=fuzz_url,
             profile_info=wordlist_info,
+            timeout_seconds=timeout_seconds,
         )
     start_time = time.monotonic()
-    logger.info("ffuf scan started: target=%s timeout=%s wordlist_count=%s", validated_target, settings.ffuf_scan_timeout_seconds, wordlist_count)
+    logger.info("ffuf scan started: target=%s timeout=%s profile=%s wordlist_count=%s", validated_target, timeout_seconds, wordlist_info["profile"], wordlist_count)
     logger.info("ffuf subprocess argv: %r", command)
     try:
         completed = subprocess.run(  # nosec B603
@@ -116,7 +120,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=settings.ffuf_scan_timeout_seconds,
+            timeout=timeout_seconds,
             cwd=str(working_directory),
             shell=False,
             check=False,
@@ -137,6 +141,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
             wordlist_count=wordlist_count,
             fuzz_url=fuzz_url,
             profile_info=wordlist_info,
+            timeout_seconds=timeout_seconds,
         )
     except FileNotFoundError:
         elapsed_seconds = time.monotonic() - start_time
@@ -152,6 +157,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
             wordlist_count=wordlist_count,
             fuzz_url=fuzz_url,
             profile_info=wordlist_info,
+            timeout_seconds=timeout_seconds,
         )
     except OSError as exc:
         elapsed_seconds = time.monotonic() - start_time
@@ -168,6 +174,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
             wordlist_count=wordlist_count,
             fuzz_url=fuzz_url,
             profile_info=wordlist_info,
+            timeout_seconds=timeout_seconds,
         )
 
     elapsed_seconds = time.monotonic() - start_time
@@ -195,6 +202,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
         wordlist_count=wordlist_count,
         fuzz_url=fuzz_url,
         profile_info=wordlist_info,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -269,6 +277,16 @@ def resolve_ffuf_profile_wordlist(profile: str | None = None, *, settings: objec
         "available": wordlist_path is not None,
         "error": error,
     }
+
+
+def resolve_ffuf_profile_timeout(profile: str | None = None, *, settings: object | None = None) -> int:
+    resolved_settings = settings or get_settings()
+    normalized_profile = normalize_ffuf_profile(profile)
+    if normalized_profile == FFUF_PROFILE_QUICK:
+        return max(1, int(getattr(resolved_settings, "ffuf_quick_scan_timeout_seconds", 30) or 30))
+    if normalized_profile == FFUF_PROFILE_DEEP:
+        return max(1, int(getattr(resolved_settings, "ffuf_deep_scan_timeout_seconds", 1500) or 1500))
+    return max(1, int(getattr(resolved_settings, "ffuf_scan_timeout_seconds", 120) or 120))
 
 
 def _configured_wordlist_for_profile(settings: object, profile: str) -> Path | str | None:
@@ -354,6 +372,7 @@ def _result(
     wordlist_count: int,
     fuzz_url: str | None,
     profile_info: dict[str, object] | None = None,
+    timeout_seconds: int | None = None,
 ) -> dict[str, object]:
     profile_info = profile_info or {}
     return {
@@ -365,6 +384,7 @@ def _result(
         "returncode": returncode,
         "exit_code": returncode,
         "elapsed_seconds": elapsed_seconds,
+        "timeout_seconds": timeout_seconds,
         "command": command,
         "working_directory": str(working_directory),
         "stdout_len": len(output or ""),

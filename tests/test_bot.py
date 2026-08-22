@@ -1927,16 +1927,21 @@ def test_ffuf_profile_selection_review_and_execution_context(tmp_path: Path) -> 
         "ffuf_profile": "standard",
         "ffuf_profile_label": "Standard",
         "fuzz_url": "https://example.com/api/FUZZ",
+        "timeout_seconds": 31,
     }
 
     with (
         patch("app.bot.handlers.scan.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_standard_path=wordlist, ffuf_threads=7, ffuf_rate_limit=13, ffuf_scan_timeout_seconds=31)),
         patch("app.bot.handlers.scan.run_ffuf_scan", return_value=result) as run_ffuf_scan,
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock) as start_auto_refresh,
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock) as stop_auto_refresh,
         patch("app.bot.handlers.scan.generate_ffuf_ai_assessment", return_value=["Executive Summary", "- ffuf observations were reviewed."]),
     ):
         asyncio.run(scan_target_handler(update, context))
 
     run_ffuf_scan.assert_called_once_with("https://example.com/api/FUZZ", "standard")
+    start_auto_refresh.assert_awaited_once_with("Running discovery...", interval_seconds=5)
+    assert stop_auto_refresh.await_count >= 1
     review_text = message.reply_text.call_args_list[0].args[0]
     result_text = message.reply_text.call_args_list[2].args[0]
     keyboard = message.reply_text.call_args_list[2].kwargs["reply_markup"]
@@ -1945,10 +1950,13 @@ def test_ffuf_profile_selection_review_and_execution_context(tmp_path: Path) -> 
     assert f"Path: {wordlist}" in review_text
     assert "Approx entries: 2" in review_text
     assert "FUZZ placement: https://example.com/api/FUZZ" in review_text
+    assert "Timeout: 31s" in review_text
     assert "Threads: 7" in review_text
     assert "Rate limit: 13/s" in review_text
     assert "Profile: Standard" in result_text
+    assert "Timeout: 31s" in result_text
     assert "Wordlist source: Configured Standard external wordlist" in result_text
+    assert not any("Running discovery..." in call.args[0] for call in message.reply_text.call_args_list)
     assert any(button.text == "Re-run Scan" for row in keyboard.inline_keyboard for button in row)
     recovery_tokens = [payload for payload in _scan_recovery_tokens.values() if payload.get("tool") == "ffuf"]
     assert recovery_tokens[-1]["options"] == {"ffuf_profile": "standard"}
@@ -1979,6 +1987,59 @@ def test_ffuf_missing_standard_profile_path_offers_profile_selection_again(tmp_p
     assert "ffuf Standard profile wordlist is unavailable." in text
     assert str(missing) in text
     assert [button.text for row in keyboard.inline_keyboard for button in row] == ["⚡ Quick", "Standard", "Deep", "⚙ Custom"]
+
+
+def test_ffuf_timeout_failure_keeps_progress_and_recovery_actions() -> None:
+    user_id = 17216
+    clear_user_scan_requests(user_id)
+    clear_user_findings(user_id)
+    clear_user_investigations(user_id)
+    _ffuf_scan_profiles.clear()
+    scan_request = create_scan_request(user_id=user_id, scan_type="ffuf")
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+    _ffuf_scan_profiles[scan_request.id] = "quick"
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="https://example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id))
+    result = {
+        "success": False,
+        "target": "https://example.com",
+        "output": "",
+        "error": "ffuf hidden-content discovery timed out.",
+        "error_type": "timeout",
+        "returncode": None,
+        "elapsed_seconds": 9,
+        "wordlist_count": 19,
+        "wordlist_path": "app/resources/wordlists/ffuf_default.txt",
+        "wordlist_source": "Bundled smoke-test wordlist",
+        "ffuf_profile": "quick",
+        "ffuf_profile_label": "Quick",
+        "fuzz_url": "https://example.com/FUZZ",
+        "timeout_seconds": 9,
+    }
+
+    with (
+        patch("app.bot.handlers.scan.get_settings", return_value=Settings(_env_file=None, ffuf_quick_scan_timeout_seconds=9)),
+        patch("app.bot.handlers.scan.run_ffuf_scan", return_value=result),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock) as start_auto_refresh,
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock) as stop_auto_refresh,
+        patch("app.bot.handlers.scan.generate_ffuf_ai_assessment") as generate_ffuf_ai_assessment,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    start_auto_refresh.assert_awaited_once_with("Running discovery...", interval_seconds=5)
+    assert stop_auto_refresh.await_count >= 1
+    generate_ffuf_ai_assessment.assert_not_called()
+    result_text = message.reply_text.call_args_list[2].args[0]
+    keyboard = message.reply_text.call_args_list[2].kwargs["reply_markup"]
+    buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert "Status\nFailed" in result_text
+    assert "Timeout: 9s" in result_text
+    assert "ffuf hidden-content discovery timed out." in result_text
+    assert "Re-run Scan" in buttons
+    assert "✏️ Edit Target" in buttons
+    assert "Scan Menu" in buttons
 
 
 def test_testssl_scan_callback_prompts_for_target() -> None:
