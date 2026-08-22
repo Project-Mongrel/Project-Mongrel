@@ -34,6 +34,28 @@ TRUTHFULNESS_FALLBACK_LINES = [
     "Recommended Next Actions",
     "- Validate observed ffuf responses with authorized follow-up testing before drawing security conclusions.",
 ]
+ZERO_OBSERVATION_TRUTHFULNESS_FALLBACK_LINES = [
+    "Executive Summary",
+    "- ffuf recorded no matching structured response observations during this run.",
+    "",
+    "Observed Facts",
+    "- No response URLs, paths, status codes, redirects, response sizes, words, lines, or matched input words were recorded in the structured ffuf evidence for this run.",
+    "",
+    "Hidden Content Notes",
+    "- No matching responses were observed by ffuf with the selected wordlist/profile and FUZZ placement.",
+    "",
+    "Interpretation",
+    "- This result does not establish that hidden content does not exist, and it does not establish security or vulnerability absence.",
+    "",
+    "Limitations / Uncertainty",
+    "- Coverage is bounded by the selected wordlist, target/FUZZ position, runtime, response filtering, and execution conditions.",
+    "",
+    "Confidence",
+    "- Confidence is limited to the observation that this ffuf run produced no structured response observations.",
+    "",
+    "Recommended Next Actions",
+    "- Consider further discovery only if justified by the assessment context, authorization, and scope.",
+]
 EVIDENCE_SCOPED_MARKERS = (
     "does not establish",
     "does not prove",
@@ -81,7 +103,7 @@ def generate_ffuf_ai_assessment(finding: dict) -> list[str]:
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
     lines = lines or list(FALLBACK_LINES)
-    return _guard_truthfulness_response(lines)
+    return _guard_truthfulness_response(lines, finding)
 
 
 def build_ffuf_ai_assessment_prompt(finding: dict) -> str:
@@ -103,6 +125,9 @@ def build_ffuf_ai_assessment_prompt(finding: dict) -> str:
             "- Do not claim the target is safe, secure, insecure, or vulnerable from ffuf evidence alone.",
             "- Zero discoveries means no paths were discovered with the selected wordlist/profile.",
             "- Zero discoveries does not imply a static site, no hidden content, no vulnerabilities, no exploitable paths, or resistance to injection.",
+            "- If there are zero ffuf response observations, do not fill Potential Risks with security conclusions. State that no matching response observations were recorded and preserve uncertainty.",
+            "- For zero-observation runs, explicitly say coverage is bounded by the selected wordlist, target/FUZZ position, runtime, response filtering, and execution conditions.",
+            "- For zero-observation runs, recommend further discovery only when justified by the assessment context.",
             "- Explain what the hidden-content observations suggest and what follow-up actions are reasonable.",
             "- Separate observed facts from potential risks and recommendations.",
             "- Mention uncertainty clearly when evidence is limited.",
@@ -141,8 +166,10 @@ def _format_ffuf_evidence(finding: dict) -> str:
         "- Evidence boundary: ffuf response observations do not prove vulnerability, exploitability, sensitive exposure, authentication bypass, or complete discovery coverage.",
     ]
     if not results:
-        lines.append("- Limitation: No structured ffuf observations were stored.")
-        lines.append("- Limitation: This does not prove hidden content, endpoints, directories, files, parameters, virtual hosts, or vulnerabilities do not exist.")
+        lines.append("- Empty-run interpretation: ffuf recorded no matching response observations during this run.")
+        lines.append("- Empty-run boundary: This does not establish that hidden content does not exist, and it does not establish security or vulnerability absence.")
+        lines.append("- Empty-run limitation: Coverage is bounded by the selected wordlist, target/FUZZ position, runtime, response filtering, and execution conditions.")
+        lines.append("- Empty-run recommendation boundary: Further discovery may be appropriate only if justified by the assessment context.")
         return "\n".join(lines)
 
     lines.append("- Observed ffuf records:")
@@ -174,10 +201,24 @@ def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").strip()[:500]
 
 
-def _guard_truthfulness_response(lines: list[str]) -> list[str]:
+def _guard_truthfulness_response(lines: list[str], finding: dict | None = None) -> list[str]:
     if _contains_unsupported_ffuf_claim(lines):
+        if _is_explicit_zero_observation_finding(finding or {}):
+            return list(ZERO_OBSERVATION_TRUTHFULNESS_FALLBACK_LINES)
         return list(TRUTHFULNESS_FALLBACK_LINES)
     return lines
+
+
+def _is_explicit_zero_observation_finding(finding: dict) -> bool:
+    if finding.get("status") not in {"completed", "complete"}:
+        return False
+    results = finding.get("ffuf_results")
+    if not isinstance(results, list) or results:
+        return False
+    try:
+        return int(finding.get("finding_count") or 0) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _contains_unsupported_ffuf_claim(lines: list[str]) -> bool:

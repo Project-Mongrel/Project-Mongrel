@@ -5,6 +5,7 @@ import pytest
 from app.services.ffuf_ai_assessment import (
     FALLBACK_LINES,
     TRUTHFULNESS_FALLBACK_LINES,
+    ZERO_OBSERVATION_TRUTHFULNESS_FALLBACK_LINES,
     build_ffuf_ai_assessment_prompt,
     generate_ffuf_ai_assessment,
 )
@@ -69,9 +70,36 @@ def test_ffuf_ai_prompt_empty_fuzzing_preserves_uncertainty() -> None:
         }
     )
 
-    assert "No structured ffuf observations were stored." in prompt
-    assert "does not prove hidden content, endpoints, directories, files, parameters, virtual hosts, or vulnerabilities do not exist" in prompt
+    assert "ffuf recorded no matching response observations during this run" in prompt
+    assert "does not establish that hidden content does not exist" in prompt
+    assert "does not establish security or vulnerability absence" in prompt
+    assert "selected wordlist, target/FUZZ position, runtime, response filtering, and execution conditions" in prompt
+    assert "Further discovery may be appropriate only if justified by the assessment context" in prompt
     assert "no hidden content exists" not in prompt.lower()
+
+
+def test_ffuf_zero_observation_prompt_includes_profile_runtime_context() -> None:
+    prompt = build_ffuf_ai_assessment_prompt(
+        {
+            "target": "https://example.com",
+            "status": "completed",
+            "finding_count": 0,
+            "ffuf_summary": {"status_codes": {}},
+            "ffuf_results": [],
+            "metadata": {
+                "wordlist_count": 29999,
+                "ffuf_profile_label": "Deep",
+                "fuzz_url": "https://example.com/FUZZ",
+                "timeout_seconds": 1500,
+            },
+        }
+    )
+
+    assert "ffuf response observations during this fuzzing run: 0" in prompt
+    assert "Wordlist entries: 29999" in prompt
+    assert "Fuzz URL: https://example.com/FUZZ" in prompt
+    assert "Zero discoveries does not imply" in prompt
+    assert "do not fill Potential Risks with security conclusions" in prompt
 
 
 @pytest.mark.parametrize(
@@ -116,3 +144,57 @@ def test_ffuf_evidence_scoped_limitations_are_allowed(legitimate_line: str) -> N
         lines = generate_ffuf_ai_assessment({"target": "https://example.com"})
 
     assert lines == response.splitlines()
+
+
+def test_ffuf_compliant_zero_observation_ai_wording_is_allowed() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "- ffuf recorded no matching response observations during this run.",
+            "",
+            "Observed Facts",
+            "- The structured evidence contains zero ffuf response observations.",
+            "",
+            "Interpretation",
+            "- This result does not establish that hidden content does not exist.",
+            "- It does not establish security or vulnerability absence.",
+            "",
+            "Limitations / Uncertainty",
+            "- Coverage is bounded by the selected wordlist, target/FUZZ position, runtime, response filtering, and execution conditions.",
+            "",
+            "Recommended Next Actions",
+            "- Further discovery may be appropriate only if justified by the assessment context.",
+        ]
+    )
+
+    with patch("app.services.ffuf_ai_assessment.ask_ai", return_value=response):
+        lines = generate_ffuf_ai_assessment(
+            {
+                "target": "https://example.com",
+                "status": "completed",
+                "finding_count": 0,
+                "ffuf_results": [],
+                "ffuf_summary": {"status_codes": {}},
+            }
+        )
+
+    assert lines == response.splitlines()
+
+
+def test_ffuf_zero_observation_unsafe_generated_conclusion_uses_zero_result_fallback() -> None:
+    response = "Executive Summary\n- No vulnerabilities were found."
+
+    with patch("app.services.ffuf_ai_assessment.ask_ai", return_value=response):
+        lines = generate_ffuf_ai_assessment(
+            {
+                "target": "https://example.com",
+                "status": "completed",
+                "finding_count": 0,
+                "ffuf_results": [],
+                "ffuf_summary": {"status_codes": {}},
+            }
+        )
+
+    assert lines == ZERO_OBSERVATION_TRUTHFULNESS_FALLBACK_LINES
+    assert "No vulnerabilities were found" not in "\n".join(lines)
+    assert "does not establish security or vulnerability absence" in "\n".join(lines)
