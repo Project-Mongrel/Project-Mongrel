@@ -491,6 +491,9 @@ def test_assessment_markdown_report_includes_metasploit_validation() -> None:
                             "target": "example.com",
                             "port": 80,
                             "validation_state": "VALIDATED",
+                            "subprocess_success": True,
+                            "module_executed": True,
+                            "session_established": False,
                             "summary": "Metasploit reported validation evidence. This is not proof of full compromise.",
                             "raw_evidence_excerpt": "The target appears vulnerable",
                         },
@@ -517,13 +520,18 @@ def test_assessment_markdown_report_includes_metasploit_validation() -> None:
     )
 
     assert "### Metasploit" in report
-    assert "- Metasploit: validation state VALIDATED recorded." in report
+    assert "- Metasploit: validation state VALIDATED recorded; execution status is not treated as exploit success." in report
     assert "Module: auxiliary/scanner/http/http_version" in report
     assert "Action: auxiliary_validation" in report
     assert "Validation State: VALIDATED" in report
+    assert "Subprocess Success: True" in report
+    assert "Module Executed: True" in report
+    assert "Session Established: False" in report
     assert "Proposal Reference: proposal-abc" in report
     assert "Artifact Reference: assessment_artifact:10" in report
+    assert "Subprocess success, target response, network evidence, or module compatibility alone is not exploit success." in report
     assert "Failed, blocked, or not reproduced validation does not mean the target is secure." in report
+    assert "execution status is not treated as exploit success" in report
     assert ("RAW " * 20) not in report
 
 

@@ -3173,6 +3173,34 @@ def test_metasploit_ai_no_evidence_path_does_not_invent_findings() -> None:
     assert message.reply_text.call_args.args[0] == "No normalized Metasploit validation evidence was available from this run."
 
 
+def test_metasploit_result_card_separates_execution_validation_and_session() -> None:
+    card = build_metasploit_result_text(
+        {
+            "target": "example.com",
+            "status": "completed",
+            "summary": "Metasploit output did not provide a conclusive validation result.",
+            "metasploit_evidence": {
+                "module": "exploit/multi/http/struts2_content_type_ognl",
+                "action_type": "exploit_validation",
+                "target": "example.com",
+                "port": 443,
+                "validation_state": "INCONCLUSIVE",
+                "subprocess_success": True,
+                "session_established": False,
+                "summary": "Metasploit output did not provide a conclusive validation result.",
+            },
+            "metadata": {"artifact_ref": "assessment_artifact:7"},
+        }
+    )
+
+    assert "Execution Result:\nmsfconsole completed" in card
+    assert "Validation State:\nINCONCLUSIVE" in card
+    assert "Session Established:\nno" in card
+    assert "module compatibility alone is not exploit success" in card
+    assert "does not prove the target is safe" in card
+    assert "exploit succeeded" not in card.lower()
+
+
 def test_httpx_result_card_summarizes_observations_without_raw_json() -> None:
     result = {"success": True, "target": "https://example.com", "elapsed_seconds": 2, "output": '{"url":"raw"}'}
     services = [

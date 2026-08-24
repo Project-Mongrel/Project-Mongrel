@@ -206,7 +206,10 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         elif prowler_evidence:
             lines.append(f"- {tool}: {int(prowler_evidence.get('finding_count') or 0)} scanner-reported cloud posture check(s) recorded.")
         elif metasploit_evidence:
-            lines.append(f"- {tool}: validation state {metasploit_evidence.get('validation_state') or 'unknown'} recorded.")
+            lines.append(
+                f"- {tool}: validation state {metasploit_evidence.get('validation_state') or 'unknown'} recorded; "
+                "execution status is not treated as exploit success."
+            )
         elif tshark_evidence:
             lines.append(f"- {tool}: {int(tshark_evidence.get('packet_count') or 0)} packet metadata observation(s) recorded.")
         elif observation_counts:
@@ -282,7 +285,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
         actions.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
     metasploit_evidence = [finding.get("metasploit_evidence") for finding in findings if finding.get("metasploit_evidence")]
     if metasploit_evidence:
-        actions.append("- Review Metasploit validation evidence and preserve proposal/artifact provenance before follow-up testing.")
+        actions.append("- Review Metasploit validation state, session evidence, and proposal/artifact provenance before follow-up testing.")
     if tshark_evidence:
         actions.append("- Review TShark PCAP metadata for unexpected endpoints, DNS names, HTTP hosts, and TLS SNI values without treating packet activity as proof of compromise.")
 
@@ -534,10 +537,15 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             f"- Module: {_clean(metasploit_evidence.get('module') or metadata.get('module') or 'unknown')}",
             f"- Action: {_clean(metasploit_evidence.get('action_type') or metadata.get('action_type') or 'unknown')}",
             f"- Validation State: {_clean(metasploit_evidence.get('validation_state') or 'unknown')}",
+            f"- Subprocess Success: {_bool_label(metasploit_evidence.get('subprocess_success'))}",
+            f"- Module Executed: {_bool_label(metasploit_evidence.get('module_executed'))}",
+            f"- Session Established: {_bool_label(metasploit_evidence.get('session_established'))}",
             f"- Evidence: {_clean(metasploit_evidence.get('summary') or finding.get('summary') or 'none')}",
             f"- Proposal Reference: {_clean(metadata.get('proposal_id') or 'not supplied')}",
             f"- Artifact Reference: {_clean(metadata.get('artifact_ref') or 'not supplied')}",
+            "- Limitation: Subprocess success, target response, network evidence, or module compatibility alone is not exploit success.",
             "- Limitation: Failed, blocked, or not reproduced validation does not mean the target is secure.",
+            "- Limitation: Session, persistence, privilege level, lateral movement, or data access is not inferred unless explicitly present in normalized evidence.",
         ]
         excerpt = _clean(metasploit_evidence.get("raw_evidence_excerpt") or "")
         if excerpt:
@@ -755,6 +763,14 @@ def _format_timestamp(value: object) -> str:
 
 def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").strip()[:700]
+
+
+def _bool_label(value: object) -> str:
+    if value is True:
+        return "True"
+    if value is False:
+        return "False"
+    return "unknown"
 
 
 def _unique(values: list[str]) -> list[str]:

@@ -14,7 +14,11 @@ def test_metasploit_parser_validated_is_not_full_compromise() -> None:
     )
 
     assert parsed["validation_state"] == "VALIDATED"
+    assert parsed["subprocess_success"] is True
+    assert parsed["module_executed"] is True
+    assert parsed["session_established"] is False
     assert "not proof of full compromise" in parsed["summary"]
+    assert "Subprocess success means msfconsole completed" in " ".join(parsed["limitations"])
     assert "No CVE, session, persistence" in " ".join(parsed["limitations"])
 
 
@@ -86,3 +90,60 @@ def test_metasploit_parser_unknown_success_output_remains_inconclusive() -> None
     )
 
     assert parsed["validation_state"] == "INCONCLUSIVE"
+    assert parsed["subprocess_success"] is True
+    assert parsed["session_established"] is False
+
+
+def test_metasploit_parser_subprocess_success_does_not_imply_exploit_success() -> None:
+    parsed = parse_metasploit_validation_result(
+        {
+            "success": True,
+            "module": "exploit/multi/http/struts2_content_type_ognl",
+            "action_type": "exploit_validation",
+            "target": "example.com",
+            "port": 80,
+            "output": "Module completed successfully, no session was created.",
+            "returncode": 0,
+        }
+    )
+
+    assert parsed["validation_state"] == "INCONCLUSIVE"
+    assert parsed["subprocess_success"] is True
+    assert parsed["session_established"] is False
+    assert "conclusive validation result" in parsed["summary"]
+
+
+def test_metasploit_parser_session_established_is_explicit_state() -> None:
+    parsed = parse_metasploit_validation_result(
+        {
+            "success": True,
+            "module": "exploit/multi/http/struts2_content_type_ognl",
+            "action_type": "exploit_validation",
+            "target": "example.com",
+            "port": 80,
+            "output": "[*] Command shell session 1 opened (10.0.0.1:4444 -> 10.0.0.2:49152)",
+            "returncode": 0,
+        }
+    )
+
+    assert parsed["validation_state"] == "SESSION_ESTABLISHED"
+    assert parsed["session_established"] is True
+    assert "session was established" in parsed["summary"]
+    assert "does not prove persistence, privilege level, lateral movement, or data access" in parsed["summary"]
+
+
+def test_metasploit_parser_module_compatibility_does_not_imply_vulnerability() -> None:
+    parsed = parse_metasploit_validation_result(
+        {
+            "success": True,
+            "module": "exploit/multi/http/struts2_content_type_ognl",
+            "action_type": "check",
+            "target": "example.com",
+            "port": 80,
+            "output": "This module is compatible with the selected target type.",
+            "returncode": 0,
+        }
+    )
+
+    assert parsed["validation_state"] == "INCONCLUSIVE"
+    assert "conclusive validation result" in parsed["summary"]

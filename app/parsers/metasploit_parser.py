@@ -1,16 +1,20 @@
-VALIDATION_STATES = frozenset({"VALIDATED", "DETECTED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"})
+VALIDATION_STATES = frozenset({"SESSION_ESTABLISHED", "VALIDATED", "DETECTED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"})
 
 
 def parse_metasploit_validation_result(result: dict) -> dict:
     output = str(result.get("output") or "")
     error = str(result.get("error") or "")
     combined = f"{output}\n{error}".lower()
+    session_established = _session_established(combined)
     if result.get("error_type") == "timeout":
         state = "BLOCKED"
         summary = "Metasploit validation timed out; this does not mean the target is safe."
     elif result.get("success") is not True:
         state = "FAILED"
         summary = "Metasploit validation failed to execute cleanly; this does not mean the target is safe."
+    elif session_established:
+        state = "SESSION_ESTABLISHED"
+        summary = "Metasploit output indicated a session was established. This is stronger evidence than module execution alone, but does not prove persistence, privilege level, lateral movement, or data access."
     elif _contains_any(combined, ("appears vulnerable", "the target appears to be vulnerable", "is vulnerable")):
         state = "VALIDATED"
         summary = "Metasploit reported validation evidence. This is not proof of full compromise."
@@ -33,10 +37,14 @@ def parse_metasploit_validation_result(result: dict) -> dict:
         "target": result.get("target"),
         "port": result.get("port"),
         "validation_state": state,
+        "subprocess_success": result.get("success") is True,
+        "module_executed": result.get("success") is True,
+        "session_established": session_established,
         "summary": summary,
         "evidence_confidence": "tool_reported",
         "limitations": [
             "Metasploit validation evidence is bounded to the approved module/action/options.",
+            "Subprocess success means msfconsole completed, not that exploitation succeeded.",
             "Appears vulnerable is validation evidence, not automatic proof of full compromise.",
             "Detected service or version metadata is not proof of vulnerability, exploitation, or compromise.",
             "Failed, blocked, timed out, or not reproduced results do not mean the target is secure.",
@@ -81,6 +89,20 @@ def _looks_like_service_detection(result: dict, text: str) -> bool:
         "service info",
     )
     return _contains_any(text, detection_terms)
+
+
+def _session_established(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "meterpreter session",
+            "command shell session",
+            "session 1 opened",
+            "session 2 opened",
+            "session opened",
+            "shell session",
+        ),
+    )
 
 
 def _excerpt(text: str, limit: int = 1200) -> str:

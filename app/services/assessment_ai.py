@@ -63,6 +63,8 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             "- Never assume vulnerabilities.",
             "- Never claim exploitation.",
             '- Never say the target is "safe" or "secure".',
+            "- Treat Metasploit execution status, validation state, and session evidence as separate facts.",
+            "- Do not infer exploit success, compromise, shell access, vulnerability confirmation, or vulnerability absence from Metasploit subprocess success, compatibility, failed validation, or no session.",
             "- Treat testssl.sh results as TLS configuration evidence only.",
             "- Do not invent TLS vulnerabilities or claim overall site security from TLS evidence alone.",
             "- Preserve testssl.sh severity, scanner wording, and uncertainty exactly; 'potentially VULNERABLE' remains potential scanner evidence requiring validation.",
@@ -103,6 +105,8 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Never assume vulnerabilities.",
             "- Never claim exploitation.",
             '- Never state a target is "safe".',
+            "- Treat Metasploit execution status, validation state, and session evidence as separate facts.",
+            "- Do not infer exploit success, compromise, shell access, vulnerability confirmation, or vulnerability absence from Metasploit subprocess success, compatibility, failed validation, or no session.",
             "- Never imply a clean Nuclei scan means the target is secure.",
             "- If evidence is missing, explain what has not yet been assessed.",
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
@@ -370,11 +374,42 @@ def _format_finding(finding: dict) -> list[str]:
             )
         for limitation in gitleaks_evidence.get("limitations") or []:
             lines.append(f"    - limitation: {_clean(limitation)}")
+    metasploit_evidence = finding.get("metasploit_evidence") or {}
+    if metasploit_evidence:
+        metadata = finding.get("metadata") or {}
+        lines.append("    Metasploit normalized validation evidence:")
+        lines.append(f"    - module={_clean(metasploit_evidence.get('module') or metadata.get('module') or 'unknown')}")
+        lines.append(f"    - action={_clean(metasploit_evidence.get('action_type') or metadata.get('action_type') or 'unknown')}")
+        lines.append(f"    - target={_clean(metasploit_evidence.get('target') or finding.get('target') or 'unknown')}")
+        lines.append(f"    - port={_clean(metasploit_evidence.get('port') or metadata.get('port') or 'not supplied')}")
+        lines.append(f"    - validation_state={_clean(metasploit_evidence.get('validation_state') or 'unknown')}")
+        lines.append(f"    - subprocess_success={_bool_label(metasploit_evidence.get('subprocess_success'))}")
+        lines.append(f"    - module_executed={_bool_label(metasploit_evidence.get('module_executed'))}")
+        lines.append(f"    - session_established={_bool_label(metasploit_evidence.get('session_established'))}")
+        lines.append(f"    - summary={_clean(metasploit_evidence.get('summary') or finding.get('summary') or '')}")
+        lines.append(
+            f"    - proposal_ref={_clean(metadata.get('proposal_id') or 'not supplied')} "
+            f"artifact_ref={_clean(metadata.get('artifact_ref') or 'not supplied')}"
+        )
+        for limitation in metasploit_evidence.get("limitations") or []:
+            lines.append(f"    - limitation: {_clean(limitation)}")
+        lines.append(
+            "    - boundary=Metasploit validation evidence only; subprocess success, compatibility, target response, "
+            "failed validation, timeout, or no session is not exploit proof or target safety proof"
+        )
     return lines
 
 
 def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").strip()[:700]
+
+
+def _bool_label(value: object) -> str:
+    if value is True:
+        return "True"
+    if value is False:
+        return "False"
+    return "unknown"
 
 
 def _is_unavailable_response(response: object) -> bool:

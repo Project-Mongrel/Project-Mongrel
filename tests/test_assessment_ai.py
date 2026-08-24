@@ -186,6 +186,50 @@ def test_assessment_ai_prompt_scopes_ffuf_evidence_to_fuzzing_observations() -> 
     assert "admin directory is vulnerable" not in prompt.lower()
 
 
+def test_assessment_ai_prompt_preserves_metasploit_validation_boundaries() -> None:
+    prompt = build_assessment_ai_prompt(
+        "What did Metasploit validate?",
+        {
+            "assessment": {"name": "Metasploit Assessment", "status": "active"},
+            "targets": [{"address": "example.com"}],
+            "scans": [{"tool": "metasploit", "status": "completed"}],
+            "findings": [
+                {
+                    "source": "metasploit",
+                    "target": "example.com",
+                    "risk_level": "info",
+                    "summary": "Metasploit output did not provide a conclusive validation result.",
+                    "metasploit_evidence": {
+                        "module": "exploit/multi/http/struts2_content_type_ognl",
+                        "action_type": "exploit_validation",
+                        "target": "example.com",
+                        "port": 443,
+                        "validation_state": "INCONCLUSIVE",
+                        "subprocess_success": True,
+                        "module_executed": True,
+                        "session_established": False,
+                        "summary": "Metasploit output did not provide a conclusive validation result.",
+                    },
+                    "metadata": {"proposal_id": "proposal-1", "artifact_ref": "assessment_artifact:7"},
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        },
+    )
+
+    assert "Treat Metasploit execution status, validation state, and session evidence as separate facts." in prompt
+    assert "Metasploit normalized validation evidence:" in prompt
+    assert "module=exploit/multi/http/struts2_content_type_ognl" in prompt
+    assert "action=exploit_validation" in prompt
+    assert "validation_state=INCONCLUSIVE" in prompt
+    assert "subprocess_success=True" in prompt
+    assert "session_established=False" in prompt
+    assert "proposal_ref=proposal-1 artifact_ref=assessment_artifact:7" in prompt
+    assert "not exploit proof or target safety proof" in prompt
+    assert "exploit succeeded" not in prompt.lower()
+
+
 def test_assessment_ai_report_prompt_includes_required_sections_and_limitations() -> None:
     context = {
         "assessment": {"name": "Report Assessment", "status": "active"},

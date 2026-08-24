@@ -445,11 +445,16 @@ def _format_metasploit_findings(scan_run: dict) -> list[str]:
         f"  - Module: {_clean(evidence.get('module') or metadata.get('module') or 'unknown')}",
         f"  - Action: {_clean(evidence.get('action_type') or metadata.get('action_type') or 'unknown')}",
         f"  - Validation State: {_clean(evidence.get('validation_state') or 'unknown')}",
+        f"  - Subprocess Success: {_bool_label(evidence.get('subprocess_success'))}",
+        f"  - Module Executed: {_bool_label(evidence.get('module_executed'))}",
+        f"  - Session Established: {_bool_label(evidence.get('session_established'))}",
         f"  - Evidence: {_clean(evidence.get('summary') or scan_run.get('summary') or 'none')}",
         f"  - Proposal Reference: {_clean(metadata.get('proposal_id') or 'not supplied')}",
         f"  - Artifact Reference: {_clean(metadata.get('artifact_ref') or 'not supplied')}",
         "  - Limitation: Validation output is bounded to the approved module/action/options.",
+        "  - Limitation: Subprocess success, target response, network evidence, or module compatibility alone is not exploit success.",
         "  - Limitation: Failed, blocked, or not reproduced validation does not mean the target is secure.",
+        "  - Limitation: Session, persistence, privilege level, lateral movement, or data access is not inferred unless explicitly present in normalized evidence.",
     ]
     excerpt = _clean(evidence.get("raw_evidence_excerpt") or "")
     if excerpt:
@@ -630,7 +635,7 @@ def _format_recommendations(scan_runs: list[dict]) -> list[str]:
     if "prowler" in sources:
         recommendations.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
     if "metasploit" in sources:
-        recommendations.append("- Review Metasploit validation evidence with the owner; do not treat failed validation as proof that the target is secure.")
+        recommendations.append("- Review Metasploit validation state, session evidence, and proposal/artifact provenance with the owner; do not treat failed validation as proof that the target is secure.")
     if "testssl" in sources:
         recommendations.append("- Review testssl.sh-reported TLS protocols, cipher observations, certificate metadata, and potential findings with the service owner.")
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
@@ -791,6 +796,14 @@ def _clean(value: object) -> str:
     return text
 
 
+def _bool_label(value: object) -> str:
+    if value is True:
+        return "True"
+    if value is False:
+        return "False"
+    return "unknown"
+
+
 def _format_finding_aware_recommendations(scan_runs: list[dict]) -> list[str]:
     recommendations = []
     ports = {
@@ -861,7 +874,7 @@ def _finding_count(scan_run: dict) -> int:
     if isinstance(scan_run.get("prowler_evidence"), dict):
         return int((scan_run.get("prowler_evidence") or {}).get("finding_count") or len((scan_run.get("prowler_evidence") or {}).get("findings") or []))
     if isinstance(scan_run.get("metasploit_evidence"), dict):
-        return 1 if (scan_run.get("metasploit_evidence") or {}).get("validation_state") == "VALIDATED" else 0
+        return 1 if (scan_run.get("metasploit_evidence") or {}).get("validation_state") in {"VALIDATED", "SESSION_ESTABLISHED"} else 0
     if isinstance(scan_run.get("testssl_evidence"), dict):
         return len(_notable_testssl_items(scan_run.get("testssl_evidence") or {}))
     if isinstance(scan_run.get("nuclei_findings"), list):

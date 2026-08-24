@@ -722,6 +722,9 @@ def test_report_generation_includes_metasploit_validation_without_raw_console_du
                 "target": "example.com",
                 "port": 80,
                 "validation_state": "VALIDATED",
+                "subprocess_success": True,
+                "module_executed": True,
+                "session_established": False,
                 "summary": "Metasploit reported validation evidence. This is not proof of full compromise.",
                 "raw_evidence_excerpt": "The target appears vulnerable",
             },
@@ -741,8 +744,13 @@ def test_report_generation_includes_metasploit_validation_without_raw_console_du
     assert "Module: auxiliary/scanner/http/http_version" in report
     assert "Action: auxiliary_validation" in report
     assert "Validation State: VALIDATED" in report
+    assert "Subprocess Success: True" in report
+    assert "Module Executed: True" in report
+    assert "Session Established: False" in report
     assert "Proposal Reference: proposal-123" in report
     assert "Artifact Reference: assessment_artifact:9" in report
     assert "The target appears vulnerable" in report
     assert "not proof of full compromise" in report
+    assert "Subprocess success, target response, network evidence, or module compatibility alone is not exploit success." in report
+    assert "Session, persistence, privilege level, lateral movement, or data access is not inferred unless explicitly present" in report
     assert ("RAW " * 20) not in report

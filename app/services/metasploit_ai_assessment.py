@@ -19,10 +19,55 @@ FALLBACK_LINES = [
     "Use the deterministic Metasploit validation result for observed evidence and limitations.",
 ]
 
+TRUTHFULNESS_FALLBACK_LINES = [
+    "Executive Summary",
+    "The Metasploit AI assessment was withheld because the generated response contained an unsupported exploitation or security conclusion.",
+    "",
+    "Observed Validation Facts",
+    "Use the deterministic Metasploit validation result for the approved module, action, target, port, validation state, and artifact/proposal provenance.",
+    "",
+    "Validation Outcome",
+    "No stronger conclusion should be drawn than the normalized validation state supports.",
+    "",
+    "Potential Impact",
+    "Do not infer compromise, shell access, vulnerability confirmation, vulnerability absence, persistence, privilege level, lateral movement, or data access unless explicitly present in the normalized evidence.",
+    "",
+    "Recommended Next Actions",
+    "Review the normalized validation evidence and preserve the approval/artifact references before any follow-up testing.",
+    "",
+    "Evidence Confidence / Limitations",
+    "Metasploit output is bounded to the approved module/action/options. Subprocess success, compatibility, failed validation, or network activity alone is not exploit proof.",
+]
+
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(password|token|secret|api[_-]?key|access[_-]?key|session[_-]?token)\s*[:=]\s*\S+"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"ASIA[0-9A-Z]{16}"),
+)
+
+EVIDENCE_SCOPED_MARKERS = (
+    "metasploit reported",
+    "validation state",
+    "normalized evidence",
+    "module completed without",
+    "did not establish",
+    "does not prove",
+    "does not mean",
+    "no conclusion",
+    "insufficient",
+    "inconclusive",
+    "not proof",
+    "not automatic proof",
+    "bounded to the approved",
+)
+
+UNSUPPORTED_METASPLOIT_CLAIM_PATTERNS = (
+    re.compile(r"\b(?:target|host|system|server|endpoint|service)\b[^.!?]{0,80}\b(?:is|was|has\s+been|appears|seems|looks)\s+(?:to\s+be\s+)?(?:compromised|owned|pwned|secure|safe)\b"),
+    re.compile(r"\b(?:exploit|exploitation)\b[^.!?]{0,80}\b(?:succeeded|successful|worked|confirmed|was\s+successful)\b"),
+    re.compile(r"\b(?:vulnerability|vulnerabilities|vuln)\b[^.!?]{0,80}\b(?:is|are|was|were|has\s+been|have\s+been)\s+(?:confirmed|proven|validated)\b"),
+    re.compile(r"\b(?:shell|session|meterpreter|access)\b[^.!?]{0,80}\b(?:obtained|opened|established|gained|created)\b"),
+    re.compile(r"\b(?:no|not)\s+(?:vulnerabilities|vulnerability|security\s+issues|risk)\b[^.!?]{0,80}\b(?:exist|found|detected|present)\b"),
+    re.compile(r"\b(?:target|host|system|server|endpoint)\b[^.!?]{0,80}\b(?:is|was)\s+(?:not\s+vulnerable|secure|safe)\b[^.!?]{0,80}\b(?:failed|not\s+reproduced|blocked|timed\s+out)?\b"),
 )
 
 
@@ -35,9 +80,7 @@ def generate_metasploit_ai_assessment(finding: dict) -> list[str]:
     if _is_unavailable_response(response):
         return list(FALLBACK_LINES)
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
-    if _validation_state(finding) == "DETECTED" and _unsafe_detected_output(lines):
-        return _detected_assessment_lines(finding)
-    return lines or list(FALLBACK_LINES)
+    return _guard_truthfulness_response(lines or list(FALLBACK_LINES), finding)
 
 
 def build_metasploit_ai_assessment_prompt(finding: dict) -> str:
@@ -51,13 +94,18 @@ def build_metasploit_ai_assessment_prompt(finding: dict) -> str:
             "- Do not include raw console scripts, raw resource files, huge console dumps, credentials, secrets, or tokens.",
             "- Preserve the exact module, action, target, validation state, and provenance.",
             "- Repeat the supplied Validation State exactly; never translate or upgrade it to another state.",
+            "- Distinguish subprocess success from validation success, exploit success, and session establishment.",
+            "- Module compatibility or successful msfconsole exit does not confirm vulnerability or exploitability.",
+            "- Network traffic or a target response is not proof that exploitation succeeded.",
             *state_specific_rules,
             "- Scanner evidence is not automatically proof of exploitation.",
             "- The phrase appears vulnerable remains scanner-reported validation evidence, not proof of full compromise.",
             "- VALIDATED must reflect actual observed validation evidence in the supplied normalized result.",
+            "- SESSION_ESTABLISHED may be described only when the normalized evidence explicitly says a session was established.",
             "- NOT_REPRODUCED does not mean the target is secure.",
             "- INCONCLUSIVE remains inconclusive.",
             "- FAILED or BLOCKED does not mean the target is not vulnerable.",
+            "- Failed validation, no session, or timeout does not prove vulnerability absence or target safety.",
             "- Do not invent CVEs, sessions, persistence, post-exploitation, data access, attacker access, compromise, or business impact.",
             "- Do not invent access, impact, or vulnerability from DETECTED metadata.",
             "- Use cautious language where impact depends on manual validation or target context.",
@@ -88,6 +136,9 @@ def _format_metasploit_evidence(finding: dict) -> str:
         f"- Port: {_clean(evidence.get('port') or metadata.get('port') or 'not supplied')}",
         f"- Validation State: {_clean(evidence.get('validation_state') or 'unknown')}",
         f"- Status: {_clean(finding.get('status') or 'unknown')}",
+        f"- Subprocess Success: {_bool_label(evidence.get('subprocess_success'))}",
+        f"- Module Executed: {_bool_label(evidence.get('module_executed'))}",
+        f"- Session Established: {_bool_label(evidence.get('session_established'))}",
         f"- Risk Tier: {_clean(evidence.get('risk_tier') or metadata.get('risk_tier') or 'unknown')}",
         f"- Expected Effect: {_clean(evidence.get('expected_effect') or metadata.get('expected_effect') or 'unknown')}",
         f"- Scanner Message: {_clean(evidence.get('summary') or finding.get('summary') or 'none')}",
@@ -108,6 +159,14 @@ def _clean(value: object) -> str:
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("<REDACTED>", text)
     return text
+
+
+def _bool_label(value: object) -> str:
+    if value is True:
+        return "True"
+    if value is False:
+        return "False"
+    return "unknown"
 
 
 def _is_unavailable_response(response: object) -> bool:
@@ -135,6 +194,11 @@ def _state_specific_rules(finding: dict) -> list[str]:
             "- INCONCLUSIVE means no conclusive validation evidence was parsed.",
             "- For INCONCLUSIVE, do not claim service, banner, version, or key metadata was observed.",
         ]
+    if state == "SESSION_ESTABLISHED":
+        return [
+            "- SESSION_ESTABLISHED means the normalized evidence explicitly reported a session.",
+            "- You may state that a session was established, but do not infer persistence, privilege level, lateral movement, data access, or broader compromise.",
+        ]
     return []
 
 
@@ -150,6 +214,39 @@ def _unsafe_detected_output(lines: list[str]) -> bool:
         "unauthorized access",
     )
     return any(phrase in text for phrase in forbidden)
+
+
+def _guard_truthfulness_response(lines: list[str], finding: dict) -> list[str]:
+    if _validation_state(finding) == "DETECTED" and _unsafe_detected_output(lines):
+        return _detected_assessment_lines(finding)
+    if _contains_unsupported_metasploit_claim(lines, finding):
+        return list(TRUTHFULNESS_FALLBACK_LINES)
+    return lines
+
+
+def _contains_unsupported_metasploit_claim(lines: list[str], finding: dict) -> bool:
+    session_established = bool((finding.get("metasploit_evidence") or {}).get("session_established"))
+    for sentence in _claim_sentences(lines):
+        if _is_evidence_scoped_statement(sentence):
+            continue
+        if session_established and re.search(r"\b(?:shell|session|meterpreter)\b[^.!?]{0,80}\b(?:obtained|opened|established|created)\b", sentence):
+            continue
+        if any(pattern.search(sentence) for pattern in UNSUPPORTED_METASPLOIT_CLAIM_PATTERNS):
+            return True
+    return False
+
+
+def _claim_sentences(lines: list[str]) -> list[str]:
+    text = " ".join(str(line or "").strip() for line in lines)
+    return [
+        re.sub(r"\s+", " ", sentence).strip().lower()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+
+
+def _is_evidence_scoped_statement(sentence: str) -> bool:
+    return any(marker in sentence for marker in EVIDENCE_SCOPED_MARKERS)
 
 
 def _detected_assessment_lines(finding: dict) -> list[str]:
