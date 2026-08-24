@@ -275,7 +275,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     if ffuf_results:
         actions.append("- Review ffuf-observed response paths and status codes as follow-up candidates before manual validation.")
     if testssl_evidence:
-        actions.append("- Review TLS protocols, certificate expiry, cipher observations, and testssl.sh-reported misconfigurations with the service owner.")
+        actions.append("- Review TLS protocols, certificate expiry, cipher observations, and testssl.sh-reported TLS findings with the service owner.")
     if gitleaks_evidence:
         actions.append("- Rotate or revoke detected secrets, remove them from repositories/artifacts, and review commit history for exposure.")
     if prowler_evidence:

@@ -1279,7 +1279,10 @@ def build_testssl_result_text(result: dict[str, object], evidence: dict | None =
         ]
     )
     for item in notable[:5]:
-        findings.append(f"{item.get('id')}: {item.get('finding') or item.get('severity') or 'reported'}")
+        findings.append(
+            f"{item.get('id')}: severity={item.get('severity') or 'info'} "
+            f"finding={item.get('finding') or 'reported'}"
+        )
     if limitations:
         findings.append("Limitations: " + " ".join(limitations[:3]))
     return render_scan_result_card(

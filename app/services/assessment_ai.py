@@ -65,6 +65,7 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             '- Never say the target is "safe" or "secure".',
             "- Treat testssl.sh results as TLS configuration evidence only.",
             "- Do not invent TLS vulnerabilities or claim overall site security from TLS evidence alone.",
+            "- Preserve testssl.sh severity, scanner wording, and uncertainty exactly; 'potentially VULNERABLE' remains potential scanner evidence requiring validation.",
             "- Treat Gitleaks detections as redacted secret-exposure evidence only.",
             "- Never include raw secret values or infer hidden secret values.",
             "- If evidence is missing, say so.",
@@ -107,6 +108,7 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
             "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, Gitleaks, assessment history, artifacts, and notes in the supplied context.",
             "- testssl.sh evidence supports TLS configuration assessment only; do not claim overall site security from TLS evidence alone.",
+            "- Preserve testssl.sh severity, scanner wording, and uncertainty exactly; do not turn potential TLS findings into confirmed exploitability.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
             "",
@@ -338,7 +340,12 @@ def _format_finding(finding: dict) -> list[str]:
         weak_protocols = testssl_evidence.get("weak_protocols") or []
         if weak_protocols:
             lines.append("    - weak/deprecated protocols: " + "; ".join(_clean(item) for item in weak_protocols[:10]))
-        for label, key in (("vulnerabilities", "vulnerabilities"), ("cipher findings", "cipher_findings"), ("security headers", "security_headers")):
+        for label, key in (
+            ("vulnerabilities", "vulnerabilities"),
+            ("notable findings", "notable_findings"),
+            ("cipher findings", "cipher_findings"),
+            ("security headers", "security_headers"),
+        ):
             values = testssl_evidence.get(key) or []
             if values:
                 lines.append(f"    - {label}:")
@@ -349,6 +356,7 @@ def _format_finding(finding: dict) -> list[str]:
                     )
         for limitation in testssl_evidence.get("limitations") or []:
             lines.append(f"    - limitation: {_clean(limitation)}")
+        lines.append("    - boundary=testssl.sh TLS scanner evidence only; preserve scanner severity and uncertainty; potential findings are not confirmed exploitability")
     gitleaks_evidence = finding.get("gitleaks_evidence") or {}
     if gitleaks_evidence:
         lines.append("    Gitleaks redacted secret-exposure evidence:")

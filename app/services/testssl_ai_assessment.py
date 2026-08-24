@@ -1,3 +1,5 @@
+import re
+
 from app.services.ai_client import ask_ai
 
 AI_UNAVAILABLE_MESSAGES = (
@@ -16,6 +18,49 @@ FALLBACK_LINES = [
     "testssl.sh AI assessment unavailable.",
     "Use the deterministic testssl.sh result for TLS configuration evidence and next actions.",
 ]
+TRUTHFULNESS_FALLBACK_LINES = [
+    "Executive Summary",
+    "- The testssl.sh AI assessment was withheld because the generated response contained an unsupported TLS security conclusion.",
+    "",
+    "Observed TLS Facts",
+    "- Use the deterministic testssl.sh result for scanner-reported protocols, certificate metadata, cipher observations, headers, findings, severities, and wording.",
+    "",
+    "Interpretation",
+    "- testssl.sh evidence is TLS scanner output only; it does not by itself prove exploitability, compromise, robust configuration, or overall endpoint security.",
+    "",
+    "Limitations / Uncertainty",
+    "- Potential findings require validation in the application and deployment context. Absence of reported findings is not proof that TLS vulnerabilities do not exist.",
+    "",
+    "Recommended Next Actions",
+    "- Review scanner-reported TLS observations with the service owner before drawing remediation or risk conclusions.",
+]
+EVIDENCE_SCOPED_MARKERS = (
+    "testssl.sh reported",
+    "scanner-reported",
+    "scanner reported",
+    "reported as potentially",
+    "potentially vulnerable",
+    "does not establish",
+    "does not prove",
+    "not proof",
+    "requires validation",
+    "requiring validation",
+    "depends on",
+    "within its tested scope",
+    "observed as supported",
+    "was observed",
+    "were observed",
+    "severity",
+    "finding=",
+)
+UNSUPPORTED_TESTSSL_CLAIM_PATTERNS = (
+    re.compile(r"\b(?:tls|ssl|configuration|endpoint|site|target|server|host|service)\b[^.!?]{0,80}\b(?:is|are|was|were|appears|seems|looks)\s+(?:to\s+be\s+)?(?:secure|safe|robust|hardened|strong|compromised|exploitable)\b"),
+    re.compile(r"\ball\s+(?:supported\s+)?ciphers?\b[^.!?]{0,80}\b(?:strong|secure|safe)\b"),
+    re.compile(r"\b(?:breach|early[_ -]?data|heartbleed|lucky13|poodle|crime|freak|logjam|drown|sweet32|ticketbleed|ccs)\b[^.!?]{0,100}\b(?:is|are|was|were|can\s+be|has\s+been)?\s*(?:confirmed|exploitable|exploited|vulnerable|compromised)\b"),
+    re.compile(r"\b(?:the\s+)?(?:site|target|server|host|endpoint)\b[^.!?]{0,80}\b(?:is|are|was|were)\s+(?:vulnerable|exploitable|compromised)\b"),
+    re.compile(r"\bno\s+(?:(?:tls|ssl)\s+)?(?:vulnerabilities|security\s+issues|security\s+risks|weaknesses)\s+(?:exist|were\s+found|were\s+detected|found|detected)\b"),
+    re.compile(r"\b(?:no|none)\s+of\s+the\s+(?:(?:tls|ssl)\s+)?(?:configuration|findings?)\b[^.!?]{0,80}\b(?:is|are|was|were)\s+(?:vulnerable|weak|risky)\b"),
+)
 
 
 def generate_testssl_ai_assessment(finding: dict) -> list[str]:
@@ -29,7 +74,7 @@ def generate_testssl_ai_assessment(finding: dict) -> list[str]:
         return list(FALLBACK_LINES)
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
-    return lines or list(FALLBACK_LINES)
+    return _guard_truthfulness_response(lines or list(FALLBACK_LINES))
 
 
 def build_testssl_ai_assessment_prompt(finding: dict) -> str:
@@ -42,8 +87,15 @@ def build_testssl_ai_assessment_prompt(finding: dict) -> str:
             "- Treat this as TLS configuration evidence only.",
             "- Do not invent TLS vulnerabilities, protocols, certificate fields, ciphers, headers, or grades.",
             "- Do not claim the overall site is safe or secure from TLS evidence alone.",
-            '- Do not say "TLS appears robust" or provide a broad TLS safety verdict.',
-            "- Preserve scanner confidence and describe early_data, LUCKY13, and similar items as scanner-reported evidence requiring context and validation.",
+            "- Do not characterize TLS configuration as robust or provide a broad TLS safety verdict.",
+            "- Do not say all supported ciphers are strong unless the supplied evidence explicitly states that.",
+            "- Preserve scanner wording, severity labels, confidence, and uncertainty exactly.",
+            "- Preserve 'potentially VULNERABLE' as scanner-reported potential evidence requiring validation, not confirmed exploitability.",
+            "- BREACH findings are scanner-reported potential evidence unless the supplied evidence explicitly proves practical exploitability.",
+            "- early_data severity must be described as scanner severity and contextualized; do not infer practical exploitability or compromise.",
+            "- Supported, offered, and not offered protocol/cipher observations are observations only.",
+            "- Absence of reported TLS findings does not prove the endpoint is secure or that no TLS vulnerabilities exist.",
+            "- Preserve scanner confidence and describe early_data, LUCKY13, BREACH, and similar items as scanner-reported evidence requiring context and validation.",
             "- Do not claim exploitation or compromise.",
             "- Separate observed facts from potential risks and recommendations.",
             "- Mention uncertainty clearly when evidence is limited.",
@@ -78,6 +130,7 @@ def _format_testssl_evidence(finding: dict) -> str:
         f"- Supported protocols: {_clean(', '.join(summary.get('supported_protocols') or []) or 'none extracted')}",
         f"- Weak/deprecated protocol count: {int(summary.get('weak_protocol_count') or 0)}",
         f"- Notable TLS finding count: {int(summary.get('notable_count') or 0)}",
+        "- Evidence boundary: testssl.sh observations are TLS scanner evidence only; preserve scanner severity and uncertainty.",
     ]
     if certificate:
         lines.extend(
@@ -119,11 +172,40 @@ def _format_testssl_evidence(finding: dict) -> str:
         lines.append(f"- Limitation: {_clean(limitation)}")
     if not evidence:
         lines.append("- Limitation: No structured testssl.sh evidence was stored.")
+        lines.append("- Limitation: Absence of structured TLS evidence does not prove the endpoint is secure or that no TLS vulnerabilities exist.")
     return "\n".join(lines)
 
 
 def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").strip()[:500]
+
+
+def _guard_truthfulness_response(lines: list[str]) -> list[str]:
+    if _contains_unsupported_testssl_claim(lines):
+        return list(TRUTHFULNESS_FALLBACK_LINES)
+    return lines
+
+
+def _contains_unsupported_testssl_claim(lines: list[str]) -> bool:
+    for sentence in _claim_sentences(lines):
+        if _is_evidence_scoped_statement(sentence):
+            continue
+        if any(pattern.search(sentence) for pattern in UNSUPPORTED_TESTSSL_CLAIM_PATTERNS):
+            return True
+    return False
+
+
+def _claim_sentences(lines: list[str]) -> list[str]:
+    text = " ".join(str(line or "").strip() for line in lines)
+    return [
+        re.sub(r"\s+", " ", sentence).strip().lower()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+
+
+def _is_evidence_scoped_statement(sentence: str) -> bool:
+    return any(marker in sentence for marker in EVIDENCE_SCOPED_MARKERS)
 
 
 def _is_unavailable_response(response: object) -> bool:

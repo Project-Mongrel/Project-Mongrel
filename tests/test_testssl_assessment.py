@@ -106,5 +106,49 @@ def test_ai_prompt_includes_grounded_testssl_constraints_and_evidence() -> None:
 
     assert "Treat testssl.sh results as TLS configuration evidence only." in prompt
     assert "Do not invent TLS vulnerabilities" in prompt
+    assert "Preserve testssl.sh severity, scanner wording, and uncertainty exactly" in prompt
     assert "testssl.sh TLS evidence" in prompt
     assert "issuer=Example CA" in prompt
+
+
+def test_testssl_report_and_assessment_context_preserve_severity_and_uncertainty() -> None:
+    finding = {
+        "summary": "testssl.sh recorded TLS evidence for example.com.",
+        "target": "example.com:443",
+        "risk_level": "info",
+        "testssl_evidence": {
+            "target": "example.com:443",
+            "host": "example.com",
+            "port": 443,
+            "scan_status": "completed",
+            "protocols": [{"id": "TLS1_3", "name": "TLS 1.3", "finding": "offered", "severity": "OK"}],
+            "vulnerabilities": [{"id": "BREACH", "finding": "potentially VULNERABLE, uses HTTP compression", "severity": "MEDIUM"}],
+            "notable_findings": [{"id": "early_data", "finding": "supported", "severity": "HIGH"}],
+            "limitations": [
+                "Scanner labels are not automatic exploit confirmation; potential findings require validation in context."
+            ],
+        },
+        "testssl_summary": {"supported_protocols": ["TLS 1.3"], "notable_count": 2, "weak_protocol_count": 0},
+    }
+    context = {
+        "assessment": {"name": "TLS Truthfulness", "status": "active"},
+        "targets": [{"address": "example.com"}],
+        "scans": [{"tool": "testssl", "status": "completed", "risk": "info", "finding": finding}],
+        "findings": [finding],
+        "artifacts": [],
+        "notes": [],
+    }
+
+    prompt = build_assessment_ai_prompt("Summarize TLS evidence.", context)
+    report = generate_assessment_markdown_report(context)
+    card = build_testssl_result_text({"success": True, "target": "example.com:443", "elapsed_seconds": 3}, finding["testssl_evidence"])
+
+    assert "BREACH severity=MEDIUM finding=potentially VULNERABLE, uses HTTP compression" in prompt
+    assert "early_data severity=HIGH finding=supported" in prompt
+    assert "potential findings are not confirmed exploitability" in prompt
+    assert "BREACH severity=MEDIUM finding=potentially VULNERABLE, uses HTTP compression" in report
+    assert "early_data severity=HIGH finding=supported" in report
+    assert "TLS configuration evidence only; this does not establish overall site security." in report
+    assert "BREACH: severity=MEDIUM finding=potentially VULNERABLE, uses HTTP compression" in card
+    assert "site is vulnerable to breach" not in report.lower()
+    assert "robust" not in report.lower()

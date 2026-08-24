@@ -334,6 +334,51 @@ def test_report_generation_from_empty_ffuf_preserves_coverage_uncertainty() -> N
     assert "No conclusion about hidden content, endpoints, directories, files, parameters, virtual hosts, vulnerabilities, or coverage" in report
 
 
+def test_report_generation_from_testssl_preserves_scanner_uncertainty() -> None:
+    add_finding(
+        user_id=9031,
+        finding={
+            "source": "testssl",
+            "target": "example.com:443",
+            "risk_level": "info",
+            "finding_count": 2,
+            "testssl_summary": {
+                "supported_protocols": ["TLS 1.2", "TLS 1.3"],
+                "notable_count": 2,
+                "weak_protocol_count": 0,
+            },
+            "testssl_evidence": {
+                "target": "example.com:443",
+                "host": "example.com",
+                "port": 443,
+                "protocols": [
+                    {"id": "TLS1_2", "name": "TLS 1.2", "finding": "offered", "severity": "OK"},
+                    {"id": "TLS1_3", "name": "TLS 1.3", "finding": "offered", "severity": "OK"},
+                ],
+                "vulnerabilities": [
+                    {
+                        "id": "BREACH",
+                        "finding": "potentially VULNERABLE, uses HTTP compression",
+                        "severity": "MEDIUM",
+                    }
+                ],
+                "notable_findings": [{"id": "early_data", "finding": "supported", "severity": "HIGH"}],
+            },
+        },
+    )
+
+    report = generate_markdown_report(user_id=9031, target="example.com:443")
+
+    assert "testssl.sh recorded TLS scanner evidence for example.com:443" in report
+    assert "Protocol observations: TLS 1.2, TLS 1.3" in report
+    assert "BREACH severity=MEDIUM finding=potentially VULNERABLE, uses HTTP compression" in report
+    assert "early_data severity=HIGH finding=supported" in report
+    assert "preserve scanner severity/uncertainty and validate potential findings in context" in report
+    assert "site is vulnerable to breach" not in report.lower()
+    assert "robust" not in report.lower()
+    assert "all ciphers are strong" not in report.lower()
+
+
 def test_report_generation_with_clean_nuclei_scan() -> None:
     add_finding(
         user_id=9003,

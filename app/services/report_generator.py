@@ -344,6 +344,8 @@ def _format_technical_findings(scan_runs: list[dict]) -> list[str]:
             finding_lines.extend(_format_playwright_observations(scan_run))
         elif source == "ffuf":
             finding_lines.extend(_format_ffuf_observations(scan_run))
+        elif source == "testssl":
+            finding_lines.extend(_format_testssl_observations(scan_run))
         else:
             finding_lines.append(f"- {_source_label(source)} finding for {scan_run.get('target') or 'unknown target'}.")
 
@@ -578,6 +580,31 @@ def _format_ffuf_observations(scan_run: dict) -> list[str]:
     return lines
 
 
+def _format_testssl_observations(scan_run: dict) -> list[str]:
+    evidence = scan_run.get("testssl_evidence") or {}
+    if not evidence:
+        return [
+            f"- testssl.sh recorded no usable structured TLS evidence for {scan_run.get('target') or 'unknown target'}.",
+            "  - No conclusion about TLS security, vulnerabilities, ciphers, or configuration quality can be drawn from that result.",
+        ]
+
+    target = scan_run.get("target") or evidence.get("target") or "unknown target"
+    protocols = evidence.get("protocols") or []
+    items = _notable_testssl_items(evidence)
+    lines = [f"- testssl.sh recorded TLS scanner evidence for {target}:"]
+    lines.append(
+        "  - Protocol observations: "
+        + (", ".join(_clean(item.get("name") or item.get("id")) for item in protocols[:10]) if protocols else "none extracted")
+    )
+    if evidence.get("weak_protocols"):
+        lines.append("  - Weak/deprecated observations: " + "; ".join(_clean(item) for item in (evidence.get("weak_protocols") or [])[:10]))
+    lines.append(f"  - Notable scanner-reported TLS findings: {len(items)}")
+    for item in items[:10]:
+        lines.append(f"    - {_clean(item.get('id') or 'finding')} severity={_clean(item.get('severity') or 'info')} finding={_clean(item.get('finding') or '')}")
+    lines.append("  - Limitation: testssl.sh evidence is TLS scanner output only; preserve scanner severity/uncertainty and validate potential findings in context.")
+    return lines
+
+
 def _format_clean_scan_notes(scan_runs: list[dict]) -> list[str]:
     clean_scans = [scan_run for scan_run in scan_runs if _is_clean_scan(scan_run)]
     if not clean_scans:
@@ -604,6 +631,8 @@ def _format_recommendations(scan_runs: list[dict]) -> list[str]:
         recommendations.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
     if "metasploit" in sources:
         recommendations.append("- Review Metasploit validation evidence with the owner; do not treat failed validation as proof that the target is secure.")
+    if "testssl" in sources:
+        recommendations.append("- Review testssl.sh-reported TLS protocols, cipher observations, certificate metadata, and potential findings with the service owner.")
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
         recommendations.append("- Treat clean scans as point-in-time evidence, not proof that no vulnerabilities exist.")
     recommendations.extend(_format_finding_aware_recommendations(scan_runs))
@@ -833,6 +862,8 @@ def _finding_count(scan_run: dict) -> int:
         return int((scan_run.get("prowler_evidence") or {}).get("finding_count") or len((scan_run.get("prowler_evidence") or {}).get("findings") or []))
     if isinstance(scan_run.get("metasploit_evidence"), dict):
         return 1 if (scan_run.get("metasploit_evidence") or {}).get("validation_state") == "VALIDATED" else 0
+    if isinstance(scan_run.get("testssl_evidence"), dict):
+        return len(_notable_testssl_items(scan_run.get("testssl_evidence") or {}))
     if isinstance(scan_run.get("nuclei_findings"), list):
         return len(scan_run.get("nuclei_findings") or [])
     if isinstance(scan_run.get("open_ports"), list):
@@ -848,6 +879,7 @@ def _source_label(source: object) -> str:
         "bbot": "BBOT",
         "prowler": "Prowler",
         "metasploit": "Metasploit",
+        "testssl": "testssl.sh",
     }
     return labels.get(str(source), str(source or "Unknown"))
 
@@ -868,4 +900,19 @@ def _source_icon_key(source_label: str) -> str:
         return "observation"
     if normalized.startswith("metasploit"):
         return "observation"
+    if normalized.startswith("testssl"):
+        return "observation"
     return "observation"
+
+
+def _notable_testssl_items(evidence: dict) -> list[dict]:
+    items = (evidence.get("vulnerabilities") or []) + (evidence.get("notable_findings") or []) + (evidence.get("cipher_findings") or [])
+    return [item for item in items if _is_notable_testssl_item(item)]
+
+
+def _is_notable_testssl_item(item: dict) -> bool:
+    severity = str(item.get("severity") or "").upper()
+    finding = str(item.get("finding") or "").lower()
+    if severity in {"HIGH", "CRITICAL", "MEDIUM", "LOW", "WARN", "WARNING"}:
+        return True
+    return not any(term in finding for term in ("not vulnerable", "not offered", "not supported", "no vulnerability"))
