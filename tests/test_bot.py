@@ -6006,6 +6006,9 @@ def test_tshark_live_result_card_polishes_source_time_duration_protocols_and_war
     assert card.count("encrypted traffic limits visibility") == 1
     assert "Packet activity is not automatically malicious." in card
     assert "A connection is not compromise." in card
+    assert "DNS associations are capture-window observations, not permanent ownership proof." in card
+    assert "TLS SNI/version metadata does not prove a successful TLS handshake." in card
+    assert "HTTP requests without response codes are not completed HTTP transactions." in card
 
 
 def test_tshark_result_card_keeps_endpoint_and_conversation_lists_bounded() -> None:
@@ -6081,7 +6084,9 @@ def test_tshark_offline_result_card_uses_uploaded_filename_readable_time_duratio
     assert "- &lt;Root&gt;\n  →\n  192.0.2.10" in card
     assert card.count("&lt;Root&gt;\n  →\n  192.0.2.10") == 1
     assert card.count("sni=n/a version=TLS 1.2") == 1
-    assert "sni=&lt;Root&gt; version=TLS 1.2" in card
+    assert "sni=n/a version=TLS 1.2 handshake_success=not established by stored metadata" in card
+    assert "sni=&lt;Root&gt; version=TLS 1.2 handshake_success=not established by stored metadata" in card
+    assert "request=GET host=example.com uri=/?token=&lt;REDACTED&gt; response_status=200" in card
     assert normalized["tls_observations"][0]["version"] == "0x0303"
 
 

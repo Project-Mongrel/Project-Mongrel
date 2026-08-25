@@ -1,3 +1,5 @@
+import re
+
 from app.services.ai_client import ask_ai
 
 AI_UNAVAILABLE_MESSAGES = (
@@ -17,6 +19,48 @@ FALLBACK_LINES = [
     "Use the deterministic TShark PCAP metadata result for observed evidence and limitations.",
 ]
 
+TRUTHFULNESS_FALLBACK_LINES = [
+    "Executive Summary",
+    "The TShark AI assessment was withheld because the generated response contained an unsupported network or security conclusion.",
+    "",
+    "Observed PCAP Metadata",
+    "Use the deterministic TShark packet metadata result for observed packets, endpoints, conversations, DNS, HTTP, TLS, truncation, and limitations.",
+    "",
+    "Network Conversation Notes",
+    "Packet activity, endpoint metadata, and conversations are observations only.",
+    "",
+    "DNS / HTTP / TLS Notes",
+    "Do not infer ownership, completed HTTP transactions, successful TLS handshakes, vulnerabilities, exploitation, authentication success, or compromise unless explicitly represented in normalized evidence.",
+    "",
+    "Potential Follow-up",
+    "Review the normalized evidence and capture scope before drawing any follow-up conclusions.",
+    "",
+    "Evidence Confidence / Limitations",
+    "Capture scope, interface, duration, truncation, encryption, and missing protocol fields limit conclusions. Absence from a capture does not prove absence from the network.",
+]
+
+EVIDENCE_SCOPED_MARKERS = (
+    "not observed",
+    "does not prove",
+    "does not establish",
+    "not evidence",
+    "not proof",
+    "insufficient",
+    "limited visibility",
+    "capture scope",
+    "absence from",
+)
+
+UNSUPPORTED_TSHARK_CLAIM_PATTERNS = (
+    re.compile(r"\b(?:exploit|exploitation)\b[^.!?]{0,80}\b(?:succeeded|successful|worked|confirmed)\b"),
+    re.compile(r"\b(?:target|host|system|server|endpoint|service)\b[^.!?]{0,80}\b(?:is|was|has\s+been|appears|seems|looks)\s+(?:to\s+be\s+)?(?:compromised|owned|pwned|vulnerable|exploitable)\b"),
+    re.compile(r"\b(?:vulnerability|vulnerabilities|vuln)\b[^.!?]{0,80}\b(?:is|are|was|were|has\s+been|have\s+been)\s+(?:confirmed|proven|validated)\b"),
+    re.compile(r"\btls\b[^.!?]{0,80}\b(?:handshake|connection)\b[^.!?]{0,80}\b(?:succeeded|successful|completed|established)\b"),
+    re.compile(r"\bhttp\b[^.!?]{0,80}\b(?:transaction|exchange|request\s*/?\s*response)\b[^.!?]{0,80}\b(?:completed|succeeded|successful)\b"),
+    re.compile(r"\b(?:authentication|login)\b[^.!?]{0,80}\b(?:succeeded|successful|confirmed)\b"),
+    re.compile(r"\b(?:dns|ip|endpoint)\b[^.!?]{0,80}\b(?:proves|confirms|establishes)\b[^.!?]{0,80}\b(?:ownership|owned|belongs\s+to)\b"),
+)
+
 
 def generate_tshark_ai_assessment(normalized_evidence: dict) -> list[str]:
     prompt = build_tshark_ai_assessment_prompt(normalized_evidence)
@@ -27,7 +71,7 @@ def generate_tshark_ai_assessment(normalized_evidence: dict) -> list[str]:
     if _is_unavailable_response(response):
         return list(FALLBACK_LINES)
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
-    return lines or list(FALLBACK_LINES)
+    return _guard_truthfulness_response(lines or list(FALLBACK_LINES), normalized_evidence)
 
 
 def build_tshark_ai_assessment_prompt(normalized_evidence: dict) -> str:
@@ -42,6 +86,10 @@ def build_tshark_ai_assessment_prompt(normalized_evidence: dict) -> str:
             "- Packets are observations, not attacks.",
             "- A connection is not compromise.",
             "- A DNS query is not exfiltration.",
+            "- DNS metadata observed in a capture does not prove permanent ownership or authoritative mapping.",
+            "- TCP packets or conversations do not prove completed connections, application success, exploitation, or compromise.",
+            "- TLS metadata from SNI/version fields does not prove a successful TLS handshake unless explicit successful-handshake evidence is supplied.",
+            "- HTTP request metadata without a response code is not a completed HTTP transaction.",
             "- Encrypted traffic limits visibility.",
             "- Absence from a capture proves nothing about absence from the network.",
             "- Capture scope and time range limit conclusions.",
@@ -87,6 +135,7 @@ def _format_tshark_evidence(evidence: dict) -> str:
         lines.append(f"- Parser warning: {_clean(warning)}")
     for limitation in evidence.get("evidence_limitations") or []:
         lines.append(f"- Limitation: {_clean(limitation)}")
+    lines.append("- Evidence boundary: TShark metadata is packet observation evidence only; it does not prove exploitation, compromise, vulnerability, ownership, authentication success, successful TLS handshakes, or completed HTTP transactions unless explicit normalized evidence supports that exact claim.")
     return "\n".join(lines)
 
 
@@ -128,6 +177,51 @@ def _tls_line(item: dict) -> str:
 
 def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").replace("\r", " ").strip()[:500]
+
+
+def _guard_truthfulness_response(lines: list[str], evidence: dict) -> list[str]:
+    if _contains_unsupported_tshark_claim(lines, evidence):
+        return list(TRUTHFULNESS_FALLBACK_LINES)
+    return lines
+
+
+def _contains_unsupported_tshark_claim(lines: list[str], evidence: dict) -> bool:
+    tls_success = _successful_tls_handshake_observed(evidence)
+    http_transaction = _http_transaction_observed(evidence)
+    for sentence in _claim_sentences(lines):
+        if _is_evidence_scoped_statement(sentence):
+            continue
+        if not tls_success and re.search(r"\btls\b[^.!?]{0,80}\b(?:handshake|connection)\b[^.!?]{0,80}\b(?:succeeded|successful|completed|established)\b", sentence):
+            return True
+        if not http_transaction and re.search(r"\bhttp\b[^.!?]{0,80}\b(?:transaction|exchange|request\s*/?\s*response)\b[^.!?]{0,80}\b(?:completed|succeeded|successful)\b", sentence):
+            return True
+        if any(pattern.search(sentence) for pattern in UNSUPPORTED_TSHARK_CLAIM_PATTERNS):
+            return True
+    return False
+
+
+def _successful_tls_handshake_observed(evidence: dict) -> bool:
+    return any(item.get("handshake_complete") is True for item in evidence.get("tls_observations") or [])
+
+
+def _http_transaction_observed(evidence: dict) -> bool:
+    return any(
+        (item.get("method") or item.get("host") or item.get("uri")) and item.get("response_code")
+        for item in evidence.get("http_observations") or []
+    )
+
+
+def _claim_sentences(lines: list[str]) -> list[str]:
+    text = " ".join(str(line or "").strip() for line in lines)
+    return [
+        re.sub(r"\s+", " ", sentence).strip().lower()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+
+
+def _is_evidence_scoped_statement(sentence: str) -> bool:
+    return any(marker in sentence for marker in EVIDENCE_SCOPED_MARKERS)
 
 
 def _is_unavailable_response(response: object) -> bool:

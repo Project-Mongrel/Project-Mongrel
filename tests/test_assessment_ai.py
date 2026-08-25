@@ -230,6 +230,46 @@ def test_assessment_ai_prompt_preserves_metasploit_validation_boundaries() -> No
     assert "exploit succeeded" not in prompt.lower()
 
 
+def test_assessment_ai_prompt_preserves_tshark_packet_boundaries() -> None:
+    prompt = build_assessment_ai_prompt(
+        "What did TShark observe?",
+        {
+            "assessment": {"name": "TShark Assessment", "status": "active"},
+            "targets": [{"address": "example.com"}],
+            "scans": [{"tool": "tshark", "status": "completed"}],
+            "findings": [
+                {
+                    "source": "tshark",
+                    "target": "capture.pcap",
+                    "risk_level": "info",
+                    "tshark_evidence": {
+                        "packet_count": 2,
+                        "byte_count": 160,
+                        "capture_start": "1710000000.1",
+                        "capture_end": "1710000001.2",
+                        "observed_protocols": [{"protocol": "tls", "packet_count": 1}],
+                        "observed_conversations": [{"src": "192.0.2.10", "dst": "198.51.100.20", "src_port": "53000", "dst_port": "443", "transport": "tcp", "packet_count": 1}],
+                        "dns_observations": [{"query_name": "example.com", "response_address": "198.51.100.20"}],
+                        "http_observations": [{"method": "GET", "host": "example.com", "uri": "/", "response_code": ""}],
+                        "tls_observations": [{"sni": "example.com", "version": "0x0303"}],
+                    },
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        },
+    )
+
+    assert "Treat TShark evidence as packet metadata only" in prompt
+    assert "TShark normalized packet metadata evidence:" in prompt
+    assert "packet_count=2 byte_count=160" in prompt
+    assert "dns_query=example.com capture_response=198.51.100.20" in prompt
+    assert "http_request=GET host=example.com uri=/ response_status=not observed" in prompt
+    assert "tls_sni=example.com version=0x0303 handshake_success=not established by stored metadata" in prompt
+    assert "do not prove exploitation, compromise, ownership, authentication success, vulnerability, successful TLS handshake, or completed HTTP transaction" in prompt
+    assert "tls handshake succeeded" not in prompt.lower()
+
+
 def test_assessment_ai_report_prompt_includes_required_sections_and_limitations() -> None:
     context = {
         "assessment": {"name": "Report Assessment", "status": "active"},

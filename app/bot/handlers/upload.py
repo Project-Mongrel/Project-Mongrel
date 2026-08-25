@@ -621,6 +621,10 @@ def build_tshark_result_text(normalized: dict, result: dict | None = None) -> st
         "- Packet activity is not automatically malicious.",
         "- A connection is not compromise.",
         "- A DNS query is not exfiltration.",
+        "- DNS associations are capture-window observations, not permanent ownership proof.",
+        "- TCP conversations do not by themselves prove completed connections, application success, exploitation, or compromise.",
+        "- TLS SNI/version metadata does not prove a successful TLS handshake.",
+        "- HTTP requests without response codes are not completed HTTP transactions.",
         "- Encrypted traffic limits visibility.",
         "- Capture scope/time limits conclusions.",
         "- Absence from the capture does not prove absence from the network.",
@@ -1964,7 +1968,8 @@ def _format_tshark_http(observations: list[dict]) -> list[str]:
     if not observations:
         return ["- none observed"]
     return [
-        f"- {_escape(item.get('method') or 'HTTP')} host={_escape(item.get('host') or 'n/a')} uri={_escape(item.get('uri') or 'n/a')} status={_escape(item.get('response_code') or 'n/a')}"
+        f"- request={_escape(item.get('method') or 'not observed')} host={_escape(item.get('host') or 'n/a')} "
+        f"uri={_escape(item.get('uri') or 'n/a')} response_status={_escape(item.get('response_code') or 'not observed')}"
         for item in observations[:6]
     ]
 
@@ -1982,7 +1987,7 @@ def _format_tshark_tls(observations: list[dict], *, suppress_duplicate_na_sni: b
             if key in seen_na_sni:
                 continue
             seen_na_sni.add(key)
-        lines.append(f"- sni={_escape(sni)} version={_escape(version)}")
+        lines.append(f"- sni={_escape(sni)} version={_escape(version)} handshake_success=not established by stored metadata")
         if len(lines) >= 6:
             break
     return lines or ["- none observed"]

@@ -379,6 +379,37 @@ def test_report_generation_from_testssl_preserves_scanner_uncertainty() -> None:
     assert "all ciphers are strong" not in report.lower()
 
 
+def test_report_generation_from_tshark_preserves_packet_boundaries() -> None:
+    add_finding(
+        user_id=9032,
+        finding={
+            "source": "tshark",
+            "target": "capture.pcap",
+            "risk_level": "info",
+            "finding_count": 3,
+            "tshark_evidence": {
+                "packet_count": 3,
+                "byte_count": 354,
+                "observed_protocols": [{"protocol": "dns", "packet_count": 1}, {"protocol": "tls", "packet_count": 1}],
+                "observed_conversations": [{"src": "192.0.2.10", "dst": "198.51.100.20", "src_port": "53000", "dst_port": "443", "transport": "tcp", "packet_count": 2}],
+                "dns_observations": [{"query_name": "example.com", "response_address": "93.184.216.34"}],
+                "http_observations": [{"method": "GET", "host": "example.com", "uri": "/", "response_code": ""}],
+                "tls_observations": [{"sni": "example.com", "version": "0x0303"}],
+            },
+        },
+    )
+
+    report = generate_markdown_report(user_id=9032, target="capture.pcap")
+
+    assert "TShark recorded packet metadata for capture.pcap" in report
+    assert "query=example.com capture_response=93.184.216.34" in report
+    assert "request=GET host=example.com uri=/ response_status=not observed" in report
+    assert "sni=example.com version=0x0303 handshake_success=not established by stored metadata" in report
+    assert "do not prove exploitation, compromise, ownership, authentication success, vulnerability, successful TLS handshakes, or completed HTTP transactions" in report
+    assert "exploit succeeded" not in report.lower()
+    assert "tls handshake succeeded" not in report.lower()
+
+
 def test_report_generation_with_clean_nuclei_scan() -> None:
     add_finding(
         user_id=9003,
@@ -547,6 +578,7 @@ def test_report_ai_prompt_is_grounded() -> None:
     assert "git-config-exposure" in prompt
     assert "Never recommend closing ports blindly." in prompt
     assert "without inferring safety from absence of findings" in prompt
+    assert "Treat TShark evidence as packet metadata only" in prompt
     assert "appears clean" not in prompt
     assert "Review whether the service is required" in prompt or "reviewing whether the service is required" in prompt
 

@@ -287,7 +287,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     if metasploit_evidence:
         actions.append("- Review Metasploit validation state, session evidence, and proposal/artifact provenance before follow-up testing.")
     if tshark_evidence:
-        actions.append("- Review TShark PCAP metadata for unexpected endpoints, DNS names, HTTP hosts, and TLS SNI values without treating packet activity as proof of compromise.")
+        actions.append("- Review TShark PCAP metadata for unexpected endpoints, DNS names, HTTP hosts, and TLS SNI values without treating packet activity as proof of exploit success, compromise, ownership, or completed application transactions.")
 
     return actions or ["- Continue assessment with additional authorized scans and manual validation."]
 
@@ -860,8 +860,14 @@ def _format_tshark_observations(evidence: dict) -> list[str]:
         f"- Capture end: {_clean(evidence.get('capture_end') or 'not available')}",
         "- Protocols: " + (", ".join(f"{_clean(item.get('protocol'))}={int(item.get('packet_count') or 0)}" for item in (evidence.get("observed_protocols") or [])[:10]) or "none recorded"),
         "- Limitation: packet activity is not automatically malicious; a connection is not compromise; a DNS query is not exfiltration.",
+        "- Limitation: DNS associations are capture-window observations, not permanent ownership proof.",
+        "- Limitation: TCP conversations do not by themselves prove completed connections, application success, exploit success, or compromise.",
+        "- Limitation: TLS SNI/version metadata does not prove a successful TLS handshake.",
+        "- Limitation: HTTP requests without response codes are not completed HTTP transactions.",
         "- Limitation: encrypted traffic limits visibility, and absence from a capture proves nothing about absence from the network.",
     ]
+    if int(evidence.get("packet_count") or 0) <= 0:
+        lines.append("- Limitation: no packet metadata was observed in this normalized evidence; this does not prove no traffic occurred.")
     endpoints = evidence.get("observed_endpoints") or []
     if endpoints:
         lines.append("- Endpoints:")
@@ -880,20 +886,20 @@ def _format_tshark_observations(evidence: dict) -> list[str]:
     if dns_observations:
         lines.append("- DNS metadata:")
         for item in dns_observations[:10]:
-            lines.append(f"  - query={_clean(item.get('query_name') or 'n/a')} response={_clean(item.get('response_name') or item.get('response_address') or 'n/a')}")
+            lines.append(f"  - query={_clean(item.get('query_name') or 'n/a')} capture_response={_clean(item.get('response_name') or item.get('response_address') or 'n/a')}")
     http_observations = evidence.get("http_observations") or []
     if http_observations:
         lines.append("- HTTP metadata:")
         for item in http_observations[:10]:
             lines.append(
-                f"  - {_clean(item.get('method') or 'HTTP')} host={_clean(item.get('host') or 'n/a')} "
-                f"uri={_clean(item.get('uri') or 'n/a')} status={_clean(item.get('response_code') or 'n/a')}"
+                f"  - request={_clean(item.get('method') or 'not observed')} host={_clean(item.get('host') or 'n/a')} "
+                f"uri={_clean(item.get('uri') or 'n/a')} response_status={_clean(item.get('response_code') or 'not observed')}"
             )
     tls_observations = evidence.get("tls_observations") or []
     if tls_observations:
         lines.append("- TLS metadata:")
         for item in tls_observations[:10]:
-            lines.append(f"  - sni={_clean(item.get('sni') or 'n/a')} version={_clean(item.get('version') or 'n/a')}")
+            lines.append(f"  - sni={_clean(item.get('sni') or 'n/a')} version={_clean(item.get('version') or 'n/a')} handshake_success=not established by stored metadata")
     active_truncation = [key for key, value in sorted(truncation.items()) if value is True]
     if active_truncation:
         lines.append("- Truncation: " + ", ".join(_clean(value) for value in active_truncation))

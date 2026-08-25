@@ -65,6 +65,7 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             '- Never say the target is "safe" or "secure".',
             "- Treat Metasploit execution status, validation state, and session evidence as separate facts.",
             "- Do not infer exploit success, compromise, shell access, vulnerability confirmation, or vulnerability absence from Metasploit subprocess success, compatibility, failed validation, or no session.",
+            "- Treat TShark evidence as packet metadata only; do not infer exploitation, compromise, vulnerability, ownership, authentication success, successful TLS handshakes, or completed HTTP transactions from packet observations alone.",
             "- Treat testssl.sh results as TLS configuration evidence only.",
             "- Do not invent TLS vulnerabilities or claim overall site security from TLS evidence alone.",
             "- Preserve testssl.sh severity, scanner wording, and uncertainty exactly; 'potentially VULNERABLE' remains potential scanner evidence requiring validation.",
@@ -107,10 +108,11 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             '- Never state a target is "safe".',
             "- Treat Metasploit execution status, validation state, and session evidence as separate facts.",
             "- Do not infer exploit success, compromise, shell access, vulnerability confirmation, or vulnerability absence from Metasploit subprocess success, compatibility, failed validation, or no session.",
+            "- Treat TShark evidence as packet metadata only; do not infer exploitation, compromise, vulnerability, ownership, authentication success, successful TLS handshakes, or completed HTTP transactions from packet observations alone.",
             "- Never imply a clean Nuclei scan means the target is secure.",
             "- If evidence is missing, explain what has not yet been assessed.",
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
-            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, Gitleaks, assessment history, artifacts, and notes in the supplied context.",
+            "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, Gitleaks, Prowler, Metasploit, TShark, assessment history, artifacts, and notes in the supplied context.",
             "- testssl.sh evidence supports TLS configuration assessment only; do not claim overall site security from TLS evidence alone.",
             "- Preserve testssl.sh severity, scanner wording, and uncertainty exactly; do not turn potential TLS findings into confirmed exploitability.",
             "- Keep the report concise and consultant-focused.",
@@ -397,6 +399,35 @@ def _format_finding(finding: dict) -> list[str]:
             "    - boundary=Metasploit validation evidence only; subprocess success, compatibility, target response, "
             "failed validation, timeout, or no session is not exploit proof or target safety proof"
         )
+    tshark_evidence = finding.get("tshark_evidence") or {}
+    if tshark_evidence:
+        lines.append("    TShark normalized packet metadata evidence:")
+        lines.append(f"    - packet_count={int(tshark_evidence.get('packet_count') or 0)} byte_count={int(tshark_evidence.get('byte_count') or 0)}")
+        lines.append(f"    - capture_start={_clean(tshark_evidence.get('capture_start') or 'not available')} capture_end={_clean(tshark_evidence.get('capture_end') or 'not available')}")
+        for item in (tshark_evidence.get("observed_protocols") or [])[:10]:
+            lines.append(f"    - protocol={_clean(item.get('protocol') or 'unknown')} packets={int(item.get('packet_count') or 0)}")
+        for item in (tshark_evidence.get("observed_conversations") or [])[:10]:
+            lines.append(
+                f"    - conversation={_clean(item.get('src') or 'unknown')}:{_clean(item.get('src_port') or '')}->"
+                f"{_clean(item.get('dst') or 'unknown')}:{_clean(item.get('dst_port') or '')} "
+                f"transport={_clean(item.get('transport') or 'unknown')} packets={int(item.get('packet_count') or 0)}"
+            )
+        for item in (tshark_evidence.get("dns_observations") or [])[:10]:
+            lines.append(f"    - dns_query={_clean(item.get('query_name') or 'n/a')} capture_response={_clean(item.get('response_name') or item.get('response_address') or 'n/a')}")
+        for item in (tshark_evidence.get("http_observations") or [])[:10]:
+            lines.append(
+                f"    - http_request={_clean(item.get('method') or 'not observed')} host={_clean(item.get('host') or 'n/a')} "
+                f"uri={_clean(item.get('uri') or 'n/a')} response_status={_clean(item.get('response_code') or 'not observed')}"
+            )
+        for item in (tshark_evidence.get("tls_observations") or [])[:10]:
+            lines.append(f"    - tls_sni={_clean(item.get('sni') or 'n/a')} version={_clean(item.get('version') or 'n/a')} handshake_success=not established by stored metadata")
+        truncation = tshark_evidence.get("truncation") or {}
+        active_truncation = [key for key, value in sorted(truncation.items()) if value is True]
+        if active_truncation:
+            lines.append("    - truncation=" + ", ".join(_clean(value) for value in active_truncation))
+        for limitation in tshark_evidence.get("evidence_limitations") or []:
+            lines.append(f"    - limitation: {_clean(limitation)}")
+        lines.append("    - boundary=TShark packet metadata only; packets, DNS, TCP, TLS, HTTP, and endpoints do not prove exploitation, compromise, ownership, authentication success, vulnerability, successful TLS handshake, or completed HTTP transaction unless explicit normalized evidence supports that exact claim")
     return lines
 
 

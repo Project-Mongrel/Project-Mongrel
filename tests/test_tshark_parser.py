@@ -78,6 +78,10 @@ def test_tshark_parser_normalizes_ipv4_ipv6_dns_http_and_tls(tmp_path) -> None:
     assert normalized["tls_observations"][0]["sni"] == "tls.example.com"
     assert normalized["tls_observations"][0]["version"] == "0x0303"
     assert "A DNS query is not evidence of exfiltration by itself." in normalized["evidence_limitations"]
+    assert "A DNS response in a capture is not permanent ownership or authoritative mapping proof." in normalized["evidence_limitations"]
+    assert "TCP packets or conversations do not prove completed connections, application success, exploit success, or compromise by themselves." in normalized["evidence_limitations"]
+    assert "TLS SNI/version metadata does not prove a successful TLS handshake by itself." in normalized["evidence_limitations"]
+    assert "HTTP request metadata without a response code is not a completed HTTP transaction." in normalized["evidence_limitations"]
     assert "Absence from the capture does not prove absence from the network." in normalized["evidence_limitations"]
 
 

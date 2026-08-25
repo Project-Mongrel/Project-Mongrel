@@ -1,6 +1,13 @@
 from unittest.mock import patch
 
-from app.services.tshark_ai_assessment import FALLBACK_LINES, build_tshark_ai_assessment_prompt, generate_tshark_ai_assessment
+import pytest
+
+from app.services.tshark_ai_assessment import (
+    FALLBACK_LINES,
+    TRUTHFULNESS_FALLBACK_LINES,
+    build_tshark_ai_assessment_prompt,
+    generate_tshark_ai_assessment,
+)
 
 
 def _evidence() -> dict:
@@ -43,8 +50,13 @@ def test_tshark_ai_prompt_uses_normalized_evidence_only_and_preserves_uncertaint
     assert "Packets are observations, not attacks." in prompt
     assert "A connection is not compromise." in prompt
     assert "A DNS query is not exfiltration." in prompt
+    assert "DNS metadata observed in a capture does not prove permanent ownership or authoritative mapping." in prompt
+    assert "TCP packets or conversations do not prove completed connections" in prompt
+    assert "TLS metadata from SNI/version fields does not prove a successful TLS handshake" in prompt
+    assert "HTTP request metadata without a response code is not a completed HTTP transaction." in prompt
     assert "Encrypted traffic limits visibility." in prompt
     assert "Absence from a capture proves nothing" in prompt
+    assert "successful TLS handshakes, or completed HTTP transactions unless explicit normalized evidence supports" in prompt
 
 
 def test_tshark_ai_prompt_excludes_sensitive_fields() -> None:
@@ -66,3 +78,44 @@ def test_tshark_ai_assessment_success_and_fallback() -> None:
 
     with patch("app.services.tshark_ai_assessment.ask_ai", side_effect=RuntimeError("boom")):
         assert generate_tshark_ai_assessment(_evidence()) == FALLBACK_LINES
+
+
+@pytest.mark.parametrize(
+    "unsafe_response",
+    [
+        "Executive Summary\nThe exploit succeeded.",
+        "Executive Summary\nThe target was compromised.",
+        "Executive Summary\nThe TLS handshake succeeded.",
+        "Executive Summary\nThe HTTP transaction completed successfully.",
+        "Executive Summary\nThe DNS record proves endpoint ownership.",
+    ],
+)
+def test_tshark_unsupported_generated_conclusions_are_withheld(unsafe_response: str) -> None:
+    with patch("app.services.tshark_ai_assessment.ask_ai", return_value=unsafe_response):
+        lines = generate_tshark_ai_assessment(_evidence())
+
+    assert lines == TRUTHFULNESS_FALLBACK_LINES
+
+
+def test_tshark_evidence_scoped_limitation_wording_is_allowed() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "TShark observed TLS SNI/version metadata, but this does not prove a successful TLS handshake.",
+            "A DNS query for example.com was observed; this does not establish permanent ownership.",
+        ]
+    )
+
+    with patch("app.services.tshark_ai_assessment.ask_ai", return_value=response):
+        lines = generate_tshark_ai_assessment(_evidence())
+
+    assert lines == response.splitlines()
+
+
+def test_tshark_http_request_without_response_is_not_completed_transaction() -> None:
+    evidence = _evidence()
+    evidence["http_observations"] = [{"method": "GET", "host": "example.com", "uri": "/", "response_code": ""}]
+    prompt = build_tshark_ai_assessment_prompt(evidence)
+
+    assert "status=n/a" in prompt
+    assert "HTTP request metadata without a response code is not a completed HTTP transaction." in prompt

@@ -5,6 +5,7 @@ import pytest
 
 from app.services.findings_store import close_findings_database, configure_findings_database
 from app.services.tshark_metasploit_correlation import (
+    TRUTHFULNESS_FALLBACK_LINES,
     build_tshark_metasploit_correlated_prompt,
     build_tshark_metasploit_correlation_record,
     generate_tshark_metasploit_correlated_assessment,
@@ -43,6 +44,9 @@ def _metasploit(state: str = "DETECTED") -> dict:
         "target": "example.com",
         "port": 443,
         "validation_state": state,
+        "subprocess_success": True,
+        "module_executed": True,
+        "session_established": state == "SESSION_ESTABLISHED",
         "summary": "Metasploit reported service or version metadata.",
         "evidence_confidence": "tool_reported",
         "raw_evidence_excerpt": "Server: nginx",
@@ -89,8 +93,10 @@ def test_exact_target_ip_port_time_aligned_corroboration() -> None:
 
     assert record["target_resolved_ips_observed"] == ["93.184.216.34"]
     assert record["tshark"]["relevant_conversations"][0]["dst_port"] == "443"
+    assert record["metasploit"]["session_established"] is False
     assert record["correlation_outcome"] == "corroborated"
     assert record["correlation_confidence"] == "high"
+    assert "not exploitability" in record["correlation_confidence_meaning"]
     assert record["agreement_disagreement_state"] == "agreement"
 
 
@@ -141,6 +147,47 @@ def test_no_false_tls_handshake_or_http_service_response_claim_in_record_and_pro
     assert record["tshark"]["http_evidence"]["responses"][0]["response_code"] == "200"
     assert "Never claim a successful TLS handshake unless successful_handshake_observed is true." in prompt
     assert "Never claim an HTTP response identified a service unless packet metadata explicitly proves that service identification." in prompt
+    assert "Correlation confidence describes attribution to the approved validation, not exploitability confidence." in prompt
+    assert "If session_established is false, correlated packets must not be described as shell/session access or exploit success." in prompt
+
+
+def test_no_metasploit_session_remains_no_session_despite_correlated_packets() -> None:
+    record = _record(metasploit=_metasploit("VALIDATED"))
+
+    assert record["correlation_outcome"] == "corroborated"
+    assert record["metasploit"]["session_established"] is False
+    assert any("not exploitability" in limitation for limitation in record["limitations"])
+
+
+def test_actual_metasploit_session_evidence_is_preserved() -> None:
+    record = _record(metasploit=_metasploit("SESSION_ESTABLISHED"))
+    prompt = build_tshark_metasploit_correlated_prompt(record)
+
+    assert record["metasploit"]["state"] == "SESSION_ESTABLISHED"
+    assert record["metasploit"]["session_established"] is True
+    assert "If session_established is true, packet absence must not downgrade the Metasploit session evidence." in prompt
+
+
+def test_legitimate_session_evidence_scoped_wording_is_allowed() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "Metasploit session evidence indicates a session was established.",
+            "Correlation confidence describes packet attribution only and does not prove additional compromise.",
+        ]
+    )
+
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value=response):
+        lines = generate_tshark_metasploit_correlated_assessment(_record(metasploit=_metasploit("SESSION_ESTABLISHED")))
+
+    assert lines == response.splitlines()
+
+
+def test_no_observed_traffic_does_not_prove_no_traffic_occurred() -> None:
+    record = _record(tshark=_tshark(packet_count=0))
+
+    assert record["correlation_outcome"] == "not_corroborated"
+    assert any("does not prove no traffic occurred" in limitation for limitation in record["limitations"])
 
 
 def test_ai_prompt_receives_only_structured_current_run_evidence_without_history() -> None:
@@ -161,3 +208,36 @@ def test_ai_generation_uses_structured_record() -> None:
         lines = generate_tshark_metasploit_correlated_assessment(record)
 
     assert lines == ["Executive Summary", "Correlated."]
+
+
+@pytest.mark.parametrize(
+    "unsafe_response",
+    [
+        "Executive Summary\nThe exploit succeeded.",
+        "Executive Summary\nHigh correlation confidence confirms the exploit worked.",
+        "Executive Summary\nThe target was compromised.",
+        "Executive Summary\nThe TLS handshake succeeded.",
+        "Executive Summary\nThe HTTP transaction completed successfully.",
+        "Executive Summary\nA shell was obtained.",
+    ],
+)
+def test_unsupported_correlated_ai_wording_is_withheld(unsafe_response: str) -> None:
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value=unsafe_response):
+        lines = generate_tshark_metasploit_correlated_assessment(_record())
+
+    assert lines == TRUTHFULNESS_FALLBACK_LINES
+
+
+def test_legitimate_evidence_scoped_correlated_wording_is_allowed() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "High correlation confidence indicates attribution between current-run packet metadata and the approved validation target, port, and time window.",
+            "This does not establish successful exploitation or compromise.",
+        ]
+    )
+
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value=response):
+        lines = generate_tshark_metasploit_correlated_assessment(_record())
+
+    assert lines == response.splitlines()

@@ -599,12 +599,16 @@ def test_assessment_markdown_report_includes_tshark_normalized_evidence_only() -
     assert "- Source file: capture.pcap" in report
     assert "- Packet count: 3" in report
     assert "- Protocols: dns=1, tls=1" in report
-    assert "query=example.com response=93.184.216.34" in report
-    assert "sni=tls.example.com version=0x0303" in report
+    assert "query=example.com capture_response=93.184.216.34" in report
+    assert "request=GET host=example.com uri=/?token=<REDACTED> response_status=200" in report
+    assert "sni=tls.example.com version=0x0303 handshake_success=not established by stored metadata" in report
     assert "packet activity is not automatically malicious" in report
     assert "a connection is not compromise" in report
     assert "a DNS query is not exfiltration" in report
     assert "encrypted traffic limits visibility" in report
     assert "absence from a capture proves nothing" in report
+    assert "DNS associations are capture-window observations, not permanent ownership proof" in report
+    assert "TLS SNI/version metadata does not prove a successful TLS handshake" in report
+    assert "HTTP requests without response codes are not completed HTTP transactions" in report
     assert "raw tshark stdout should not appear" not in report
     assert "secret-value" not in report

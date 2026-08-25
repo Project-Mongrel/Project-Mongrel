@@ -39,6 +39,50 @@ FALLBACK_LINES = [
     "Review the validation result, capture provenance, and packet metadata together.",
 ]
 
+TRUTHFULNESS_FALLBACK_LINES = [
+    "Executive Summary",
+    "The correlated TShark + Metasploit AI assessment was withheld because the generated response contained an unsupported exploitation or packet-state conclusion.",
+    "",
+    "Metasploit Evidence",
+    "Use the normalized Metasploit validation state, subprocess status, module execution, and session evidence in the correlation record.",
+    "",
+    "TShark Evidence",
+    "Use only normalized packet metadata, DNS, conversations, TLS, HTTP, packet count, and capture provenance from the current run.",
+    "",
+    "Correlation Outcome",
+    "Correlation confidence describes attribution between captured traffic and the approved validation, not exploitability or compromise.",
+    "",
+    "Confidence",
+    "Review the deterministic correlation confidence and limitations in the stored record.",
+    "",
+    "Limitations",
+    "Packet activity cannot upgrade Metasploit evidence into exploit success. Packet absence cannot invalidate explicit Metasploit session evidence.",
+    "",
+    "Recommended Next Actions",
+    "Review validation state, session evidence, capture scope, hostname/IP/port alignment, and limitations before follow-up testing.",
+]
+
+EVIDENCE_SCOPED_MARKERS = (
+    "not observed",
+    "does not prove",
+    "does not establish",
+    "not evidence",
+    "not proof",
+    "insufficient",
+    "limited visibility",
+    "correlation confidence describes",
+    "attribution",
+)
+
+UNSUPPORTED_CORRELATED_CLAIM_PATTERNS = (
+    re.compile(r"\b(?:exploit|exploitation)\b[^.!?]{0,100}\b(?:succeeded|successful|worked|confirmed)\b"),
+    re.compile(r"\b(?:target|host|system|server|endpoint|service)\b[^.!?]{0,100}\b(?:is|was|has\s+been|appears|seems|looks)\s+(?:to\s+be\s+)?(?:compromised|owned|pwned|vulnerable|exploitable)\b"),
+    re.compile(r"\b(?:vulnerability|vulnerabilities|vuln)\b[^.!?]{0,100}\b(?:is|are|was|were|has\s+been|have\s+been)\s+(?:confirmed|proven|validated)\b"),
+    re.compile(r"\btls\b[^.!?]{0,100}\b(?:handshake|connection)\b[^.!?]{0,100}\b(?:succeeded|successful|completed|established)\b"),
+    re.compile(r"\bhttp\b[^.!?]{0,100}\b(?:transaction|exchange|request\s*/?\s*response)\b[^.!?]{0,100}\b(?:completed|succeeded|successful)\b"),
+    re.compile(r"\bhigh\s+correlation\s+confidence\b[^.!?]{0,120}\b(?:confirms|proves|means)\b[^.!?]{0,80}\b(?:exploit|exploitation|compromise|vulnerab)\b"),
+)
+
 
 def build_tshark_metasploit_correlation_record(
     *,
@@ -91,6 +135,9 @@ def build_tshark_metasploit_correlation_record(
             "module": _clean(metasploit_evidence.get("module") or provenance.get("module")),
             "action": _clean(metasploit_evidence.get("action_type") or provenance.get("action")),
             "state": _clean(metasploit_evidence.get("validation_state")),
+            "subprocess_success": bool(metasploit_evidence.get("subprocess_success")),
+            "module_executed": bool(metasploit_evidence.get("module_executed")),
+            "session_established": bool(metasploit_evidence.get("session_established")),
             "observed_service_metadata": _metasploit_service_metadata(metasploit_evidence),
         },
         "tshark": {
@@ -115,6 +162,7 @@ def build_tshark_metasploit_correlation_record(
         },
         "packet_count": int(tshark_evidence.get("packet_count") or 0),
         "correlation_confidence": confidence,
+        "correlation_confidence_meaning": "Confidence describes attribution between current-run packet metadata and the approved validation target/port/time context, not exploitability, compromise, authentication success, or vulnerability confirmation.",
         "limitations": limitations,
         "correlation_outcome": outcome,
         "agreement_disagreement_state": agreement_state,
@@ -130,7 +178,7 @@ def generate_tshark_metasploit_correlated_assessment(correlation_record: dict) -
     if _is_unavailable_response(response):
         return list(FALLBACK_LINES)
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
-    return lines or list(FALLBACK_LINES)
+    return _guard_correlated_truthfulness_response(lines or list(FALLBACK_LINES), correlation_record)
 
 
 def build_tshark_metasploit_correlated_prompt(correlation_record: dict) -> str:
@@ -146,6 +194,12 @@ def build_tshark_metasploit_correlated_prompt(correlation_record: dict) -> str:
             "- Never claim a successful TLS handshake unless successful_handshake_observed is true.",
             "- Never claim an HTTP response identified a service unless packet metadata explicitly proves that service identification.",
             "- Packet evidence must not upgrade Metasploit detection into a vulnerability.",
+            "- Correlation confidence describes attribution to the approved validation, not exploitability confidence.",
+            "- Do not claim Metasploit validation succeeded because packets were correlated.",
+            "- Do not claim successful exploitation, compromise, authentication success, or vulnerability confirmation from packet evidence.",
+            "- Preserve Metasploit subprocess_success, module_executed, session_established, and validation state exactly.",
+            "- If session_established is false, correlated packets must not be described as shell/session access or exploit success.",
+            "- If session_established is true, packet absence must not downgrade the Metasploit session evidence.",
             "- Failed or missing capture/validation evidence must remain inconclusive or not corroborated.",
             "- Preserve provenance, uncertainty, and limitations.",
             "- Return final answer only.",
@@ -182,6 +236,8 @@ def _correlation_outcome(
         "Correlation uses only current-run normalized Metasploit evidence, normalized TShark metadata, and capture provenance.",
         "Packet timing alone is not treated as attribution to the validation.",
         "No packet evidence upgrades service detection into vulnerability validation.",
+        "Correlation confidence describes packet-to-validation attribution, not exploitability, compromise, authentication success, or vulnerability confidence.",
+        "Absence of packet evidence does not prove no traffic occurred when capture visibility, interface selection, timing, filtering, truncation, or parsing limits apply.",
     ]
     if metasploit_evidence.get("validation_state") in {"FAILED", "BLOCKED"} or metasploit_evidence.get("source") != "metasploit":
         limitations.append("Metasploit validation did not complete with usable validation evidence.")
@@ -190,7 +246,7 @@ def _correlation_outcome(
         limitations.append("TShark capture or parsing failed, so packet evidence cannot independently corroborate the validation.")
         return "inconclusive", "low", "inconclusive", limitations
     if int(tshark_evidence.get("packet_count") or 0) <= 0:
-        limitations.append("TShark produced no packet metadata for this run.")
+        limitations.append("TShark produced no packet metadata for this run; this does not prove no traffic occurred.")
         return "not_corroborated", "low", "no_packet_agreement", limitations
 
     host_aligned = bool(dns_evidence or _matching_host_http_or_tls(target, http_evidence, tls_evidence) or target_ips)
@@ -349,6 +405,45 @@ def _bounded_record(record: dict) -> dict:
         tshark["observed_endpoints_ports"] = (tshark.get("observed_endpoints_ports") or [])[:20]
         bounded["tshark"] = tshark
     return bounded
+
+
+def _guard_correlated_truthfulness_response(lines: list[str], record: dict) -> list[str]:
+    if _contains_unsupported_correlated_claim(lines, record):
+        return list(TRUTHFULNESS_FALLBACK_LINES)
+    return lines
+
+
+def _contains_unsupported_correlated_claim(lines: list[str], record: dict) -> bool:
+    metasploit = record.get("metasploit") or {}
+    tshark = record.get("tshark") or {}
+    session_established = bool(metasploit.get("session_established"))
+    tls_success = bool((tshark.get("tls_handshake_evidence") or {}).get("successful_handshake_observed"))
+    http_transaction = bool((tshark.get("http_evidence") or {}).get("responses") and (tshark.get("http_evidence") or {}).get("requests"))
+    for sentence in _claim_sentences(lines):
+        if _is_evidence_scoped_statement(sentence):
+            continue
+        if not session_established and re.search(r"\b(?:shell|session|meterpreter)\b[^.!?]{0,80}\b(?:obtained|opened|established|created)\b", sentence):
+            return True
+        if not tls_success and re.search(r"\btls\b[^.!?]{0,100}\b(?:handshake|connection)\b[^.!?]{0,100}\b(?:succeeded|successful|completed|established)\b", sentence):
+            return True
+        if not http_transaction and re.search(r"\bhttp\b[^.!?]{0,100}\b(?:transaction|exchange|request\s*/?\s*response)\b[^.!?]{0,100}\b(?:completed|succeeded|successful)\b", sentence):
+            return True
+        if any(pattern.search(sentence) for pattern in UNSUPPORTED_CORRELATED_CLAIM_PATTERNS):
+            return True
+    return False
+
+
+def _claim_sentences(lines: list[str]) -> list[str]:
+    text = " ".join(str(line or "").strip() for line in lines)
+    return [
+        re.sub(r"\s+", " ", sentence).strip().lower()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+
+
+def _is_evidence_scoped_statement(sentence: str) -> bool:
+    return any(marker in sentence for marker in EVIDENCE_SCOPED_MARKERS)
 
 
 def _bounded_item(item: dict) -> dict:

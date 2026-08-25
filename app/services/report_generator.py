@@ -94,6 +94,8 @@ def build_report_ai_assessment_prompt(scan_runs: list[dict], target: str | None 
         "- Do not invent ports.",
         "- Do not invent services.",
         "- Do not invent CVEs.",
+        "- Treat TShark evidence as packet metadata only; do not infer exploitation, compromise, vulnerability, ownership, authentication success, successful TLS handshakes, or completed HTTP transactions from packet observations alone.",
+        "- Treat TShark correlation confidence as packet-to-validation attribution confidence, not exploitability or compromise confidence.",
         "- If evidence is missing, say it is unknown from the available scan history.",
         "- Give context-aware recommendations based on the supplied services and findings.",
         "- Never recommend closing ports blindly.",
@@ -346,6 +348,8 @@ def _format_technical_findings(scan_runs: list[dict]) -> list[str]:
             finding_lines.extend(_format_ffuf_observations(scan_run))
         elif source == "testssl":
             finding_lines.extend(_format_testssl_observations(scan_run))
+        elif source == "tshark":
+            finding_lines.extend(_format_tshark_observations(scan_run))
         else:
             finding_lines.append(f"- {_source_label(source)} finding for {scan_run.get('target') or 'unknown target'}.")
 
@@ -610,6 +614,49 @@ def _format_testssl_observations(scan_run: dict) -> list[str]:
     return lines
 
 
+def _format_tshark_observations(scan_run: dict) -> list[str]:
+    evidence = scan_run.get("tshark_evidence") or scan_run.get("normalized_evidence") or scan_run
+    target = scan_run.get("target") or (evidence.get("source_file") or {}).get("name") or "unknown target"
+    packet_count = int(evidence.get("packet_count") or 0)
+    lines = [
+        f"- TShark recorded packet metadata for {target}:",
+        f"  - Packet count: {packet_count}",
+        f"  - Byte count: {int(evidence.get('byte_count') or 0)}",
+        "  - Protocols: " + (", ".join(f"{_clean(item.get('protocol'))}={int(item.get('packet_count') or 0)}" for item in (evidence.get("observed_protocols") or [])[:10]) or "none recorded"),
+    ]
+    if packet_count <= 0:
+        lines.append("  - Limitation: no packet metadata was observed in this normalized evidence; this does not prove no traffic occurred.")
+    conversations = evidence.get("observed_conversations") or []
+    if conversations:
+        lines.append("  - Conversations:")
+        for item in conversations[:5]:
+            lines.append(
+                f"    - {_clean(item.get('src') or 'unknown')}:{_clean(item.get('src_port') or '')} -> "
+                f"{_clean(item.get('dst') or 'unknown')}:{_clean(item.get('dst_port') or '')} "
+                f"{_clean(item.get('transport') or 'unknown')} packets={int(item.get('packet_count') or 0)}"
+            )
+    dns = evidence.get("dns_observations") or []
+    if dns:
+        lines.append("  - DNS capture-window observations:")
+        for item in dns[:5]:
+            lines.append(f"    - query={_clean(item.get('query_name') or 'n/a')} capture_response={_clean(item.get('response_name') or item.get('response_address') or 'n/a')}")
+    http = evidence.get("http_observations") or []
+    if http:
+        lines.append("  - HTTP metadata:")
+        for item in http[:5]:
+            lines.append(
+                f"    - request={_clean(item.get('method') or 'not observed')} host={_clean(item.get('host') or 'n/a')} "
+                f"uri={_clean(item.get('uri') or 'n/a')} response_status={_clean(item.get('response_code') or 'not observed')}"
+            )
+    tls = evidence.get("tls_observations") or []
+    if tls:
+        lines.append("  - TLS metadata:")
+        for item in tls[:5]:
+            lines.append(f"    - sni={_clean(item.get('sni') or 'n/a')} version={_clean(item.get('version') or 'n/a')} handshake_success=not established by stored metadata")
+    lines.append("  - Limitation: packet activity, DNS, TCP, TLS, HTTP, and endpoints do not prove exploitation, compromise, ownership, authentication success, vulnerability, successful TLS handshakes, or completed HTTP transactions unless explicit normalized evidence supports that exact claim.")
+    return lines
+
+
 def _format_clean_scan_notes(scan_runs: list[dict]) -> list[str]:
     clean_scans = [scan_run for scan_run in scan_runs if _is_clean_scan(scan_run)]
     if not clean_scans:
@@ -638,6 +685,8 @@ def _format_recommendations(scan_runs: list[dict]) -> list[str]:
         recommendations.append("- Review Metasploit validation state, session evidence, and proposal/artifact provenance with the owner; do not treat failed validation as proof that the target is secure.")
     if "testssl" in sources:
         recommendations.append("- Review testssl.sh-reported TLS protocols, cipher observations, certificate metadata, and potential findings with the service owner.")
+    if "tshark" in sources:
+        recommendations.append("- Review TShark packet metadata with capture scope, interface, duration, truncation, and protocol visibility limits before drawing network conclusions.")
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
         recommendations.append("- Treat clean scans as point-in-time evidence, not proof that no vulnerabilities exist.")
     recommendations.extend(_format_finding_aware_recommendations(scan_runs))
@@ -875,6 +924,9 @@ def _finding_count(scan_run: dict) -> int:
         return int((scan_run.get("prowler_evidence") or {}).get("finding_count") or len((scan_run.get("prowler_evidence") or {}).get("findings") or []))
     if isinstance(scan_run.get("metasploit_evidence"), dict):
         return 1 if (scan_run.get("metasploit_evidence") or {}).get("validation_state") in {"VALIDATED", "SESSION_ESTABLISHED"} else 0
+    if scan_run.get("source") == "tshark":
+        evidence = scan_run.get("tshark_evidence") or scan_run.get("normalized_evidence") or scan_run
+        return int(evidence.get("packet_count") or 0)
     if isinstance(scan_run.get("testssl_evidence"), dict):
         return len(_notable_testssl_items(scan_run.get("testssl_evidence") or {}))
     if isinstance(scan_run.get("nuclei_findings"), list):
@@ -893,6 +945,7 @@ def _source_label(source: object) -> str:
         "prowler": "Prowler",
         "metasploit": "Metasploit",
         "testssl": "testssl.sh",
+        "tshark": "TShark",
     }
     return labels.get(str(source), str(source or "Unknown"))
 
