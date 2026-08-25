@@ -795,6 +795,11 @@ def test_report_generation_includes_prowler_provider_context_counts_and_failed_c
     assert "Passed checks: 1" in report
     assert "Highest scanner-reported severity: Critical" in report
     assert "FAIL iam_root_mfa severity=Critical service=iam" in report
+    assert "PASS results are specific check passes, not proof" in report
+    assert "FAIL results are scanner-reported failed checks, not confirmed exploitability, compromise, attacker access, data exposure" in report
+    assert "Prowler severity and compliance mappings are scanner metadata" in report
+    assert "do not infer broad account security or compliance status" in report
+    assert "resource/account is secure" in report
     assert "AKIAABCDEFGHIJKLMNOP" not in report
     assert "{\"" not in report
 

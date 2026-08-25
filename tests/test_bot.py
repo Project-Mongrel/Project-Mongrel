@@ -2351,6 +2351,7 @@ def test_prowler_scan_provider_success_stores_normalized_evidence(tmp_path) -> N
     sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
     assert any("Prowler Cloud Posture Scan Complete" in text for text in sent_messages)
     assert any("Provider: AWS" in text and "Context: standalone-aws" in text for text in sent_messages)
+    assert any("PASS/FAIL are check-specific scanner statuses" in text for text in sent_messages)
     assert any("Prowler AI Assessment" in text for text in sent_messages)
     assert not any("Synthetic Prowler check." * 20 in text for text in sent_messages)
     finding = get_user_findings(7216)[0]
@@ -2507,6 +2508,7 @@ def test_prowler_no_credentials_stderr_is_sanitized_in_telegram() -> None:
     assert "[Module:" not in combined
     assert "fake-token-for-test" not in combined
     result_card = next(text for text in sent_messages if "Prowler Cloud Posture Scan Complete" in text)
+    assert "Failed or partial scans do not prove cloud security or insecurity." in result_card
     findings_text = result_card.split("Findings", 1)[1].split("Observed Assets", 1)[0]
     assert "Cloud credentials were not available" not in findings_text
     assert "Highest scanner-reported severity" not in findings_text

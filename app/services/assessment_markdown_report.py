@@ -205,6 +205,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
             lines.append(f"- {tool}: {int(gitleaks_evidence.get('finding_count') or 0)} redacted secret-exposure finding(s) recorded.")
         elif prowler_evidence:
             lines.append(f"- {tool}: {int(prowler_evidence.get('finding_count') or 0)} scanner-reported cloud posture check(s) recorded.")
+            lines.append("  PASS/FAIL, severity, and compliance mappings remain check-specific scanner evidence, not broad cloud security or compliance conclusions.")
         elif metasploit_evidence:
             lines.append(
                 f"- {tool}: validation state {metasploit_evidence.get('validation_state') or 'unknown'} recorded; "
@@ -282,7 +283,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     if gitleaks_evidence:
         actions.append("- Review Gitleaks potential secret matches; rotate or revoke only after confirming the value and owner, then remove confirmed secrets from repositories/artifacts and review commit history.")
     if prowler_evidence:
-        actions.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
+        actions.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context without treating FAIL as exploitability, compromise, data exposure, or organization-wide non-compliance.")
     metasploit_evidence = [finding.get("metasploit_evidence") for finding in findings if finding.get("metasploit_evidence")]
     if metasploit_evidence:
         actions.append("- Review Metasploit validation state, session evidence, and proposal/artifact provenance before follow-up testing.")
@@ -526,7 +527,9 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             f"- Passed checks: {int(summary.get('passed_count') or 0)}",
             f"- Highest scanner-reported severity: {_clean(summary.get('highest_severity') or 'none')}",
             "- Top failed services: " + (", ".join(_clean(value) for value in (summary.get("top_failed_services") or [])[:10]) or "none"),
-            "- Limitation: FAIL results are scanner-reported failed checks, not confirmed exploitability or compromise.",
+            "- Limitation: PASS results are specific check passes, not proof that the resource/account is secure, hardened, vulnerability-free, or compliant.",
+            "- Limitation: FAIL results are scanner-reported failed checks, not confirmed exploitability, compromise, attacker access, data exposure, or organization-wide non-compliance.",
+            "- Limitation: Prowler severity and compliance mappings are scanner metadata for specific checks, not proof of business impact or regulatory status.",
         ]
         for item in failed[:10]:
             lines.append(

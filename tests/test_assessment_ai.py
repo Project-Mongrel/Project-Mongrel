@@ -313,6 +313,60 @@ def test_assessment_ai_prompt_preserves_gitleaks_secret_boundaries() -> None:
     assert "ghp_1234567890abcdefghijklmnopqrstuv" not in prompt
 
 
+def test_assessment_ai_prompt_preserves_prowler_cloud_check_boundaries() -> None:
+    prompt = build_assessment_ai_prompt(
+        "What did Prowler find?",
+        {
+            "assessment": {"name": "Prowler Assessment", "status": "active"},
+            "targets": [{"address": "aws", "target_type": "cloud_provider"}],
+            "scans": [{"tool": "prowler", "status": "completed"}],
+            "findings": [
+                {
+                    "source": "prowler",
+                    "target": "standalone-aws",
+                    "provider": "aws",
+                    "cloud_context": "standalone-aws",
+                    "risk_level": "info",
+                    "summary": "Prowler recorded scanner-reported checks.",
+                    "prowler_summary": {
+                        "finding_count": 2,
+                        "failed_count": 1,
+                        "passed_count": 1,
+                        "highest_severity": "HIGH",
+                    },
+                    "prowler_evidence": {
+                        "provider": "aws",
+                        "cloud_context": "standalone-aws",
+                        "finding_count": 2,
+                        "findings": [
+                            {
+                                "status": "FAIL",
+                                "severity": "HIGH",
+                                "check_id": "s3_check",
+                                "service": "s3",
+                                "region": "eu-west-1",
+                                "resource_identifier": "bucket-1",
+                                "check_title": "S3 check",
+                            },
+                            {"status": "PASS", "severity": "informational", "check_id": "iam_check", "service": "iam"},
+                        ],
+                    },
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        },
+    )
+
+    assert "Treat Prowler evidence as scanner-reported cloud check results only" in prompt
+    assert "Prowler scanner-reported cloud check evidence:" in prompt
+    assert "status=FAIL severity=HIGH check_id=s3_check service=s3 region=eu-west-1 resource=bucket-1" in prompt
+    assert "PASS is not account/resource security proof" in prompt
+    assert "FAIL is not exploitability, compromise, attacker access, data exposure, or organization-wide compliance proof" in prompt
+    assert "severity/compliance mappings remain scanner metadata" in prompt
+    assert "AWS account is secure" not in prompt
+
+
 def test_assessment_ai_report_prompt_includes_required_sections_and_limitations() -> None:
     context = {
         "assessment": {"name": "Report Assessment", "status": "active"},

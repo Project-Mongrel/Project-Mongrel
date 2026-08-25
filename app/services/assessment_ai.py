@@ -72,6 +72,8 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             "- Treat Gitleaks detections as redacted secret-exposure evidence only.",
             "- Never include raw secret values or infer hidden secret values.",
             "- Do not infer Gitleaks-detected values are valid, active, usable, owned by the target, or evidence of access, compromise, exfiltration, or repository security posture.",
+            "- Treat Prowler evidence as scanner-reported cloud check results only; PASS does not prove account/resource security, and FAIL does not prove exploitability, compromise, attacker access, data exposure, or compliance failure.",
+            "- Preserve Prowler severity and compliance mappings as check-specific scanner metadata, not business impact or organization-wide regulatory conclusions.",
             "- If evidence is missing, say so.",
             "- If evidence is insufficient, recommend the next assessment step.",
             f"- For secure/safe questions, start with: {SECURE_PREAMBLE}",
@@ -117,6 +119,8 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- testssl.sh evidence supports TLS configuration assessment only; do not claim overall site security from TLS evidence alone.",
             "- Preserve testssl.sh severity, scanner wording, and uncertainty exactly; do not turn potential TLS findings into confirmed exploitability.",
             "- Gitleaks evidence is redacted secret-pattern detection only; do not claim validity, current usability, ownership, access, compromise, exfiltration, repository security, or absence of secrets from Gitleaks output alone.",
+            "- Prowler evidence is scanner-reported cloud check output only; do not claim cloud/account/resource security, exploitability, compromise, data exposure, organization-wide compliance/non-compliance, or absence of misconfigurations from Prowler output alone.",
+            "- Preserve Prowler PASS/FAIL, severity, resource/service/region metadata, and compliance mappings as check-specific scanner evidence.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
             "",
@@ -380,6 +384,33 @@ def _format_finding(finding: dict) -> list[str]:
         for limitation in gitleaks_evidence.get("limitations") or []:
             lines.append(f"    - limitation: {_clean(limitation)}")
         lines.append("    - boundary=Gitleaks redacted secret-pattern detection only; validity, current usability, ownership, access, compromise, exfiltration, repository security, and absence of secrets are not established")
+    prowler_evidence = finding.get("prowler_evidence") or {}
+    if prowler_evidence:
+        summary = finding.get("prowler_summary") or {}
+        checks = prowler_evidence.get("findings") or []
+        failed = [item for item in checks if str(item.get("status") or "").upper() == "FAIL"]
+        lines.append("    Prowler scanner-reported cloud check evidence:")
+        lines.append(f"    - provider={_clean(finding.get('provider') or prowler_evidence.get('provider') or 'unknown')}")
+        lines.append(f"    - context={_clean(finding.get('cloud_context') or prowler_evidence.get('cloud_context') or finding.get('target') or 'unknown')}")
+        lines.append(
+            f"    - checks={int(summary.get('finding_count') or prowler_evidence.get('finding_count') or len(checks))} "
+            f"failed={int(summary.get('failed_count') or len(failed))} "
+            f"passed={int(summary.get('passed_count') or 0)} "
+            f"highest_scanner_severity={_clean(summary.get('highest_severity') or 'none')}"
+        )
+        for item in checks[:20]:
+            lines.append(
+                f"    - status={_clean(item.get('status') or 'unknown')} "
+                f"severity={_clean(item.get('severity') or 'unknown')} "
+                f"check_id={_clean(item.get('check_id') or 'check')} "
+                f"service={_clean(item.get('service') or 'unknown')} "
+                f"region={_clean(item.get('region') or 'unknown')} "
+                f"resource={_clean(item.get('resource_identifier') or item.get('resource_name') or 'not supplied')} "
+                f"title={_clean(item.get('check_title') or 'unknown')}"
+            )
+        for limitation in prowler_evidence.get("limitations") or []:
+            lines.append(f"    - limitation: {_clean(limitation)}")
+        lines.append("    - boundary=Prowler scanner-reported cloud check evidence only; PASS is not account/resource security proof, FAIL is not exploitability, compromise, attacker access, data exposure, or organization-wide compliance proof, and severity/compliance mappings remain scanner metadata")
     metasploit_evidence = finding.get("metasploit_evidence") or {}
     if metasploit_evidence:
         metadata = finding.get("metadata") or {}

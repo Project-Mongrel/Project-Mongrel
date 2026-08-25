@@ -92,5 +92,9 @@ def test_assessment_markdown_report_includes_prowler_provider_context_and_failed
     assert "- Failed checks: 1" in report
     assert "- Highest scanner-reported severity: Medium" in report
     assert "- FAIL iam_check severity=Medium service=iam" in report
-    assert "FAIL results are scanner-reported failed checks" in report
+    assert "PASS results are specific check passes, not proof" in report
+    assert "FAIL results are scanner-reported failed checks, not confirmed exploitability, compromise, attacker access, data exposure" in report
+    assert "Prowler severity and compliance mappings are scanner metadata" in report
+    assert "organization-wide non-compliance" in report
+    assert "resource/account is secure" in report
     assert "{\"" not in report

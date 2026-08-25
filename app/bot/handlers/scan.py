@@ -1517,6 +1517,13 @@ def build_prowler_result_text(result: dict[str, object], evidence: dict | None =
                 "Top failed services: " + (", ".join(summary.get("top_failed_services") or []) or "none"),
             ]
         )
+    findings.extend(
+        [
+            "Scope: PASS/FAIL are Prowler check statuses for the scanned scope.",
+            "Limitation: FAIL does not prove exploitability, compromise, attacker access, or data exposure.",
+            "Limitation: PASS or zero FAIL findings does not prove the account/resource is secure, vulnerability-free, or compliant.",
+        ]
+    )
     if output_files:
         findings.append(f"Output artifact: {Path(str(output_files[0])).name}")
     top_failed = [
@@ -1535,7 +1542,15 @@ def build_prowler_result_text(result: dict[str, object], evidence: dict | None =
         status="Complete" if result.get("success") is True else "Failed",
         elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
         risk="INFO" if result.get("success") is True else None,
-        summary=f"{provider} cloud posture evidence collected for {cloud_context}." if result.get("success") is True else f"Prowler scan failed. {_safe_prowler_failure_text(result, provider)}",
+        summary=(
+            f"{provider} scanner-reported cloud posture evidence collected for {cloud_context}. "
+            "PASS/FAIL are check-specific scanner statuses, not exploitability, compromise, exposure, or compliance proof."
+        )
+        if result.get("success") is True
+        else (
+            f"Prowler scan failed. {_safe_prowler_failure_text(result, provider)} "
+            "Failed or partial scans do not prove cloud security or insecurity."
+        ),
         findings=findings,
         assets=[f"Provider: {provider}", f"Context: {cloud_context}"],
     )

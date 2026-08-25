@@ -97,6 +97,7 @@ def build_report_ai_assessment_prompt(scan_runs: list[dict], target: str | None 
         "- Treat TShark evidence as packet metadata only; do not infer exploitation, compromise, vulnerability, ownership, authentication success, successful TLS handshakes, or completed HTTP transactions from packet observations alone.",
         "- Treat TShark correlation confidence as packet-to-validation attribution confidence, not exploitability or compromise confidence.",
         "- Treat Gitleaks evidence as redacted secret-pattern detection only; do not infer validity, current usability, ownership, unauthorized access, compromise, exfiltration, repository security, or absence of secrets.",
+        "- Treat Prowler evidence as scanner-reported cloud check output only; PASS does not prove account/resource security, FAIL does not prove exploitability, compromise, data exposure, or compliance failure, and severity/compliance mappings remain check-specific scanner metadata.",
         "- If evidence is missing, say it is unknown from the available scan history.",
         "- Give context-aware recommendations based on the supplied services and findings.",
         "- Never recommend closing ports blindly.",
@@ -227,6 +228,7 @@ def _format_scan_run_for_ai_prompt(index: int, scan_run: dict) -> list[str]:
                 f"   Failed Checks: {int(summary.get('failed_count') or 0)}",
                 f"   Passed Checks: {int(summary.get('passed_count') or 0)}",
                 f"   Highest Scanner-Reported Severity: {summary.get('highest_severity') or 'none'}",
+                "   Boundary: PASS/FAIL are check-specific scanner results; they do not prove cloud/account/resource security, exploitability, compromise, data exposure, or organization-wide compliance.",
                 "   Prowler Checks:",
             ]
         )
@@ -445,6 +447,9 @@ def _format_prowler_findings(scan_run: dict) -> list[str]:
         f"  - Passed checks: {int(summary.get('passed_count') or 0)}",
         f"  - Highest scanner-reported severity: {summary.get('highest_severity') or 'none'}",
         "  - Top failed services: " + (", ".join(summary.get("top_failed_services") or []) or "none"),
+        "  - Limitation: PASS results are specific check passes, not proof that the resource/account is secure, hardened, vulnerability-free, or compliant.",
+        "  - Limitation: FAIL results are scanner-reported failed checks, not confirmed exploitability, compromise, attacker access, data exposure, or organization-wide non-compliance.",
+        "  - Limitation: Prowler severity and compliance mappings are scanner metadata for specific checks, not proof of business impact or regulatory status.",
         "  - Failed-check evidence:",
     ]
     if not failed:
@@ -731,7 +736,7 @@ def _format_recommendations(scan_runs: list[dict]) -> list[str]:
     if "nuclei" in sources:
         recommendations.append("- Manually validate matched Nuclei findings before remediation planning.")
     if "prowler" in sources:
-        recommendations.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
+        recommendations.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context without treating FAIL as exploitability, compromise, data exposure, or organization-wide non-compliance.")
     if "metasploit" in sources:
         recommendations.append("- Review Metasploit validation state, session evidence, and proposal/artifact provenance with the owner; do not treat failed validation as proof that the target is secure.")
     if "testssl" in sources:
@@ -930,7 +935,7 @@ def _format_finding_aware_recommendations(scan_runs: list[dict]) -> list[str]:
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
         recommendations.append("- Clean Nuclei: treat the result as point-in-time evidence that no selected templates matched, not proof that no vulnerabilities exist.")
     if any(scan_run.get("source") == "prowler" for scan_run in scan_runs):
-        recommendations.append("- Prowler: treat FAIL results as scanner-reported failed checks requiring cloud-context validation.")
+        recommendations.append("- Prowler: treat PASS/FAIL as check-specific scanner results requiring cloud-context validation; do not infer broad account security or compliance status.")
     if any(scan_run.get("source") == "metasploit" for scan_run in scan_runs):
         recommendations.append("- Metasploit: preserve proposal/artifact provenance and manually validate scope before follow-up testing.")
 
