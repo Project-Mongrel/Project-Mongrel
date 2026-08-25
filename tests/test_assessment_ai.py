@@ -270,6 +270,49 @@ def test_assessment_ai_prompt_preserves_tshark_packet_boundaries() -> None:
     assert "tls handshake succeeded" not in prompt.lower()
 
 
+def test_assessment_ai_prompt_preserves_gitleaks_secret_boundaries() -> None:
+    prompt = build_assessment_ai_prompt(
+        "What did Gitleaks find?",
+        {
+            "assessment": {"name": "Gitleaks Assessment", "status": "active"},
+            "targets": [{"address": "/tmp/artifact"}],
+            "scans": [{"tool": "gitleaks", "status": "completed"}],
+            "findings": [
+                {
+                    "source": "gitleaks",
+                    "target": "/tmp/artifact",
+                    "risk_level": "high",
+                    "gitleaks_evidence": {
+                        "scan_root": "/tmp/artifact",
+                        "finding_count": 1,
+                        "affected_files_count": 1,
+                        "findings": [
+                            {
+                                "rule_id": "github-pat",
+                                "file_path": "src/config.py",
+                                "line_number": 12,
+                                "provider": "github",
+                                "severity": "high",
+                                "fingerprint": "abc123",
+                                "redacted_secret_preview": "<REDACTED> len=36",
+                                "commit": "deadbeef",
+                            }
+                        ],
+                    },
+                }
+            ],
+            "artifacts": [],
+            "notes": [],
+        },
+    )
+
+    assert "Treat Gitleaks detections as redacted secret-exposure evidence only." in prompt
+    assert "Do not infer Gitleaks-detected values are valid, active, usable" in prompt
+    assert "rule=github-pat file=src/config.py line=12 provider=github severity=high fingerprint=abc123 commit=deadbeef secret=<REDACTED> len=36" in prompt
+    assert "validity, current usability, ownership, access, compromise, exfiltration, repository security, and absence of secrets are not established" in prompt
+    assert "ghp_1234567890abcdefghijklmnopqrstuv" not in prompt
+
+
 def test_assessment_ai_report_prompt_includes_required_sections_and_limitations() -> None:
     context = {
         "assessment": {"name": "Report Assessment", "status": "active"},

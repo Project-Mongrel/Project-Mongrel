@@ -280,7 +280,7 @@ def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
     if testssl_evidence:
         actions.append("- Review TLS protocols, certificate expiry, cipher observations, and testssl.sh-reported TLS findings with the service owner.")
     if gitleaks_evidence:
-        actions.append("- Rotate or revoke detected secrets, remove them from repositories/artifacts, and review commit history for exposure.")
+        actions.append("- Review Gitleaks potential secret matches; rotate or revoke only after confirming the value and owner, then remove confirmed secrets from repositories/artifacts and review commit history.")
     if prowler_evidence:
         actions.append("- Review Prowler FAIL checks with the cloud owner and validate risk in the authorized cloud context.")
     metasploit_evidence = [finding.get("metasploit_evidence") for finding in findings if finding.get("metasploit_evidence")]
@@ -489,18 +489,25 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
         summary = finding.get("gitleaks_summary") or {}
         lines = [
             f"- Scope: {_clean(gitleaks_evidence.get('scan_root') or finding.get('target') or 'unknown')}",
-            f"- Secret findings: {int(summary.get('finding_count') or gitleaks_evidence.get('finding_count') or 0)}",
+            f"- Potential secret-pattern findings: {int(summary.get('finding_count') or gitleaks_evidence.get('finding_count') or 0)}",
             f"- Affected files: {int(summary.get('affected_files_count') or gitleaks_evidence.get('affected_files_count') or 0)}",
             "- Rules: " + _format_count_summary(summary.get("rule_summary") or gitleaks_evidence.get("rule_summary") or {}),
             "- Providers: " + _format_count_summary(summary.get("provider_summary") or gitleaks_evidence.get("provider_summary") or {}),
             "- Severity: " + _format_count_summary(summary.get("severity_summary") or gitleaks_evidence.get("severity_summary") or {}),
-            "- Limitation: Secret values are redacted. Detections are not proof of compromise.",
+            "- Limitation: Secret values are redacted. Detections are not proof of validity, current usability, ownership, access, compromise, exfiltration, or repository security posture.",
+            "- Limitation: Zero findings only means no matches were reported within the scanned scope/rules; it does not prove no secrets exist.",
         ]
         for item in (gitleaks_evidence.get("findings") or [])[:10]:
+            provenance = []
+            if item.get("fingerprint") or item.get("secret_hash"):
+                provenance.append(f"fingerprint={_clean(item.get('fingerprint') or item.get('secret_hash'))}")
+            if item.get("commit"):
+                provenance.append(f"commit={_clean(item.get('commit'))}")
             lines.append(
                 f"- {_clean(item.get('rule_id') or 'unknown')} file={_clean(item.get('file_path') or 'unknown')} "
                 f"line={_clean(item.get('line_number') or 'unknown')} provider={_clean(item.get('provider') or 'unknown')} "
                 f"secret={_clean(item.get('redacted_secret_preview') or '<REDACTED>')}"
+                f"{' ' + ' '.join(provenance) if provenance else ''}"
             )
         return lines
 

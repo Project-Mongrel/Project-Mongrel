@@ -410,6 +410,69 @@ def test_report_generation_from_tshark_preserves_packet_boundaries() -> None:
     assert "tls handshake succeeded" not in report.lower()
 
 
+def test_report_generation_from_gitleaks_preserves_secret_boundaries() -> None:
+    add_finding(
+        user_id=9033,
+        finding={
+            "source": "gitleaks",
+            "target": "/tmp/artifact",
+            "risk_level": "high",
+            "finding_count": 1,
+            "gitleaks_summary": {
+                "finding_count": 1,
+                "affected_files_count": 1,
+                "rule_summary": {"github-pat": 1},
+                "provider_summary": {"github": 1},
+                "severity_summary": {"high": 1},
+            },
+            "gitleaks_evidence": {
+                "scan_root": "/tmp/artifact",
+                "finding_count": 1,
+                "affected_files_count": 1,
+                "findings": [
+                    {
+                        "rule_id": "github-pat",
+                        "file_path": "src/config.py",
+                        "line_number": 12,
+                        "provider": "github",
+                        "severity": "high",
+                        "fingerprint": "abc123",
+                        "redacted_secret_preview": "<REDACTED> len=36",
+                        "commit": "deadbeef",
+                    }
+                ],
+            },
+        },
+    )
+
+    report = generate_markdown_report(user_id=9033, target="/tmp/artifact")
+
+    assert "Gitleaks reported 1 redacted potential secret-pattern match(es)" in report
+    assert "rule=github-pat file=src/config.py line=12 provider=github secret=<REDACTED> len=36 fingerprint=abc123 commit=deadbeef" in report
+    assert "validity, current usability, ownership, unauthorized access, compromise, exfiltration, and repository security were not established" in report
+    assert "active credentials" not in report.lower()
+    assert "repository is compromised" not in report.lower()
+
+
+def test_report_generation_from_empty_gitleaks_does_not_imply_no_secrets() -> None:
+    add_finding(
+        user_id=9034,
+        finding={
+            "source": "gitleaks",
+            "target": "/tmp/artifact",
+            "risk_level": "info",
+            "finding_count": 0,
+            "gitleaks_evidence": {"scan_root": "/tmp/artifact", "finding_count": 0, "findings": []},
+        },
+    )
+
+    report = generate_markdown_report(user_id=9034, target="/tmp/artifact")
+
+    assert "no matches were reported within the scanned scope/rules; this does not prove no secrets exist" in report
+    assert "no secrets exist" in report
+    assert "repository is secure" not in report.lower()
+
+
 def test_report_generation_with_clean_nuclei_scan() -> None:
     add_finding(
         user_id=9003,

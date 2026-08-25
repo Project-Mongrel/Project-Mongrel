@@ -1363,8 +1363,10 @@ def build_gitleaks_result_text(result: dict[str, object], evidence: dict | None 
     if result.get("success") is not True:
         limitations.append(str(result.get("error") or "Gitleaks did not complete successfully."))
     findings = [
-        f"Secret findings: {finding_count}",
+        f"Potential secret-pattern findings: {finding_count}",
         f"Affected files: {affected_files}",
+        "Limitation: Detection only; secrets were not validated, used, or tied to confirmed access.",
+        "Limitation: A match does not prove validity, current usability, ownership, compromise, exfiltration, or repository security posture.",
     ]
     for item in (evidence.get("findings") or [])[:5]:
         findings.append(
@@ -1379,7 +1381,6 @@ def build_gitleaks_result_text(result: dict[str, object], evidence: dict | None 
             "Severity: " + _format_count_summary(summary.get("severity_summary") or {}),
         ]
     )
-    findings.append("Limitation: Detection only; secrets were not validated or used.")
     if limitations:
         findings.append("Limitations: " + " ".join(str(value) for value in limitations[:3]))
     return render_scan_result_card(
@@ -1388,7 +1389,7 @@ def build_gitleaks_result_text(result: dict[str, object], evidence: dict | None 
         status="Complete" if result.get("success") is True else "Failed",
         elapsed=f"{int(float(result.get('elapsed_seconds') or 0))}s",
         risk="HIGH" if finding_count else ("INFO" if result.get("success") is True else None),
-        summary=f"{finding_count} redacted secret-exposure finding(s) recorded.",
+        summary=f"{finding_count} redacted potential secret-pattern finding(s) recorded.",
         findings=findings,
         assets=[str(evidence.get("scan_root") or result.get("target") or "")],
     )
@@ -1717,7 +1718,7 @@ def store_gitleaks_scan_result(user_id: int, result: dict[str, object], evidence
             "target_key": normalize_target_key(target),
             "status": status,
             "summary": (
-                f"Gitleaks recorded {finding_count} redacted secret-exposure finding(s)."
+                f"Gitleaks recorded {finding_count} redacted potential secret-pattern finding(s)."
                 if result.get("success") is True
                 else str(result.get("error") or "Gitleaks secret scan failed.")
             ),

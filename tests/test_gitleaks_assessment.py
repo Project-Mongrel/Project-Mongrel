@@ -202,10 +202,11 @@ def test_gitleaks_telegram_card_never_displays_raw_secret() -> None:
     )
 
     assert "Gitleaks Scan Complete" in card
-    assert "Secret findings: 1" in card
+    assert "Potential secret-pattern findings: 1" in card
     assert "Affected files: 1" in card
     assert "github-pat" in card
     assert "<REDACTED>" in card
+    assert "does not prove validity, current usability, ownership, compromise, exfiltration, or repository security posture" in card
     assert RAW_SECRET not in card
 
 
@@ -213,8 +214,10 @@ def test_markdown_report_includes_redacted_gitleaks_section() -> None:
     report = generate_assessment_markdown_report(_stored_context())
 
     assert "### Gitleaks" in report
-    assert "Secret findings: 1" in report
+    assert "Potential secret-pattern findings: 1" in report
     assert "github-pat" in report
+    assert "fingerprint=abc123" in report
+    assert "Detections are not proof of validity, current usability, ownership, access, compromise, exfiltration, or repository security posture" in report
     assert "<REDACTED>" in report
     assert RAW_SECRET not in report
 
@@ -225,6 +228,8 @@ def test_assessment_ai_prompt_includes_redacted_gitleaks_constraints() -> None:
     assert "Treat Gitleaks detections as redacted secret-exposure evidence only." in prompt
     assert "Never include raw secret values" in prompt
     assert "Gitleaks redacted secret-exposure evidence" in prompt
+    assert "validity, current usability, ownership, access, compromise, exfiltration, repository security, and absence of secrets are not established" in prompt
+    assert "fingerprint=abc123" in prompt
     assert "<REDACTED>" in prompt
     assert RAW_SECRET not in prompt
 

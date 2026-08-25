@@ -71,6 +71,7 @@ def build_assessment_ai_prompt(question: str, context: dict) -> str:
             "- Preserve testssl.sh severity, scanner wording, and uncertainty exactly; 'potentially VULNERABLE' remains potential scanner evidence requiring validation.",
             "- Treat Gitleaks detections as redacted secret-exposure evidence only.",
             "- Never include raw secret values or infer hidden secret values.",
+            "- Do not infer Gitleaks-detected values are valid, active, usable, owned by the target, or evidence of access, compromise, exfiltration, or repository security posture.",
             "- If evidence is missing, say so.",
             "- If evidence is insufficient, recommend the next assessment step.",
             f"- For secure/safe questions, start with: {SECURE_PREAMBLE}",
@@ -115,6 +116,7 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, Gitleaks, Prowler, Metasploit, TShark, assessment history, artifacts, and notes in the supplied context.",
             "- testssl.sh evidence supports TLS configuration assessment only; do not claim overall site security from TLS evidence alone.",
             "- Preserve testssl.sh severity, scanner wording, and uncertainty exactly; do not turn potential TLS findings into confirmed exploitability.",
+            "- Gitleaks evidence is redacted secret-pattern detection only; do not claim validity, current usability, ownership, access, compromise, exfiltration, repository security, or absence of secrets from Gitleaks output alone.",
             "- Keep the report concise and consultant-focused.",
             "- Return final answer only.",
             "",
@@ -372,10 +374,12 @@ def _format_finding(finding: dict) -> list[str]:
             lines.append(
                 f"    - rule={_clean(item.get('rule_id') or 'unknown')} file={_clean(item.get('file_path') or 'unknown')} "
                 f"line={_clean(item.get('line_number') or 'unknown')} provider={_clean(item.get('provider') or 'unknown')} "
-                f"severity={_clean(item.get('severity') or 'unknown')} secret={_clean(item.get('redacted_secret_preview') or '<REDACTED>')}"
+                f"severity={_clean(item.get('severity') or 'unknown')} fingerprint={_clean(item.get('fingerprint') or item.get('secret_hash') or 'not supplied')} "
+                f"commit={_clean(item.get('commit') or 'not supplied')} secret={_clean(item.get('redacted_secret_preview') or '<REDACTED>')}"
             )
         for limitation in gitleaks_evidence.get("limitations") or []:
             lines.append(f"    - limitation: {_clean(limitation)}")
+        lines.append("    - boundary=Gitleaks redacted secret-pattern detection only; validity, current usability, ownership, access, compromise, exfiltration, repository security, and absence of secrets are not established")
     metasploit_evidence = finding.get("metasploit_evidence") or {}
     if metasploit_evidence:
         metadata = finding.get("metadata") or {}

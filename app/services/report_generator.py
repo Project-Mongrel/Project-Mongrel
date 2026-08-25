@@ -96,6 +96,7 @@ def build_report_ai_assessment_prompt(scan_runs: list[dict], target: str | None 
         "- Do not invent CVEs.",
         "- Treat TShark evidence as packet metadata only; do not infer exploitation, compromise, vulnerability, ownership, authentication success, successful TLS handshakes, or completed HTTP transactions from packet observations alone.",
         "- Treat TShark correlation confidence as packet-to-validation attribution confidence, not exploitability or compromise confidence.",
+        "- Treat Gitleaks evidence as redacted secret-pattern detection only; do not infer validity, current usability, ownership, unauthorized access, compromise, exfiltration, repository security, or absence of secrets.",
         "- If evidence is missing, say it is unknown from the available scan history.",
         "- Give context-aware recommendations based on the supplied services and findings.",
         "- Never recommend closing ports blindly.",
@@ -248,6 +249,24 @@ def _format_scan_run_for_ai_prompt(index: int, scan_run: dict) -> list[str]:
                 f"   Provenance: proposal={metadata.get('proposal_id') or 'not supplied'} artifact={metadata.get('artifact_ref') or 'not supplied'}",
             ]
         )
+    if scan_run.get("source") == "gitleaks":
+        evidence = scan_run.get("gitleaks_evidence") or {}
+        summary = scan_run.get("gitleaks_summary") or {}
+        lines.extend(
+            [
+                f"   Gitleaks Findings: {int(summary.get('finding_count') or evidence.get('finding_count') or 0)}",
+                f"   Affected Files: {int(summary.get('affected_files_count') or evidence.get('affected_files_count') or 0)}",
+                "   Boundary: redacted secret-pattern detection only; validity, usability, ownership, access, compromise, exfiltration, and repository security are not established.",
+                "   Gitleaks Redacted Findings:",
+            ]
+        )
+        for finding in (evidence.get("findings") or [])[:20]:
+            lines.append(
+                f"   - rule={finding.get('rule_id') or 'unknown'} file={finding.get('file_path') or 'unknown'} "
+                f"line={finding.get('line_number') or 'unknown'} fingerprint={finding.get('fingerprint') or finding.get('secret_hash') or 'not supplied'}"
+            )
+        if not evidence.get("findings"):
+            lines.append("   - none; no matches were reported within the scanned scope/rules")
 
     return lines
 
@@ -348,6 +367,8 @@ def _format_technical_findings(scan_runs: list[dict]) -> list[str]:
             finding_lines.extend(_format_ffuf_observations(scan_run))
         elif source == "testssl":
             finding_lines.extend(_format_testssl_observations(scan_run))
+        elif source == "gitleaks":
+            finding_lines.extend(_format_gitleaks_observations(scan_run))
         elif source == "tshark":
             finding_lines.extend(_format_tshark_observations(scan_run))
         else:
@@ -614,6 +635,36 @@ def _format_testssl_observations(scan_run: dict) -> list[str]:
     return lines
 
 
+def _format_gitleaks_observations(scan_run: dict) -> list[str]:
+    evidence = scan_run.get("gitleaks_evidence") or {}
+    summary = scan_run.get("gitleaks_summary") or {}
+    findings = evidence.get("findings") or []
+    target = scan_run.get("target") or evidence.get("scan_root") or "unknown target"
+    finding_count = int(summary.get("finding_count") or evidence.get("finding_count") or len(findings))
+    lines = [
+        f"- Gitleaks reported {finding_count} redacted potential secret-pattern match(es) for {target}:",
+        f"  - Affected files: {int(summary.get('affected_files_count') or evidence.get('affected_files_count') or 0)}",
+        "  - Rules: " + _format_count_summary(summary.get("rule_summary") or evidence.get("rule_summary") or {}),
+        "  - Providers: " + _format_count_summary(summary.get("provider_summary") or evidence.get("provider_summary") or {}),
+        "  - Severity: " + _format_count_summary(summary.get("severity_summary") or evidence.get("severity_summary") or {}),
+        "  - Limitation: Gitleaks evidence is redacted secret-pattern detection only; validity, current usability, ownership, unauthorized access, compromise, exfiltration, and repository security were not established.",
+    ]
+    if finding_count <= 0:
+        lines.append("  - Limitation: no matches were reported within the scanned scope/rules; this does not prove no secrets exist.")
+    for item in findings[:10]:
+        detail = (
+            f"    - rule={_clean(item.get('rule_id') or 'unknown')} file={_clean(item.get('file_path') or 'unknown')} "
+            f"line={_clean(item.get('line_number') or 'unknown')} provider={_clean(item.get('provider') or 'unknown')} "
+            f"secret={_clean(item.get('redacted_secret_preview') or '<REDACTED>')}"
+        )
+        if item.get("fingerprint") or item.get("secret_hash"):
+            detail = f"{detail} fingerprint={_clean(item.get('fingerprint') or item.get('secret_hash'))}"
+        if item.get("commit"):
+            detail = f"{detail} commit={_clean(item.get('commit'))}"
+        lines.append(detail)
+    return lines
+
+
 def _format_tshark_observations(scan_run: dict) -> list[str]:
     evidence = scan_run.get("tshark_evidence") or scan_run.get("normalized_evidence") or scan_run
     target = scan_run.get("target") or (evidence.get("source_file") or {}).get("name") or "unknown target"
@@ -685,6 +736,8 @@ def _format_recommendations(scan_runs: list[dict]) -> list[str]:
         recommendations.append("- Review Metasploit validation state, session evidence, and proposal/artifact provenance with the owner; do not treat failed validation as proof that the target is secure.")
     if "testssl" in sources:
         recommendations.append("- Review testssl.sh-reported TLS protocols, cipher observations, certificate metadata, and potential findings with the service owner.")
+    if "gitleaks" in sources:
+        recommendations.append("- Review Gitleaks potential secret matches with the owner; rotate or revoke only after confirmation, and avoid placing raw secret values in reports or prompts.")
     if "tshark" in sources:
         recommendations.append("- Review TShark packet metadata with capture scope, interface, duration, truncation, and protocol visibility limits before drawing network conclusions.")
     if any(_is_clean_scan(scan_run) for scan_run in scan_runs):
@@ -845,6 +898,10 @@ def _clean(value: object) -> str:
     return text
 
 
+def _format_count_summary(counts: dict) -> str:
+    return ", ".join(f"{_clean(key)}={int(value or 0)}" for key, value in sorted(counts.items())) if counts else "none"
+
+
 def _bool_label(value: object) -> str:
     if value is True:
         return "True"
@@ -929,6 +986,9 @@ def _finding_count(scan_run: dict) -> int:
         return int(evidence.get("packet_count") or 0)
     if isinstance(scan_run.get("testssl_evidence"), dict):
         return len(_notable_testssl_items(scan_run.get("testssl_evidence") or {}))
+    if isinstance(scan_run.get("gitleaks_evidence"), dict):
+        evidence = scan_run.get("gitleaks_evidence") or {}
+        return int(evidence.get("finding_count") or len(evidence.get("findings") or []))
     if isinstance(scan_run.get("nuclei_findings"), list):
         return len(scan_run.get("nuclei_findings") or [])
     if isinstance(scan_run.get("open_ports"), list):
@@ -945,6 +1005,7 @@ def _source_label(source: object) -> str:
         "prowler": "Prowler",
         "metasploit": "Metasploit",
         "testssl": "testssl.sh",
+        "gitleaks": "Gitleaks",
         "tshark": "TShark",
     }
     return labels.get(str(source), str(source or "Unknown"))
