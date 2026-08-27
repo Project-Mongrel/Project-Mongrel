@@ -261,7 +261,8 @@ async def assessment_text_handler(update: Update, context: ContextTypes.DEFAULT_
         return True
 
     if state.get("stage") == ASSESSMENT_STAGE_TARGET:
-        assessment = create_assessment(str(state.get("name") or "Untitled Assessment"))
+        user_id = update.effective_user.id if update.effective_user is not None else None
+        assessment = create_assessment(str(state.get("name") or "Untitled Assessment"), user_id=user_id)
         target = add_assessment_target(assessment["id"], address=text)
         clear_assessment_flow_state(context)
         await update.message.reply_text(

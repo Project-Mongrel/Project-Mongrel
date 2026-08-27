@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from app.services.findings_store import _get_connection
 
 
-def create_assessment(name: str, description: str | None = None) -> dict:
+def create_assessment(name: str, description: str | None = None, user_id: int | None = None) -> dict:
     normalized_name = str(name or "").strip()
     if not normalized_name:
         raise ValueError("Assessment name is required.")
@@ -14,10 +14,10 @@ def create_assessment(name: str, description: str | None = None) -> dict:
         _initialize_schema(connection)
         cursor = connection.execute(
             """
-            INSERT INTO assessments (name, description, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO assessments (user_id, name, description, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (normalized_name, description, "active", _format_datetime(now), _format_datetime(now)),
+            (user_id, normalized_name, description, "active", _format_datetime(now), _format_datetime(now)),
         )
         assessment_id = int(cursor.lastrowid)
 
@@ -34,6 +34,16 @@ def get_assessment(assessment_id: int) -> dict | None:
     return _row_to_assessment(row) if row is not None else None
 
 
+def get_user_assessment(user_id: int, assessment_id: int) -> dict | None:
+    with _get_connection() as connection:
+        _initialize_schema(connection)
+        row = connection.execute(
+            "SELECT * FROM assessments WHERE id = ? AND user_id = ?",
+            (assessment_id, user_id),
+        ).fetchone()
+    return _row_to_assessment(row) if row is not None else None
+
+
 def list_assessments(status: str | None = None) -> list[dict]:
     with _get_connection() as connection:
         _initialize_schema(connection)
@@ -43,6 +53,22 @@ def list_assessments(status: str | None = None) -> list[dict]:
             rows = connection.execute(
                 "SELECT * FROM assessments WHERE status = ? ORDER BY created_at ASC, id ASC",
                 (status,),
+            ).fetchall()
+    return [_row_to_assessment(row) for row in rows]
+
+
+def list_user_assessments(user_id: int, status: str | None = None) -> list[dict]:
+    with _get_connection() as connection:
+        _initialize_schema(connection)
+        if status is None:
+            rows = connection.execute(
+                "SELECT * FROM assessments WHERE user_id = ? ORDER BY created_at ASC, id ASC",
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM assessments WHERE user_id = ? AND status = ? ORDER BY created_at ASC, id ASC",
+                (user_id, status),
             ).fetchall()
     return [_row_to_assessment(row) for row in rows]
 
@@ -257,6 +283,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS assessments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             name TEXT NOT NULL,
             description TEXT,
             status TEXT NOT NULL DEFAULT 'active',
@@ -265,6 +292,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(connection, "assessments", "user_id", "INTEGER")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS assessment_targets (
@@ -334,6 +362,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_assessment_scans_tool ON assessment_scans(tool)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_assessment_artifacts_assessment ON assessment_artifacts(assessment_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_assessment_notes_assessment ON assessment_notes(assessment_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_assessments_user_status ON assessments(user_id, status)")
     connection.commit()
 
 
@@ -352,9 +381,16 @@ def _require_scan(assessment_id: int, scan_id: int) -> None:
         raise ValueError("Assessment scan not found.")
 
 
+def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
 def _row_to_assessment(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
+        "user_id": row["user_id"],
         "name": row["name"],
         "description": row["description"],
         "status": row["status"],
