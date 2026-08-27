@@ -248,6 +248,22 @@ def test_ollama_success_returns_response_text() -> None:
     assert payload["options"]["think"] is False
 
 
+def test_ollama_optional_num_predict_overrides_default() -> None:
+    settings = Settings(ai_enabled=True, ollama_base_url="https://ollama.example", ollama_model="qwen3:4b")
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {"message": {"role": "assistant", "content": "Assessment answer."}},
+    )
+
+    with (
+        patch("app.services.ai_client.get_settings", return_value=settings),
+        patch("app.services.ai_client.httpx.post", return_value=response) as post,
+    ):
+        assert ask_ollama("Summarize the assessment.", num_predict=768) == "Assessment answer."
+
+    assert post.call_args.kwargs["json"]["options"]["num_predict"] == 768
+
+
 def test_qwen_response_parsing_ignores_thinking() -> None:
     settings = Settings(ai_enabled=True, ollama_base_url="https://ollama.example")
     response = SimpleNamespace(

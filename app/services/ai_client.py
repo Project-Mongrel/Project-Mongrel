@@ -34,7 +34,7 @@ MONGREL_IDENTITY_PROMPT = (
 )
 
 
-def ask_ai(prompt: str) -> str:
+def ask_ai(prompt: str, num_predict: int | None = None) -> str:
     settings = get_settings()
     if not settings.ai_enabled:
         return "AI integration is not configured yet."
@@ -45,7 +45,9 @@ def ask_ai(prompt: str) -> str:
     if not settings.ollama_base_url:
         return "Ollama base URL is not configured."
 
-    return ask_ollama(prompt)
+    if num_predict is None:
+        return ask_ollama(prompt)
+    return ask_ollama(prompt, num_predict=num_predict)
 
 
 def build_mongrel_prompt(user_question: str) -> str:
@@ -65,8 +67,9 @@ def build_ollama_messages(user_question: str) -> list[dict[str, str]]:
     ]
 
 
-def ask_ollama(user_question: str) -> str:
+def ask_ollama(user_question: str, num_predict: int | None = None) -> str:
     settings = get_settings()
+    prediction_budget = int(num_predict) if num_predict is not None else 256
     try:
         response = httpx.post(
             f"{settings.ollama_base_url.rstrip('/')}/api/chat",
@@ -75,7 +78,7 @@ def ask_ollama(user_question: str) -> str:
                 "messages": build_ollama_messages(user_question),
                 "stream": False,
                 "options": {
-                    "num_predict": 256,
+                    "num_predict": prediction_budget,
                     "temperature": 0.2,
                     "think": False,
                 },
