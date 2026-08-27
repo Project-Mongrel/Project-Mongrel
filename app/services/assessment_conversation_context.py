@@ -1,0 +1,359 @@
+import hashlib
+import json
+from datetime import datetime
+from typing import Any
+
+from app.services.assessment_context import build_assessment_context
+from app.services.assessment_conversation_store import (
+    get_latest_assessment_conversation,
+    get_user_conversation,
+    list_recent_messages,
+)
+from app.services.assessment_guard import build_assessment_guard, build_guard_prompt_section
+from app.services.assessment_store import get_user_assessment
+
+CONTEXT_SCHEMA_VERSION = "assessment_conversation_context.v1"
+DEFAULT_RECENT_MESSAGE_LIMIT = 8
+MAX_FINDINGS_PER_TOOL = 5
+MAX_ITEMS_PER_LIST = 10
+MAX_ARTIFACTS = 8
+MAX_TEXT_LENGTH = 1200
+RAW_FIELD_NAMES = {
+    "raw",
+    "raw_output",
+    "output",
+    "stdout",
+    "stderr",
+    "console_output",
+    "pcap",
+    "pcap_data",
+    "raw_pcap",
+    "raw_packets",
+    "packet_rows",
+    "decrypted_secret",
+    "raw_secret",
+    "secret_payload",
+}
+SECRET_FIELD_ALLOWLIST = {"redacted_secret_preview", "secret_hash"}
+TOOL_ALIASES = {
+    "nmap": ("nmap", "port scan", "open port", "open ports"),
+    "bbot": ("bbot",),
+    "nuclei": ("nuclei",),
+    "httpx": ("httpx", "http fingerprint"),
+    "katana": ("katana", "crawl", "crawler"),
+    "playwright": ("playwright", "browser", "dom"),
+    "ffuf": ("ffuf", "fuzz", "fuzzing"),
+    "testssl": ("testssl", "testssl.sh", "tls", "ssl"),
+    "gitleaks": ("gitleaks", "secret", "secrets"),
+    "prowler": ("prowler", "cloud", "aws", "azure", "gcp"),
+    "metasploit": ("metasploit", "msfconsole", "session", "exploit validation"),
+    "tshark": ("tshark", "pcap", "packet", "packets", "dns", "tcp"),
+}
+CORRELATION_TERMS = ("correlation", "correlated", "capture during validation")
+
+
+def build_assessment_conversation_context(
+    *,
+    user_id: int,
+    assessment_id: int,
+    question: str,
+    conversation_id: str | None = None,
+    recent_message_limit: int = DEFAULT_RECENT_MESSAGE_LIMIT,
+) -> dict:
+    assessment = get_user_assessment(user_id, assessment_id)
+    if assessment is None:
+        raise ValueError("Assessment not found for user.")
+
+    assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
+    conversation = _resolve_conversation(user_id, assessment_id, conversation_id)
+    recent_messages = (
+        list_recent_messages(user_id, conversation["id"], limit=recent_message_limit) if conversation is not None else []
+    )
+    selected_tools = detect_question_tools(question)
+    full_assessment = not selected_tools
+    evidence = _build_evidence_context(assessment_context, selected_tools)
+    provenance = _build_provenance(
+        assessment_context=assessment_context,
+        evidence=evidence,
+        user_id=user_id,
+        assessment_id=assessment_id,
+        conversation=conversation,
+        selected_tools=selected_tools,
+        recent_messages=recent_messages,
+        full_assessment=full_assessment,
+    )
+    context = {
+        "schema_version": CONTEXT_SCHEMA_VERSION,
+        "current_question": str(question or "").strip(),
+        "priority_rules": [
+            "current_user_question",
+            "stored_normalized_assessment_evidence",
+            "assessment_artifacts_and_provenance",
+            "stored_conversation_summary",
+            "recent_conversation_messages",
+        ],
+        "evidence_precedence": (
+            "Stored normalized assessment evidence is authoritative. Conversation history is interpretation, not evidence. "
+            "Newer assessment evidence supersedes older assistant statements."
+        ),
+        "selection": {
+            "mode": "full_assessment" if full_assessment else "tool_relevant",
+            "selected_tools": selected_tools,
+        },
+        "conversation": {
+            "id": conversation["id"] if conversation is not None else None,
+            "summary": conversation.get("summary") if conversation is not None else None,
+            "recent_messages": [_message_for_context(message) for message in recent_messages],
+            "recent_message_limit": max(0, int(recent_message_limit or 0)),
+        },
+        "assessment_context": evidence,
+        "truthfulness": {
+            "guard": build_assessment_guard(assessment_context, question=question),
+            "prompt_section": build_guard_prompt_section(assessment_context, question=question),
+            "tool_boundaries": _tool_boundaries(),
+        },
+        "provenance": provenance,
+    }
+    context["evidence_context_digest"] = build_context_digest(context)
+    return context
+
+
+def build_context_digest(context: dict) -> str:
+    payload = {key: value for key, value in context.items() if key != "evidence_context_digest"}
+    encoded = json.dumps(payload, default=_json_default, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def detect_question_tools(question: str) -> list[str]:
+    normalized = f" {str(question or '').lower()} "
+    selected = []
+    for tool, aliases in TOOL_ALIASES.items():
+        if any(alias in normalized for alias in aliases):
+            selected.append(tool)
+    if any(term in normalized for term in CORRELATION_TERMS):
+        for tool in ("tshark", "metasploit"):
+            if tool not in selected:
+                selected.append(tool)
+    return selected
+
+
+def _resolve_conversation(user_id: int, assessment_id: int, conversation_id: str | None) -> dict | None:
+    if conversation_id:
+        conversation = get_user_conversation(user_id, conversation_id)
+        if conversation is None:
+            raise ValueError("Assessment conversation not found.")
+        if int(conversation["assessment_id"]) != int(assessment_id):
+            raise ValueError("Assessment conversation does not belong to the requested assessment.")
+        return conversation
+    return get_latest_assessment_conversation(user_id, assessment_id)
+
+
+def _build_evidence_context(assessment_context: dict, selected_tools: list[str]) -> dict:
+    scan_ids = set()
+    finding_ids = set()
+    scans = []
+    findings_by_tool: dict[str, int] = {}
+    full_assessment = not selected_tools
+    for scan in assessment_context.get("scans") or []:
+        tool = _normalize_tool(scan.get("tool"))
+        if not _include_tool(tool, selected_tools, full_assessment):
+            continue
+        scans.append(_sanitize(scan, drop_finding=True))
+        scan_ids.add(scan.get("id"))
+        finding = scan.get("finding")
+        if isinstance(finding, dict):
+            finding_id = finding.get("id")
+            if finding_id in finding_ids:
+                continue
+            count = findings_by_tool.get(tool, 0)
+            if count >= MAX_FINDINGS_PER_TOOL:
+                continue
+            findings_by_tool[tool] = count + 1
+            finding_ids.add(finding_id)
+
+    findings = []
+    included_finding_ids = set()
+    for finding in assessment_context.get("findings") or []:
+        tool = _normalize_tool(finding.get("source"))
+        if not _include_tool(tool, selected_tools, full_assessment):
+            continue
+        if finding.get("id") in included_finding_ids:
+            continue
+        if len([item for item in findings if item.get("source") == tool]) >= MAX_FINDINGS_PER_TOOL:
+            continue
+        included_finding_ids.add(finding.get("id"))
+        findings.append(_sanitize(finding))
+
+    artifacts = []
+    selected_scan_ids = {scan.get("id") for scan in scans}
+    for artifact in assessment_context.get("artifacts") or []:
+        if not _include_artifact(artifact, selected_tools, full_assessment, selected_scan_ids):
+            continue
+        artifacts.append(_artifact_for_context(artifact))
+        if len(artifacts) >= MAX_ARTIFACTS:
+            break
+
+    return {
+        "assessment": _sanitize(assessment_context.get("assessment") or {}),
+        "targets": _sanitize(assessment_context.get("targets") or []),
+        "scans": scans,
+        "findings": findings,
+        "artifacts": artifacts,
+        "notes": _sanitize(assessment_context.get("notes") or []),
+        "budget": {
+            "recent_messages_bounded": True,
+            "evidence_prioritized_over_history": True,
+            "raw_outputs_excluded": True,
+            "max_findings_per_tool": MAX_FINDINGS_PER_TOOL,
+            "max_items_per_list": MAX_ITEMS_PER_LIST,
+            "max_artifacts": MAX_ARTIFACTS,
+            "max_text_length": MAX_TEXT_LENGTH,
+        },
+    }
+
+
+def _build_provenance(
+    *,
+    assessment_context: dict,
+    evidence: dict,
+    user_id: int,
+    assessment_id: int,
+    conversation: dict | None,
+    selected_tools: list[str],
+    recent_messages: list[dict],
+    full_assessment: bool,
+) -> dict:
+    return {
+        "schema_version": CONTEXT_SCHEMA_VERSION,
+        "user_id": user_id,
+        "assessment_id": assessment_id,
+        "conversation_id": conversation["id"] if conversation is not None else None,
+        "conversation_summary_present": bool(conversation and conversation.get("summary")),
+        "history_message_ids": [message.get("id") for message in recent_messages],
+        "selection_mode": "full_assessment" if full_assessment else "tool_relevant",
+        "selected_tools": selected_tools,
+        "included_scan_ids": [scan.get("id") for scan in evidence.get("scans") or []],
+        "included_finding_ids": [finding.get("id") for finding in evidence.get("findings") or []],
+        "included_artifact_ids": [artifact.get("id") for artifact in evidence.get("artifacts") or []],
+        "available_scan_ids": [scan.get("id") for scan in assessment_context.get("scans") or []],
+        "available_artifact_ids": [artifact.get("id") for artifact in assessment_context.get("artifacts") or []],
+        "evidence_counts": {
+            "targets": len(evidence.get("targets") or []),
+            "scans": len(evidence.get("scans") or []),
+            "findings": len(evidence.get("findings") or []),
+            "artifacts": len(evidence.get("artifacts") or []),
+            "notes": len(evidence.get("notes") or []),
+        },
+    }
+
+
+def _message_for_context(message: dict) -> dict:
+    return {
+        "id": message.get("id"),
+        "role": message.get("role"),
+        "content": _truncate(str(message.get("content") or "")),
+        "created_at": message.get("created_at"),
+    }
+
+
+def _artifact_for_context(artifact: dict) -> dict:
+    safe_artifact = {
+        "id": artifact.get("id"),
+        "assessment_id": artifact.get("assessment_id"),
+        "scan_id": artifact.get("scan_id"),
+        "artifact_type": artifact.get("artifact_type"),
+        "title": artifact.get("title"),
+        "file_path": artifact.get("file_path"),
+        "created_at": artifact.get("created_at"),
+    }
+    content = artifact.get("content")
+    if isinstance(content, str) and content.strip():
+        safe_artifact["content"] = _parse_or_excerpt(content)
+    return _sanitize(safe_artifact)
+
+
+def _parse_or_excerpt(value: str) -> Any:
+    trimmed = value.strip()
+    if len(trimmed) > MAX_TEXT_LENGTH:
+        return {"excerpt": _truncate(trimmed), "truncated": True}
+    try:
+        decoded = json.loads(trimmed)
+    except ValueError:
+        return _truncate(trimmed)
+    return _sanitize(decoded)
+
+
+def _include_artifact(artifact: dict, selected_tools: list[str], full_assessment: bool, selected_scan_ids: set[object]) -> bool:
+    if full_assessment:
+        return True
+    scan_id = artifact.get("scan_id")
+    if scan_id in selected_scan_ids:
+        return True
+    haystack = " ".join(str(artifact.get(key) or "").lower() for key in ("artifact_type", "title", "content"))
+    return any(tool in haystack for tool in selected_tools) or (
+        "tshark" in selected_tools and "correlation" in haystack
+    )
+
+
+def _include_tool(tool: str, selected_tools: list[str], full_assessment: bool) -> bool:
+    if full_assessment:
+        return True
+    if tool in selected_tools:
+        return True
+    if tool == "testssl" and "testssl" in selected_tools:
+        return True
+    return False
+
+
+def _normalize_tool(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "testssl.sh":
+        return "testssl"
+    return normalized
+
+
+def _sanitize(value: Any, *, drop_finding: bool = False) -> Any:
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key)
+            key_lower = key_text.lower()
+            if drop_finding and key_lower == "finding":
+                continue
+            if key_lower in RAW_FIELD_NAMES:
+                continue
+            if "secret" in key_lower and key_lower not in SECRET_FIELD_ALLOWLIST and not key_lower.startswith("redacted_"):
+                sanitized[key_text] = "<REDACTED>"
+                continue
+            sanitized[key_text] = _sanitize(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize(item) for item in value[:MAX_ITEMS_PER_LIST]]
+    if isinstance(value, tuple):
+        return [_sanitize(item) for item in list(value)[:MAX_ITEMS_PER_LIST]]
+    if isinstance(value, str):
+        return _truncate(value)
+    return value
+
+
+def _truncate(value: str) -> str:
+    if len(value) <= MAX_TEXT_LENGTH:
+        return value
+    return value[: MAX_TEXT_LENGTH - 15].rstrip() + "... [truncated]"
+
+
+def _tool_boundaries() -> list[str]:
+    return [
+        "Stored normalized evidence is authoritative; conversation history is interpretation only.",
+        "Absence of findings is not proof of security or vulnerability absence.",
+        "Metasploit module execution, subprocess success, sessions, exploitation, and compromise are distinct states.",
+        "TShark correlation confidence describes attribution confidence, not exploitability confidence.",
+        "Prowler PASS/FAIL applies to the specific scanner check and does not prove account-wide posture.",
+        "Gitleaks findings are redacted secret-pattern matches; validity, ownership, usability, and compromise are not established.",
+    ]
+
+
+def _json_default(value: object) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
