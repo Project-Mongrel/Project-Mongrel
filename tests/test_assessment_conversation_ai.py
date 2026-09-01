@@ -380,6 +380,192 @@ def test_conversation_uses_configured_larger_response_budget() -> None:
     assert ask_ai.call_args.kwargs["num_predict"] == 900
 
 
+def test_live_nmap_service_labels_do_not_prove_cleartext_or_tls_behavior() -> None:
+    assessment = create_assessment("Hello Sunday Kids", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+
+    unsupported_answers = (
+        "Port 80 proves sensitive data is exposed in cleartext and interceptable.",
+        "HTTPS on 443 establishes successful encrypted communication and a completed TLS handshake.",
+        "HTTP on port 80 proves a man-in-the-middle attack is exploitable.",
+    )
+    for response in unsupported_answers:
+        with patch("app.services.assessment_conversation_ai.ask_ai", return_value=response):
+            result = answer_assessment_conversation_question(
+                user_id=1001,
+                assessment_id=assessment["id"],
+                conversation_id=None,
+                question="What does the Nmap web-service evidence prove?",
+            )
+
+        assert result["answer"] == TRUTHFULNESS_FALLBACK_ANSWER
+        assert result["fallback_reason"] == "truthfulness_guard"
+
+
+def test_prompt_states_precise_nmap_http_and_https_evidence_semantics() -> None:
+    assessment = create_assessment("Service Semantics", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What have we learned from these web ports?",
+    )
+    prompt = build_assessment_conversation_prompt(context)
+
+    assert "does not prove sensitive data is sent in cleartext" in prompt
+    assert "do not prove a successful TLS handshake" in prompt
+    assert "Do not invent remediation such as CSP, CDN use, or IP allowlisting" in prompt
+
+
+def test_guard_allows_explicit_service_label_uncertainty() -> None:
+    assert violates_conversation_truthfulness(
+        "Port 80 does not prove sensitive data is exposed in cleartext or establish MITM risk."
+    ) is False
+    assert violates_conversation_truthfulness(
+        "HTTPS on 443 and 8443 does not prove a successful TLS handshake or completed encrypted communication."
+    ) is False
+    assert violates_conversation_truthfulness("HTTP exposure is not by itself a security weakness.") is False
+
+
+def test_generic_remediation_detached_from_evidence_is_withheld() -> None:
+    assessment = create_assessment("No Invented Remediation", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+
+    with patch(
+        "app.services.assessment_conversation_ai.ask_ai",
+        return_value="Deploy a CDN, add CSP, and use an IP allowlist to fix the exposed HTTP service.",
+    ):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What remediation is required?",
+        )
+
+    assert result["answer"] == TRUTHFULNESS_FALLBACK_ANSWER
+
+
+def test_capability_catalog_contains_locked_competition_toolset() -> None:
+    assessment = create_assessment("Capabilities", user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What can Mongrel do?",
+    )
+
+    assert list(context["mongrel_capabilities"]) == [
+        "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl.sh",
+        "gitleaks", "prowler", "metasploit", "tshark",
+    ]
+    assert "uploaded PCAPs" in context["mongrel_capabilities"]["tshark"]
+    assert "reachable web responses" in context["mongrel_capabilities"]["httpx"]
+
+
+def test_web_service_next_step_prefers_httpx_after_nmap_with_rationale() -> None:
+    assessment = create_assessment("Web Next Step", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    response = (
+        "Observed Facts\nNmap classified exposed web-associated services on ports 80, 443, 8080 and 8443.\n"
+        "Uncertainty\nThose labels do not establish which HTTP endpoints respond or how they behave.\n"
+        "Recommended Next Step\nUse Mongrel's httpx because it fills that gap by probing and characterizing the HTTP(S) endpoints."
+    )
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=response) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Which Mongrel tool should investigate these web services next?",
+        )
+
+    prompt = ask_ai.call_args.args[0]
+    assert '"completed_tools": [\n      "nmap"' in prompt
+    assert '"preferred_next_tools": [\n      "httpx"' in prompt
+    assert "do not simply repeat Nmap" in prompt
+    assert "httpx" in result["answer"].lower()
+    assert "because" in result["answer"].lower()
+    assert "run nmap" not in result["answer"].lower()
+
+
+def test_traffic_analysis_prefers_tshark_and_explains_modes() -> None:
+    assessment = create_assessment("Traffic Next Step", user_id=1001)
+    response = (
+        "Use Mongrel's TShark because it can analyze an uploaded PCAP, perform a standalone live capture, or capture during "
+        "an explicitly approved validation. No packet evidence has been collected yet."
+    )
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=response) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Can Mongrel inspect the network traffic?",
+        )
+
+    assert '"preferred_next_tools": [\n      "tshark"' in ask_ai.call_args.args[0]
+    assert "tshark" in result["answer"].lower()
+    assert "mitmproxy" not in result["answer"].lower()
+    assert "tcpdump" not in result["answer"].lower()
+
+
+def test_external_traffic_tool_without_tshark_is_withheld_when_tshark_fits() -> None:
+    assessment = create_assessment("Internal Traffic Capability", user_id=1001)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Use mitmproxy to inspect the traffic."):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Can Mongrel inspect traffic?",
+        )
+
+    assert result["answer"] == TRUTHFULNESS_FALLBACK_ANSWER
+
+
+def test_novice_guidance_is_plain_mongrel_specific_and_gap_driven() -> None:
+    assessment = create_assessment("Novice Web Guidance", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    response = (
+        "Observed Facts\nIn plain English, the host answered and Nmap saw four web-associated open ports.\n"
+        "What this does not prove\nWe do not yet know whether the sites respond, encrypt successfully, or contain a vulnerability.\n"
+        "Recommended Next Step\nUse Mongrel's httpx because it checks which web endpoints respond and records basic web details."
+    )
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=response) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="I'm a complete novice. What have we learned and what should I do next?",
+        )
+
+    assert '"novice": true' in ask_ai.call_args.args[0]
+    assert "httpx" in result["answer"].lower()
+    assert "because" in result["answer"].lower()
+    assert "generic security" not in result["answer"].lower()
+
+
+def test_live_quality_changes_do_not_execute_any_tool() -> None:
+    assessment = create_assessment("Advice Only", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    response = "Use httpx because it fills the current web-response evidence gap."
+
+    with (
+        patch("app.services.assessment_conversation_ai.ask_ai", return_value=response),
+        patch("app.tools.httpx_runner.run_httpx_scan") as httpx_runner,
+        patch("app.tools.tshark_runner.run_tshark_offline_analysis") as tshark_runner,
+    ):
+        answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should I do next for the web services?",
+        )
+
+    httpx_runner.assert_not_called()
+    tshark_runner.assert_not_called()
+
+
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:
     finding = add_finding(
         user_id=user_id,
@@ -390,6 +576,25 @@ def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str)
             "risk_level": "medium",
             "summary": f"Nmap observed {service}.",
             "open_ports": [{"port": port, "protocol": "tcp", "service": service}],
+        },
+    )
+    return record_assessment_scan(assessment_id, tool="nmap", status="completed", finding_id=finding["id"])
+
+
+def _add_live_web_nmap_scan(assessment_id: int, *, user_id: int) -> dict:
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nmap",
+            "target": "hellosundaykids.com",
+            "status": "completed",
+            "summary": "Host reachable; web-associated services observed.",
+            "open_ports": [
+                {"port": 80, "protocol": "tcp", "service": "http"},
+                {"port": 443, "protocol": "tcp", "service": "https"},
+                {"port": 8080, "protocol": "tcp", "service": "http-proxy"},
+                {"port": 8443, "protocol": "tcp", "service": "https-alt"},
+            ],
         },
     )
     return record_assessment_scan(assessment_id, tool="nmap", status="completed", finding_id=finding["id"])

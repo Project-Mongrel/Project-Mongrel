@@ -50,6 +50,24 @@ TOOL_ALIASES = {
     "tshark": ("tshark", "pcap", "packet", "packets", "dns", "tcp"),
 }
 CORRELATION_TERMS = ("correlation", "correlated", "capture during validation")
+MONGREL_CAPABILITIES = {
+    "nmap": "Observe host reachability, exposed ports, and service classifications; it does not prove application behavior or vulnerabilities.",
+    "bbot": "Perform bounded reconnaissance and asset/discovery enumeration.",
+    "nuclei": "Run approved template-based checks against a suitable target; matches are scanner evidence, not automatic exploit proof.",
+    "httpx": "Probe discovered HTTP/HTTPS endpoints and record reachable web responses, status, titles, redirects, and web technology observations.",
+    "playwright": "Observe a web application through a browser, including rendered pages, DOM behavior, screenshots, and browser-visible flows.",
+    "katana": "Crawl a web application to discover reachable URLs, paths, forms, and linked resources.",
+    "ffuf": "Perform bounded web content/path discovery using an approved fuzzing profile.",
+    "testssl.sh": "Assess observed TLS endpoints for protocol, cipher, and certificate behavior.",
+    "gitleaks": "Scan authorized repositories or files for redacted secret-pattern matches; it does not prove a secret is valid or usable.",
+    "prowler": "Evaluate supported cloud-provider checks; each result applies to its specific check, not the whole account posture.",
+    "metasploit": "Perform explicitly approved, allowlisted validation; execution, target response, sessions, and compromise remain distinct facts.",
+    "tshark": "Analyze uploaded PCAPs, perform standalone live capture, or capture during approved validation and correlate packet evidence.",
+}
+WEB_QUESTION_TERMS = ("web", "website", "http", "https", "url", "endpoint", "service", "services")
+TRAFFIC_QUESTION_TERMS = ("traffic", "packet", "packets", "pcap", "capture", "network conversation")
+NOVICE_QUESTION_TERMS = ("novice", "beginner", "don't know", "do not know", "new to", "what should i do next")
+WEB_SERVICE_PORTS = {80, 443, 8080, 8443}
 
 
 def build_assessment_conversation_context(
@@ -107,6 +125,8 @@ def build_assessment_conversation_context(
             "recent_message_limit": max(0, int(recent_message_limit or 0)),
         },
         "assessment_context": evidence,
+        "mongrel_capabilities": MONGREL_CAPABILITIES,
+        "recommendation_context": _build_recommendation_context(question, assessment_context),
         "truthfulness": {
             "guard": build_assessment_guard(assessment_context, question=question),
             "prompt_section": build_guard_prompt_section(assessment_context, question=question),
@@ -350,7 +370,58 @@ def _tool_boundaries() -> list[str]:
         "TShark correlation confidence describes attribution confidence, not exploitability confidence.",
         "Prowler PASS/FAIL applies to the specific scanner check and does not prove account-wide posture.",
         "Gitleaks findings are redacted secret-pattern matches; validity, ownership, usability, and compromise are not established.",
+        "Nmap service labels classify exposed services; HTTP does not prove sensitive cleartext data or interception risk, and HTTPS does not prove a successful or secure TLS exchange.",
     ]
+
+
+def _build_recommendation_context(question: str, assessment_context: dict) -> dict:
+    normalized_question = str(question or "").lower()
+    completed_tools = []
+    for scan in assessment_context.get("scans") or []:
+        tool = _normalize_tool(scan.get("tool"))
+        if str(scan.get("status") or "").lower() == "completed" and tool and tool not in completed_tools:
+            completed_tools.append(tool)
+
+    web_services_observed = _has_nmap_web_service(assessment_context)
+    traffic_intent = any(term in normalized_question for term in TRAFFIC_QUESTION_TERMS)
+    web_intent = any(term in normalized_question for term in WEB_QUESTION_TERMS)
+    novice_intent = any(term in normalized_question for term in NOVICE_QUESTION_TERMS)
+    preferred_next_tools = []
+    rationale = []
+    if traffic_intent:
+        preferred_next_tools.append("tshark")
+        rationale.append("TShark is Mongrel's internal packet/capture capability; recommend its fitting mode without claiming packets already exist.")
+    elif web_services_observed and (web_intent or novice_intent):
+        preferred_next_tools.append("httpx")
+        rationale.append("Nmap already identified web-associated exposed services; httpx can test which HTTP(S) endpoints respond and characterize them.")
+
+    return {
+        "completed_tools": completed_tools,
+        "web_services_observed_by_nmap": web_services_observed,
+        "question_intents": {"web": web_intent, "traffic": traffic_intent, "novice": novice_intent},
+        "preferred_next_tools": preferred_next_tools,
+        "rationale": rationale,
+        "rules": [
+            "Do not blindly recommend a completed tool when another Mongrel capability fills the current evidence gap.",
+            "Prefer Mongrel's own capability when it satisfies the request; name an external tool only for a clearly explained capability gap.",
+            "A recommendation is advice only and must never trigger tool execution.",
+        ],
+    }
+
+
+def _has_nmap_web_service(assessment_context: dict) -> bool:
+    for finding in assessment_context.get("findings") or []:
+        if _normalize_tool(finding.get("source")) != "nmap":
+            continue
+        for item in finding.get("open_ports") or []:
+            try:
+                port = int(item.get("port"))
+            except (TypeError, ValueError, AttributeError):
+                port = None
+            service = str(item.get("service") or "").lower() if isinstance(item, dict) else ""
+            if port in WEB_SERVICE_PORTS or service in {"http", "https", "http-proxy", "https-alt"}:
+                return True
+    return False
 
 
 def _json_default(value: object) -> str:

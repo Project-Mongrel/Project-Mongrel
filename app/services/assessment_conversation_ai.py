@@ -24,6 +24,17 @@ UNSUPPORTED_CONVERSATION_CLAIM_PATTERNS = (
     re.compile(r"\b(?:organization|company|aws account|cloud account)\s+(?:is|was)\s+(?:compliant|non-compliant)\b"),
 )
 SESSION_CLAIM_PATTERN = re.compile(r"\b(?:shell|session)\s+(?:was|is)\s+(?:obtained|opened|established)\b")
+SERVICE_LABEL_OVERCLAIM_PATTERNS = (
+    re.compile(r"\b(?:port\s+80|http(?:\s+service)?)\b.{0,80}\b(?:sensitive data|credentials?|secrets?)\b.{0,50}\b(?:cleartext|unencrypted|interceptable|exposed)\b"),
+    re.compile(r"\b(?:sensitive data|credentials?|secrets?)\b.{0,60}\b(?:cleartext|unencrypted|interceptable|exposed)\b.{0,80}\b(?:port\s+80|http(?:\s+service)?)\b"),
+    re.compile(r"\b(?:port\s+80|http(?:\s+service)?)\b.{0,100}\b(?:proves?|confirms?|establishes?)\b.{0,60}\b(?:mitm|man-in-the-middle|interception|exploitab)"),
+    re.compile(r"\b(?:443|8443|https|https-alt)\b.{0,100}\b(?:proves?|confirms?|establishes?|means)\b.{0,60}\b(?:successful|secure|encrypted communication|tls handshake)"),
+    re.compile(r"\b(?:443|8443|https|https-alt)\b.{0,60}\b(?:is|are|provides?|uses?)\b.{0,40}\b(?:established|successful|completed)\s+(?:tls|encrypted communication)"),
+    re.compile(r"\b(?:http exposure|exposed http|port\s+80)\b.{0,50}\b(?:is|constitutes?|creates?)\b.{0,40}\b(?:security weakness|vulnerability|mitm risk|interception risk)\b"),
+)
+DETACHED_REMEDIATION_TERMS = ("content security policy", "csp", "cdn", "ip whitelist", "ip allowlist")
+TRAFFIC_TERMS = ("traffic", "packet", "packets", "pcap", "capture")
+EXTERNAL_TRAFFIC_TOOLS = ("tcpdump", "mitmproxy", "wireshark")
 
 
 def answer_assessment_conversation_question(
@@ -76,9 +87,16 @@ def build_assessment_conversation_prompt(context: dict) -> str:
             "- Prowler PASS/FAIL applies to the specific scanner check only; PASS is not account/resource security proof.",
             "- Gitleaks findings are redacted secret-pattern matches only; never reveal or infer raw secret values.",
             "- testssl.sh findings preserve scanner wording, severity, and uncertainty.",
+            "- Nmap service names are observations/classifications only. `80/tcp http` does not prove sensitive data is sent in cleartext, interception/MITM risk, a vulnerability, or exploitability.",
+            "- `443/tcp https` and `8443/tcp https-alt` do not prove a successful TLS handshake, completed encrypted communication, certificate validity, or TLS quality. testssl.sh or protocol evidence is needed for TLS claims.",
+            "- Do not invent remediation such as CSP, CDN use, or IP allowlisting unless stored evidence establishes the specific problem it would address.",
+            "- Use the supplied Mongrel capability catalog and recommendation context. Prefer a fitting Mongrel tool over an external tool.",
+            "- If Nmap already found web-associated services and the user asks how to investigate them, normally recommend httpx first because it fills the HTTP reachability/fingerprinting gap; do not simply repeat Nmap.",
+            "- For traffic or packet analysis, recognize TShark and explain the applicable uploaded-PCAP, standalone-capture, or capture-during-approved-validation mode without claiming packet evidence exists.",
             "- You may recommend tools, but every recommendation must explain why and must not execute anything.",
             "- Active or invasive execution must remain behind Mongrel's existing explicit approval and execution flows.",
             "- Adapt depth to the user: plain English for beginner questions, concise technical comparison for experienced questions.",
+            "- For a novice summary, give plain-English observed facts, what they do not prove, one Mongrel-specific next action, and why it fills the evidence gap. Avoid a generic security lecture.",
             "- Keep the answer concise.",
             "",
             "Recommended answer shape:",
@@ -101,7 +119,14 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
         return False
     if any(pattern.search(normalized) for pattern in UNSUPPORTED_CONVERSATION_CLAIM_PATTERNS):
         return True
+    if _has_service_label_overclaim(normalized):
+        return True
     if SESSION_CLAIM_PATTERN.search(normalized) and not _metasploit_session_established(context or {}):
+        return True
+    question = str((context or {}).get("current_question") or "").lower()
+    if any(term in question for term in TRAFFIC_TERMS) and any(tool in normalized for tool in EXTERNAL_TRAFFIC_TOOLS) and "tshark" not in normalized:
+        return True
+    if any(term in normalized for term in DETACHED_REMEDIATION_TERMS) and not _answer_remediation_supported(normalized, context or {}):
         return True
     return False
 
@@ -143,6 +168,25 @@ def _metasploit_session_established(context: dict) -> bool:
         evidence = finding.get("metasploit_evidence") if isinstance(finding, dict) else None
         if isinstance(evidence, dict) and evidence.get("session_established") is True:
             return True
+    return False
+
+
+def _answer_remediation_supported(answer: str, context: dict) -> bool:
+    if re.search(r"\b(?:no evidence|not justified|not established|unsupported|cannot recommend)\b.{0,80}\b(?:csp|cdn|ip whitelist|ip allowlist)\b", answer):
+        return True
+    evidence_text = json.dumps((context.get("assessment_context") or {}).get("findings") or [], default=_json_default).lower()
+    return any(term in evidence_text for term in DETACHED_REMEDIATION_TERMS if term in answer)
+
+
+def _has_service_label_overclaim(answer: str) -> bool:
+    for pattern in SERVICE_LABEL_OVERCLAIM_PATTERNS:
+        match = pattern.search(answer)
+        if match is None:
+            continue
+        claim = match.group(0)
+        if re.search(r"\b(?:does|do|did|is|are)\s+not\b|\bnot\s+(?:proof|proven|established|confirmed)\b|\bno evidence\b", claim):
+            continue
+        return True
     return False
 
 
