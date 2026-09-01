@@ -21,6 +21,7 @@ from app.bot.handlers.assessment import (
     ACTIVE_ASSESSMENT_ID_KEY,
     assessment_callback_handler,
     build_assessment_chat_intro,
+    build_assessment_chat_keyboard,
     build_assessment_dashboard_keyboard,
     build_assessment_dashboard_text,
     build_assessment_history_text,
@@ -129,6 +130,7 @@ from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edi
 from app.core.config import Settings
 from app.services.active_scan_state import clear_active_scan, get_active_scan, set_active_scan
 from app.services.assessment_context import build_assessment_context
+from app.services.assessment_conversation_store import get_or_create_assessment_conversation
 from app.services.assessment_guard import build_assessment_guard
 from app.services.assessment_store import (
     add_assessment_target,
@@ -329,6 +331,7 @@ def test_new_assessment_flow_creates_assessment_target_and_dashboard() -> None:
 
     assessment = list_assessments()[-1]
     assert assessment["name"] == "Mission 10.11 Assessment"
+    assert assessment["user_id"] == 8101
     assert list_assessment_targets(assessment["id"])[0]["address"] == "example.com"
 
 
@@ -783,7 +786,7 @@ def test_assessment_history_callback_lists_recorded_scans() -> None:
 
 
 def test_assessment_ask_mongrel_starts_assessment_conversation() -> None:
-    assessment = create_assessment("Assessment Chat")
+    assessment = create_assessment("Assessment Chat", user_id=8129)
     target = add_assessment_target(assessment["id"], address="scanme.nmap.org")
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
@@ -794,21 +797,23 @@ def test_assessment_ask_mongrel_starts_assessment_conversation() -> None:
     )
     context = SimpleNamespace(user_data={})
 
-    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), context))
+    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8129)), context))
 
     query.answer.assert_called_once()
     query.edit_message_text.assert_not_called()
-    query_message.reply_text.assert_called_once_with(build_assessment_chat_intro(assessment, [target]))
+    assert query_message.reply_text.call_args.args[0] == build_assessment_chat_intro(assessment, [target])
+    assert query_message.reply_text.call_args.kwargs["reply_markup"] == build_assessment_chat_keyboard(assessment["id"])
     assert "Ask Mongrel anything. Cybersecurity is my specialty." not in query_message.reply_text.call_args.args[0]
     assert "Assessment AI" in query_message.reply_text.call_args.args[0]
     assert context.user_data[ASSESSMENT_CHAT_STATE_KEY]["assessment_id"] == assessment["id"]
     assert context.user_data[ASSESSMENT_CHAT_STATE_KEY][ACTIVE_ASSESSMENT_ID_KEY] == assessment["id"]
     assert context.user_data[ASSESSMENT_CHAT_STATE_KEY]["assessment_chat"] is True
+    assert context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"]
 
 
 def test_assessment_ask_mongrel_answers_with_assessment_evidence() -> None:
     clear_user_findings(8130)
-    assessment = create_assessment("Assessment Chat Evidence")
+    assessment = create_assessment("Assessment Chat Evidence", user_id=8130)
     target = add_assessment_target(assessment["id"], address="scanme.nmap.org")
     finding = add_finding(
         user_id=8130,
@@ -821,10 +826,11 @@ def test_assessment_ask_mongrel_answers_with_assessment_evidence() -> None:
         },
     )
     record_assessment_scan(assessment["id"], tool="nmap", status="completed", target_id=target["id"], finding_id=finding["id"])
-    context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"]}})
+    conversation = get_or_create_assessment_conversation(8130, assessment["id"])
+    context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"], "conversation_id": conversation["id"]}})
     message = SimpleNamespace(text="What ports are open?", reply_text=AsyncMock())
 
-    with patch("app.services.assessment_ai.ask_ai", return_value="Observed evidence shows 22/tcp ssh."):
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Observed evidence shows 22/tcp ssh."):
         asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8130)), context))
 
     assert message.reply_text.call_args_list[0].args[0] == "Reviewing assessment evidence..."
@@ -834,7 +840,7 @@ def test_assessment_ask_mongrel_answers_with_assessment_evidence() -> None:
 
 def test_assessment_chat_followup_does_not_call_generic_ask_mongrel() -> None:
     clear_user_findings(8136)
-    assessment = create_assessment("Assessment Chat Followup")
+    assessment = create_assessment("Assessment Chat Followup", user_id=8136)
     target = add_assessment_target(assessment["id"], address="scanme.nmap.org")
     finding = add_finding(
         user_id=8136,
@@ -847,11 +853,12 @@ def test_assessment_chat_followup_does_not_call_generic_ask_mongrel() -> None:
     )
     record_assessment_scan(assessment["id"], tool="nmap", status="completed", target_id=target["id"], finding_id=finding["id"])
     set_ai_waiting(8136)
-    context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"]}})
+    conversation = get_or_create_assessment_conversation(8136, assessment["id"])
+    context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"], "conversation_id": conversation["id"]}})
     message = SimpleNamespace(text="What evidence supports that?", reply_text=AsyncMock())
 
     with (
-        patch("app.services.assessment_ai.ask_ai", return_value="Assessment evidence shows 22/tcp ssh.") as assessment_ask_ai,
+        patch("app.services.assessment_conversation_ai.ask_ai", return_value="Assessment evidence shows 22/tcp ssh.") as assessment_ask_ai,
         patch("app.bot.handlers.scan.ask_ai", side_effect=AssertionError("generic Ask Mongrel should not be called")) as generic_ask_ai,
     ):
         asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8136)), context))
@@ -887,7 +894,7 @@ def test_assessment_chat_exit_words_clear_state() -> None:
 
 
 def test_assessment_dashboard_callback_exits_assessment_chat() -> None:
-    assessment = create_assessment("Assessment Dashboard Exit")
+    assessment = create_assessment("Assessment Dashboard Exit", user_id=8137)
     query = SimpleNamespace(
         data=f"assessment:dashboard:{assessment['id']}",
         answer=AsyncMock(),
@@ -895,7 +902,7 @@ def test_assessment_dashboard_callback_exits_assessment_chat() -> None:
     )
     context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"], ACTIVE_ASSESSMENT_ID_KEY: assessment["id"]}})
 
-    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), context))
+    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8137)), context))
 
     assert ASSESSMENT_CHAT_STATE_KEY not in context.user_data
     assert "Assessment Dashboard" in query.edit_message_text.call_args.args[0]
@@ -903,7 +910,7 @@ def test_assessment_dashboard_callback_exits_assessment_chat() -> None:
 
 def test_ask_handler_preserves_assessment_chat_mode() -> None:
     clear_ai_waiting(8138)
-    assessment = create_assessment("Assessment Ask Handler")
+    assessment = create_assessment("Assessment Ask Handler", user_id=8138)
     target = add_assessment_target(assessment["id"], address="example.com")
     context = SimpleNamespace(
         user_data={

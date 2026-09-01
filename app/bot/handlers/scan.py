@@ -2507,7 +2507,15 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     user_id = update.effective_user.id if update.effective_user is not None else None
-    if user_id is not None:
+    scan_request_id = context.user_data.get(PENDING_NMAP_REQUEST_KEY)
+    pending_scan_input = False
+    if user_id is not None and isinstance(scan_request_id, str):
+        pending_request = get_scan_request(user_id=user_id, scan_request_id=scan_request_id)
+        pending_scan_input = pending_request is not None and pending_request.status == "awaiting_target"
+
+    # Authoritative text-routing precedence: active scan/recovery/approval input,
+    # finding analysis, assessment creation, assessment conversation, generic Ask.
+    if user_id is not None and not pending_scan_input:
         finding_analysis_context = get_finding_analysis_context(user_id)
         if finding_analysis_context is not None:
             if _is_finding_analysis_exit_message(update.message.text or ""):
@@ -2531,12 +2539,17 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(ai_response)
             return
 
-    if is_assessment_chat_active(context):
+    if not pending_scan_input and is_assessment_flow_active(context):
+        handled = await assessment_text_handler(update, context)
+        if handled:
+            return
+
+    if not pending_scan_input and is_assessment_chat_active(context):
         handled = await assessment_chat_text_handler(update, context)
         if handled:
             return
 
-    if user_id is not None and is_ai_waiting(user_id):
+    if not pending_scan_input and user_id is not None and is_ai_waiting(user_id):
         logger.info("Ask Mongrel question received for user_id=%s", user_id)
         await update.message.reply_text("Analyzing...")
         try:
@@ -2556,12 +2569,6 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         clear_assessment_flow_state(context)
         return
 
-    if is_assessment_flow_active(context):
-        handled = await assessment_text_handler(update, context)
-        if handled:
-            return
-
-    scan_request_id = context.user_data.get(PENDING_NMAP_REQUEST_KEY)
     if user_id is None or not isinstance(scan_request_id, str):
         return
 

@@ -9,10 +9,13 @@ from app.services.assessment_store import (
     add_assessment_target,
     create_assessment,
     get_assessment,
+    get_user_assessment,
     list_assessment_scans,
     list_assessment_targets,
 )
-from app.services.assessment_ai import FALLBACK_REPORT, answer_assessment_question, generate_assessment_ai_report
+from app.services.assessment_ai import FALLBACK_REPORT, generate_assessment_ai_report
+from app.services.assessment_conversation_ai import FALLBACK_ANSWER, answer_assessment_conversation_question
+from app.services.assessment_conversation_store import append_message, get_or_create_assessment_conversation
 from app.services.assessment_context import build_assessment_context
 from app.services.assessment_markdown_report import generate_assessment_markdown_report
 from app.services.icon_helper import icon_label, section_label
@@ -42,6 +45,16 @@ def build_assessment_chat_intro(assessment: dict, targets: list[dict] | None = N
             "Ask anything about this assessment.",
             "",
             "I will answer only from collected evidence.",
+            "Your conversation is saved and will resume here next time.",
+        ]
+    )
+
+
+def build_assessment_chat_keyboard(assessment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Exit Conversation", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:exit_conversation:{assessment_id}")],
+            [InlineKeyboardButton("Back to Assessment", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:dashboard:{assessment_id}")],
         ]
     )
 
@@ -284,7 +297,7 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
         return False
 
     text = str(update.message.text or "").strip()
-    if text.lower() in {"home", "back", "cancel"}:
+    if text.lower() in {"home", "back", "cancel", "exit conversation", "back to assessment"}:
         clear_assessment_chat_state(context)
         await update.message.reply_text("Exited assessment Ask Mongrel mode.", reply_markup=build_main_menu_keyboard())
         return True
@@ -292,15 +305,77 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("Please send a question about this assessment.")
         return True
 
-    assessment_id = int(state.get(ACTIVE_ASSESSMENT_ID_KEY) or state.get("assessment_id"))
-    user_id = update.effective_user.id if update.effective_user is not None else 0
+    try:
+        assessment_id = int(state.get(ACTIVE_ASSESSMENT_ID_KEY) or state.get("assessment_id"))
+    except (TypeError, ValueError):
+        clear_assessment_chat_state(context)
+        await update.message.reply_text("Assessment conversation is unavailable.", reply_markup=build_main_menu_keyboard())
+        return True
+    user_id = update.effective_user.id if update.effective_user is not None else None
+    conversation_id = str(state.get("conversation_id") or "").strip()
+    assessment = get_user_assessment(user_id, assessment_id) if user_id is not None else None
+    if assessment is None or not conversation_id:
+        clear_assessment_chat_state(context)
+        await update.message.reply_text("Assessment conversation not found.", reply_markup=build_main_menu_keyboard())
+        return True
+
+    try:
+        append_message(
+            conversation_id,
+            user_id,
+            "user",
+            text,
+            assessment_id=assessment_id,
+            metadata={"source": "telegram"},
+        )
+    except Exception:
+        await update.message.reply_text(
+            "I could not save your question, so it was not sent to Ask Mongrel. Please try again.",
+            reply_markup=build_assessment_chat_keyboard(assessment_id),
+        )
+        return True
+
     await update.message.reply_text("Reviewing assessment evidence...")
     try:
-        assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
-        answer = answer_assessment_question(text, assessment_context)
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment_id,
+            conversation_id=conversation_id,
+            question=text,
+        )
     except Exception:
-        answer = "Assessment AI is unavailable. Review the assessment dashboard, scan history, and stored findings for next steps."
-    await update.message.reply_text(answer)
+        result = {
+            "answer": FALLBACK_ANSWER,
+            "evidence_refs": {},
+            "evidence_context_digest": None,
+            "provenance": {"assessment_id": assessment_id, "user_id": user_id, "conversation_id": conversation_id},
+            "fallback_reason": "exception",
+        }
+
+    answer = str(result.get("answer") or FALLBACK_ANSWER)
+    try:
+        append_message(
+            conversation_id,
+            user_id,
+            "assistant",
+            answer,
+            assessment_id=assessment_id,
+            evidence_refs=result.get("evidence_refs"),
+            evidence_context_digest=result.get("evidence_context_digest"),
+            metadata={
+                "source": "telegram",
+                "provenance": result.get("provenance") or {},
+                "fallback_reason": result.get("fallback_reason"),
+            },
+        )
+    except Exception:
+        await update.message.reply_text(
+            "Ask Mongrel generated a response, but I could not save it. The response was not added to this conversation; please try again.",
+            reply_markup=build_assessment_chat_keyboard(assessment_id),
+        )
+        return True
+
+    await update.message.reply_text(answer, reply_markup=build_assessment_chat_keyboard(assessment_id))
     return True
 
 
@@ -323,8 +398,17 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text("Assessment not found.")
         return
 
+    effective_user = getattr(update, "effective_user", None)
+    user_id = effective_user.id if effective_user is not None else None
     assessment = get_assessment(assessment_id)
     if assessment is None:
+        await query.edit_message_text("Assessment not found.")
+        return
+
+    conversation_operation = action in {"ask", "exit_conversation"} or (
+        action == "dashboard" and is_assessment_chat_active(context)
+    )
+    if conversation_operation and (user_id is None or get_user_assessment(user_id, assessment_id) is None):
         await query.edit_message_text("Assessment not found.")
         return
 
@@ -341,6 +425,16 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         )
         return
 
+    if action == "exit_conversation":
+        clear_assessment_chat_state(context)
+        message = getattr(query, "message", None)
+        reply_text = getattr(message, "reply_text", None)
+        if reply_text is not None:
+            await reply_text("Exited assessment Ask Mongrel mode.", reply_markup=build_main_menu_keyboard())
+        else:
+            await query.edit_message_text("Exited assessment Ask Mongrel mode.")
+        return
+
     if action == "history":
         await query.edit_message_text(
             build_assessment_history_text(assessment, list_assessment_scans(assessment_id)),
@@ -350,18 +444,29 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 
     if action == "ask":
         targets = list_assessment_targets(assessment_id)
+        try:
+            conversation = get_or_create_assessment_conversation(
+                user_id=user_id,
+                assessment_id=assessment_id,
+                title=f"Ask Mongrel — {assessment.get('name') or 'Untitled assessment'}",
+                metadata={"source": "telegram"},
+            )
+        except Exception:
+            await query.edit_message_text("Assessment conversation could not be opened. Please try again.")
+            return
         context.user_data[ASSESSMENT_CHAT_STATE_KEY] = {
             "assessment_chat": True,
             ACTIVE_ASSESSMENT_ID_KEY: assessment_id,
             "assessment_id": assessment_id,
+            "conversation_id": conversation["id"],
         }
         message = getattr(query, "message", None)
         reply_text = getattr(message, "reply_text", None)
         prompt = build_assessment_chat_intro(assessment, targets)
         if reply_text is not None:
-            await reply_text(prompt)
+            await reply_text(prompt, reply_markup=build_assessment_chat_keyboard(assessment_id))
         else:
-            await query.edit_message_text(prompt)
+            await query.edit_message_text(prompt, reply_markup=build_assessment_chat_keyboard(assessment_id))
         return
 
     if action == "ai_report":
