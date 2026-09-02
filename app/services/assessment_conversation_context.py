@@ -54,7 +54,7 @@ MONGREL_CAPABILITIES = {
     "nmap": "Observe host reachability, exposed ports, and service classifications; it does not prove application behavior or vulnerabilities.",
     "bbot": "Perform bounded reconnaissance and asset/discovery enumeration.",
     "nuclei": "Run approved template-based checks against a suitable target; matches are scanner evidence, not automatic exploit proof.",
-    "httpx": "Probe discovered HTTP/HTTPS endpoints and record reachable web responses, status, titles, redirects, and web technology observations.",
+    "httpx": "Probe and characterize HTTP/HTTPS endpoints and record reachable web responses, including status, titles, redirects, and technology hints; it does not itself establish vulnerability or misconfiguration.",
     "playwright": "Observe a web application through a browser, including rendered pages, DOM behavior, screenshots, and browser-visible flows.",
     "katana": "Crawl a web application to discover reachable URLs, paths, forms, and linked resources.",
     "ffuf": "Perform bounded web content/path discovery using an approved fuzzing profile.",
@@ -62,7 +62,18 @@ MONGREL_CAPABILITIES = {
     "gitleaks": "Scan authorized repositories or files for redacted secret-pattern matches; it does not prove a secret is valid or usable.",
     "prowler": "Evaluate supported cloud-provider checks; each result applies to its specific check, not the whole account posture.",
     "metasploit": "Perform explicitly approved, allowlisted validation; execution, target response, sessions, and compromise remain distinct facts.",
-    "tshark": "Analyze uploaded PCAPs, perform standalone live capture, or capture during approved validation and correlate packet evidence.",
+    "tshark": "Observe packet/capture metadata from uploaded PCAPs, standalone live capture, or capture during approved validation; it does not establish encryption security, exploitability, compromise, or application security.",
+}
+TELEGRAM_CAPABILITY_GUIDANCE = {
+    "httpx": {
+        "assessment_action": "Run httpx",
+        "guidance": "Return to the assessment dashboard and choose Run httpx; Mongrel will collect the required target through its workflow.",
+    },
+    "tshark": {
+        "assessment_action": "Run TShark",
+        "choices": ["Capture During Validation", "Analyze PCAP", "Standalone Live Capture"],
+        "guidance": "Return to the assessment dashboard and choose Run TShark, then choose the mode that matches the evidence gap.",
+    },
 }
 WEB_QUESTION_TERMS = ("web", "website", "http", "https", "url", "endpoint", "service", "services")
 TRAFFIC_QUESTION_TERMS = ("traffic", "packet", "packets", "pcap", "capture", "network conversation")
@@ -126,7 +137,15 @@ def build_assessment_conversation_context(
         },
         "assessment_context": evidence,
         "mongrel_capabilities": MONGREL_CAPABILITIES,
+        "telegram_capability_guidance": TELEGRAM_CAPABILITY_GUIDANCE,
         "recommendation_context": _build_recommendation_context(question, assessment_context),
+        "evidence_language_contract": [
+            "Nmap port/service labels are classifications only and do not establish application behavior, vulnerability, exploitability, interception, or encryption quality.",
+            "A scanned hostname and its resolved IP identify the same scanned endpoint unless stored evidence explicitly records independently discovered hosts; do not count them as two hosts.",
+            "httpx characterizes observed HTTP endpoints and responses; it does not by itself establish vulnerability or misconfiguration.",
+            "TShark reports only packet/capture facts actually present in normalized evidence and must not promise conclusions about encryption security, exploitability, compromise, or application security.",
+            "The user-facing cloud assessment tool name is Prowler; never use legacy or combined internal cloud-tool aliases.",
+        ],
         "truthfulness": {
             "guard": build_assessment_guard(assessment_context, question=question),
             "prompt_section": build_guard_prompt_section(assessment_context, question=question),
@@ -403,7 +422,9 @@ def _build_recommendation_context(question: str, assessment_context: dict) -> di
         "rationale": rationale,
         "rules": [
             "Do not blindly recommend a completed tool when another Mongrel capability fills the current evidence gap.",
+            "Do not recommend a tool merely because it has not run; it must answer the question and fill an identified evidence gap.",
             "Prefer Mongrel's own capability when it satisfies the request; name an external tool only for a clearly explained capability gap.",
+            "Guide the user through the verified Telegram capability guidance; do not provide installation steps, shell commands, or invented navigation labels.",
             "A recommendation is advice only and must never trigger tool execution.",
         ],
     }

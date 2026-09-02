@@ -213,3 +213,55 @@ def test_assistant_persistence_failure_surfaces_unsaved_response() -> None:
 
     assert "could not save it" in message.reply_text.call_args_list[-1].args[0]
     assert "Unsaved generated text" not in message.reply_text.call_args_list[-1].args[0]
+
+
+def test_successful_turn_emits_safe_complete_timing_summary(caplog) -> None:
+    assessment = create_assessment("Sensitive assessment label", user_id=1011)
+    context, _ = _enter(assessment["id"], 1011)
+    update, message = _text("private raw conversation question", 1011)
+    result = {
+        "answer": "private generated response",
+        "evidence_refs": {"scan_ids": [7]},
+        "evidence_context_digest": "digest-safe",
+        "provenance": {"assessment_id": assessment["id"]},
+        "fallback_reason": None,
+        "instrumentation": {
+            "context_ms": 12.5,
+            "prompt_ms": 1.25,
+            "ai_ms": 42000.0,
+            "postprocess_ms": 0.75,
+            "engine_ms": 42014.5,
+            "prompt_chars": 12345,
+            "context_chars": 9876,
+            "history_message_count": 4,
+            "evidence_scan_count": 3,
+            "evidence_finding_count": 2,
+            "evidence_artifact_count": 1,
+            "output_token_budget": 900,
+        },
+    }
+
+    caplog.set_level("INFO", logger="app.bot.handlers.assessment")
+    with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", return_value=result):
+        asyncio.run(scan_target_handler(update, context))
+
+    timing_logs = [record.getMessage() for record in caplog.records if "assessment_ask_timing" in record.getMessage()]
+    assert len(timing_logs) == 1
+    logged = timing_logs[0]
+    for stage in (
+        "lookup_ms=", "context_ms=12.500", "prompt_ms=1.250", "ai_ms=42000.000",
+        "postprocess_ms=0.750", "user_persistence_ms=", "assistant_persistence_ms=",
+        "persistence_ms=", "total_ms=",
+    ):
+        assert stage in logged
+    for metadata in (
+        "prompt_chars=12345", "context_chars=9876", "history_message_count=4",
+        "evidence_scan_count=3", "evidence_finding_count=2", "evidence_artifact_count=1",
+        "output_token_budget=900",
+    ):
+        assert metadata in logged
+    assert "private raw conversation question" not in logged
+    assert "private generated response" not in logged
+    assert "Sensitive assessment label" not in logged
+    assert "digest-safe" not in logged
+    assert message.reply_text.call_args_list[-1].args[0] == result["answer"]

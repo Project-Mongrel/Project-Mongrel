@@ -6,10 +6,12 @@ import pytest
 from app.core.config import Settings
 from app.services.assessment_conversation_ai import (
     FALLBACK_ANSWER,
+    NATIVE_GUIDANCE_FALLBACK_ANSWER,
     TRUTHFULNESS_FALLBACK_ANSWER,
     answer_assessment_conversation_question,
     build_assessment_conversation_prompt,
     violates_conversation_truthfulness,
+    violates_mongrel_native_guidance,
 )
 from app.services.assessment_conversation_context import build_assessment_conversation_context
 from app.services.assessment_conversation_store import append_message, create_conversation
@@ -564,6 +566,256 @@ def test_live_quality_changes_do_not_execute_any_tool() -> None:
 
     httpx_runner.assert_not_called()
     tshark_runner.assert_not_called()
+
+
+def test_httpx_guidance_uses_verified_mongrel_workflow_not_install_or_cli() -> None:
+    assessment = create_assessment("Native httpx", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    response = (
+        "Return to the assessment dashboard and choose Run httpx. This is the next step because Nmap identified "
+        "web-associated services but has not established which HTTP endpoints respond."
+    )
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=response) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="How do I investigate these web services?",
+        )
+
+    prompt = ask_ai.call_args.args[0]
+    assert '"assessment_action": "Run httpx"' in prompt
+    assert "Never tell the user to install Mongrel's tools" in prompt
+    assert result["answer"] == response
+    assert "install" not in result["answer"].lower()
+    assert "httpx -" not in result["answer"].lower()
+
+
+@pytest.mark.parametrize(
+    "bad_guidance",
+    [
+        "Install httpx with apt install httpx, then run it yourself.",
+        "Run this command:\n```bash\nhttpx -u https://example.com\n```",
+    ],
+)
+def test_internal_httpx_install_and_raw_cli_guidance_is_withheld(bad_guidance: str) -> None:
+    assessment = create_assessment("No raw httpx", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=bad_guidance):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="How should I inspect these web services?",
+        )
+
+    assert result["answer"] == NATIVE_GUIDANCE_FALLBACK_ANSWER
+    assert result["fallback_reason"] == "native_guidance_guard"
+
+
+def test_tshark_guidance_uses_only_verified_assessment_labels() -> None:
+    assessment = create_assessment("Native TShark", user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="How can Mongrel inspect traffic?",
+    )
+    guidance = context["telegram_capability_guidance"]["tshark"]
+
+    assert guidance["assessment_action"] == "Run TShark"
+    assert guidance["choices"] == ["Capture During Validation", "Analyze PCAP", "Standalone Live Capture"]
+    assert "Install" not in guidance["guidance"]
+
+
+def test_unrelated_unrun_tool_is_not_added_to_preferred_recommendation() -> None:
+    assessment = create_assessment("Scoped Recommendation", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What should a novice do next for these web services?",
+    )
+
+    assert context["recommendation_context"]["preferred_next_tools"] == ["httpx"]
+    assert "nuclei" not in context["recommendation_context"]["preferred_next_tools"]
+    assert "katana" not in context["recommendation_context"]["preferred_next_tools"]
+    assert violates_mongrel_native_guidance("Use httpx because it fills the web response gap.", context) is False
+    assert violates_mongrel_native_guidance("Use httpx, then run Nuclei as another unrun tool.", context) is True
+
+
+def test_novice_prompt_requires_one_clear_evidence_driven_action() -> None:
+    assessment = create_assessment("One novice action", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="I'm a novice. What should I do next?",
+    )
+    prompt = build_assessment_conversation_prompt(context)
+
+    assert "recommend exactly one clear next action" in prompt
+    assert context["recommendation_context"]["preferred_next_tools"] == ["httpx"]
+
+
+def test_native_guidance_remains_advice_only_and_executes_nothing() -> None:
+    assessment = create_assessment("Native advice only", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    response = "Choose Run httpx in the assessment because it fills the web-response evidence gap."
+
+    with (
+        patch("app.services.assessment_conversation_ai.ask_ai", return_value=response),
+        patch("app.tools.httpx_runner.run_httpx_scan") as runner,
+    ):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should I do next for these web services?",
+        )
+
+    assert result["answer"] == response
+    runner.assert_not_called()
+
+
+def test_hostname_and_resolved_ip_are_not_counted_as_independent_hosts() -> None:
+    assessment = create_assessment("Endpoint identity", user_id=1001)
+    finding = add_finding(
+        user_id=1001,
+        finding={
+            "source": "nmap",
+            "target": "hellosundaykids.com",
+            "resolved_ip": "203.0.113.10",
+            "host_status": "up",
+            "open_ports": [{"port": 443, "protocol": "tcp", "service": "https"}],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", finding_id=finding["id"])
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="How many hosts did Nmap find?",
+    )
+    prompt = build_assessment_conversation_prompt(context)
+
+    assert "two identifiers for the same scanned endpoint" in prompt
+    assert "Never inflate the host count from DNS resolution alone" in prompt
+    assert violates_conversation_truthfulness(
+        "Nmap independently discovered two hosts: hostname hellosundaykids.com and resolved IP 203.0.113.10.", context
+    ) is True
+    assert violates_conversation_truthfulness(
+        "The hostname and resolved IP are two identifiers for the same scanned endpoint, not two independently discovered hosts.", context
+    ) is False
+
+
+def test_httpx_language_is_endpoint_characterization_not_vulnerability_proof() -> None:
+    assessment = create_assessment("httpx semantics", user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What would httpx establish?",
+    )
+
+    assert "Probe and characterize HTTP/HTTPS endpoints" in context["mongrel_capabilities"]["httpx"]
+    assert "does not itself establish vulnerability or misconfiguration" in context["mongrel_capabilities"]["httpx"]
+    assert violates_conversation_truthfulness("httpx proves the endpoint is vulnerable and misconfigured.", context) is True
+    assert violates_conversation_truthfulness(
+        "httpx characterizes the observed response; it does not prove the endpoint is vulnerable or misconfigured.", context
+    ) is False
+
+
+def test_tshark_language_does_not_promise_security_or_compromise_conclusions() -> None:
+    assessment = create_assessment("TShark semantics", user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What can TShark tell us if we capture traffic?",
+    )
+
+    capability = context["mongrel_capabilities"]["tshark"]
+    assert "packet/capture metadata" in capability
+    assert "does not establish encryption security, exploitability, compromise, or application security" in capability
+    assert violates_conversation_truthfulness("TShark will prove encryption security and determine exploitability.", context) is True
+    assert violates_conversation_truthfulness(
+        "TShark can report observed packet metadata, but it cannot prove encryption security or compromise.", context
+    ) is False
+
+
+def test_tshark_answer_is_bounded_to_normalized_packet_observations() -> None:
+    assessment = create_assessment("Observed packets only", user_id=1001)
+    finding = add_finding(
+        user_id=1001,
+        finding={
+            "source": "tshark",
+            "target": "capture.pcap",
+            "tshark_evidence": {
+                "packet_count": 3,
+                "observed_protocols": [{"protocol": "tcp", "packet_count": 3}],
+                "evidence_limitations": ["No application payload conclusion was established."],
+            },
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="tshark", status="completed", finding_id=finding["id"])
+
+    with patch(
+        "app.services.assessment_conversation_ai.ask_ai",
+        return_value="Observed Facts\nTShark recorded 3 TCP packet metadata observations. No application-security conclusion is established.",
+    ) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What packet evidence was actually observed?",
+        )
+
+    assert '"packet_count": 3' in ask_ai.call_args.args[0]
+    assert "3 TCP packet metadata observations" in result["answer"]
+
+
+def test_user_facing_cloud_tool_name_is_only_prowler() -> None:
+    assessment = create_assessment("Cloud naming", user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What cloud tool does Mongrel provide?",
+    )
+    prompt = build_assessment_conversation_prompt(context)
+
+    assert "The user-facing cloud tool is Prowler" in prompt
+    assert "ScoutSuite/Prowler" not in prompt
+    assert violates_conversation_truthfulness("Use ScoutSuite/Prowler for cloud checks.", context) is True
+    assert violates_conversation_truthfulness("Use Prowler for the relevant supported cloud checks.", context) is False
+
+
+def test_assessment_answer_returns_safe_latency_stages_and_sizes() -> None:
+    assessment = create_assessment("Timing metadata", user_id=1001)
+    conversation = create_conversation(assessment["id"], user_id=1001)
+    append_message(conversation["id"], user_id=1001, role="user", content="Earlier private conversation text")
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Observed Facts\nNmap observed web-associated services."):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=conversation["id"],
+            question="Private question text",
+        )
+
+    instrumentation = result["instrumentation"]
+    assert set(instrumentation) == {
+        "context_ms", "prompt_ms", "ai_ms", "postprocess_ms", "engine_ms",
+        "prompt_chars", "context_chars", "history_message_count",
+        "evidence_scan_count", "evidence_finding_count", "evidence_artifact_count",
+        "output_token_budget",
+    }
+    assert all(instrumentation[key] >= 0 for key in ("context_ms", "prompt_ms", "ai_ms", "postprocess_ms", "engine_ms"))
+    assert instrumentation["prompt_chars"] > instrumentation["context_chars"] > 0
+    assert instrumentation["history_message_count"] == 1
+    assert instrumentation["evidence_scan_count"] == 1
+    assert instrumentation["evidence_finding_count"] == 1
+    assert instrumentation["evidence_artifact_count"] == 0
+    assert instrumentation["output_token_budget"] >= 256
 
 
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:

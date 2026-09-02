@@ -2,7 +2,7 @@ CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf")
 LOCKED_TOOL_LIMITATIONS = (
     "testssl.sh not run",
     "Gitleaks not run",
-    "ScoutSuite/Prowler not run",
+    "Prowler not run",
     "Metasploit validation not run",
     "TShark not run",
 )
@@ -241,7 +241,7 @@ def _locked_tool_limitations(status_by_tool: dict[str, set[str]]) -> list[str]:
     if "gitleaks" in status_by_tool:
         limitations = [limitation for limitation in limitations if limitation != "Gitleaks not run"]
     if "prowler" in status_by_tool:
-        limitations = [limitation for limitation in limitations if limitation != "ScoutSuite/Prowler not run"]
+        limitations = [limitation for limitation in limitations if limitation != "Prowler not run"]
     if "metasploit" in status_by_tool:
         limitations = [limitation for limitation in limitations if limitation != "Metasploit validation not run"]
     return limitations

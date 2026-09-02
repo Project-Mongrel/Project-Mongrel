@@ -1,4 +1,6 @@
+import logging
 from pathlib import Path
+from time import perf_counter
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
@@ -15,7 +17,7 @@ from app.services.assessment_store import (
 )
 from app.services.assessment_ai import FALLBACK_REPORT, generate_assessment_ai_report
 from app.services.assessment_conversation_ai import FALLBACK_ANSWER, answer_assessment_conversation_question
-from app.services.assessment_conversation_store import append_message, get_or_create_assessment_conversation
+from app.services.assessment_conversation_store import append_message, get_or_create_assessment_conversation, get_user_conversation
 from app.services.assessment_context import build_assessment_context
 from app.services.assessment_markdown_report import generate_assessment_markdown_report
 from app.services.icon_helper import icon_label, section_label
@@ -27,6 +29,7 @@ ASSESSMENT_STAGE_NAME = "awaiting_name"
 ASSESSMENT_STAGE_TARGET = "awaiting_target"
 ASSESSMENT_CALLBACK_PREFIX = "assessment"
 ACTIVE_ASSESSMENT_ID_KEY = "active_assessment_id"
+logger = logging.getLogger(__name__)
 
 
 def build_assessment_chat_intro(assessment: dict, targets: list[dict] | None = None) -> str:
@@ -305,6 +308,7 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("Please send a question about this assessment.")
         return True
 
+    turn_started = perf_counter()
     try:
         assessment_id = int(state.get(ACTIVE_ASSESSMENT_ID_KEY) or state.get("assessment_id"))
     except (TypeError, ValueError):
@@ -313,12 +317,17 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
         return True
     user_id = update.effective_user.id if update.effective_user is not None else None
     conversation_id = str(state.get("conversation_id") or "").strip()
+    lookup_started = perf_counter()
     assessment = get_user_assessment(user_id, assessment_id) if user_id is not None else None
+    if user_id is not None and conversation_id:
+        get_user_conversation(user_id, conversation_id)
+    lookup_ms = _assessment_ask_elapsed_ms(lookup_started)
     if assessment is None or not conversation_id:
         clear_assessment_chat_state(context)
         await update.message.reply_text("Assessment conversation not found.", reply_markup=build_main_menu_keyboard())
         return True
 
+    user_persistence_started = perf_counter()
     try:
         append_message(
             conversation_id,
@@ -334,6 +343,7 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
             reply_markup=build_assessment_chat_keyboard(assessment_id),
         )
         return True
+    user_persistence_ms = _assessment_ask_elapsed_ms(user_persistence_started)
 
     await update.message.reply_text("Reviewing assessment evidence...")
     try:
@@ -353,6 +363,7 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
         }
 
     answer = str(result.get("answer") or FALLBACK_ANSWER)
+    assistant_persistence_started = perf_counter()
     try:
         append_message(
             conversation_id,
@@ -374,9 +385,62 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
             reply_markup=build_assessment_chat_keyboard(assessment_id),
         )
         return True
+    assistant_persistence_ms = _assessment_ask_elapsed_ms(assistant_persistence_started)
 
     await update.message.reply_text(answer, reply_markup=build_assessment_chat_keyboard(assessment_id))
+    _log_assessment_ask_timing(
+        assessment_id=assessment_id,
+        conversation_id=conversation_id,
+        lookup_ms=lookup_ms,
+        user_persistence_ms=user_persistence_ms,
+        assistant_persistence_ms=assistant_persistence_ms,
+        total_ms=_assessment_ask_elapsed_ms(turn_started),
+        instrumentation=result.get("instrumentation") or {},
+        fallback_reason=result.get("fallback_reason"),
+    )
     return True
+
+
+def _log_assessment_ask_timing(
+    *,
+    assessment_id: int,
+    conversation_id: str,
+    lookup_ms: float,
+    user_persistence_ms: float,
+    assistant_persistence_ms: float,
+    total_ms: float,
+    instrumentation: dict,
+    fallback_reason: object,
+) -> None:
+    logger.info(
+        "assessment_ask_timing assessment_id=%s conversation_id=%s ownership_conversation_lookup_ms=%.3f context_ms=%.3f prompt_ms=%.3f "
+        "ai_ms=%.3f postprocess_ms=%.3f user_persistence_ms=%.3f assistant_persistence_ms=%.3f persistence_ms=%.3f "
+        "total_ms=%.3f prompt_chars=%s context_chars=%s history_message_count=%s evidence_scan_count=%s "
+        "evidence_finding_count=%s evidence_artifact_count=%s output_token_budget=%s fallback_reason=%s",
+        assessment_id,
+        conversation_id,
+        lookup_ms,
+        float(instrumentation.get("context_ms") or 0.0),
+        float(instrumentation.get("prompt_ms") or 0.0),
+        float(instrumentation.get("ai_ms") or 0.0),
+        float(instrumentation.get("postprocess_ms") or 0.0),
+        user_persistence_ms,
+        assistant_persistence_ms,
+        user_persistence_ms + assistant_persistence_ms,
+        total_ms,
+        int(instrumentation.get("prompt_chars") or 0),
+        int(instrumentation.get("context_chars") or 0),
+        int(instrumentation.get("history_message_count") or 0),
+        int(instrumentation.get("evidence_scan_count") or 0),
+        int(instrumentation.get("evidence_finding_count") or 0),
+        int(instrumentation.get("evidence_artifact_count") or 0),
+        int(instrumentation.get("output_token_budget") or 0),
+        str(fallback_reason or "none"),
+    )
+
+
+def _assessment_ask_elapsed_ms(started: float) -> float:
+    return round((perf_counter() - started) * 1000, 3)
 
 
 async def assessment_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

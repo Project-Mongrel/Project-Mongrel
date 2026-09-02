@@ -78,7 +78,7 @@ def test_guard_recognizes_prowler_and_preserves_scanner_confidence() -> None:
     guard = build_assessment_guard(_stored_prowler_context())
 
     assert "prowler" in guard["completed_tools"]
-    assert "ScoutSuite/Prowler not run" not in guard["locked_tool_limitations"]
+    assert "Prowler not run" not in guard["locked_tool_limitations"]
     assert any("prowler FAIL iam_check iam" in value for value in guard["observed_assets"]["services"])
 
 
