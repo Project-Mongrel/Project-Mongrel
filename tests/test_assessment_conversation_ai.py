@@ -818,6 +818,57 @@ def test_assessment_answer_returns_safe_latency_stages_and_sizes() -> None:
     assert instrumentation["output_token_budget"] >= 256
 
 
+def test_prompt_compaction_preserves_evidence_rules_tools_and_native_guidance() -> None:
+    assessment = create_assessment("Compact prompt", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What should I do next for these web services?",
+    )
+
+    prompt = build_assessment_conversation_prompt(context)
+    encoded_context = prompt.split("Conversation Context JSON:\n", 1)[1].rsplit("\n\nAnswer:", 1)[0]
+    model_context = json.loads(encoded_context)
+
+    assert "does not prove sensitive data is sent in cleartext" in prompt
+    assert "do not prove a successful TLS handshake" in prompt
+    assert set(model_context["mongrel_capabilities"]) == {
+        "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl.sh",
+        "gitleaks", "prowler", "metasploit", "tshark",
+    }
+    assert model_context["telegram_capability_guidance"]["httpx"]["assessment_action"] == "Run httpx"
+    assert model_context["assessment_context"]["scans"]
+    assert model_context["assessment_context"]["findings"]
+    assert "provenance" not in model_context
+    assert "evidence_context_digest" not in model_context
+    assert "budget" not in model_context["assessment_context"]
+    assert "rules" not in model_context["recommendation_context"]
+    assert "prompt_section" not in model_context
+    assert "tool_boundaries" not in model_context
+    assert len(encoded_context) < len(json.dumps(context, default=str, sort_keys=True, indent=2))
+
+
+def test_default_assessment_ask_budget_is_isolated_and_conservative() -> None:
+    assessment = create_assessment("Ask-only budget", user_id=1001)
+    settings = Settings(ai_enabled=True)
+
+    with (
+        patch("app.services.assessment_conversation_ai.get_settings", return_value=settings),
+        patch("app.services.assessment_conversation_ai.ask_ai", return_value="Observed Facts\nNo evidence yet.") as ask_ai,
+    ):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Summarize.",
+        )
+
+    assert settings.ask_mongrel_num_predict == 384
+    assert ask_ai.call_args.kwargs["num_predict"] == 384
+    assert result["instrumentation"]["output_token_budget"] == 384
+
+
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:
     finding = add_finding(
         user_id=user_id,

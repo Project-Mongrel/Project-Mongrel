@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = ""
     ollama_model: str = "qwen3:4b"
     ai_timeout_seconds: int = 60
-    ask_mongrel_num_predict: int = 512
+    ask_mongrel_num_predict: int = 384
     bbot_binary: str = "bbot"
     bbot_scan_timeout_seconds: int = 600
     bbot_presets: str = "subdomain-enum"

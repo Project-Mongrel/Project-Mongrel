@@ -68,9 +68,10 @@ def answer_assessment_conversation_question(
         question=question,
     )
     context_ms = _elapsed_ms(context_started)
-    context_chars = len(json.dumps(context, default=_json_default, sort_keys=True))
+    prompt_context = _build_prompt_context(context)
+    context_chars = len(json.dumps(prompt_context, default=_json_default, sort_keys=True))
     prompt_started = perf_counter()
-    prompt = build_assessment_conversation_prompt(context)
+    prompt = build_assessment_conversation_prompt(context, prompt_context=prompt_context)
     prompt_ms = _elapsed_ms(prompt_started)
     output_token_budget = _conversation_num_predict()
     ai_started = perf_counter()
@@ -130,7 +131,8 @@ def answer_assessment_conversation_question(
     )
 
 
-def build_assessment_conversation_prompt(context: dict) -> str:
+def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict | None = None) -> str:
+    model_context = prompt_context if prompt_context is not None else _build_prompt_context(context)
     return "\n".join(
         [
             "You are Mongrel, answering an assessment-scoped Ask Mongrel question.",
@@ -177,7 +179,7 @@ def build_assessment_conversation_prompt(context: dict) -> str:
             "Recommended Next Step",
             "",
             "Conversation Context JSON:",
-            json.dumps(context, default=_json_default, sort_keys=True, indent=2),
+            json.dumps(model_context, default=_json_default, sort_keys=True, indent=2),
             "",
             "Answer:",
         ]
@@ -246,8 +248,38 @@ def _result(answer: str, context: dict, fallback_reason: str | None = None, inst
 
 
 def _conversation_num_predict() -> int:
-    configured = int(get_settings().ask_mongrel_num_predict or 512)
+    configured = int(get_settings().ask_mongrel_num_predict or 384)
     return max(256, min(configured, 2048))
+
+
+def _build_prompt_context(context: dict) -> dict:
+    """Return the evidence-complete, generation-relevant subset of stored context.
+
+    Digest/provenance bookkeeping and rendered copies of rules remain in the
+    authoritative context and result, but are not repeated in the model prompt.
+    """
+    conversation = context.get("conversation") or {}
+    assessment_context = context.get("assessment_context") or {}
+    recommendation = context.get("recommendation_context") or {}
+    truthfulness = context.get("truthfulness") or {}
+    return {
+        "current_question": context.get("current_question"),
+        "evidence_precedence": context.get("evidence_precedence"),
+        "selection": context.get("selection"),
+        "conversation": {
+            "summary": conversation.get("summary"),
+            "recent_messages": conversation.get("recent_messages") or [],
+        },
+        "assessment_context": {
+            key: value for key, value in assessment_context.items() if key != "budget"
+        },
+        "mongrel_capabilities": context.get("mongrel_capabilities") or {},
+        "telegram_capability_guidance": context.get("telegram_capability_guidance") or {},
+        "recommendation_context": {
+            key: value for key, value in recommendation.items() if key != "rules"
+        },
+        "truthfulness_guard": truthfulness.get("guard") or {},
+    }
 
 
 def _is_unavailable_response(response: object) -> bool:
