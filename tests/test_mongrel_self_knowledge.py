@@ -8,7 +8,10 @@ from app.services.assessment_conversation_ai import (
     build_assessment_conversation_prompt,
     violates_conversation_truthfulness,
 )
-from app.services.assessment_conversation_context import build_assessment_conversation_context
+from app.services.assessment_conversation_context import (
+    build_assessment_conversation_context,
+    classify_assessment_conversation_intent,
+)
 from app.services.assessment_conversation_store import append_message, create_conversation
 from app.services.assessment_store import create_assessment
 from app.services.findings_store import close_findings_database, configure_findings_database
@@ -231,3 +234,73 @@ def test_active_validation_remains_advice_only_and_approval_bounded():
     assert "explicit human review/approval" in metasploit["approval"]
     assert "must not execute anything" in prompt
     assert "Active or invasive execution must remain behind" in prompt
+
+
+@pytest.mark.parametrize(("question", "expected"), [
+    ("What can Mongrel actually do?", "product_self_knowledge"),
+    ("What tools do you have?", "product_self_knowledge"),
+    ("What modes does Mongrel have?", "product_self_knowledge"),
+    ("What did Nmap find?", "current_assessment_evidence"),
+    ("What should I run next?", "next_step_recommendation"),
+    ("What does httpx do?", "individual_tool_explanation"),
+    ("Explain SSRF.", "security_concept"),
+    ("Think like an attacker: what matters?", "attacker_informed_defensive_reasoning"),
+])
+def test_current_question_intent_routes_to_distinct_behavior(question, expected):
+    assert classify_assessment_conversation_intent(question) == expected
+    assert _context(question)["question_intent"] == expected
+
+
+def test_exact_live_product_question_uses_product_context_and_returns_no_assessment_drift():
+    context = _context("What can Mongrel actually do?")
+    assessment_id = context["provenance"]["assessment_id"]
+    answer = (
+        "Mongrel is an evidence-driven security assessment platform with exactly 12 tools: Nmap, BBOT, Nuclei, "
+        "httpx, Playwright, Katana, ffuf, testssl.sh, Gitleaks, Prowler, Metasploit, and TShark. Assessment Mode "
+        "stores evidence, history, and reports; Tool Mode provides direct single-tool use; Ask Mongrel analyzes and "
+        "advises without automatic execution. Guided Metasploit validation requires explicit review and approval."
+    )
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=answer) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment_id, conversation_id=None, question="What can Mongrel actually do?"
+        )
+
+    prompt = ask_ai.call_args.args[0]
+    model_json = prompt.split("Conversation Context JSON:\n", 1)[1].rsplit("\n\nAnswer:", 1)[0]
+    assert result["answer"] == answer
+    assert "12 tools" in result["answer"]
+    assert "Assessment Mode" in result["answer"]
+    assert "I recommend" not in result["answer"]
+    assert "truthfulness_guard" not in result["answer"]
+    assert '"assessment_context"' not in model_json
+    assert '"recommendation_context"' not in model_json
+    assert '"conversation"' not in model_json
+    assert "Tools Used" not in result["answer"]
+
+
+@pytest.mark.parametrize("bad_answer", [
+    "Assessment Summary: the current assessment shows one host. Recommended Next Step: run httpx.",
+    "Tools Used: Nmap. I recommend running TShark.",
+    "The truthfulness_guard and recommendation_context say to run httpx.",
+])
+def test_product_question_rejects_assessment_drift_recommendations_and_internal_labels(bad_answer):
+    context = _context("What can Mongrel actually do?")
+    assert violates_conversation_truthfulness(bad_answer, context) is True
+
+
+@pytest.mark.parametrize("label", [
+    "truthfulness_guard", "recommendation_context", "assessment_context", "evidence_status",
+    "telegram_capability_guidance", "question_intent", "mongrel_self_knowledge",
+])
+def test_internal_field_labels_are_rejected_when_exposed(label):
+    answer = f"The internal field name is {label}."
+    assert violates_conversation_truthfulness(answer, _context("How do you work internally?")) is True
+
+
+@pytest.mark.parametrize("answer", [
+    "Security guardrails can reduce operational risk when they are paired with explicit approval.",
+    "The application returns JSON data through its public API.",
+    "Mongrel's capabilities include packet analysis and bounded vulnerability validation.",
+])
+def test_internal_language_suppression_does_not_block_normal_security_discussion(answer):
+    assert violates_conversation_truthfulness(answer, _context("Explain Mongrel's capabilities.")) is False

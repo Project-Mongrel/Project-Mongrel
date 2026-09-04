@@ -51,10 +51,16 @@ EVIDENCE_LANGUAGE_OVERCLAIM_PATTERNS = (
     re.compile(r"\bscoutsuite\s*/\s*prowler\b"),
 )
 INTERNAL_INSTRUCTION_LEAK_PATTERNS = (
+    re.compile(r"\b(?:truthfulness_guard|recommendation_context|assessment_context|evidence_status|telegram_capability_guidance|question_intent|mongrel_self_knowledge)\b"),
     re.compile(r"\b(?:system|internal|hidden)\s+(?:prompt|instructions?|rules?|guard(?: text)?)\b"),
     re.compile(r"\bhidden\s+capability\s+(?:policy|rules?)\b"),
     re.compile(r"\b(?:the\s+)?guard\s+text\s+(?:says|states|requires|instructs)\b"),
     re.compile(r"\binternal\s+(?:json|profile(?:\s+representation)?)\b"),
+    re.compile(r"\b(?:internal\s+)?context\s+section(?:s| names?)?\b"),
+    re.compile(r"\b(?:internal\s+)?recommendation[- ]rule\s+internals?\b"),
+    re.compile(r"\b(?:internal\s+)?(?:field|key)\s+names?\b"),
+    re.compile(r"\bthe assistant should\b"),
+    re.compile(r"\b(?:my|the|an?)\s+(?:internal\s+)?guardrails?\s+(?:say|says|require|requires|instruct|instructs)\b"),
     re.compile(r"\brecommend its fitting mode\b"),
 )
 TOOL_RAN_CLAIM_PATTERN = re.compile(
@@ -62,6 +68,11 @@ TOOL_RAN_CLAIM_PATTERN = re.compile(
     r".{0,40}\b(?:ran|was run|completed|executed|captured|found|reported|detected)\b"
 )
 OWASP_MAPPING_PATTERN = re.compile(r"\b(?:owasp\s+)?a(?:0?[1-9]|10)\b|\bowasp\s+(?:top\s*10\s+)?(?:category|mapping)\b")
+PRODUCT_ASSESSMENT_DRIFT_PATTERNS = (
+    re.compile(r"(?:^|\n)\s*(?:tools used|assessment summary|recommended next step)\s*:?", re.MULTILINE),
+    re.compile(r"\b(?:the|this|your|current) assessment (?:shows|found|reports|contains|indicates)\b"),
+    re.compile(r"\bi recommend (?:running|using|choosing)\s+(?:nmap|bbot|nuclei|httpx|playwright|katana|ffuf|testssl(?:\.sh)?|gitleaks|prowler|metasploit|tshark)\b"),
+)
 
 
 def answer_assessment_conversation_question(
@@ -145,6 +156,7 @@ def answer_assessment_conversation_question(
 
 def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict | None = None) -> str:
     model_context = prompt_context if prompt_context is not None else _build_prompt_context(context)
+    intent = str(context.get("question_intent") or "current_assessment_evidence")
     return "\n".join(
         [
             "You are Mongrel, answering an assessment-scoped Ask Mongrel question.",
@@ -190,11 +202,7 @@ def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict 
             "- For novice users, recommend exactly one clear next action unless the question explicitly asks for alternatives.",
             "- Keep the answer concise.",
             "",
-            "Recommended answer shape:",
-            "Observed Facts",
-            "Interpretation",
-            "Uncertainty",
-            "Recommended Next Step",
+            *_intent_framing(intent),
             "",
             "Conversation Context JSON:",
             json.dumps(model_context, default=_json_default, sort_keys=True, indent=2),
@@ -215,6 +223,10 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
     if _has_evidence_language_overclaim(normalized):
         return True
     if any(pattern.search(normalized) for pattern in INTERNAL_INSTRUCTION_LEAK_PATTERNS):
+        return True
+    if (context or {}).get("question_intent") == "product_self_knowledge" and any(
+        pattern.search(normalized) for pattern in PRODUCT_ASSESSMENT_DRIFT_PATTERNS
+    ):
         return True
     if _claims_unrun_tool(normalized, context or {}):
         return True
@@ -286,25 +298,55 @@ def _build_prompt_context(context: dict) -> dict:
     assessment_context = context.get("assessment_context") or {}
     recommendation = context.get("recommendation_context") or {}
     truthfulness = context.get("truthfulness") or {}
-    return {
+    intent = str(context.get("question_intent") or "current_assessment_evidence")
+    prompt_context = {
         "current_question": context.get("current_question"),
+        "question_intent": intent,
         "evidence_precedence": context.get("evidence_precedence"),
-        "selection": context.get("selection"),
-        "conversation": {
+        "mongrel_self_knowledge": context.get("mongrel_self_knowledge") or {},
+    }
+    if intent != "product_self_knowledge":
+        prompt_context["selection"] = context.get("selection")
+        prompt_context["conversation"] = {
             "summary": conversation.get("summary"),
             "recent_messages": conversation.get("recent_messages") or [],
-        },
-        "assessment_context": {
+        }
+        prompt_context["mongrel_capabilities"] = context.get("mongrel_capabilities") or {}
+    if intent != "product_self_knowledge":
+        prompt_context["assessment_context"] = {
             key: value for key, value in assessment_context.items() if key != "budget"
-        },
-        "mongrel_capabilities": context.get("mongrel_capabilities") or {},
-        "mongrel_self_knowledge": context.get("mongrel_self_knowledge") or {},
-        "telegram_capability_guidance": context.get("telegram_capability_guidance") or {},
-        "recommendation_context": {
+        }
+        prompt_context["evidence_status"] = truthfulness.get("guard") or {}
+    if intent in {"next_step_recommendation", "attacker_informed_defensive_reasoning", "current_assessment_evidence"}:
+        prompt_context["recommendation_context"] = {
             key: value for key, value in recommendation.items() if key != "rules"
-        },
-        "truthfulness_guard": truthfulness.get("guard") or {},
-    }
+        }
+        prompt_context["telegram_capability_guidance"] = context.get("telegram_capability_guidance") or {}
+    return prompt_context
+
+
+def _intent_framing(intent: str) -> list[str]:
+    if intent == "product_self_knowledge":
+        return [
+            "Response framing for this product question:",
+            "- Use Mongrel self-knowledge as the primary source and directly describe the 12-tool platform, modes, evidence workflow, stored history/reports, and approval boundaries.",
+            "- Do not summarize assessment evidence, emit a Tools Used section, dump evidence, or recommend another tool unless explicitly asked.",
+        ]
+    if intent == "individual_tool_explanation":
+        return [
+            "Response framing for this tool question:",
+            "- Explain the named tool directly: purpose, evidence it can produce, limitations, and relevant relationships. Assessment evidence is optional supporting context, not a substitute for the explanation.",
+        ]
+    if intent == "next_step_recommendation":
+        return ["Response framing for this recommendation question:", "- Recommend only an evidence-gap-driven next decision and explain why it fits."]
+    if intent == "security_concept":
+        return ["Response framing for this concept question:", "- Explain the concept directly; do not map it to a concrete finding without supporting stored evidence."]
+    if intent == "attacker_informed_defensive_reasoning":
+        return ["Response framing for this defensive reasoning question:", "- Explain plausible attacker hypotheses and defensive priorities while distinguishing them from confirmed findings."]
+    return [
+        "Response framing for this assessment evidence question:",
+        "- Lead with stored observed evidence, then distinguish interpretation, uncertainty, and any directly relevant next decision.",
+    ]
 
 
 def _is_unavailable_response(response: object) -> bool:

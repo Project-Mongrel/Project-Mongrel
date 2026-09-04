@@ -80,6 +80,18 @@ WEB_QUESTION_TERMS = ("web", "website", "http", "https", "url", "endpoint", "ser
 TRAFFIC_QUESTION_TERMS = ("traffic", "packet", "packets", "pcap", "capture", "network conversation")
 NOVICE_QUESTION_TERMS = ("novice", "beginner", "don't know", "do not know", "new to", "what should i do next")
 WEB_SERVICE_PORTS = {80, 443, 8080, 8443}
+PRODUCT_QUESTION_PATTERNS = (
+    "what can mongrel", "what does mongrel do", "what are your tools", "what tools do you have",
+    "what modes does mongrel", "difference between assessment mode", "can you run tools automatically",
+)
+RECOMMENDATION_QUESTION_TERMS = ("what next", "do next", "run next", "should i run", "which tool", "recommend")
+ASSESSMENT_QUESTION_TERMS = ("what did", "what was found", "what have we found", "current assessment", "assessment evidence", "scan result")
+SECURITY_CONCEPT_TERMS = (
+    "owasp", "ssrf", "injection", "path traversal", "file upload", "access control", "authentication",
+    "lateral movement", "persistence", "privilege", "attack chain",
+)
+ATTACKER_QUESTION_TERMS = ("think like an attacker", "attacker", "attack path", "attack chain")
+TOOL_EXPLANATION_TERMS = ("what does", "why would i use", "what can", "explain", "what is")
 
 
 def build_assessment_conversation_context(
@@ -100,6 +112,7 @@ def build_assessment_conversation_context(
         list_recent_messages(user_id, conversation["id"], limit=recent_message_limit) if conversation is not None else []
     )
     selected_tools = detect_question_tools(question)
+    question_intent = classify_assessment_conversation_intent(question, selected_tools=selected_tools)
     full_assessment = not selected_tools
     evidence = _build_evidence_context(assessment_context, selected_tools)
     provenance = _build_provenance(
@@ -115,6 +128,7 @@ def build_assessment_conversation_context(
     context = {
         "schema_version": CONTEXT_SCHEMA_VERSION,
         "current_question": str(question or "").strip(),
+        "question_intent": question_intent,
         "priority_rules": [
             "current_user_question",
             "stored_normalized_assessment_evidence",
@@ -157,6 +171,26 @@ def build_assessment_conversation_context(
     }
     context["evidence_context_digest"] = build_context_digest(context)
     return context
+
+
+def classify_assessment_conversation_intent(question: str, *, selected_tools: list[str] | None = None) -> str:
+    """Classify current intent without invoking the model; order resolves overlapping wording."""
+
+    normalized = " ".join(str(question or "").lower().split())
+    tools = selected_tools if selected_tools is not None else detect_question_tools(question)
+    if any(pattern in normalized for pattern in PRODUCT_QUESTION_PATTERNS):
+        return "product_self_knowledge"
+    if any(term in normalized for term in ATTACKER_QUESTION_TERMS):
+        return "attacker_informed_defensive_reasoning"
+    if any(term in normalized for term in RECOMMENDATION_QUESTION_TERMS):
+        return "next_step_recommendation"
+    if tools and any(term in normalized for term in TOOL_EXPLANATION_TERMS):
+        return "individual_tool_explanation"
+    if any(term in normalized for term in ASSESSMENT_QUESTION_TERMS):
+        return "current_assessment_evidence"
+    if any(term in normalized for term in SECURITY_CONCEPT_TERMS):
+        return "security_concept"
+    return "current_assessment_evidence"
 
 
 def build_context_digest(context: dict) -> str:
