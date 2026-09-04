@@ -127,3 +127,9 @@ def build_mongrel_self_knowledge_profile() -> dict:
     """Return an isolated copy so callers cannot mutate the canonical profile."""
 
     return deepcopy(_PROFILE)
+
+
+def get_mongrel_tool_names() -> tuple[str, ...]:
+    """Return the canonical competition tool names in product display order."""
+
+    return tuple(_PROFILE["tools"])

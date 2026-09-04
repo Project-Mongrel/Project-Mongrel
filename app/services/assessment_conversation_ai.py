@@ -6,6 +6,7 @@ from app.core.config import get_settings
 from app.services.ai_client import ask_ai
 from app.services.assessment_ai import AI_UNAVAILABLE_MESSAGES
 from app.services.assessment_conversation_context import build_assessment_conversation_context
+from app.services.mongrel_self_knowledge import get_mongrel_tool_names
 
 FALLBACK_ANSWER = (
     "Ask Mongrel is unavailable. Review the assessment dashboard, scan history, stored findings, and reports for next steps."
@@ -17,6 +18,15 @@ TRUTHFULNESS_FALLBACK_ANSWER = (
 NATIVE_GUIDANCE_FALLBACK_ANSWER = (
     "Ask Mongrel withheld guidance that did not use Mongrel's supported workflow. Return to the assessment dashboard and "
     "choose the relevant Mongrel action; no tool was run."
+)
+PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER = (
+    "Mongrel is an evidence-driven security assessment platform with exactly 12 tools: "
+    + ", ".join(get_mongrel_tool_names()[:-1])
+    + ", and "
+    + get_mongrel_tool_names()[-1]
+    + ". Assessment Mode stores evidence, history, and reports; Tool Mode provides direct single-tool use; Ask Mongrel "
+    "analyzes stored evidence and advises without automatically running tools. Guided Metasploit validation requires "
+    "explicit user review and approval."
 )
 UNSUPPORTED_CONVERSATION_CLAIM_PATTERNS = (
     re.compile(r"\b(?:target|host|system|application|site|aws account|cloud account|environment|resource)\s+(?:is|appears|looks|seems)\s+(?:safe|secure|hardened|protected)\b"),
@@ -40,9 +50,16 @@ SERVICE_LABEL_OVERCLAIM_PATTERNS = (
 DETACHED_REMEDIATION_TERMS = ("content security policy", "csp", "cdn", "ip whitelist", "ip allowlist")
 TRAFFIC_TERMS = ("traffic", "packet", "packets", "pcap", "capture")
 EXTERNAL_TRAFFIC_TOOLS = ("tcpdump", "mitmproxy", "wireshark")
+_TOOL_COMMAND_PATTERN = "|".join(
+    sorted(
+        {re.escape(name.lower()) for name in get_mongrel_tool_names()} | {"msfconsole", "testssl"},
+        key=len,
+        reverse=True,
+    )
+)
 INSTALL_OR_RAW_COMMAND_PATTERNS = (
-    re.compile(r"\b(?:install|brew install|apt(?:-get)? install|pipx? install|go install)\b.{0,50}\b(?:httpx|tshark)\b"),
-    re.compile(r"(?:```(?:bash|sh|shell)?\s*|^|\n)\s*\$?\s*(?:sudo\s+)?(?:httpx|tshark)\s+(?:-|--|https?://|[\w.-]+\s+-)"),
+    re.compile(rf"\b(?:install|brew install|apt(?:-get)? install|pipx? install|go install)\b.{{0,80}}\b(?:{_TOOL_COMMAND_PATTERN})\b"),
+    re.compile(rf"(?:```(?:bash|sh|shell)?\s*|^|\n)\s*\$?\s*(?:sudo\s+)?(?:{_TOOL_COMMAND_PATTERN})\s+(?:-|--|https?://|[\w.-]+\s+-)"),
 )
 EVIDENCE_LANGUAGE_OVERCLAIM_PATTERNS = (
     re.compile(r"\bhttpx\b.{0,80}\b(?:proves?|confirms?|establishes?|shows?)\b.{0,60}\b(?:vulnerab|misconfigur)"),
@@ -135,6 +152,9 @@ def answer_assessment_conversation_question(
         elif violates_mongrel_native_guidance(answer, context):
             answer = NATIVE_GUIDANCE_FALLBACK_ANSWER
             fallback_reason = "native_guidance_guard"
+        elif has_incomplete_product_tool_enumeration(answer, context):
+            answer = PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER
+            fallback_reason = "product_tool_enumeration_guard"
     postprocess_ms = _elapsed_ms(postprocess_started)
     return _result(
         answer,
@@ -246,6 +266,8 @@ def violates_mongrel_native_guidance(answer: str, context: dict | None = None) -
     normalized = str(answer or "").lower()
     if any(pattern.search(normalized) for pattern in INSTALL_OR_RAW_COMMAND_PATTERNS):
         return True
+    if (context or {}).get("question_intent") == "individual_tool_explanation":
+        return False
 
     recommendation = (context or {}).get("recommendation_context") or {}
     preferred = {str(tool).lower() for tool in recommendation.get("preferred_next_tools") or []}
@@ -258,6 +280,32 @@ def violates_mongrel_native_guidance(answer: str, context: dict | None = None) -
         )
     )
     return bool(recommended_tools - preferred)
+
+
+def has_incomplete_product_tool_enumeration(answer: str, context: dict | None = None) -> bool:
+    """Reject a claimed 12-tool enumeration unless it contains exactly the canonical set."""
+
+    if (context or {}).get("question_intent") != "product_self_knowledge":
+        return False
+    normalized = " ".join(str(answer or "").lower().split())
+    if not re.search(r"\b(?:exactly\s+)?12(?:-tool|\s+tools?)\b", normalized):
+        return False
+
+    canonical = get_mongrel_tool_names()
+    mentioned = {name for name in canonical if re.search(rf"(?<!\w){re.escape(name.lower())}(?!\w)", normalized)}
+    if len(mentioned) < 2:
+        return False
+    if mentioned != set(canonical):
+        return True
+
+    enumeration = re.search(
+        r"(?i:\b12(?:-tool|\s+tools?)\b[^:;]*:)\s*(.+?)(?:\.(?:\s+[A-Z]|$)|\n|$)",
+        str(answer or ""),
+    )
+    if enumeration is None:
+        return False
+    items = [item.strip() for item in re.split(r",|\band\b", enumeration.group(1)) if item.strip()]
+    return len(items) != len(canonical)
 
 
 def _result(answer: str, context: dict, fallback_reason: str | None = None, instrumentation: dict | None = None) -> dict:

@@ -3,10 +3,14 @@ from unittest.mock import patch
 import pytest
 
 from app.services.assessment_conversation_ai import (
+    NATIVE_GUIDANCE_FALLBACK_ANSWER,
+    PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER,
     TRUTHFULNESS_FALLBACK_ANSWER,
     answer_assessment_conversation_question,
     build_assessment_conversation_prompt,
+    has_incomplete_product_tool_enumeration,
     violates_conversation_truthfulness,
+    violates_mongrel_native_guidance,
 )
 from app.services.assessment_conversation_context import (
     build_assessment_conversation_context,
@@ -15,7 +19,7 @@ from app.services.assessment_conversation_context import (
 from app.services.assessment_conversation_store import append_message, create_conversation
 from app.services.assessment_store import create_assessment
 from app.services.findings_store import close_findings_database, configure_findings_database
-from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile
+from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile, get_mongrel_tool_names
 
 
 @pytest.fixture(autouse=True)
@@ -304,3 +308,81 @@ def test_internal_field_labels_are_rejected_when_exposed(label):
 ])
 def test_internal_language_suppression_does_not_block_normal_security_discussion(answer):
     assert violates_conversation_truthfulness(answer, _context("Explain Mongrel's capabilities.")) is False
+
+
+@pytest.mark.parametrize("tool", get_mongrel_tool_names())
+def test_factual_explanation_for_each_tool_is_not_treated_as_execution_guidance(tool):
+    context = _context(f"What does {tool} do?")
+    purpose = build_mongrel_self_knowledge_profile()["tools"][tool]["purpose"]
+    answer = f"{tool} is Mongrel's capability for {purpose.rstrip('.').lower()}."
+    assessment_id = context["provenance"]["assessment_id"]
+
+    assert context["question_intent"] == "individual_tool_explanation"
+    assert violates_mongrel_native_guidance(answer, context) is False
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=answer):
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment_id, conversation_id=None, question=context["current_question"]
+        )
+    assert result["answer"] == answer
+    assert result["fallback_reason"] is None
+
+
+def test_exact_httpx_explanation_is_accepted_but_external_execution_guidance_is_blocked():
+    context = _context("What does httpx do?")
+    assessment_id = context["provenance"]["assessment_id"]
+    explanation = "httpx probes authorized web endpoints and records observed HTTP response characteristics."
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=explanation):
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment_id, conversation_id=None, question="What does httpx do?"
+        )
+    assert result["answer"] == explanation
+    assert result["fallback_reason"] is None
+
+    for unsafe in ("Install httpx and run: httpx -u example.com", "Open a shell and run:\nhttpx -u example.com"):
+        with patch("app.services.assessment_conversation_ai.ask_ai", return_value=unsafe):
+            result = answer_assessment_conversation_question(
+                user_id=1001, assessment_id=assessment_id, conversation_id=None, question="What does httpx do?"
+            )
+        assert result["answer"] == NATIVE_GUIDANCE_FALLBACK_ANSWER
+        assert result["fallback_reason"] == "native_guidance_guard"
+
+
+@pytest.mark.parametrize("command", [
+    "nmap -sV example.com", "bbot -t example.com", "nuclei -u https://example.com",
+    "httpx -u https://example.com", "playwright --help", "katana -u https://example.com",
+    "ffuf -u https://example.com/FUZZ", "testssl.sh --help", "gitleaks --help", "prowler --help",
+    "msfconsole -q", "tshark -i eth0",
+])
+def test_raw_cli_guidance_remains_blocked_for_every_builtin_tool(command):
+    context = _context("Explain the tool.")
+    assert violates_mongrel_native_guidance(f"Open a shell and run:\n{command}", context) is True
+
+
+def test_claimed_twelve_tool_enumeration_must_match_canonical_profile_exactly():
+    context = _context("What can Mongrel actually do?")
+    canonical = get_mongrel_tool_names()
+    complete = "Mongrel has exactly 12 tools: " + ", ".join(canonical[:-1]) + ", and " + canonical[-1] + "."
+    missing_testssl = "Mongrel has exactly 12 tools: " + ", ".join(name for name in canonical if name != "testssl.sh") + "."
+    invented_thirteenth = complete[:-1] + ", and Wireshark."
+
+    assert "testssl.sh" in complete
+    assert has_incomplete_product_tool_enumeration(complete, context) is False
+    assert has_incomplete_product_tool_enumeration(missing_testssl, context) is True
+    assert has_incomplete_product_tool_enumeration(invented_thirteenth, context) is True
+
+
+@pytest.mark.parametrize("bad_answer", [
+    "Mongrel has exactly 12 tools: Nmap, BBOT, Nuclei, httpx, Playwright, Katana, ffuf, Gitleaks, Prowler, Metasploit, and TShark.",
+    "Mongrel has exactly 12 tools: Nmap, BBOT, Nuclei, httpx, Playwright, Katana, ffuf, testssl.sh, Gitleaks, Prowler, Metasploit, TShark, and Wireshark.",
+])
+def test_bad_live_product_enumeration_is_replaced_with_canonical_answer(bad_answer):
+    context = _context("What can Mongrel actually do?")
+    assessment_id = context["provenance"]["assessment_id"]
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=bad_answer):
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment_id, conversation_id=None, question=context["current_question"]
+        )
+    assert result["answer"] == PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER
+    assert result["fallback_reason"] == "product_tool_enumeration_guard"
+    assert all(name in result["answer"] for name in get_mongrel_tool_names())
+    assert "Wireshark" not in result["answer"]
