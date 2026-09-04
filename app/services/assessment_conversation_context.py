@@ -11,6 +11,7 @@ from app.services.assessment_conversation_store import (
 )
 from app.services.assessment_guard import build_assessment_guard, build_guard_prompt_section
 from app.services.assessment_store import get_user_assessment
+from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile
 
 CONTEXT_SCHEMA_VERSION = "assessment_conversation_context.v1"
 DEFAULT_RECENT_MESSAGE_LIMIT = 8
@@ -137,6 +138,7 @@ def build_assessment_conversation_context(
         },
         "assessment_context": evidence,
         "mongrel_capabilities": MONGREL_CAPABILITIES,
+        "mongrel_self_knowledge": build_mongrel_self_knowledge_profile(),
         "telegram_capability_guidance": TELEGRAM_CAPABILITY_GUIDANCE,
         "recommendation_context": _build_recommendation_context(question, assessment_context),
         "evidence_language_contract": [
@@ -409,7 +411,7 @@ def _build_recommendation_context(question: str, assessment_context: dict) -> di
     rationale = []
     if traffic_intent:
         preferred_next_tools.append("tshark")
-        rationale.append("TShark is Mongrel's internal packet/capture capability; recommend its fitting mode without claiming packets already exist.")
+        rationale.append("TShark is Mongrel's packet/capture capability; explain the mode that addresses the evidence gap without claiming packets already exist.")
     elif web_services_observed and (web_intent or novice_intent):
         preferred_next_tools.append("httpx")
         rationale.append("Nmap already identified web-associated exposed services; httpx can test which HTTP(S) endpoints respond and characterize them.")
