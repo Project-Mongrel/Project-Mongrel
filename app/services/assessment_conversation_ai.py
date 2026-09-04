@@ -80,6 +80,10 @@ INTERNAL_INSTRUCTION_LEAK_PATTERNS = (
     re.compile(r"\b(?:my|the|an?)\s+(?:internal\s+)?guardrails?\s+(?:say|says|require|requires|instruct|instructs)\b"),
     re.compile(r"\brecommend its fitting mode\b"),
 )
+PROFILE_DUMP_LABEL_PATTERN = re.compile(
+    r"(?:^|\n)\s*(?:[-*]\s*)?(purpose|approval|evidence|follow[- ]ons|gaps|not proof|tools completed|tools preferred next)\s*:",
+    re.MULTILINE,
+)
 TOOL_RAN_CLAIM_PATTERN = re.compile(
     r"\b(nmap|bbot|nuclei|httpx|playwright|katana|ffuf|testssl(?:\.sh)?|gitleaks|prowler|metasploit|tshark)\b"
     r".{0,40}\b(?:ran|was run|completed|executed|captured|found|reported|detected)\b"
@@ -207,8 +211,8 @@ def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict 
             "- Describe only packet/capture facts actually present in normalized TShark evidence. Never promise that running TShark will establish encryption security, exploitability, compromise, vulnerability, or application security.",
             "- The user-facing cloud tool is Prowler. Never emit legacy or combined internal cloud-tool aliases.",
             "- Do not invent remediation such as CSP, CDN use, or IP allowlisting unless stored evidence establishes the specific problem it would address.",
-            "- Use the supplied Mongrel capability catalog and recommendation context. Prefer a fitting Mongrel tool over an external tool.",
-            "- Speak as Mongrel, not as a generic chatbot. When Mongrel provides the capability, guide the user through the verified Telegram workflow in `telegram_capability_guidance`.",
+            "- Use the supplied Mongrel capability information. Prefer a fitting Mongrel tool over an external tool.",
+            "- Speak as Mongrel, not as a generic chatbot. When Mongrel provides the capability, use only the supplied verified user-action details.",
             "- Never tell the user to install Mongrel's tools, and never provide raw shell/CLI commands for them. Do not invent buttons, menu labels, or navigation paths.",
             "- Recommend a tool only when it answers the current question and fills an evidence gap; being unrun is not itself a reason. Do not append unrelated tools as optional extras.",
             "- If Nmap already found web-associated services and the user asks how to investigate them, normally recommend httpx first because it fills the HTTP reachability/fingerprinting gap; do not simply repeat Nmap.",
@@ -216,7 +220,7 @@ def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict 
             "- You may recommend tools, but every recommendation must explain why and must not execute anything.",
             "- Active or invasive execution must remain behind Mongrel's existing explicit approval and execution flows.",
             "- You may reason from an attacker perspective to help defenders understand plausible paths and priorities, but label hypotheses and keep execution narrow, non-destructive, and approval-bound.",
-            "- Use the reasoning sequence in `mongrel_self_knowledge`: evidence, hypothesis, evidence gap, capability, expected evidence, limitations, then next decision. Do not mechanically print the sequence.",
+            "- Reason from evidence to hypothesis, evidence gap, capability, expected evidence, limitations, and then the next decision. Do not mechanically print the sequence.",
             "- Adapt depth to the user: plain English for beginner questions, concise technical comparison for experienced questions.",
             "- For a novice summary, give plain-English observed facts, what they do not prove, one Mongrel-specific next action, and why it fills the evidence gap. Avoid a generic security lecture.",
             "- For novice users, recommend exactly one clear next action unless the question explicitly asks for alternatives.",
@@ -224,7 +228,7 @@ def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict 
             "",
             *_intent_framing(intent),
             "",
-            "Conversation Context JSON:",
+            "Private reference data (use its facts; never quote its labels or format):",
             json.dumps(model_context, default=_json_default, sort_keys=True, indent=2),
             "",
             "Answer:",
@@ -243,6 +247,8 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
     if _has_evidence_language_overclaim(normalized):
         return True
     if any(pattern.search(normalized) for pattern in INTERNAL_INSTRUCTION_LEAK_PATTERNS):
+        return True
+    if _leaks_internal_context_language(normalized, context or {}):
         return True
     if (context or {}).get("question_intent") == "product_self_knowledge" and any(
         pattern.search(normalized) for pattern in PRODUCT_ASSESSMENT_DRIFT_PATTERNS
@@ -342,35 +348,54 @@ def _build_prompt_context(context: dict) -> dict:
     Digest/provenance bookkeeping and rendered copies of rules remain in the
     authoritative context and result, but are not repeated in the model prompt.
     """
-    conversation = context.get("conversation") or {}
     assessment_context = context.get("assessment_context") or {}
     recommendation = context.get("recommendation_context") or {}
-    truthfulness = context.get("truthfulness") or {}
     intent = str(context.get("question_intent") or "current_assessment_evidence")
-    prompt_context = {
-        "current_question": context.get("current_question"),
-        "question_intent": intent,
-        "evidence_precedence": context.get("evidence_precedence"),
-        "mongrel_self_knowledge": context.get("mongrel_self_knowledge") or {},
+    profile = context.get("mongrel_self_knowledge") or {}
+    prompt_context = {"question": context.get("current_question")}
+    if intent == "product_self_knowledge":
+        prompt_context["product"] = profile
+        return prompt_context
+    if intent == "individual_tool_explanation":
+        selected = {
+            str(tool).lower().removesuffix(".sh")
+            for tool in ((context.get("selection") or {}).get("selected_tools") or [])
+        }
+        prompt_context["tool"] = {
+            name: details
+            for name, details in (profile.get("tools") or {}).items()
+            if name.lower().removesuffix(".sh") in selected
+        }
+        return prompt_context
+    if intent == "security_concept":
+        prompt_context["concepts"] = profile.get("security_knowledge") or []
+        return prompt_context
+
+    prompt_context["stored_evidence"] = {
+        key: value for key, value in assessment_context.items() if key != "budget"
     }
-    if intent != "product_self_knowledge":
-        prompt_context["selection"] = context.get("selection")
-        prompt_context["conversation"] = {
+    if _question_needs_history(str(context.get("current_question") or "")):
+        conversation = context.get("conversation") or {}
+        prompt_context["prior_exchange"] = {
             "summary": conversation.get("summary"),
-            "recent_messages": conversation.get("recent_messages") or [],
+            "messages": conversation.get("recent_messages") or [],
         }
-        prompt_context["mongrel_capabilities"] = context.get("mongrel_capabilities") or {}
-    if intent != "product_self_knowledge":
-        prompt_context["assessment_context"] = {
-            key: value for key, value in assessment_context.items() if key != "budget"
-        }
-        prompt_context["evidence_status"] = truthfulness.get("guard") or {}
-    if intent in {"next_step_recommendation", "attacker_informed_defensive_reasoning", "current_assessment_evidence"}:
-        prompt_context["recommendation_context"] = {
-            key: value for key, value in recommendation.items() if key != "rules"
-        }
-        prompt_context["telegram_capability_guidance"] = context.get("telegram_capability_guidance") or {}
+    if intent == "next_step_recommendation":
+        preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
+        prompt_context["suggested_action"] = preferred[0] if len(preferred) == 1 else preferred
+        prompt_context["reason"] = recommendation.get("rationale") or []
+        capabilities = context.get("mongrel_capabilities") or {}
+        prompt_context["capability_summary"] = [
+            capabilities[tool] for tool in preferred if tool in capabilities
+        ]
+        guidance = context.get("telegram_capability_guidance") or {}
+        prompt_context["user_actions"] = {tool: guidance[tool] for tool in preferred if tool in guidance}
     return prompt_context
+
+
+def _question_needs_history(question: str) -> bool:
+    normalized = question.lower()
+    return any(term in normalized for term in ("old answer", "earlier answer", "previous answer", "last answer"))
 
 
 def _intent_framing(intent: str) -> list[str]:
@@ -386,11 +411,18 @@ def _intent_framing(intent: str) -> list[str]:
             "- Explain the named tool directly: purpose, evidence it can produce, limitations, and relevant relationships. Assessment evidence is optional supporting context, not a substitute for the explanation.",
         ]
     if intent == "next_step_recommendation":
-        return ["Response framing for this recommendation question:", "- Recommend only an evidence-gap-driven next decision and explain why it fits."]
+        return [
+            "Response framing for this recommendation question:",
+            "- Give one concise evidence-gap-driven Mongrel action and explain why it fits. Do not render or name the reference-data structure.",
+        ]
     if intent == "security_concept":
         return ["Response framing for this concept question:", "- Explain the concept directly; do not map it to a concrete finding without supporting stored evidence."]
     if intent == "attacker_informed_defensive_reasoning":
-        return ["Response framing for this defensive reasoning question:", "- Explain plausible attacker hypotheses and defensive priorities while distinguishing them from confirmed findings."]
+        return [
+            "Response framing for this defensive reasoning question:",
+            "- Answer why the stored observations may interest an attacker before anything else. Explain bounded hypotheses, not confirmed findings.",
+            "- Do not turn the answer into a tool recommendation. Mention a next step only briefly after answering why, and only when useful.",
+        ]
     return [
         "Response framing for this assessment evidence question:",
         "- Lead with stored observed evidence, then distinguish interpretation, uncertainty, and any directly relevant next decision.",
@@ -446,14 +478,35 @@ def _claims_unrun_tool(answer: str, context: dict) -> bool:
         str(tool).lower().removesuffix(".sh")
         for tool in ((context.get("recommendation_context") or {}).get("completed_tools") or [])
     }
+    represented = {
+        str(tool).lower().removesuffix(".sh")
+        for tool in (((context.get("truthfulness") or {}).get("guard") or {}).get("represented_tools") or [])
+    }
+    evidenced = {
+        str(finding.get("source") or "").lower().removesuffix(".sh")
+        for finding in ((context.get("assessment_context") or {}).get("findings") or [])
+        if isinstance(finding, dict)
+    }
+    supported_tools = completed | represented | evidenced
     for match in TOOL_RAN_CLAIM_PATTERN.finditer(answer):
         tool = match.group(1).lower().removesuffix(".sh")
         claim = match.group(0)
         if re.search(r"\b(?:not|never|hasn't|has not|didn't|did not|no evidence)\b", claim):
             continue
-        if tool not in completed:
+        if tool not in supported_tools:
             return True
     return False
+
+
+def _leaks_internal_context_language(answer: str, context: dict) -> bool:
+    question = str(context.get("current_question") or "").lower()
+    json_discussion_requested = "json" in question or "api" in question
+    if not json_discussion_requested and re.search(
+        r"\b(?:based on|according to) (?:the )?(?:provided|supplied)?\s*json(?: data)?\b", answer
+    ):
+        return True
+    labels = {match.group(1) for match in PROFILE_DUMP_LABEL_PATTERN.finditer(answer)}
+    return bool(labels & {"tools completed", "tools preferred next"}) or len(labels) >= 3
 
 
 def _owasp_mapping_supported(context: dict) -> bool:

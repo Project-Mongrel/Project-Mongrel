@@ -154,7 +154,7 @@ def test_stale_assistant_claim_loses_to_newer_evidence() -> None:
 def test_recommendation_includes_rationale() -> None:
     assessment = create_assessment("Recommendation", user_id=1001)
     _add_nmap_scan(assessment["id"], user_id=1001, port=80, service="http")
-    response = "Recommended Next Step\nRun Nuclei because Nmap observed an HTTP service that may warrant template-based checks."
+    response = "Use Mongrel's httpx next because Nmap observed an HTTP service but has not established which endpoints respond."
 
     with patch("app.services.assessment_conversation_ai.ask_ai", return_value=response):
         result = answer_assessment_conversation_question(
@@ -481,8 +481,7 @@ def test_web_service_next_step_prefers_httpx_after_nmap_with_rationale() -> None
         )
 
     prompt = ask_ai.call_args.args[0]
-    assert '"completed_tools": [\n      "nmap"' in prompt
-    assert '"preferred_next_tools": [\n      "httpx"' in prompt
+    assert '"suggested_action": "httpx"' in prompt
     assert "do not simply repeat Nmap" in prompt
     assert "httpx" in result["answer"].lower()
     assert "because" in result["answer"].lower()
@@ -504,7 +503,8 @@ def test_traffic_analysis_prefers_tshark_and_explains_modes() -> None:
             question="Can Mongrel inspect the network traffic?",
         )
 
-    assert '"preferred_next_tools": [\n      "tshark"' in ask_ai.call_args.args[0]
+    assert '"TShark"' in ask_ai.call_args.args[0]
+    assert "Analyze PCAP" in ask_ai.call_args.args[0]
     assert "tshark" in result["answer"].lower()
     assert "mitmproxy" not in result["answer"].lower()
     assert "tcpdump" not in result["answer"].lower()
@@ -541,7 +541,7 @@ def test_novice_guidance_is_plain_mongrel_specific_and_gap_driven() -> None:
             question="I'm a complete novice. What have we learned and what should I do next?",
         )
 
-    assert '"novice": true' in ask_ai.call_args.args[0]
+    assert '"suggested_action": "httpx"' in ask_ai.call_args.args[0]
     assert "httpx" in result["answer"].lower()
     assert "because" in result["answer"].lower()
     assert "generic security" not in result["answer"].lower()
@@ -828,22 +828,18 @@ def test_prompt_compaction_preserves_evidence_rules_tools_and_native_guidance() 
     )
 
     prompt = build_assessment_conversation_prompt(context)
-    encoded_context = prompt.split("Conversation Context JSON:\n", 1)[1].rsplit("\n\nAnswer:", 1)[0]
+    encoded_context = prompt.split("Private reference data (use its facts; never quote its labels or format):\n", 1)[1].rsplit("\n\nAnswer:", 1)[0]
     model_context = json.loads(encoded_context)
 
     assert "does not prove sensitive data is sent in cleartext" in prompt
     assert "do not prove a successful TLS handshake" in prompt
-    assert set(model_context["mongrel_capabilities"]) == {
-        "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl.sh",
-        "gitleaks", "prowler", "metasploit", "tshark",
-    }
-    assert model_context["telegram_capability_guidance"]["httpx"]["assessment_action"] == "Run httpx"
-    assert model_context["assessment_context"]["scans"]
-    assert model_context["assessment_context"]["findings"]
+    assert model_context["suggested_action"] == "httpx"
+    assert model_context["user_actions"]["httpx"]["assessment_action"] == "Run httpx"
+    assert model_context["stored_evidence"]["scans"]
+    assert model_context["stored_evidence"]["findings"]
     assert "provenance" not in model_context
     assert "evidence_context_digest" not in model_context
-    assert "budget" not in model_context["assessment_context"]
-    assert "rules" not in model_context["recommendation_context"]
+    assert "budget" not in model_context["stored_evidence"]
     assert "prompt_section" not in model_context
     assert "tool_boundaries" not in model_context
     assert len(encoded_context) < len(json.dumps(context, default=str, sort_keys=True, indent=2))

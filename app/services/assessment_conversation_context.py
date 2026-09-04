@@ -48,7 +48,7 @@ TOOL_ALIASES = {
     "gitleaks": ("gitleaks", "secret", "secrets"),
     "prowler": ("prowler", "cloud", "aws", "azure", "gcp"),
     "metasploit": ("metasploit", "msfconsole", "session", "exploit validation"),
-    "tshark": ("tshark", "pcap", "packet", "packets", "dns", "tcp"),
+    "tshark": ("tshark", "traffic", "pcap", "packet", "packets", "dns", "tcp"),
 }
 CORRELATION_TERMS = ("correlation", "correlated", "capture during validation")
 MONGREL_CAPABILITIES = {
@@ -84,7 +84,10 @@ PRODUCT_QUESTION_PATTERNS = (
     "what can mongrel", "what does mongrel do", "what are your tools", "what tools do you have",
     "what modes does mongrel", "difference between assessment mode", "can you run tools automatically",
 )
-RECOMMENDATION_QUESTION_TERMS = ("what next", "do next", "run next", "should i run", "which tool", "recommend")
+RECOMMENDATION_QUESTION_TERMS = (
+    "what next", "do next", "run next", "should i run", "which tool", "which mongrel tool", "recommend",
+    "how do i investigate",
+)
 ASSESSMENT_QUESTION_TERMS = ("what did", "what was found", "what have we found", "current assessment", "assessment evidence", "scan result")
 SECURITY_CONCEPT_TERMS = (
     "owasp", "ssrf", "injection", "path traversal", "file upload", "access control", "authentication",
@@ -180,6 +183,8 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
     tools = selected_tools if selected_tools is not None else detect_question_tools(question)
     if any(pattern in normalized for pattern in PRODUCT_QUESTION_PATTERNS):
         return "product_self_knowledge"
+    if "tshark" in tools and any(term in normalized for term in ("can mongrel", "can you", "what can")):
+        return "individual_tool_explanation"
     if any(term in normalized for term in ATTACKER_QUESTION_TERMS):
         return "attacker_informed_defensive_reasoning"
     if any(term in normalized for term in RECOMMENDATION_QUESTION_TERMS):
@@ -446,7 +451,9 @@ def _build_recommendation_context(question: str, assessment_context: dict) -> di
     if traffic_intent:
         preferred_next_tools.append("tshark")
         rationale.append("TShark is Mongrel's packet/capture capability; explain the mode that addresses the evidence gap without claiming packets already exist.")
-    elif web_services_observed and (web_intent or novice_intent):
+    elif web_services_observed and (
+        web_intent or novice_intent or any(term in normalized_question for term in RECOMMENDATION_QUESTION_TERMS)
+    ):
         preferred_next_tools.append("httpx")
         rationale.append("Nmap already identified web-associated exposed services; httpx can test which HTTP(S) endpoints respond and characterize them.")
 

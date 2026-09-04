@@ -17,7 +17,8 @@ from app.services.assessment_conversation_context import (
     classify_assessment_conversation_intent,
 )
 from app.services.assessment_conversation_store import append_message, create_conversation
-from app.services.assessment_store import create_assessment
+from app.services.assessment_store import create_assessment, record_assessment_scan
+from app.services.findings_store import add_finding
 from app.services.findings_store import close_findings_database, configure_findings_database
 from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile, get_mongrel_tool_names
 
@@ -46,7 +47,9 @@ def test_profile_has_exactly_the_twelve_competition_tools_and_required_fields():
 
 def test_profile_is_only_added_to_assessment_scoped_prompt_and_prioritizes_current_question():
     prompt = build_assessment_conversation_prompt(_context("What does httpx do?"))
-    assert '"mongrel_self_knowledge"' in prompt
+    assert '"tool"' in prompt
+    assert '"httpx"' in prompt
+    assert '"Nmap": {' not in prompt
     assert "Answer the current user question first" in prompt
     assert "Earlier conversation is context, not a script" in prompt
 
@@ -184,7 +187,7 @@ def test_relationship_questions_have_gap_driven_follow_on_knowledge(question):
     prompt = build_assessment_conversation_prompt(context)
     assert "evidence gap" in prompt.lower()
     assert "being unrun is not itself a reason" in prompt
-    assert "automatically execute" in prompt
+    assert "must not execute anything" in prompt
 
 
 @pytest.mark.parametrize("answer", [
@@ -270,7 +273,7 @@ def test_exact_live_product_question_uses_product_context_and_returns_no_assessm
         )
 
     prompt = ask_ai.call_args.args[0]
-    model_json = prompt.split("Conversation Context JSON:\n", 1)[1].rsplit("\n\nAnswer:", 1)[0]
+    model_json = prompt.split("Private reference data (use its facts; never quote its labels or format):\n", 1)[1].rsplit("\n\nAnswer:", 1)[0]
     assert result["answer"] == answer
     assert "12 tools" in result["answer"]
     assert "Assessment Mode" in result["answer"]
@@ -386,3 +389,115 @@ def test_bad_live_product_enumeration_is_replaced_with_canonical_answer(bad_answ
     assert result["fallback_reason"] == "product_tool_enumeration_guard"
     assert all(name in result["answer"] for name in get_mongrel_tool_names())
     assert "Wireshark" not in result["answer"]
+
+
+def _assessment_with_nmap_web_evidence():
+    assessment = create_assessment("Live intent regression", user_id=1001)
+    finding = add_finding(
+        user_id=1001,
+        finding={
+            "source": "nmap",
+            "target": "example.com",
+            "status": "partial",
+            "host_status": "up",
+            "open_ports": [
+                {"port": 80, "protocol": "tcp", "service": "http", "version": "nginx"},
+                {"port": 443, "protocol": "tcp", "service": "https"},
+            ],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="partial", finding_id=finding["id"])
+    return assessment
+
+
+def test_exact_live_nmap_evidence_question_accepts_stored_normalized_observations():
+    assessment = _assessment_with_nmap_web_evidence()
+    question = "What did nmap actually find in this assessment?"
+    answer = "Nmap reported example.com as up with 80/tcp classified as HTTP (nginx) and 443/tcp classified as HTTPS. Those service labels do not establish a vulnerability or safety."
+    context = build_assessment_conversation_context(user_id=1001, assessment_id=assessment["id"], question=question)
+
+    assert context["question_intent"] == "current_assessment_evidence"
+    assert violates_conversation_truthfulness(answer, context) is False
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=answer):
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None, question=question
+        )
+    assert result["answer"] == answer
+    assert result["fallback_reason"] is None
+
+
+def test_exact_live_recommendation_question_gets_one_candidate_without_profile_dump():
+    assessment = _assessment_with_nmap_web_evidence()
+    question = "what should we run next and why?"
+    context = build_assessment_conversation_context(user_id=1001, assessment_id=assessment["id"], question=question)
+    prompt = build_assessment_conversation_prompt(context)
+    answer = "Use Mongrel's httpx next because Nmap identified web-associated ports but has not established which HTTP endpoints respond or how they behave."
+
+    assert context["question_intent"] == "next_step_recommendation"
+    assert context["recommendation_context"]["preferred_next_tools"] == ["httpx"]
+    assert '"Nmap": {' not in prompt
+    assert '"TShark": {' not in prompt
+    assert '"httpx": {' in prompt
+    assert violates_conversation_truthfulness(answer, context) is False
+
+    dumped = (
+        "Based on the provided JSON data\nTools Completed: Nmap\nTools Preferred Next: httpx\n"
+        "Purpose: probe web endpoints\nApproval: scoped\nEvidence: responses\nFollow-Ons: Katana\nGaps: web behavior\nNot Proof: vulnerability"
+    )
+    assert violates_conversation_truthfulness(dumped, context) is True
+
+
+def test_exact_live_attacker_question_answers_why_without_recommendation_context():
+    assessment = _assessment_with_nmap_web_evidence()
+    question = "Think like an attacker. Why would the exposed ports we found interest you?"
+    context = build_assessment_conversation_context(user_id=1001, assessment_id=assessment["id"], question=question)
+    prompt = build_assessment_conversation_prompt(context)
+    answer = (
+        "Ports 80 and 443 may interest an attacker because internet-facing web services expand the observable attack surface "
+        "and offer application, authentication, content, and TLS behavior to investigate. These are hypotheses; the stored "
+        "port classifications do not confirm a vulnerability or exploit path."
+    )
+
+    assert context["question_intent"] == "attacker_informed_defensive_reasoning"
+    assert '"suggested_action"' not in prompt
+    assert '"capability_summary"' not in prompt
+    assert '"httpx": {' not in prompt
+    assert violates_conversation_truthfulness(answer, context) is False
+
+
+@pytest.mark.parametrize("phrase", [
+    "Based on the provided JSON data, httpx is preferred.",
+    "According to the JSON, the tools preferred next are httpx.",
+    "Tools Preferred Next: httpx",
+    "Purpose: probe\nApproval: scoped\nEvidence: response\nGaps: behavior",
+])
+def test_internal_context_rendering_language_is_rejected(phrase):
+    assert violates_conversation_truthfulness(phrase, _context("What should we run next and why?")) is True
+
+
+def test_legitimate_json_api_discussion_is_not_blocked():
+    context = _context("What does a JSON API response mean?")
+    assert violates_conversation_truthfulness("Based on the provided JSON data, the API returned an items array.", context) is False
+
+
+def test_multiturn_five_intents_keep_current_question_dominant():
+    assessment = _assessment_with_nmap_web_evidence()
+    conversation = create_conversation(assessment["id"], user_id=1001)
+    turns = [
+        ("what can Mongrel do?", "product_self_knowledge", '"product"', '"stored_evidence"'),
+        ("what does httpx do?", "individual_tool_explanation", '"tool"', '"stored_evidence"'),
+        ("what did Nmap find?", "current_assessment_evidence", '"stored_evidence"', '"suggested_action"'),
+        ("what should we run next?", "next_step_recommendation", '"suggested_action"', '"TShark": {'),
+        ("think like an attacker: why do these ports matter?", "attacker_informed_defensive_reasoning", '"stored_evidence"', '"suggested_action"'),
+    ]
+    for question, intent, included, excluded in turns:
+        append_message(conversation["id"], user_id=1001, role="user", content=question)
+        append_message(conversation["id"], user_id=1001, role="assistant", content="Earlier answer about httpx.")
+        context = build_assessment_conversation_context(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=conversation["id"], question=question
+        )
+        prompt = build_assessment_conversation_prompt(context)
+        assert context["question_intent"] == intent
+        assert included in prompt
+        assert excluded not in prompt
+        assert "Earlier answer about httpx." not in prompt
