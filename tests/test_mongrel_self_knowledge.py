@@ -420,11 +420,13 @@ def test_exact_live_nmap_evidence_question_accepts_stored_normalized_observation
 
     assert context["question_intent"] == "current_assessment_evidence"
     assert violates_conversation_truthfulness(answer, context) is False
-    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=answer):
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=answer) as ask_ai:
         result = answer_assessment_conversation_question(
             user_id=1001, assessment_id=assessment["id"], conversation_id=None, question=question
         )
-    assert result["answer"] == answer
+    ask_ai.assert_not_called()
+    assert "80/tcp classified as http" in result["answer"]
+    assert "443/tcp classified as https" in result["answer"]
     assert result["fallback_reason"] is None
 
 
@@ -512,21 +514,26 @@ def test_multiturn_five_intents_keep_current_question_dominant():
     "Port 8443/https-alt indicates weak TLS.",
     "These service labels indicate exploitable vulnerabilities while maintaining a low risk level.",
 ])
-def test_exact_live_nmap_assumptions_are_rejected_and_rendered_from_evidence(unsupported):
+def test_exact_live_nmap_assumptions_are_rejected_while_direct_answer_is_rendered_from_evidence(unsupported):
     assessment = _assessment_with_nmap_web_evidence()
     question = "What did nmap actually find in this assessment?"
     context = build_assessment_conversation_context(user_id=1001, assessment_id=assessment["id"], question=question)
-    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=unsupported):
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=unsupported) as ask_ai:
         result = answer_assessment_conversation_question(
             user_id=1001, assessment_id=assessment["id"], conversation_id=None, question=question
         )
 
     assert violates_conversation_truthfulness(unsupported, context) is True
-    assert result["fallback_reason"] == "nmap_evidence_fallback"
+    ask_ai.assert_not_called()
+    assert result["fallback_reason"] is None
     assert "80/tcp classified as http" in result["answer"]
     assert "443/tcp classified as https" in result["answer"]
-    assert "do not establish vulnerabilities" in result["answer"]
+    assert "did not establish vulnerability or TLS quality" in result["answer"]
     assert "low risk" not in result["answer"].lower()
+    assert "encrypted https" not in result["answer"].lower()
+    assert "unencrypted proxy" not in result["answer"].lower()
+    assert "actual proxy" not in result["answer"].lower()
+    assert "use httpx" not in result["answer"].lower()
 
 
 def test_nmap_prompt_contains_only_compact_represented_evidence_semantics():
@@ -555,6 +562,22 @@ def test_exact_live_attacker_overclaims_are_rejected(unsupported):
         question="Think like an attacker. Why would the exposed ports we found interest you?",
     )
     assert violates_conversation_truthfulness(unsupported, context) is True
+
+
+def test_unsupported_attacker_generation_returns_bounded_answer_instead_of_withholding():
+    assessment = _assessment_with_nmap_web_evidence()
+    question = "Think like an attacker. Why would the exposed ports we found interest you?"
+    unsupported = "HTTP allows cleartext traffic interception and HTTPS indicates weak TLS, so run Nmap with specific flags."
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=unsupported):
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None, question=question
+        )
+
+    assert result["fallback_reason"] == "attacker_reasoning_fallback"
+    assert "attack surface" in result["answer"]
+    assert "does not establish that any service is vulnerable" in result["answer"]
+    assert "withheld" not in result["answer"].lower()
+    assert "specific flags" not in result["answer"].lower()
 
 
 def test_attacker_reasoning_allows_hypotheses_and_optional_mongrel_httpx_next_step():

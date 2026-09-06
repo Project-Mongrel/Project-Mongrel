@@ -1,5 +1,6 @@
 import json
 import re
+from copy import deepcopy
 from time import perf_counter
 
 from app.core.config import get_settings
@@ -114,6 +115,23 @@ def answer_assessment_conversation_question(
         question=question,
     )
     context_ms = _elapsed_ms(context_started)
+    direct_nmap_answer = _build_direct_nmap_evidence_fallback(context)
+    if direct_nmap_answer:
+        return _result(
+            direct_nmap_answer,
+            context,
+            instrumentation=_instrumentation(
+                context,
+                context_ms=context_ms,
+                prompt_ms=0.0,
+                ai_ms=0.0,
+                postprocess_ms=0.0,
+                engine_ms=_elapsed_ms(engine_started),
+                context_chars=0,
+                prompt_chars=0,
+                output_token_budget=0,
+            ),
+        )
     prompt_context = _build_prompt_context(context)
     context_chars = len(json.dumps(prompt_context, default=_json_default, sort_keys=True))
     prompt_started = perf_counter()
@@ -153,9 +171,9 @@ def answer_assessment_conversation_question(
             answer = FALLBACK_ANSWER
             fallback_reason = "empty"
         elif violates_conversation_truthfulness(answer, context):
-            evidence_fallback = _build_direct_nmap_evidence_fallback(context)
-            answer = evidence_fallback or TRUTHFULNESS_FALLBACK_ANSWER
-            fallback_reason = "nmap_evidence_fallback" if evidence_fallback else "truthfulness_guard"
+            attacker_fallback = _build_attacker_reasoning_fallback(context)
+            answer = attacker_fallback or TRUTHFULNESS_FALLBACK_ANSWER
+            fallback_reason = "attacker_reasoning_fallback" if attacker_fallback else "truthfulness_guard"
         elif violates_mongrel_native_guidance(answer, context):
             answer = NATIVE_GUIDANCE_FALLBACK_ANSWER
             fallback_reason = "native_guidance_guard"
@@ -376,9 +394,7 @@ def _build_prompt_context(context: dict) -> dict:
         prompt_context["concepts"] = profile.get("security_knowledge") or []
         return prompt_context
 
-    prompt_context["stored_evidence"] = {
-        key: value for key, value in assessment_context.items() if key != "budget"
-    }
+    prompt_context["stored_evidence"] = _evidence_for_generation(assessment_context, intent)
     semantics = get_represented_evidence_semantics(assessment_context.get("findings") or [])
     if semantics:
         prompt_context["evidence_semantics"] = semantics
@@ -404,6 +420,22 @@ def _build_prompt_context(context: dict) -> dict:
 def _question_needs_history(question: str) -> bool:
     normalized = question.lower()
     return any(term in normalized for term in ("old answer", "earlier answer", "previous answer", "last answer"))
+
+
+def _evidence_for_generation(assessment_context: dict, intent: str) -> dict:
+    evidence = deepcopy({key: value for key, value in assessment_context.items() if key != "budget"})
+    for finding in evidence.get("findings") or []:
+        if not isinstance(finding, dict) or str(finding.get("source") or "").lower() != "nmap":
+            continue
+        for key in ("risk_level", "risk_notes", "impact", "recommendation"):
+            finding.pop(key, None)
+        for port in finding.get("open_ports") or []:
+            if isinstance(port, dict):
+                port.pop("intelligence", None)
+    if intent == "attacker_informed_defensive_reasoning":
+        evidence.pop("artifacts", None)
+        evidence.pop("notes", None)
+    return evidence
 
 
 def _intent_framing(intent: str) -> list[str]:
@@ -494,7 +526,7 @@ def _has_nmap_semantic_overclaim(answer: str, context: dict) -> bool:
     )
     dangerous = re.compile(
         r"\b(?:vulnerabilit|weak tls|insecure transport|cleartext traffic|traffic interception|interception opportunity|"
-        r"open proxy|proxy misconfigur|misconfigured http proxy|exploitab|compromis|encrypted web service|"
+        r"open proxy|actual proxy|proxy misconfigur|misconfigured http proxy|exploitab|compromis|encrypted|unencrypted|"
         r"encryption (?:was )?negotiated|secure tls)"
     )
     service = re.compile(r"\b(?:nmap|port(?:s)?|http|https|http-proxy|https-alt|80|443|8080|8443)\b")
@@ -533,14 +565,42 @@ def _build_direct_nmap_evidence_fallback(context: dict) -> str | None:
             version = str(item.get("version") or "").strip()
             label = f"{port}/{protocol} classified as {service}"
             if version:
-                label += f" ({version})"
+                label += f"; scanner-reported version/product: {version}"
             ports.append(label)
         observations.append(prefix + (" and reported " + ", ".join(ports) if ports else " with no stored open-port observations") + ".")
-    observations.append(
-        "These are Nmap reachability and service-classification observations; they do not establish vulnerabilities, "
-        "cleartext transmission, successful encryption, proxy misconfiguration, exploitability, safety, or a risk level."
-    )
+    observations.append("That is what Nmap established; it did not establish vulnerability or TLS quality.")
     return " ".join(observations)
+
+
+def _build_attacker_reasoning_fallback(context: dict) -> str | None:
+    if context.get("question_intent") != "attacker_informed_defensive_reasoning":
+        return None
+    findings = [
+        finding for finding in ((context.get("assessment_context") or {}).get("findings") or [])
+        if isinstance(finding, dict) and str(finding.get("source") or "").lower() == "nmap"
+    ]
+    exposed = []
+    web_associated = False
+    for finding in findings:
+        for item in finding.get("open_ports") or []:
+            if not isinstance(item, dict):
+                continue
+            port = item.get("port")
+            protocol = str(item.get("protocol") or "tcp")
+            service = str(item.get("service") or "unknown")
+            exposed.append(f"{port}/{protocol} ({service})")
+            web_associated = web_associated or port in {80, 443, 8080, 8443} or service in {
+                "http", "https", "http-proxy", "https-alt"
+            }
+    if not exposed:
+        return None
+    surfaces = "web-facing surfaces" if web_associated else "externally exposed service surfaces"
+    return (
+        f"An attacker would care about the observed {', '.join(exposed)} because they expose {surfaces} that may provide "
+        "application, authentication, content, or protocol behavior worth investigating. These are possible areas of "
+        "attack surface, not confirmed weaknesses. The stored Nmap evidence does not establish that any service is "
+        "vulnerable or exploitable, or that its TLS, transport, or proxy behavior is insecure."
+    )
 
 
 def _claims_unrun_tool(answer: str, context: dict) -> bool:
