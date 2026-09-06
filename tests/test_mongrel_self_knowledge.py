@@ -403,6 +403,8 @@ def _assessment_with_nmap_web_evidence():
             "open_ports": [
                 {"port": 80, "protocol": "tcp", "service": "http", "version": "nginx"},
                 {"port": 443, "protocol": "tcp", "service": "https"},
+                {"port": 8080, "protocol": "tcp", "service": "http-proxy"},
+                {"port": 8443, "protocol": "tcp", "service": "https-alt"},
             ],
         },
     )
@@ -501,3 +503,76 @@ def test_multiturn_five_intents_keep_current_question_dominant():
         assert included in prompt
         assert excluded not in prompt
         assert "Earlier answer about httpx." not in prompt
+
+
+@pytest.mark.parametrize("unsupported", [
+    "Port 80/http means cleartext traffic and web application vulnerabilities.",
+    "Port 443/https is an encrypted web service.",
+    "Port 8080/http-proxy is a potentially misconfigured HTTP proxy.",
+    "Port 8443/https-alt indicates weak TLS.",
+    "These service labels indicate exploitable vulnerabilities while maintaining a low risk level.",
+])
+def test_exact_live_nmap_assumptions_are_rejected_and_rendered_from_evidence(unsupported):
+    assessment = _assessment_with_nmap_web_evidence()
+    question = "What did nmap actually find in this assessment?"
+    context = build_assessment_conversation_context(user_id=1001, assessment_id=assessment["id"], question=question)
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=unsupported):
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None, question=question
+        )
+
+    assert violates_conversation_truthfulness(unsupported, context) is True
+    assert result["fallback_reason"] == "nmap_evidence_fallback"
+    assert "80/tcp classified as http" in result["answer"]
+    assert "443/tcp classified as https" in result["answer"]
+    assert "do not establish vulnerabilities" in result["answer"]
+    assert "low risk" not in result["answer"].lower()
+
+
+def test_nmap_prompt_contains_only_compact_represented_evidence_semantics():
+    assessment = _assessment_with_nmap_web_evidence()
+    context = build_assessment_conversation_context(
+        user_id=1001, assessment_id=assessment["id"], question="What did nmap actually find in this assessment?"
+    )
+    prompt = build_assessment_conversation_prompt(context)
+    assert '"evidence_semantics"' in prompt
+    assert '"nmap"' in prompt
+    assert "http-proxy is a service classification only" in prompt
+    assert "does not prove sensitive cleartext transmission" in prompt
+    assert '"httpx": {' not in prompt
+
+
+@pytest.mark.parametrize("unsupported", [
+    "The exposed ports indicate potential web application vulnerabilities or weak TLS configurations.",
+    "HTTP could allow cleartext traffic interception.",
+    "HTTPS might reveal misconfigurations compromising security.",
+])
+def test_exact_live_attacker_overclaims_are_rejected(unsupported):
+    assessment = _assessment_with_nmap_web_evidence()
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="Think like an attacker. Why would the exposed ports we found interest you?",
+    )
+    assert violates_conversation_truthfulness(unsupported, context) is True
+
+
+def test_attacker_reasoning_allows_hypotheses_and_optional_mongrel_httpx_next_step():
+    assessment = _assessment_with_nmap_web_evidence()
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="Think like an attacker. Why would the exposed ports we found interest you?",
+    )
+    answer = (
+        "An attacker would be interested because these web-facing services expand the observable attack surface and are "
+        "worth investigating for application behavior, content, TLS configuration, paths, technologies, and authentication "
+        "surfaces—not because Nmap has proven a vulnerability. If useful, use Mongrel's httpx to characterize the web responses."
+    )
+    assert violates_conversation_truthfulness(answer, context) is False
+    assert violates_mongrel_native_guidance(answer, context) is False
+
+
+def test_attacker_raw_nmap_flags_remain_blocked():
+    context = _context("Think like an attacker. Why do these ports matter?")
+    assert violates_mongrel_native_guidance("Use Nmap with specific flags to investigate further.", context) is True

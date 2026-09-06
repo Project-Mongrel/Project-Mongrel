@@ -6,6 +6,7 @@ from app.core.config import get_settings
 from app.services.ai_client import ask_ai
 from app.services.assessment_ai import AI_UNAVAILABLE_MESSAGES
 from app.services.assessment_conversation_context import build_assessment_conversation_context
+from app.services.assessment_evidence_semantics import get_represented_evidence_semantics
 from app.services.mongrel_self_knowledge import get_mongrel_tool_names
 
 FALLBACK_ANSWER = (
@@ -60,6 +61,7 @@ _TOOL_COMMAND_PATTERN = "|".join(
 INSTALL_OR_RAW_COMMAND_PATTERNS = (
     re.compile(rf"\b(?:install|brew install|apt(?:-get)? install|pipx? install|go install)\b.{{0,80}}\b(?:{_TOOL_COMMAND_PATTERN})\b"),
     re.compile(rf"(?:```(?:bash|sh|shell)?\s*|^|\n)\s*\$?\s*(?:sudo\s+)?(?:{_TOOL_COMMAND_PATTERN})\s+(?:-|--|https?://|[\w.-]+\s+-)"),
+    re.compile(r"\b(?:use|run)\s+nmap\b.{0,60}\b(?:specific\s+)?flags?\b"),
 )
 EVIDENCE_LANGUAGE_OVERCLAIM_PATTERNS = (
     re.compile(r"\bhttpx\b.{0,80}\b(?:proves?|confirms?|establishes?|shows?)\b.{0,60}\b(?:vulnerab|misconfigur)"),
@@ -151,8 +153,9 @@ def answer_assessment_conversation_question(
             answer = FALLBACK_ANSWER
             fallback_reason = "empty"
         elif violates_conversation_truthfulness(answer, context):
-            answer = TRUTHFULNESS_FALLBACK_ANSWER
-            fallback_reason = "truthfulness_guard"
+            evidence_fallback = _build_direct_nmap_evidence_fallback(context)
+            answer = evidence_fallback or TRUTHFULNESS_FALLBACK_ANSWER
+            fallback_reason = "nmap_evidence_fallback" if evidence_fallback else "truthfulness_guard"
         elif violates_mongrel_native_guidance(answer, context):
             answer = NATIVE_GUIDANCE_FALLBACK_ANSWER
             fallback_reason = "native_guidance_guard"
@@ -245,6 +248,8 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
     if _has_service_label_overclaim(normalized):
         return True
     if _has_evidence_language_overclaim(normalized):
+        return True
+    if _has_nmap_semantic_overclaim(normalized, context or {}):
         return True
     if any(pattern.search(normalized) for pattern in INTERNAL_INSTRUCTION_LEAK_PATTERNS):
         return True
@@ -374,6 +379,9 @@ def _build_prompt_context(context: dict) -> dict:
     prompt_context["stored_evidence"] = {
         key: value for key, value in assessment_context.items() if key != "budget"
     }
+    semantics = get_represented_evidence_semantics(assessment_context.get("findings") or [])
+    if semantics:
+        prompt_context["evidence_semantics"] = semantics
     if _question_needs_history(str(context.get("current_question") or "")):
         conversation = context.get("conversation") or {}
         prompt_context["prior_exchange"] = {
@@ -471,6 +479,68 @@ def _has_evidence_language_overclaim(answer: str) -> bool:
             continue
         return True
     return False
+
+
+def _has_nmap_semantic_overclaim(answer: str, context: dict) -> bool:
+    findings = ((context.get("assessment_context") or {}).get("findings") or [])
+    if not any(str(finding.get("source") or "").lower() == "nmap" for finding in findings if isinstance(finding, dict)):
+        return False
+    question = str(context.get("current_question") or "").lower()
+    if "risk" not in question and re.search(r"\b(?:low|medium|moderate|high|critical) risk(?: level)?\b", answer):
+        return True
+    safe = re.compile(
+        r"\b(?:does not|do not|did not|not proven|not established|not confirmed|hypothes(?:is|es)|"
+        r"area(?:s)? of interest|worth investigating|to investigate|would investigate|cannot infer|cannot conclude)\b"
+    )
+    dangerous = re.compile(
+        r"\b(?:vulnerabilit|weak tls|insecure transport|cleartext traffic|traffic interception|interception opportunity|"
+        r"open proxy|proxy misconfigur|misconfigured http proxy|exploitab|compromis|encrypted web service|"
+        r"encryption (?:was )?negotiated|secure tls)"
+    )
+    service = re.compile(r"\b(?:nmap|port(?:s)?|http|https|http-proxy|https-alt|80|443|8080|8443)\b")
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", answer):
+        if service.search(sentence) and dangerous.search(sentence) and not safe.search(sentence):
+            return True
+    return False
+
+
+def _build_direct_nmap_evidence_fallback(context: dict) -> str | None:
+    if context.get("question_intent") != "current_assessment_evidence":
+        return None
+    selected = {str(tool).lower() for tool in ((context.get("selection") or {}).get("selected_tools") or [])}
+    if selected != {"nmap"}:
+        return None
+    findings = [
+        finding for finding in ((context.get("assessment_context") or {}).get("findings") or [])
+        if isinstance(finding, dict) and str(finding.get("source") or "").lower() == "nmap"
+    ]
+    if not findings:
+        return None
+    observations = []
+    for finding in findings:
+        target = str(finding.get("target") or "the assessed target")
+        host_status = str(finding.get("host_status") or "").strip()
+        prefix = f"For {target}, stored Nmap evidence"
+        if host_status:
+            prefix += f" recorded host status {host_status}"
+        ports = []
+        for item in finding.get("open_ports") or []:
+            if not isinstance(item, dict):
+                continue
+            port = item.get("port")
+            protocol = str(item.get("protocol") or "tcp")
+            service = str(item.get("service") or "unknown")
+            version = str(item.get("version") or "").strip()
+            label = f"{port}/{protocol} classified as {service}"
+            if version:
+                label += f" ({version})"
+            ports.append(label)
+        observations.append(prefix + (" and reported " + ", ".join(ports) if ports else " with no stored open-port observations") + ".")
+    observations.append(
+        "These are Nmap reachability and service-classification observations; they do not establish vulnerabilities, "
+        "cleartext transmission, successful encryption, proxy misconfiguration, exploitability, safety, or a risk level."
+    )
+    return " ".join(observations)
 
 
 def _claims_unrun_tool(answer: str, context: dict) -> bool:
