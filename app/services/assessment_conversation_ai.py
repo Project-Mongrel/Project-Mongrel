@@ -424,6 +424,11 @@ def _question_needs_history(question: str) -> bool:
 
 def _evidence_for_generation(assessment_context: dict, intent: str) -> dict:
     evidence = deepcopy({key: value for key, value in assessment_context.items() if key != "budget"})
+    # Notes and artifacts can contain prior interpretation, reports, or duplicate/raw
+    # output. Normalized scans/findings remain the primary generation evidence.
+    evidence.pop("notes", None)
+    evidence.pop("artifacts", None)
+    evidence = _clean_generation_enrichment(evidence)
     for finding in evidence.get("findings") or []:
         if not isinstance(finding, dict) or str(finding.get("source") or "").lower() != "nmap":
             continue
@@ -432,10 +437,53 @@ def _evidence_for_generation(assessment_context: dict, intent: str) -> dict:
         for port in finding.get("open_ports") or []:
             if isinstance(port, dict):
                 port.pop("intelligence", None)
-    if intent == "attacker_informed_defensive_reasoning":
-        evidence.pop("artifacts", None)
-        evidence.pop("notes", None)
     return evidence
+
+
+_GENERATION_ENRICHMENT_FIELDS = {
+    "risk_level",
+    "risk_notes",
+    "summary",
+    "top_risk",
+    "top_risks",
+    "command",
+    "commands",
+    "working_directory",
+    "output_path",
+    "output_paths",
+    "output_directory",
+    "parser_error",
+    "parser_errors",
+    "debug_error",
+    "debug_errors",
+    "raw_json",
+    "raw_event",
+    "raw_evidence_excerpt",
+}
+
+
+def _clean_generation_enrichment(value: object, *, source: str = "") -> object:
+    """Remove non-primary enrichment from the model slice, not stored evidence."""
+
+    if isinstance(value, list):
+        return [_clean_generation_enrichment(item, source=source) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    current_source = str(value.get("source") or source).strip().lower().removesuffix(".sh")
+    cleaned = {}
+    for key, item in value.items():
+        normalized_key = str(key).lower()
+        if normalized_key in _GENERATION_ENRICHMENT_FIELDS:
+            continue
+        if current_source == "nuclei" and normalized_key in {"remediation", "classification"}:
+            continue
+        if current_source == "prowler" and normalized_key in {"risk", "remediation", "compliance", "compliance_mappings"}:
+            continue
+        if current_source == "ffuf" and normalized_key in {"classification", "interesting_paths"}:
+            continue
+        cleaned[key] = _clean_generation_enrichment(item, source=current_source)
+    return cleaned
 
 
 def _intent_framing(intent: str) -> list[str]:
