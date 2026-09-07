@@ -115,10 +115,17 @@ def answer_assessment_conversation_question(
         question=question,
     )
     context_ms = _elapsed_ms(context_started)
-    direct_nmap_answer = _build_direct_nmap_evidence_fallback(context)
-    if direct_nmap_answer:
+    direct_evidence_answer = (
+        _build_cross_tool_port_443_answer(context)
+        or _build_httpx_waf_semantic_answer(context)
+        or _build_direct_nmap_evidence_fallback(context)
+        or _build_direct_httpx_evidence_answer(context)
+        or _build_direct_testssl_evidence_answer(context)
+        or _build_direct_tshark_evidence_answer(context)
+    )
+    if direct_evidence_answer:
         return _result(
-            direct_nmap_answer,
+            direct_evidence_answer,
             context,
             instrumentation=_instrumentation(
                 context,
@@ -618,6 +625,289 @@ def _build_direct_nmap_evidence_fallback(context: dict) -> str | None:
         observations.append(prefix + (" and reported " + ", ".join(ports) if ports else " with no stored open-port observations") + ".")
     observations.append("That is what Nmap established; it did not establish vulnerability or TLS quality.")
     return " ".join(observations)
+
+
+def _selected_tools(context: dict) -> set[str]:
+    return {
+        str(tool).strip().lower().removesuffix(".sh")
+        for tool in ((context.get("selection") or {}).get("selected_tools") or [])
+    }
+
+
+def _tool_findings(context: dict, tool: str) -> list[dict]:
+    normalized = tool.lower().removesuffix(".sh")
+    return [
+        finding
+        for finding in ((context.get("assessment_context") or {}).get("findings") or [])
+        if isinstance(finding, dict)
+        and str(finding.get("source") or "").lower().removesuffix(".sh") == normalized
+    ]
+
+
+def _build_direct_httpx_evidence_answer(context: dict) -> str | None:
+    if context.get("question_intent") != "current_assessment_evidence" or _selected_tools(context) != {"httpx"}:
+        return None
+    question = str(context.get("current_question") or "").lower()
+    if not any(term in question for term in ("what did", "what was observed", "actually observe", "actually find")):
+        return None
+    findings = _tool_findings(context, "httpx")
+    if not findings:
+        return None
+    services = [item for finding in findings for item in (finding.get("httpx_services") or []) if isinstance(item, dict)]
+    if not services:
+        return (
+            "The stored httpx result contains no normalized HTTP response observations. That does not establish that the "
+            "host is down or that a site is absent."
+        )
+    rendered = []
+    for service in services[:10]:
+        parts = [str(service.get("url") or service.get("host") or "observed endpoint")]
+        if service.get("status_code") is not None:
+            parts.append(f"status {service.get('status_code')}")
+        for key, label in (
+            ("title", "title"), ("redirect_location", "redirect"), ("web_server", "server"),
+            ("content_type", "content type"), ("ip", "IP"), ("cdn", "CDN"), ("cname", "CNAME"),
+        ):
+            value = service.get(key)
+            if value not in (None, "", [], {}):
+                parts.append(f"{label} {_plain_value(value)}")
+        technologies = service.get("technologies") or []
+        if technologies:
+            parts.append("technology hints " + _plain_value(technologies))
+        tls = service.get("tls")
+        if tls:
+            parts.append("stored TLS metadata " + _plain_value(tls))
+        rendered.append("; ".join(parts))
+    return (
+        "Stored httpx observations: " + ". ".join(rendered) + ". These are response and metadata observations; they do "
+        "not by themselves establish a WAF, vulnerability, host availability beyond the observed response, vulnerable "
+        "technology, or overall TLS safety."
+    )
+
+
+def _build_httpx_waf_semantic_answer(context: dict) -> str | None:
+    question = str(context.get("current_question") or "").lower()
+    if "403" not in question or "waf" not in question or not any(term in question for term in ("prove", "mean", "show", "confirm")):
+        return None
+    httpx_findings = _tool_findings(context, "httpx")
+    if not httpx_findings:
+        return None
+    answer = "No. A 403 response is an observed HTTP status and does not by itself prove a WAF."
+    has_stored_403 = any(
+        str(service.get("status_code")) == "403"
+        for finding in httpx_findings
+        for service in finding.get("httpx_services") or []
+        if isinstance(service, dict)
+    )
+    if not has_stored_403:
+        answer += " The selected stored httpx evidence does not contain a 403 observation."
+    waf_matches = []
+    for finding in _tool_findings(context, "nuclei"):
+        for match in finding.get("nuclei_findings") or []:
+            if not isinstance(match, dict):
+                continue
+            identity = " ".join(str(match.get(key) or "") for key in ("template_id", "name", "tags")).lower()
+            if "waf" in identity:
+                waf_matches.append(match)
+    if waf_matches:
+        match = waf_matches[0]
+        severity = str(match.get("severity") or "unknown")
+        severity_label = "informational" if severity.lower() == "info" else severity
+        name = str(match.get("name") or match.get("template_id") or "WAF-detection template")
+        location = str(match.get("matched_at") or match.get("host") or "").strip()
+        article = "an" if severity_label[:1].lower() in "aeiou" else "a"
+        answer += f" Nuclei separately reported {article} {severity_label} {name} template match"
+        if location:
+            answer += f" at {location}"
+        answer += "; that is separate scanner evidence, not something established by the 403 response alone."
+    return answer
+
+
+def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
+    if context.get("question_intent") != "current_assessment_evidence" or _selected_tools(context) != {"testssl"}:
+        return None
+    question = str(context.get("current_question") or "").lower()
+    if not any(term in question for term in ("what did", "actually establish", "actually report")):
+        return None
+    findings = _tool_findings(context, "testssl")
+    evidence_items = [finding.get("testssl_evidence") for finding in findings if isinstance(finding.get("testssl_evidence"), dict)]
+    if not evidence_items:
+        return None
+    sections = []
+    for evidence in evidence_items:
+        target = str(evidence.get("target") or evidence.get("host") or "the assessed TLS endpoint")
+        details = []
+        protocols = [_scanner_record(item) for item in evidence.get("protocols") or [] if isinstance(item, dict)]
+        if protocols:
+            details.append("protocol observations: " + "; ".join(protocols))
+        certificate = evidence.get("certificate") or {}
+        if certificate:
+            details.append("certificate metadata: " + _plain_value(certificate))
+        for key, label in (
+            ("weak_protocols", "weak/deprecated protocol observations"),
+            ("cipher_findings", "cipher findings"),
+            ("vulnerabilities", "scanner vulnerability checks"),
+            ("security_headers", "security-header observations"),
+            ("notable_findings", "notable findings"),
+        ):
+            values = evidence.get(key) or []
+            if values:
+                details.append(label + ": " + "; ".join(_scanner_record(item) if isinstance(item, dict) else str(item) for item in values))
+        limitations = [str(item) for item in evidence.get("limitations") or [] if str(item).strip()]
+        if limitations:
+            details.append("stored limitations: " + " ".join(limitations))
+        sections.append(f"For {target}, testssl.sh reported " + ("; ".join(details) if details else "no normalized TLS observations"))
+    return (
+        ". ".join(sections) + ". Scanner wording and severity are preserved; this does not establish exploitability, "
+        "a completed captured TLS handshake, compromise, or overall TLS security."
+    )
+
+
+def _tshark_evidence(context: dict) -> list[dict]:
+    evidence = []
+    assessment = context.get("assessment_context") or {}
+    for finding in assessment.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        item = finding.get("tshark_evidence")
+        if isinstance(item, dict):
+            evidence.append(item)
+    for scan in assessment.get("scans") or []:
+        if not isinstance(scan, dict):
+            continue
+        item = scan.get("tshark_evidence")
+        if isinstance(item, dict):
+            evidence.append(item)
+    for artifact in assessment.get("artifacts") or []:
+        if not isinstance(artifact, dict) or str(artifact.get("artifact_type") or "") != "tshark_normalized_evidence":
+            continue
+        item = artifact.get("content")
+        if isinstance(item, dict):
+            evidence.append(item)
+    unique = []
+    seen = set()
+    for item in evidence:
+        marker = json.dumps(item, default=_json_default, sort_keys=True)
+        if marker not in seen:
+            seen.add(marker)
+            unique.append(item)
+    return unique
+
+
+def _build_direct_tshark_evidence_answer(context: dict) -> str | None:
+    question = str(context.get("current_question") or "").lower()
+    handshake_question = "tls" in question and "handshake" in question and any(term in question for term in ("packet", "capture", "tshark"))
+    direct_question = "tshark" in question and any(term in question for term in ("what did", "actually observe", "actually capture"))
+    if context.get("question_intent") != "current_assessment_evidence" or not (handshake_question or direct_question):
+        return None
+    evidence_items = _tshark_evidence(context)
+    if not evidence_items:
+        return None
+    handshake_established = any(
+        item.get("handshake_complete") is True
+        or item.get("handshake_success") is True
+        or any(
+            isinstance(observation, dict)
+            and (observation.get("handshake_complete") is True or observation.get("handshake_success") is True)
+            for observation in item.get("tls_observations") or []
+        )
+        for item in evidence_items
+    )
+    if handshake_question:
+        if handshake_established:
+            return "Yes. The stored TShark capture metadata explicitly records a completed TLS handshake."
+        return (
+            "No—not from the stored evidence. The TShark metadata did not establish whether a TLS handshake completed. "
+            "TLS packets, version fields, and SNI alone do not prove completion. testssl.sh early_data, heartbeat, cipher, "
+            "or certificate findings describe separate scanner evidence and cannot determine completion of this captured handshake."
+        )
+    rendered = []
+    for evidence in evidence_items:
+        packet_count = int(evidence.get("packet_count") or 0)
+        byte_count = int(evidence.get("byte_count") or 0)
+        details = [f"captured {packet_count} packets ({byte_count} bytes)"]
+        endpoints = [str(item.get("address")) for item in evidence.get("observed_endpoints") or [] if isinstance(item, dict) and item.get("address")]
+        if endpoints:
+            details.append("observed endpoints " + ", ".join(endpoints[:10]))
+        protocols = [str(item.get("protocol")) for item in evidence.get("observed_protocols") or [] if isinstance(item, dict) and item.get("protocol")]
+        if protocols:
+            details.append("protocol metadata " + ", ".join(protocols[:10]))
+        dns = [str(item.get("query_name")) for item in evidence.get("dns_observations") or [] if isinstance(item, dict) and item.get("query_name")]
+        if dns:
+            details.append("DNS names " + ", ".join(dns[:10]))
+        tls = []
+        for item in evidence.get("tls_observations") or []:
+            if isinstance(item, dict):
+                values = [f"SNI {item.get('sni')}" if item.get("sni") else "", f"version {item.get('version')}" if item.get("version") else ""]
+                tls.append(", ".join(value for value in values if value) or "TLS metadata")
+        if tls:
+            details.append("TLS observations " + "; ".join(tls[:10]))
+        http = evidence.get("http_observations") or []
+        details.append(f"HTTP metadata observations {len(http)}" if http else "no HTTP metadata was observed in the stored capture evidence")
+        rendered.append("; ".join(details))
+    return (
+        "TShark " + ". It also ".join(rendered) + ". The stored metadata "
+        + ("explicitly records a completed TLS handshake" if handshake_established else "does not establish a completed TLS handshake")
+        + ", completed HTTP transaction, vulnerability, exploitation, or compromise."
+    )
+
+
+def _build_cross_tool_port_443_answer(context: dict) -> str | None:
+    question = str(context.get("current_question") or "").lower()
+    required = {"nmap", "httpx", "metasploit", "tshark"}
+    if "443" not in question or "combine" not in question or not required.issubset(_selected_tools(context)):
+        return None
+    statements = []
+    for finding in _tool_findings(context, "nmap"):
+        for item in finding.get("open_ports") or []:
+            if isinstance(item, dict) and str(item.get("port")) == "443":
+                statements.append(f"Nmap classified 443/{item.get('protocol') or 'tcp'} as {item.get('service') or 'unknown'}.")
+                break
+    httpx_services = [item for finding in _tool_findings(context, "httpx") for item in finding.get("httpx_services") or [] if isinstance(item, dict)]
+    if httpx_services:
+        observations = [f"{item.get('url') or item.get('host') or 'endpoint'} status {item.get('status_code')}" for item in httpx_services[:5]]
+        statements.append("httpx recorded HTTP(S)-related response metadata: " + ", ".join(observations) + ".")
+    for finding in _tool_findings(context, "metasploit"):
+        evidence = finding.get("metasploit_evidence") or {}
+        if isinstance(evidence, dict):
+            state = str(evidence.get("validation_state") or "unknown")
+            session = evidence.get("session_established") is True
+            statements.append(f"Metasploit recorded validation state {state}; session established was {session}. Module or service/version detection is not exploit or session proof.")
+            break
+    tshark = _tshark_evidence(context)
+    if tshark:
+        item = tshark[0]
+        tls = [entry for entry in item.get("tls_observations") or [] if isinstance(entry, dict)]
+        sni = [str(entry.get("sni")) for entry in tls if entry.get("sni")]
+        statements.append(
+            "TShark observed target-related TLS packet metadata"
+            + (" including SNI " + ", ".join(sni[:5]) if sni else "")
+            + "; its stored metadata did not establish a completed TLS handshake."
+        )
+    if not statements:
+        return None
+    statements.append(
+        "Together, the attributed observations support an exposed web/TLS-associated service surface on port 443. They do not by themselves establish vulnerability, exploitability, compromise, or overall TLS security."
+    )
+    return " ".join(statements)
+
+
+def _scanner_record(item: dict) -> str:
+    identifier = str(item.get("name") or item.get("id") or "scanner item")
+    details = []
+    if item.get("severity") not in (None, ""):
+        details.append(f"severity {item.get('severity')}")
+    if item.get("finding") not in (None, ""):
+        details.append(f"finding {item.get('finding')}")
+    return identifier + (" (" + ", ".join(details) + ")" if details else "")
+
+
+def _plain_value(value: object) -> str:
+    if isinstance(value, dict):
+        return ", ".join(f"{key}={_plain_value(item)}" for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_plain_value(item) for item in value)
+    return str(value)
 
 
 def _build_attacker_reasoning_fallback(context: dict) -> str | None:

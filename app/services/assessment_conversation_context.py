@@ -214,6 +214,10 @@ def detect_question_tools(question: str) -> list[str]:
         for tool in ("tshark", "metasploit"):
             if tool not in selected:
                 selected.append(tool)
+    packet_provenance = any(term in normalized for term in ("packet", "packets", "pcap", "capture"))
+    explicit_testssl = any(term in normalized for term in ("testssl", "tls configuration", "cipher", "certificate"))
+    if packet_provenance and "tshark" in selected and "testssl" in selected and not explicit_testssl:
+        selected.remove("testssl")
     return selected
 
 

@@ -1,9 +1,10 @@
 import json
+from unittest.mock import patch
 
 import pytest
 
-from app.services.assessment_conversation_ai import build_assessment_conversation_prompt
-from app.services.assessment_conversation_context import build_assessment_conversation_context
+from app.services.assessment_conversation_ai import answer_assessment_conversation_question, build_assessment_conversation_prompt
+from app.services.assessment_conversation_context import build_assessment_conversation_context, detect_question_tools
 from app.services.assessment_evidence_semantics import get_evidence_semantics
 from app.services.assessment_store import add_assessment_artifact, add_assessment_note, create_assessment, record_assessment_scan
 from app.services.findings_store import add_finding, close_findings_database, configure_findings_database
@@ -187,3 +188,224 @@ def test_cross_tool_attacker_prompt_includes_only_two_represented_semantics_and_
     assert '"prowler": [' in prompt
     assert '"nuclei": [' not in prompt
     assert "prior AI conclusion" not in prompt
+
+
+def _add_httpx_evidence(assessment_id: int, status: int = 403) -> None:
+    finding = add_finding(
+        user_id=1001,
+        finding={
+            "source": "httpx",
+            "target": "https://example.com",
+            "status": "completed",
+            "httpx_services": [{
+                "url": "https://example.com",
+                "status_code": status,
+                "title": "Restricted",
+                "redirect_location": "https://www.example.com",
+                "web_server": "nginx",
+                "technologies": ["nginx"],
+                "content_type": "text/html",
+                "ip": "23.227.38.65",
+                "cdn": True,
+                "cname": ["edge.example.net"],
+                "tls": {"subject_cn": "example.com"},
+            }],
+        },
+    )
+    record_assessment_scan(assessment_id, tool="httpx", status="completed", finding_id=finding["id"])
+
+
+def _add_tshark_artifact(assessment_id: int) -> None:
+    scan = record_assessment_scan(assessment_id, tool="tshark", status="completed")
+    add_assessment_artifact(
+        assessment_id,
+        scan_id=scan["id"],
+        artifact_type="tshark_normalized_evidence",
+        title="TShark normalized PCAP evidence",
+        content=json.dumps({
+            "execution_status": "completed",
+            "success": True,
+            "packet_count": 76,
+            "byte_count": 265200,
+            "observed_protocols": [
+                {"protocol": "dns", "packet_count": 4},
+                {"protocol": "tls", "packet_count": 40},
+            ],
+            "observed_endpoints": [{"address": "23.227.38.65", "packet_count": 40}],
+            "observed_conversations": [{
+                "src": "192.0.2.10", "dst": "23.227.38.65", "src_port": "51000",
+                "dst_port": "443", "transport": "tcp", "packet_count": 40,
+            }],
+            "dns_observations": [{"query_name": "hellosundaykids.com", "response_address": "23.227.38.65"}],
+            "http_observations": [],
+            "tls_observations": [{"sni": "hellosundaykids.com", "version": "TLS 1.2"}],
+            "evidence_limitations": ["TLS SNI/version metadata does not prove a successful TLS handshake by itself."],
+        }),
+    )
+
+
+def _add_testssl_evidence(assessment_id: int) -> None:
+    finding = add_finding(
+        user_id=1001,
+        finding={
+            "source": "testssl",
+            "target": "hellosundaykids.com:443",
+            "status": "completed",
+            "testssl_evidence": {
+                "target": "hellosundaykids.com:443",
+                "host": "hellosundaykids.com",
+                "port": 443,
+                "protocols": [{"id": "TLS1_2", "name": "TLS 1.2", "finding": "offered", "severity": "OK"}],
+                "certificate": {"issuer": "Example CA", "not_after": "2030-01-01"},
+                "vulnerabilities": [{"id": "heartbleed", "finding": "not vulnerable", "severity": "OK"}],
+                "notable_findings": [{"id": "early_data", "finding": "potentially VULNERABLE", "severity": "HIGH"}],
+                "limitations": ["Scanner labels are not automatic exploit confirmation."],
+            },
+        },
+    )
+    record_assessment_scan(assessment_id, tool="testssl", status="completed", finding_id=finding["id"])
+
+
+def test_live_httpx_direct_question_is_deterministic_and_not_withheld():
+    assessment = create_assessment("httpx direct", user_id=1001)
+    _add_httpx_evidence(assessment["id"])
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None,
+            question="What did httpx actually observe?",
+        )
+    ask_ai.assert_not_called()
+    answer = result["answer"]
+    assert "status 403" in answer
+    assert "technology hints nginx" in answer
+    assert "stored TLS metadata subject_cn=example.com" in answer
+    assert "withheld" not in answer.lower()
+    assert "WAF" in answer and "do not by themselves establish" in answer
+    assert "recommend" not in answer.lower()
+    assert result["instrumentation"]["prompt_chars"] == 0
+    assert result["instrumentation"]["context_chars"] == 0
+
+
+def test_live_httpx_403_question_answers_no_and_separates_nuclei_waf_evidence():
+    assessment = create_assessment("httpx WAF boundary", user_id=1001)
+    _add_httpx_evidence(assessment["id"])
+    nuclei = add_finding(
+        user_id=1001,
+        finding={
+            "source": "nuclei", "target": "https://example.com", "status": "completed",
+            "nuclei_findings": [{
+                "template_id": "waf-detect", "name": "WAF Detection", "severity": "info",
+                "matched_at": "https://example.com",
+            }],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed", finding_id=nuclei["id"])
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None,
+            question="Do the 403 responses prove there is a WAF?",
+        )
+    ask_ai.assert_not_called()
+    assert result["answer"].startswith("No. A 403 response")
+    assert "does not by itself prove a WAF" in result["answer"]
+    assert "Nuclei separately reported an informational WAF Detection template match" in result["answer"]
+    assert "separate scanner evidence" in result["answer"]
+
+
+def test_live_testssl_direct_question_preserves_scanner_wording_without_withholding():
+    assessment = create_assessment("testssl direct", user_id=1001)
+    _add_testssl_evidence(assessment["id"])
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None,
+            question="What did testssl.sh actually establish about TLS?",
+        )
+    ask_ai.assert_not_called()
+    assert "potentially VULNERABLE" in result["answer"]
+    assert "severity HIGH" in result["answer"]
+    assert "does not establish exploitability" in result["answer"]
+    assert "withheld" not in result["answer"].lower()
+    assert result["instrumentation"]["prompt_chars"] == 0
+
+
+def test_live_tshark_direct_question_reports_packet_metadata_without_inventing_service_absence():
+    assessment = create_assessment("TShark direct", user_id=1001)
+    _add_tshark_artifact(assessment["id"])
+    metasploit = add_finding(
+        user_id=1001,
+        finding={"source": "metasploit", "target": "hellosundaykids.com", "status": "completed"},
+    )
+    record_assessment_scan(assessment["id"], tool="metasploit", status="completed", finding_id=metasploit["id"])
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None,
+            question="What did TShark actually observe during the Metasploit validation?",
+        )
+    ask_ai.assert_not_called()
+    answer = result["answer"]
+    for expected in ("76 packets", "265200 bytes", "23.227.38.65", "DNS", "TLS", "SNI hellosundaykids.com", "version TLS 1.2"):
+        assert expected in answer
+    assert "no HTTP metadata was observed" in answer
+    assert "does not establish a completed TLS handshake" in answer
+    assert "no HTTP service" not in answer
+    assert "no HTTPS traffic" not in answer
+    assert result["instrumentation"]["prompt_chars"] == 0
+
+
+def test_tls_packet_question_uses_tshark_provenance_and_ignores_testssl_early_data_and_heartbeat():
+    assessment = create_assessment("TLS provenance", user_id=1001)
+    _add_tshark_artifact(assessment["id"])
+    _add_testssl_evidence(assessment["id"])
+    question = "Did the TLS packets prove that a TLS handshake completed?"
+    context = build_assessment_conversation_context(user_id=1001, assessment_id=assessment["id"], question=question)
+    assert detect_question_tools(question) == ["tshark"]
+    assert context["selection"]["selected_tools"] == ["tshark"]
+    assert all(finding.get("source") != "testssl" for finding in context["assessment_context"]["findings"])
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None, question=question,
+        )
+    ask_ai.assert_not_called()
+    assert result["answer"].startswith("No—not from the stored evidence")
+    assert "did not establish whether a TLS handshake completed" in result["answer"]
+    assert "cannot determine completion of this captured handshake" in result["answer"]
+    assert "prevents" not in result["answer"]
+    assert result["instrumentation"]["prompt_chars"] == 0
+
+
+def test_cross_tool_port_443_synthesis_attributes_each_source_and_stays_bounded():
+    assessment = create_assessment("Port 443 synthesis", user_id=1001)
+    nmap = add_finding(
+        user_id=1001,
+        finding={"source": "nmap", "target": "hellosundaykids.com", "status": "completed", "open_ports": [{"port": 443, "protocol": "tcp", "service": "https"}]},
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", finding_id=nmap["id"])
+    _add_httpx_evidence(assessment["id"], status=200)
+    metasploit = add_finding(
+        user_id=1001,
+        finding={
+            "source": "metasploit", "target": "hellosundaykids.com", "status": "completed",
+            "metasploit_evidence": {
+                "validation_state": "DETECTED", "subprocess_success": True,
+                "module_executed": True, "session_established": False,
+            },
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="metasploit", status="completed", finding_id=metasploit["id"])
+    _add_tshark_artifact(assessment["id"])
+    question = "Combine the Nmap, httpx, Metasploit and TShark evidence. What can we actually conclude about port 443?"
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None, question=question,
+        )
+    ask_ai.assert_not_called()
+    answer = result["answer"]
+    assert "Nmap classified 443/tcp as https" in answer
+    assert "httpx recorded HTTP(S)-related response metadata" in answer
+    assert "Metasploit recorded validation state DETECTED" in answer
+    assert "session established was False" in answer
+    assert "TShark observed target-related TLS packet metadata including SNI hellosundaykids.com" in answer
+    assert "did not establish a completed TLS handshake" in answer
+    assert "support an exposed web/TLS-associated service surface on port 443" in answer
+    assert "do not by themselves establish vulnerability, exploitability, compromise, or overall TLS security" in answer
+    assert result["instrumentation"]["prompt_chars"] == 0
