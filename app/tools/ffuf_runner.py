@@ -113,7 +113,7 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
         )
     start_time = time.monotonic()
     logger.info("ffuf scan started: target=%s timeout=%s profile=%s wordlist_count=%s", validated_target, timeout_seconds, wordlist_info["profile"], wordlist_count)
-    logger.info("ffuf subprocess argv: %r", command)
+    logger.info("ffuf subprocess prepared: arg_count=%s", len(command))
     try:
         completed = subprocess.run(  # nosec B603
             command,

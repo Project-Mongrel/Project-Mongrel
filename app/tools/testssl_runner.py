@@ -81,7 +81,7 @@ def run_testssl_scan(target: str) -> dict[str, object]:
         )
     start_time = time.monotonic()
     logger.info("testssl.sh scan started: target=%s timeout=%s", validated_target, settings.testssl_scan_timeout_seconds)
-    logger.info("testssl.sh subprocess argv: %r", command)
+    logger.info("testssl.sh subprocess prepared: arg_count=%s", len(command))
     try:
         completed = subprocess.run(  # nosec B603
             command,

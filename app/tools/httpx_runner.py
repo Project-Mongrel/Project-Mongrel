@@ -67,7 +67,7 @@ def run_httpx_scan(target: str) -> dict[str, object]:
         )
     start_time = time.monotonic()
     logger.info("httpx scan started: target=%s timeout=%s", validated_target, settings.httpx_scan_timeout_seconds)
-    logger.info("httpx subprocess argv: %r", command)
+    logger.info("httpx subprocess prepared: arg_count=%s", len(command))
     try:
         completed = subprocess.run(  # nosec B603
             command,

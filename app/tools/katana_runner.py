@@ -76,7 +76,7 @@ def run_katana_scan(target: str) -> dict[str, object]:
         settings.katana_scan_timeout_seconds,
         settings.katana_crawl_depth,
     )
-    logger.info("Katana subprocess argv: %r", command)
+    logger.info("Katana subprocess prepared: arg_count=%s", len(command))
     try:
         completed = subprocess.run(  # nosec B603
             command,

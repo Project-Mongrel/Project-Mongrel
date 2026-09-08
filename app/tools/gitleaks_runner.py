@@ -37,7 +37,7 @@ def run_gitleaks_scan(scope: str) -> dict[str, object]:
     command = _build_gitleaks_command(executable, scan_path, json_path)
     start_time = time.monotonic()
     logger.info("Gitleaks scan started: scope=%s timeout=%s", scan_path, settings.gitleaks_scan_timeout_seconds)
-    logger.info("Gitleaks subprocess argv: %r", command)
+    logger.info("Gitleaks subprocess prepared: arg_count=%s", len(command))
     try:
         completed = subprocess.run(  # nosec B603
             command,

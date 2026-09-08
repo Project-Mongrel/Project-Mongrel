@@ -28,6 +28,24 @@ from app.core.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 SCAN_CALLBACK_PATTERN = "^(scan:(nmap|nuclei|bbot|httpx|katana|playwright|ffuf|testssl|gitleaks|prowler|metasploit|tshark)|scanrx:.+|ffufp:.+|bbot_ai:.+|ai_summary:.+|glev:.+|glrv:.+|glcx:.+|msf:.+|nav:home)$"
+GENERIC_TELEGRAM_ERROR = "Mongrel could not complete that request. Please try again or review the service status."
+
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log protected diagnostics while keeping Telegram error responses generic."""
+
+    error = getattr(context, "error", None)
+    error_info = (type(error), error, error.__traceback__) if isinstance(error, BaseException) else None
+    logger.error("Unhandled Telegram update error: type=%s", type(error).__name__, exc_info=error_info)
+    try:
+        callback_query = getattr(update, "callback_query", None)
+        message = getattr(update, "effective_message", None)
+        if callback_query is not None:
+            await callback_query.answer(GENERIC_TELEGRAM_ERROR, show_alert=True)
+        elif message is not None:
+            await message.reply_text(GENERIC_TELEGRAM_ERROR)
+    except Exception as notification_error:
+        logger.warning("Unable to send generic Telegram error response: type=%s", type(notification_error).__name__)
 
 
 def build_application(settings: Settings) -> Application:
@@ -55,6 +73,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CallbackQueryHandler(upload_callback_handler, pattern="^upload:explain_ai$"))
     application.add_handler(MessageHandler(filters.Document.ALL, upload_document_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, scan_target_handler))
+    application.add_error_handler(telegram_error_handler)
     return application
 
 

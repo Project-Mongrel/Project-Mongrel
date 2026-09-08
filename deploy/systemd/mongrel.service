@@ -1,0 +1,57 @@
+[Unit]
+Description=Project Mongrel Telegram Bot
+Documentation=https://github.com/FuzzyDuckLabs/Project-Mongrel
+Wants=network-online.target
+After=network-online.target ollama.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=mongrel
+Group=mongrel
+SupplementaryGroups=wireshark
+WorkingDirectory=/home/mongrel/Project-Mongrel
+EnvironmentFile=/etc/mongrel/mongrel.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/mongrel/go/bin:/home/mongrel/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/home/mongrel/Project-Mongrel/.venv/bin/python -m app.bot.bot
+
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30s
+SendSIGKILL=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mongrel
+UMask=0077
+
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/mongrel/Project-Mongrel/data
+ReadWritePaths=/home/mongrel/Project-Mongrel/app/reports
+ReadWritePaths=-/home/mongrel/Project-Mongrel/uploads
+ReadWritePaths=-/home/mongrel/Project-Mongrel/artifacts
+ReadWritePaths=-/home/mongrel/.cache
+ReadWritePaths=-/home/mongrel/.config/bbot
+ReadWritePaths=-/home/mongrel/.local/share/bbot
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

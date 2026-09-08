@@ -92,7 +92,7 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
         settings.nuclei_request_timeout,
         settings.nuclei_retries,
     )
-    logger.info("Nuclei subprocess argv: %r", command)
+    logger.info("Nuclei subprocess prepared: arg_count=%s", len(command))
     logger.info("Nuclei working directory: %s", working_directory)
     process_timeout_seconds = _nuclei_process_timeout(settings)
     logger.info("Nuclei subprocess timeout: %s", process_timeout_seconds)
@@ -205,7 +205,7 @@ def run_nuclei_scan(target: str) -> dict[str, object]:
     try:
         returncode = process.wait(timeout=process_timeout_seconds)
     except subprocess.TimeoutExpired:
-        logger.warning("Nuclei scan timed out after %ss: argv=%r cwd=%s", process_timeout_seconds, command, working_directory)
+        logger.warning("Nuclei scan timed out after %ss", process_timeout_seconds)
         process.kill()
         returncode = process.wait()
         _join_stream_thread(stdout_thread, "stdout")

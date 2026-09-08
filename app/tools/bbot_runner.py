@@ -185,7 +185,7 @@ def run_bbot_scan(target: str) -> dict[str, object]:
     )
     started_at = time.monotonic()
     logger.info("BBOT recon started: target=%s output_dir=%s timeout=%s", validated_target, output_dir, timeout_seconds)
-    logger.info("BBOT subprocess argv: %r", command)
+    logger.info("BBOT subprocess prepared: arg_count=%s", len(command))
     logger.info("BBOT working directory: %s", working_directory)
 
     try:
@@ -222,7 +222,7 @@ def run_bbot_scan(target: str) -> dict[str, object]:
     try:
         returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        logger.error("BBOT recon timed out after %ss: argv=%r cwd=%s", timeout_seconds, command, working_directory)
+        logger.error("BBOT recon timed out after %ss", timeout_seconds)
         process.kill()
         returncode = process.wait()
         _join_stream_thread(stdout_thread, "stdout")
