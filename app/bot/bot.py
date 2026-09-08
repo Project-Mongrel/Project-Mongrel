@@ -11,6 +11,7 @@ from app.bot.handlers import (
     findings_handler,
     home_handler,
     new_assessment_handler,
+    previous_assessments_handler,
     reports_handler,
     reports_callback_handler,
     scan_callback_handler,
@@ -58,6 +59,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("cancel", cancel_handler))
     application.add_handler(MessageHandler(filters.Regex("^Home$"), home_handler))
     application.add_handler(MessageHandler(filters.Regex("^New Assessment$"), new_assessment_handler))
+    application.add_handler(MessageHandler(filters.Regex("^Previous Assessments$"), previous_assessments_handler))
     application.add_handler(MessageHandler(filters.Regex("^Scan$"), scan_handler))
     application.add_handler(MessageHandler(filters.Regex("^(Upload|Upload Findings)$"), upload_handler))
     application.add_handler(MessageHandler(filters.Regex("^Findings$"), findings_handler))

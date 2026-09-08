@@ -10,14 +10,19 @@ from app.bot.keyboards import build_main_menu_keyboard
 from app.services.assessment_store import (
     add_assessment_target,
     create_assessment,
-    get_assessment,
     get_user_assessment,
+    list_user_assessments,
     list_assessment_scans,
     list_assessment_targets,
 )
 from app.services.assessment_ai import FALLBACK_REPORT, generate_assessment_ai_report
 from app.services.assessment_conversation_ai import FALLBACK_ANSWER, answer_assessment_conversation_question
-from app.services.assessment_conversation_store import append_message, get_or_create_assessment_conversation, get_user_conversation
+from app.services.assessment_conversation_store import (
+    append_message,
+    get_latest_assessment_conversation,
+    get_or_create_assessment_conversation,
+    get_user_conversation,
+)
 from app.services.assessment_context import build_assessment_context
 from app.services.assessment_markdown_report import generate_assessment_markdown_report
 from app.services.icon_helper import icon_label, section_label
@@ -29,6 +34,7 @@ ASSESSMENT_STAGE_NAME = "awaiting_name"
 ASSESSMENT_STAGE_TARGET = "awaiting_target"
 ASSESSMENT_CALLBACK_PREFIX = "assessment"
 ACTIVE_ASSESSMENT_ID_KEY = "active_assessment_id"
+PREVIOUS_ASSESSMENTS_PAGE_SIZE = 5
 logger = logging.getLogger(__name__)
 
 
@@ -149,16 +155,115 @@ def build_assessment_dashboard_keyboard(assessment_id: int) -> InlineKeyboardMar
             [InlineKeyboardButton("Run Metasploit", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:metasploit:{assessment_id}")],
             [InlineKeyboardButton("Run TShark", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:tshark:{assessment_id}")],
             [
-                InlineKeyboardButton("Ask Mongrel", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ask:{assessment_id}"),
+                InlineKeyboardButton("Ask Mongrel about this assessment", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ask:{assessment_id}"),
                 InlineKeyboardButton("Generate AI Report", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ai_report:{assessment_id}"),
             ],
             [
                 InlineKeyboardButton("Markdown Report", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:markdown:{assessment_id}"),
                 InlineKeyboardButton("History", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:history:{assessment_id}"),
             ],
+            [InlineKeyboardButton("Previous Assessments", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:list:0")],
             [InlineKeyboardButton("Home", callback_data="nav:home")],
         ]
     )
+
+
+def build_previous_assessments_text(entries: list[dict], *, page: int, total: int) -> str:
+    lines = [section_label("history", "Previous Assessments"), ""]
+    if not entries:
+        lines.append("No saved assessments found.")
+        return "\n".join(lines)
+    start = page * PREVIOUS_ASSESSMENTS_PAGE_SIZE
+    for index, entry in enumerate(entries, start=start + 1):
+        assessment = entry["assessment"]
+        lines.extend(
+            [
+                f"{index}. {assessment.get('name') or 'Untitled assessment'}",
+                f"Target: {entry.get('target') or 'Not set'}",
+                f"Date: {_format_dashboard_time(entry.get('activity_at'))}",
+                f"Status: {str(assessment.get('status') or 'active').title()}",
+                f"Completed tools: {entry.get('completed_tool_count', 0)}/12",
+                "",
+            ]
+        )
+    page_count = max(1, (total + PREVIOUS_ASSESSMENTS_PAGE_SIZE - 1) // PREVIOUS_ASSESSMENTS_PAGE_SIZE)
+    lines.append(f"Page {page + 1} of {page_count}")
+    return "\n".join(lines).rstrip()
+
+
+def build_previous_assessments_keyboard(entries: list[dict], *, page: int, total: int) -> InlineKeyboardMarkup:
+    rows = []
+    for entry in entries:
+        assessment = entry["assessment"]
+        status = str(assessment.get("status") or "active").lower()
+        action = "Continue Assessment" if status != "completed" else "Open Assessment"
+        name = str(assessment.get("name") or "Untitled assessment")
+        if len(name) > 30:
+            name = name[:27].rstrip() + "..."
+        rows.append([
+            InlineKeyboardButton(
+                f"{action} — {name}",
+                callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:dashboard:{assessment['id']}",
+            )
+        ])
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("Previous", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:list:{page - 1}"))
+    if (page + 1) * PREVIOUS_ASSESSMENTS_PAGE_SIZE < total:
+        navigation.append(InlineKeyboardButton("Next", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:list:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton("Home", callback_data="nav:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _previous_assessment_entries(user_id: int) -> list[dict]:
+    entries = []
+    for assessment in list_user_assessments(user_id):
+        assessment_id = int(assessment["id"])
+        targets = list_assessment_targets(assessment_id)
+        scans = list_assessment_scans(assessment_id)
+        conversation = get_latest_assessment_conversation(user_id, assessment_id)
+        activity_times = [
+            _latest_scan_time(scans),
+            conversation.get("last_message_at") if conversation else None,
+            assessment.get("updated_at"),
+            assessment.get("created_at"),
+        ]
+        completed_tools = {
+            str(scan.get("tool") or "").lower().removesuffix(".sh")
+            for scan in scans
+            if str(scan.get("status") or "").lower() == "completed"
+        }
+        entries.append(
+            {
+                "assessment": assessment,
+                "target": targets[0].get("address") if targets else None,
+                "activity_at": max(value for value in activity_times if value is not None),
+                "completed_tool_count": min(12, len(completed_tools)),
+            }
+        )
+    return sorted(entries, key=lambda entry: (entry.get("activity_at"), entry["assessment"].get("id")), reverse=True)
+
+
+async def previous_assessments_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+    await _send_previous_assessments(update.message, user_id=update.effective_user.id, page=0, edit=False)
+
+
+async def _send_previous_assessments(destination: object, *, user_id: int, page: int, edit: bool) -> None:
+    entries = _previous_assessment_entries(user_id)
+    page_count = max(1, (len(entries) + PREVIOUS_ASSESSMENTS_PAGE_SIZE - 1) // PREVIOUS_ASSESSMENTS_PAGE_SIZE)
+    safe_page = max(0, min(int(page), page_count - 1))
+    start = safe_page * PREVIOUS_ASSESSMENTS_PAGE_SIZE
+    selected = entries[start : start + PREVIOUS_ASSESSMENTS_PAGE_SIZE]
+    text = build_previous_assessments_text(selected, page=safe_page, total=len(entries))
+    keyboard = build_previous_assessments_keyboard(selected, page=safe_page, total=len(entries))
+    if edit:
+        await destination.edit_message_text(text, reply_markup=keyboard)
+    else:
+        await destination.reply_text(text, reply_markup=keyboard)
 
 
 async def _safe_edit_assessment_dashboard(query: object, text: str, assessment_id: int, unchanged_notice: str | None = None) -> None:
@@ -456,23 +561,26 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     action = parts[1]
+    effective_user = getattr(update, "effective_user", None)
+    user_id = effective_user.id if effective_user is not None else None
+    if action == "list":
+        if user_id is None:
+            await query.edit_message_text("Previous assessments are unavailable.")
+            return
+        try:
+            page = int(parts[-1])
+        except ValueError:
+            page = 0
+        await _send_previous_assessments(query, user_id=user_id, page=page, edit=True)
+        return
     try:
         assessment_id = int(parts[-1])
     except ValueError:
         await query.edit_message_text("Assessment not found.")
         return
 
-    effective_user = getattr(update, "effective_user", None)
-    user_id = effective_user.id if effective_user is not None else None
-    assessment = get_assessment(assessment_id)
+    assessment = get_user_assessment(user_id, assessment_id) if user_id is not None else None
     if assessment is None:
-        await query.edit_message_text("Assessment not found.")
-        return
-
-    conversation_operation = action in {"ask", "exit_conversation"} or (
-        action == "dashboard" and is_assessment_chat_active(context)
-    )
-    if conversation_operation and (user_id is None or get_user_assessment(user_id, assessment_id) is None):
         await query.edit_message_text("Assessment not found.")
         return
 

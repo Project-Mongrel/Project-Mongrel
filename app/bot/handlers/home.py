@@ -17,6 +17,7 @@ def build_home_text() -> str:
         "Available actions:\n"
         "- Home: return to this control panel\n"
         "- New Assessment: create an assessment workspace\n"
+        "- Previous Assessments: reopen saved assessment workspaces\n"
         "- Scan: prepare authorized scan workflows\n"
         "- Upload Findings: send scan output for analysis\n"
         "- Findings: review security findings\n"

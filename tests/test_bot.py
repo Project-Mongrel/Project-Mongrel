@@ -277,10 +277,11 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
         "Run Prowler",
         "Run Metasploit",
         "Run TShark",
-        "Ask Mongrel",
+        "Ask Mongrel about this assessment",
         "Generate AI Report",
         "Markdown Report",
         "History",
+        "Previous Assessments",
         "Home",
     ]
 
