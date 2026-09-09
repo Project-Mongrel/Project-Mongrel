@@ -339,7 +339,7 @@ def test_new_assessment_flow_creates_assessment_target_and_dashboard() -> None:
 def test_assessment_nmap_button_records_assessment_scan() -> None:
     clear_user_findings(8120)
     clear_user_investigations(8120)
-    assessment = create_assessment("Assessment Nmap")
+    assessment = create_assessment("Assessment Nmap", user_id=8120)
     target = add_assessment_target(assessment["id"], address="127.0.0.1")
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
@@ -382,7 +382,7 @@ def test_assessment_bbot_button_records_assessment_scan() -> None:
     clear_user_findings(8121)
     clear_user_investigations(8121)
     clear_user_observations(8121)
-    assessment = create_assessment("Assessment BBOT")
+    assessment = create_assessment("Assessment BBOT", user_id=8121)
     target = add_assessment_target(assessment["id"], address="example.com")
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
@@ -426,7 +426,7 @@ def test_assessment_nuclei_button_records_assessment_scan() -> None:
     clear_user_findings(8122)
     clear_user_investigations(8122)
     clear_active_scan(8122)
-    assessment = create_assessment("Assessment Nuclei")
+    assessment = create_assessment("Assessment Nuclei", user_id=8122)
     target = add_assessment_target(assessment["id"], address="https://example.com")
     status_message = SimpleNamespace(edit_text=AsyncMock())
     query_message = SimpleNamespace(reply_text=AsyncMock(return_value=status_message))
@@ -467,7 +467,7 @@ def test_assessment_nuclei_button_records_assessment_scan() -> None:
 def test_assessment_failed_scan_records_failed_status() -> None:
     clear_user_findings(8123)
     clear_user_investigations(8123)
-    assessment = create_assessment("Assessment Failed Nmap")
+    assessment = create_assessment("Assessment Failed Nmap", user_id=8123)
     add_assessment_target(assessment["id"], address="127.0.0.1")
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
@@ -477,9 +477,11 @@ def test_assessment_failed_scan_records_failed_status() -> None:
         message=query_message,
     )
 
-    with patch(
-        "app.bot.handlers.scan.run_nmap_scan",
-        return_value={"success": False, "target": "127.0.0.1", "output": "", "error": "nmap failed"},
+    with (
+        patch(
+            "app.bot.handlers.scan.run_nmap_scan",
+            return_value={"success": False, "target": "127.0.0.1", "output": "", "error": "nmap failed"},
+        ),
     ):
         asyncio.run(
             assessment_callback_handler(
@@ -496,7 +498,7 @@ def test_assessment_failed_scan_records_failed_status() -> None:
 
 
 def test_domain_assessment_skips_incompatible_gitleaks_and_prowler_without_findings() -> None:
-    assessment = create_assessment("Domain Tool Compatibility")
+    assessment = create_assessment("Domain Tool Compatibility", user_id=8124)
     add_assessment_target(assessment["id"], address="example.com")
 
     for tool in ("gitleaks", "prowler"):
@@ -545,7 +547,7 @@ def test_assessment_dashboard_gitleaks_and_prowler_buttons_route_to_assessment_h
 
 
 def test_repeated_assessment_dashboard_render_handles_message_not_modified() -> None:
-    assessment = create_assessment("Repeated Dashboard")
+    assessment = create_assessment("Repeated Dashboard", user_id=8126)
     add_assessment_target(assessment["id"], address="example.com")
     query = SimpleNamespace(
         data=f"assessment:dashboard:{assessment['id']}",
@@ -565,7 +567,7 @@ def test_repeated_assessment_dashboard_render_handles_message_not_modified() -> 
 
 
 def test_assessment_dashboard_changed_render_still_edits_message() -> None:
-    assessment = create_assessment("Changed Dashboard")
+    assessment = create_assessment("Changed Dashboard", user_id=8127)
     add_assessment_target(assessment["id"], address="example.com")
     query = SimpleNamespace(
         data=f"assessment:dashboard:{assessment['id']}",
@@ -587,7 +589,7 @@ def test_assessment_dashboard_changed_render_still_edits_message() -> None:
 
 
 def test_assessment_gitleaks_skip_dashboard_handles_message_not_modified() -> None:
-    assessment = create_assessment("Gitleaks Skip Repeated")
+    assessment = create_assessment("Gitleaks Skip Repeated", user_id=8128)
     add_assessment_target(assessment["id"], address="example.com")
     query = SimpleNamespace(
         data=f"assessment:run:gitleaks:{assessment['id']}",
@@ -613,7 +615,7 @@ def test_assessment_gitleaks_skip_dashboard_handles_message_not_modified() -> No
 
 
 def test_assessment_prowler_skip_dashboard_handles_message_not_modified() -> None:
-    assessment = create_assessment("Prowler Skip Repeated")
+    assessment = create_assessment("Prowler Skip Repeated", user_id=8129)
     add_assessment_target(assessment["id"], address="example.com")
     query = SimpleNamespace(
         data=f"assessment:run:prowler:{assessment['id']}",
@@ -640,7 +642,7 @@ def test_assessment_prowler_skip_dashboard_handles_message_not_modified() -> Non
 
 def test_valid_local_directory_gitleaks_assessment_still_runs(tmp_path) -> None:
     clear_user_scan_requests(8130)
-    assessment = create_assessment("Local Gitleaks")
+    assessment = create_assessment("Local Gitleaks", user_id=8130)
     target = add_assessment_target(assessment["id"], address=str(tmp_path))
     message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
@@ -668,7 +670,7 @@ def test_valid_local_directory_gitleaks_assessment_still_runs(tmp_path) -> None:
 
 def test_valid_provider_prowler_assessment_still_runs() -> None:
     clear_user_scan_requests(8131)
-    assessment = create_assessment("AWS Prowler")
+    assessment = create_assessment("AWS Prowler", user_id=8131)
     target = add_assessment_target(assessment["id"], address="aws")
     message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
@@ -696,7 +698,7 @@ def test_valid_provider_prowler_assessment_still_runs() -> None:
 
 def test_assessment_metasploit_launch_routes_only_to_metasploit_prompt() -> None:
     clear_user_scan_requests(8125)
-    assessment = create_assessment("Metasploit Routing")
+    assessment = create_assessment("Metasploit Routing", user_id=8125)
     add_assessment_target(assessment["id"], address="example.com")
     message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
@@ -726,7 +728,7 @@ def test_assessment_metasploit_launch_routes_only_to_metasploit_prompt() -> None
 
 
 def test_assessment_tshark_button_shows_separate_upload_live_choice_and_clears_stale_state() -> None:
-    assessment = create_assessment("TShark Assessment")
+    assessment = create_assessment("TShark Assessment", user_id=8132)
     add_assessment_target(assessment["id"], address="example.com")
     query = SimpleNamespace(
         data=f"assessment:run:tshark:{assessment['id']}",
@@ -769,7 +771,7 @@ def test_assessment_dashboard_shows_tshark_button_and_status() -> None:
 
 
 def test_assessment_history_callback_lists_recorded_scans() -> None:
-    assessment = create_assessment("History Callback Assessment")
+    assessment = create_assessment("History Callback Assessment", user_id=8133)
     record_assessment_scan(assessment["id"], tool="bbot", status="completed", elapsed_seconds=19, risk="info")
     query = SimpleNamespace(
         data=f"assessment:history:{assessment['id']}",
@@ -777,7 +779,12 @@ def test_assessment_history_callback_lists_recorded_scans() -> None:
         edit_message_text=AsyncMock(),
     )
 
-    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), SimpleNamespace(user_data={})))
+    asyncio.run(
+        assessment_callback_handler(
+            SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8133)),
+            SimpleNamespace(user_data={}),
+        )
+    )
 
     query.answer.assert_called_once()
     assert "Assessment History" in query.edit_message_text.call_args.args[0]
@@ -952,7 +959,7 @@ def test_home_exits_assessment_chat_mode() -> None:
 
 def test_assessment_markdown_report_callback_sends_report() -> None:
     clear_user_findings(8134)
-    assessment = create_assessment("Markdown Assessment")
+    assessment = create_assessment("Markdown Assessment", user_id=8134)
     add_assessment_target(assessment["id"], address="example.com")
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
@@ -979,7 +986,7 @@ def test_assessment_markdown_report_callback_sends_report() -> None:
 
 def test_assessment_ai_report_callback_sends_assessment_report() -> None:
     clear_user_findings(8132)
-    assessment = create_assessment("Assessment AI Report")
+    assessment = create_assessment("Assessment AI Report", user_id=8132)
     target = add_assessment_target(assessment["id"], address="scanme.nmap.org")
     finding = add_finding(
         user_id=8132,
@@ -1022,7 +1029,7 @@ def test_assessment_ai_report_callback_sends_assessment_report() -> None:
 
 
 def test_assessment_ai_report_callback_returns_fallback_when_ai_unavailable() -> None:
-    assessment = create_assessment("Assessment AI Report Fallback")
+    assessment = create_assessment("Assessment AI Report Fallback", user_id=8133)
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
         data=f"assessment:ai_report:{assessment['id']}",
@@ -1045,7 +1052,7 @@ def test_assessment_ai_report_callback_returns_fallback_when_ai_unavailable() ->
 
 
 def test_assessment_ai_report_callback_splits_long_reports() -> None:
-    assessment = create_assessment("Assessment AI Long Report")
+    assessment = create_assessment("Assessment AI Long Report", user_id=8135)
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
         data=f"assessment:ai_report:{assessment['id']}",
@@ -1073,7 +1080,7 @@ def test_assessment_ai_report_callback_splits_long_reports() -> None:
 
 
 def test_assessment_markdown_report_callback_edits_when_message_missing() -> None:
-    assessment = create_assessment("Placeholder Fallback Assessment")
+    assessment = create_assessment("Placeholder Fallback Assessment", user_id=8136)
     query = SimpleNamespace(
         data=f"assessment:markdown:{assessment['id']}",
         answer=AsyncMock(),
@@ -1081,7 +1088,12 @@ def test_assessment_markdown_report_callback_edits_when_message_missing() -> Non
         message=None,
     )
 
-    asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query), SimpleNamespace(user_data={})))
+    asyncio.run(
+        assessment_callback_handler(
+            SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8136)),
+            SimpleNamespace(user_data={}),
+        )
+    )
 
     query.answer.assert_called_once()
     query.edit_message_text.assert_called_once()
@@ -4163,7 +4175,7 @@ def test_assessment_bbot_partial_scan_records_partial_status() -> None:
     clear_user_findings(8124)
     clear_user_investigations(8124)
     clear_user_observations(8124)
-    assessment = create_assessment("Assessment BBOT Partial")
+    assessment = create_assessment("Assessment BBOT Partial", user_id=8124)
     target = add_assessment_target(assessment["id"], address="example.com")
     query_message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(

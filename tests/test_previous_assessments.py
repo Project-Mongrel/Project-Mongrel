@@ -170,3 +170,15 @@ def test_forged_assessment_callbacks_cannot_open_another_users_assessment(action
     assert "secret.example" not in query.edit_message_text.call_args.args[0]
     assert ASSESSMENT_CHAT_STATE_KEY not in context.user_data
     assert list_assessment_scans(assessment["id"]) == before
+
+
+def test_ownerless_legacy_assessment_callback_remains_inaccessible() -> None:
+    assessment = create_assessment("Unattributed legacy assessment")
+    add_assessment_target(assessment["id"], "legacy-private.example")
+    record_assessment_scan(assessment["id"], "nmap", "completed", raw_reference="legacy-private.xml")
+    update, query = _callback_update(4206, f"assessment:dashboard:{assessment['id']}")
+
+    asyncio.run(assessment_callback_handler(update, SimpleNamespace(user_data={})))
+
+    assert query.edit_message_text.call_args.args[0] == "Assessment not found."
+    assert "legacy-private.example" not in query.edit_message_text.call_args.args[0]
