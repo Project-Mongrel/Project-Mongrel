@@ -167,6 +167,75 @@ def test_recommendation_includes_rationale() -> None:
     assert "because" in result["answer"].lower()
 
 
+def test_natural_what_is_next_recovers_grounded_advice_from_unsafe_model_output() -> None:
+    assessment = create_assessment("Natural Recommendation", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=8080, service="http-proxy")
+
+    with patch(
+        "app.services.assessment_conversation_ai.ask_ai",
+        return_value="The service is vulnerable, so run httpx next.",
+    ):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What is next",
+        )
+
+    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert "httpx next" in result["answer"]
+    assert "not evidence of a vulnerability" in result["answer"]
+    assert "withheld" not in result["answer"].lower()
+
+
+@pytest.mark.parametrize("question", ["Why?", "Which one?", "What will that tell me?", "What did you mean by that?", "And 8080?"])
+def test_short_followups_receive_bounded_persisted_history(question: str) -> None:
+    assessment = create_assessment("Natural Follow-up", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=8080, service="http-proxy")
+    conversation = create_conversation(assessment["id"], user_id=1001)
+    append_message(conversation["id"], user_id=1001, role="user", content="What next?")
+    append_message(
+        conversation["id"],
+        user_id=1001,
+        role="assistant",
+        content="I would investigate the web-associated surface with httpx next.",
+    )
+    response = "It would record observed HTTP response metadata; that would not prove a vulnerability."
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=response) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=conversation["id"],
+            question=question,
+        )
+
+    prompt = ask_ai.call_args.args[0]
+    assert "I would investigate the web-associated surface with httpx next." in prompt
+    assert question in prompt
+    assert result["answer"] == response
+    assert len(result["evidence_refs"]["history_message_ids"]) == 2
+
+
+def test_domain_recommendation_does_not_blindly_add_repository_or_cloud_tools() -> None:
+    assessment = create_assessment("Domain Compatibility", user_id=1001)
+    add_assessment_target(assessment["id"], "example.com")
+    _add_nmap_scan(assessment["id"], user_id=1001, port=443, service="https")
+    response = "Use Mongrel's httpx next because it can characterize observed HTTP responses without claiming a weakness."
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=response) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should we investigate next?",
+        )
+
+    assert result["answer"] == response
+    assert "gitleaks" not in result["answer"].lower()
+    assert "prowler" not in result["answer"].lower()
+
+
 def test_conversation_engine_does_not_execute_tools() -> None:
     assessment = create_assessment("No Execute", user_id=1001)
 

@@ -5,6 +5,7 @@ import pytest
 from app.services.assessment_context import build_assessment_context
 from app.services.assessment_conversation_context import (
     build_assessment_conversation_context,
+    classify_assessment_conversation_intent,
     detect_question_tools,
 )
 from app.services.assessment_conversation_store import append_message, create_conversation, update_summary_status
@@ -57,6 +58,31 @@ def test_recent_messages_are_bounded_and_ordered() -> None:
     messages = context["conversation"]["recent_messages"]
     assert [message["content"] for message in messages] == ["Turn 3", "Turn 4", "Turn 5"]
     assert context["conversation"]["recent_message_limit"] == 3
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("What is next", "next_step_recommendation"),
+        ("What should we investigate next?", "next_step_recommendation"),
+        ("Which one first?", "prioritization"),
+        ("What haven't we checked?", "remaining_coverage_gaps"),
+        ("Anything worrying so far?", "significance_interpretation"),
+        ("Do we know it's vulnerable?", "uncertainty_safety"),
+        ("Tell me like I'm new to this.", "simplify_explanation"),
+        ("Why?", "follow_up_reference"),
+        ("Why that one?", "follow_up_reference"),
+        ("After that?", "follow_up_reference"),
+        ("What will that tell me?", "follow_up_reference"),
+        ("And 8080?", "follow_up_reference"),
+        ("Explain that.", "explanation"),
+        ("What does that mean?", "explanation"),
+        ("Explain the TLS stuff simply.", "simplify_explanation"),
+        ("How could an attacker look at this?", "attacker_informed_defensive_reasoning"),
+    ],
+)
+def test_natural_conversation_intents(question: str, expected: str) -> None:
+    assert classify_assessment_conversation_intent(question) == expected
 
 
 def test_stored_summary_represents_older_conversation() -> None:

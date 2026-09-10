@@ -31,7 +31,7 @@ PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER = (
     "explicit user review and approval."
 )
 UNSUPPORTED_CONVERSATION_CLAIM_PATTERNS = (
-    re.compile(r"\b(?:target|host|system|application|site|aws account|cloud account|environment|resource)\s+(?:is|appears|looks|seems)\s+(?:safe|secure|hardened|protected)\b"),
+    re.compile(r"\b(?:target|host|system|application|site|service|aws account|cloud account|environment|resource)\s+(?:is|appears|looks|seems)\s+(?:safe|secure|hardened|protected|vulnerable|exploitable|compromised)\b"),
     re.compile(r"\b(?:no|zero)\s+(?:vulnerabilities|security issues|security risks|misconfigurations|attack paths)\s+(?:exist|were found|were detected|are present)\b"),
     re.compile(r"\b(?:exploit|exploitation)\s+(?:succeeded|worked|was successful)\b"),
     re.compile(r"\b(?:target|host|system|repository|environment|resource)\s+(?:was|is|has been)\s+(?:compromised|owned|exploited)\b"),
@@ -178,9 +178,12 @@ def answer_assessment_conversation_question(
             answer = FALLBACK_ANSWER
             fallback_reason = "empty"
         elif violates_conversation_truthfulness(answer, context):
-            attacker_fallback = _build_attacker_reasoning_fallback(context)
-            answer = attacker_fallback or TRUTHFULNESS_FALLBACK_ANSWER
-            fallback_reason = "attacker_reasoning_fallback" if attacker_fallback else "truthfulness_guard"
+            conversational_fallback = _build_grounded_conversational_fallback(context)
+            answer = conversational_fallback or TRUTHFULNESS_FALLBACK_ANSWER
+            if conversational_fallback and context.get("question_intent") == "attacker_informed_defensive_reasoning":
+                fallback_reason = "attacker_reasoning_fallback"
+            else:
+                fallback_reason = "grounded_conversation_fallback" if conversational_fallback else "truthfulness_guard"
         elif violates_mongrel_native_guidance(answer, context):
             answer = NATIVE_GUIDANCE_FALLBACK_ANSWER
             fallback_reason = "native_guidance_guard"
@@ -405,7 +408,10 @@ def _build_prompt_context(context: dict) -> dict:
     semantics = get_represented_evidence_semantics(assessment_context.get("findings") or [])
     if semantics:
         prompt_context["evidence_semantics"] = semantics
-    if _question_needs_history(str(context.get("current_question") or "")):
+    if _question_needs_history(
+        str(context.get("current_question") or ""),
+        intent=intent,
+    ):
         conversation = context.get("conversation") or {}
         prompt_context["prior_exchange"] = {
             "summary": conversation.get("summary"),
@@ -424,9 +430,20 @@ def _build_prompt_context(context: dict) -> dict:
     return prompt_context
 
 
-def _question_needs_history(question: str) -> bool:
+def _question_needs_history(question: str, *, intent: str = "") -> bool:
     normalized = question.lower()
-    return any(term in normalized for term in ("old answer", "earlier answer", "previous answer", "last answer"))
+    if intent in {
+        "explanation",
+        "follow_up_reference",
+        "prioritization",
+        "significance_interpretation",
+        "simplify_explanation",
+    }:
+        return True
+    return any(
+        term in normalized
+        for term in ("old answer", "earlier answer", "previous answer", "last answer", "that", "which one", "after that")
+    )
 
 
 def _evidence_for_generation(assessment_context: dict, intent: str) -> dict:
@@ -518,6 +535,32 @@ def _intent_framing(intent: str) -> list[str]:
             "- Answer why the stored observations may interest an attacker before anything else. Explain bounded hypotheses, not confirmed findings.",
             "- Do not turn the answer into a tool recommendation. Mention a next step only briefly after answering why, and only when useful.",
         ]
+    if intent in {"explanation", "follow_up_reference", "simplify_explanation"}:
+        return [
+            "Response framing for this follow-up:",
+            "- Resolve references from the latest relevant exchange, but treat prior assistant text as interpretation rather than evidence.",
+            "- Answer directly in plain language and ground any factual claim in stored evidence.",
+        ]
+    if intent == "prioritization":
+        return [
+            "Response framing for this prioritization question:",
+            "- State what should come first and why, based on the current evidence gap; this is advice, not a finding or execution.",
+        ]
+    if intent == "remaining_coverage_gaps":
+        return [
+            "Response framing for this coverage question:",
+            "- Distinguish completed stored coverage from meaningful remaining gaps; absence of evidence is not safety.",
+        ]
+    if intent == "significance_interpretation":
+        return [
+            "Response framing for this significance question:",
+            "- Explain what the observation may mean and why it matters without turning it into a confirmed weakness.",
+        ]
+    if intent == "uncertainty_safety":
+        return [
+            "Response framing for this certainty question:",
+            "- State clearly what is and is not established; never infer security or vulnerability from incomplete coverage.",
+        ]
     return [
         "Response framing for this assessment evidence question:",
         "- Lead with stored observed evidence, then distinguish interpretation, uncertainty, and any directly relevant next decision.",
@@ -577,7 +620,8 @@ def _has_nmap_semantic_overclaim(answer: str, context: dict) -> bool:
         return True
     safe = re.compile(
         r"\b(?:does not|do not|did not|not proven|not established|not confirmed|hypothes(?:is|es)|"
-        r"area(?:s)? of interest|worth investigating|to investigate|would investigate|cannot infer|cannot conclude)\b"
+        r"area(?:s)? of interest|worth investigating|to investigate|would investigate|cannot infer|cannot conclude|"
+        r"(?:does|do|did|would|will|can|could) not (?:prove|establish|confirm|show|mean))\b"
     )
     dangerous = re.compile(
         r"\b(?:vulnerabilit|weak tls|insecure transport|cleartext traffic|traffic interception|interception opportunity|"
@@ -908,6 +952,35 @@ def _plain_value(value: object) -> str:
     if isinstance(value, (list, tuple)):
         return ", ".join(_plain_value(item) for item in value)
     return str(value)
+
+
+def _build_grounded_conversational_fallback(context: dict) -> str | None:
+    attacker_answer = _build_attacker_reasoning_fallback(context)
+    if attacker_answer:
+        return attacker_answer
+
+    intent = str(context.get("question_intent") or "")
+    if intent in {"next_step_recommendation", "prioritization"}:
+        recommendation = context.get("recommendation_context") or {}
+        preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
+        if preferred == ["httpx"]:
+            return (
+                "I would use Mongrel's httpx next. Stored Nmap evidence identified web-associated exposed services, "
+                "while httpx can check which HTTP(S) endpoints respond and record response metadata. That is a grounded "
+                "investigation recommendation, not evidence of a vulnerability, and no tool has been run by this answer."
+            )
+        if preferred == ["tshark"]:
+            return (
+                "I would use Mongrel's TShark capability next because the question requires packet-level evidence. "
+                "The appropriate Mongrel capture or PCAP-analysis mode depends on the traffic available. This is a "
+                "recommendation only; it does not claim packets exist or run a capture."
+            )
+    if intent == "uncertainty_safety":
+        return (
+            "The stored assessment evidence is not enough to conclude that the target is secure or vulnerable overall. "
+            "It establishes only the observations recorded by completed tools; untested areas remain evidence gaps."
+        )
+    return None
 
 
 def _build_attacker_reasoning_fallback(context: dict) -> str | None:

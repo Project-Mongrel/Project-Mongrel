@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from datetime import datetime
 from typing import Any
 
@@ -85,8 +86,8 @@ PRODUCT_QUESTION_PATTERNS = (
     "what modes does mongrel", "difference between assessment mode", "can you run tools automatically",
 )
 RECOMMENDATION_QUESTION_TERMS = (
-    "what next", "do next", "run next", "should i run", "which tool", "which mongrel tool", "recommend",
-    "how do i investigate",
+    "what next", "what is next", "do next", "run next", "should i run", "which tool", "which mongrel tool",
+    "recommend", "what would you investigate", "would you investigate", "how do i investigate",
 )
 ASSESSMENT_QUESTION_TERMS = ("what did", "what was found", "what have we found", "current assessment", "assessment evidence", "scan result")
 SECURITY_CONCEPT_TERMS = (
@@ -95,6 +96,16 @@ SECURITY_CONCEPT_TERMS = (
 )
 ATTACKER_QUESTION_TERMS = ("think like an attacker", "attacker", "attack path", "attack chain")
 TOOL_EXPLANATION_TERMS = ("what does", "why would i use", "what can", "explain", "what is")
+FOLLOW_UP_PATTERNS = (
+    r"^(?:and\s+)?(?:why|why (?:that|this) one|which one|after that|what do you mean|what did you mean by that)\??$",
+    r"^(?:and\s+)?what (?:will|would) that (?:tell|show|mean)(?: me)?\??$",
+    r"^and (?:what about )?(?:port\s+)?\d{1,5}\??$",
+)
+PRIORITIZATION_TERMS = ("which one first", "what first", "prioriti", "highest priority", "most important")
+COVERAGE_GAP_TERMS = ("anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing")
+SIGNIFICANCE_TERMS = ("anything worrying", "is that bad", "does that matter", "how serious", "why should i care")
+UNCERTAINTY_TERMS = ("are we secure", "is it secure", "do we know it's vulnerable", "do we know it is vulnerable", "is it vulnerable", "are we safe")
+SIMPLIFY_TERMS = ("like i'm new", "like i am new", "simply", "simple terms", "plain english", "beginner")
 
 
 def build_assessment_conversation_context(
@@ -157,7 +168,11 @@ def build_assessment_conversation_context(
         "mongrel_capabilities": MONGREL_CAPABILITIES,
         "mongrel_self_knowledge": build_mongrel_self_knowledge_profile(),
         "telegram_capability_guidance": TELEGRAM_CAPABILITY_GUIDANCE,
-        "recommendation_context": _build_recommendation_context(question, assessment_context),
+        "recommendation_context": _build_recommendation_context(
+            question,
+            assessment_context,
+            question_intent=question_intent,
+        ),
         "evidence_language_contract": [
             "Nmap port/service labels are classifications only and do not establish application behavior, vulnerability, exploitability, interception, or encryption quality.",
             "A scanned hostname and its resolved IP identify the same scanned endpoint unless stored evidence explicitly records independently discovered hosts; do not count them as two hosts.",
@@ -189,12 +204,28 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "attacker_informed_defensive_reasoning"
     if any(term in normalized for term in RECOMMENDATION_QUESTION_TERMS):
         return "next_step_recommendation"
+    if any(term in normalized for term in PRIORITIZATION_TERMS):
+        return "prioritization"
+    if re.search(r"\b(?:what|which)\b.{0,32}\bnext\b", normalized):
+        return "next_step_recommendation"
+    if any(term in normalized for term in COVERAGE_GAP_TERMS):
+        return "remaining_coverage_gaps"
+    if any(term in normalized for term in UNCERTAINTY_TERMS):
+        return "uncertainty_safety"
+    if any(term in normalized for term in SIGNIFICANCE_TERMS):
+        return "significance_interpretation"
+    if any(term in normalized for term in SIMPLIFY_TERMS):
+        return "simplify_explanation"
+    if any(re.search(pattern, normalized) for pattern in FOLLOW_UP_PATTERNS):
+        return "follow_up_reference"
     if tools and any(term in normalized for term in TOOL_EXPLANATION_TERMS):
         return "individual_tool_explanation"
     if any(term in normalized for term in ASSESSMENT_QUESTION_TERMS):
         return "current_assessment_evidence"
     if any(term in normalized for term in SECURITY_CONCEPT_TERMS):
         return "security_concept"
+    if any(term in normalized for term in ("explain that", "what does that mean", "what do you mean")):
+        return "explanation"
     return "current_assessment_evidence"
 
 
@@ -438,7 +469,12 @@ def _tool_boundaries() -> list[str]:
     ]
 
 
-def _build_recommendation_context(question: str, assessment_context: dict) -> dict:
+def _build_recommendation_context(
+    question: str,
+    assessment_context: dict,
+    *,
+    question_intent: str = "current_assessment_evidence",
+) -> dict:
     normalized_question = str(question or "").lower()
     completed_tools = []
     for scan in assessment_context.get("scans") or []:
@@ -455,8 +491,9 @@ def _build_recommendation_context(question: str, assessment_context: dict) -> di
     if traffic_intent:
         preferred_next_tools.append("tshark")
         rationale.append("TShark is Mongrel's packet/capture capability; explain the mode that addresses the evidence gap without claiming packets already exist.")
-    elif web_services_observed and (
+    elif web_services_observed and "httpx" not in completed_tools and (
         web_intent or novice_intent or any(term in normalized_question for term in RECOMMENDATION_QUESTION_TERMS)
+        or question_intent in {"next_step_recommendation", "prioritization"}
     ):
         preferred_next_tools.append("httpx")
         rationale.append("Nmap already identified web-associated exposed services; httpx can test which HTTP(S) endpoints respond and characterize them.")
