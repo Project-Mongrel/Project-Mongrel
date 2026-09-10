@@ -108,6 +108,16 @@ UNCERTAINTY_TERMS = (
     "are we secure", "is it secure", "do we know it's vulnerable", "do we know it is vulnerable", "is it vulnerable",
     "is that a vulnerability", "does that mean it is vulnerable", "does that mean it's vulnerable", "are we safe",
 )
+CASUAL_SECURITY_TERM_ALIASES = (
+    (re.compile(r"\b(?:vulnerabilty|vunerability|vuln)\b"), "vulnerability"),
+    (re.compile(r"\bexploitible\b"), "exploitable"),
+)
+UNCERTAINTY_PATTERNS = (
+    re.compile(r"\bis\s+(?:this|that|it)\s+(?:a\s+)?vulnerability\b"),
+    re.compile(r"\bdoes\s+(?:this|that|it)\s+mean\s+(?:(?:it\s+is|it'?s)\s+)?vulnerable\b"),
+    re.compile(r"\bcan\s+(?:this|that|it)\s+be\s+exploit(?:ed|able)\b"),
+    re.compile(r"\bare\s+we\s+(?:safe|secure)\b"),
+)
 SIMPLIFY_TERMS = ("like i'm new", "like i am new", "simply", "simple terms", "plain english", "beginner")
 
 
@@ -197,7 +207,7 @@ def build_assessment_conversation_context(
 def classify_assessment_conversation_intent(question: str, *, selected_tools: list[str] | None = None) -> str:
     """Classify current intent without invoking the model; order resolves overlapping wording."""
 
-    normalized = " ".join(str(question or "").lower().split())
+    normalized = _normalize_intent_text(question)
     tools = selected_tools if selected_tools is not None else detect_question_tools(question)
     if any(pattern in normalized for pattern in PRODUCT_QUESTION_PATTERNS):
         return "product_self_knowledge"
@@ -213,7 +223,9 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "next_step_recommendation"
     if any(term in normalized for term in COVERAGE_GAP_TERMS):
         return "remaining_coverage_gaps"
-    if any(term in normalized for term in UNCERTAINTY_TERMS):
+    if any(term in normalized for term in UNCERTAINTY_TERMS) or any(
+        pattern.search(normalized) for pattern in UNCERTAINTY_PATTERNS
+    ):
         return "uncertainty_safety"
     if any(term in normalized for term in SIGNIFICANCE_TERMS):
         return "significance_interpretation"
@@ -230,6 +242,13 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
     if any(term in normalized for term in ("explain that", "what does that mean", "what do you mean")):
         return "explanation"
     return "current_assessment_evidence"
+
+
+def _normalize_intent_text(question: str) -> str:
+    normalized = " ".join(str(question or "").lower().replace("’", "'").split())
+    for pattern, replacement in CASUAL_SECURITY_TERM_ALIASES:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized
 
 
 def build_context_digest(context: dict) -> str:

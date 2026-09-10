@@ -188,6 +188,41 @@ def test_natural_what_is_next_recovers_grounded_advice_from_unsafe_model_output(
     assert "withheld" not in result["answer"].lower()
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "is that a vulnerability?",
+        "is that a vulnerabilty?",
+        "is that a vunerability?",
+        "is that a vuln?",
+        "does that mean its vulnerable?",
+        "can that be exploited?",
+        "can that be exploitible?",
+        "are we safe?",
+        "are we secure?",
+    ],
+)
+def test_casual_uncertainty_questions_recover_bounded_answer(question: str) -> None:
+    assessment = create_assessment("Casual uncertainty", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=8080, service="http-proxy")
+
+    with patch(
+        "app.services.assessment_conversation_ai.ask_ai",
+        return_value="Yes, that is a vulnerability and the target is exploitable.",
+    ):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question=question,
+        )
+
+    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert "not enough to conclude" in result["answer"]
+    assert "secure or vulnerable overall" in result["answer"]
+    assert "withheld" not in result["answer"].lower()
+
+
 @pytest.mark.parametrize("question", ["Why?", "Which one?", "What will that tell me?", "What did you mean by that?", "And 8080?"])
 def test_short_followups_receive_bounded_persisted_history(question: str) -> None:
     assessment = create_assessment("Natural Follow-up", user_id=1001)

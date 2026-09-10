@@ -85,6 +85,24 @@ def test_natural_conversation_intents(question: str, expected: str) -> None:
     assert classify_assessment_conversation_intent(question) == expected
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "is that a vulnerability?",
+        "is that a vulnerabilty?",
+        "is that a vunerability?",
+        "is that a vuln?",
+        "does that mean its vulnerable?",
+        "can that be exploited?",
+        "can that be exploitible?",
+        "are we safe?",
+        "are we secure?",
+    ],
+)
+def test_casual_security_uncertainty_variants_share_safe_intent(question: str) -> None:
+    assert classify_assessment_conversation_intent(question) == "uncertainty_safety"
+
+
 def test_stored_summary_represents_older_conversation() -> None:
     assessment = create_assessment("Summary Context", user_id=1001)
     conversation = create_conversation(assessment["id"], user_id=1001)
