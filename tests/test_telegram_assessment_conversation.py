@@ -7,8 +7,9 @@ import pytest
 from app.bot.handlers.assessment import ASSESSMENT_CHAT_STATE_KEY, assessment_callback_handler
 from app.bot.handlers.scan import PENDING_NMAP_REQUEST_KEY, scan_target_handler
 from app.services.assessment_conversation_ai import FALLBACK_ANSWER
-from app.services.assessment_conversation_store import get_latest_assessment_conversation, list_recent_messages
-from app.services.assessment_store import create_assessment
+from app.services.assessment_conversation_store import append_message, get_latest_assessment_conversation, list_recent_messages
+from app.services.assessment_store import add_assessment_target, create_assessment, record_assessment_scan
+from app.services.findings_store import add_finding
 from app.services.chat_state import clear_ai_waiting, set_ai_waiting
 from app.services.findings_store import close_findings_database, configure_findings_database
 from app.services.scan_manager import create_scan_request, mark_scan_request_awaiting_target
@@ -43,6 +44,26 @@ def _enter(assessment_id: int, user_id: int, context=None):
 def _text(text: str, user_id: int):
     message = SimpleNamespace(text=text, reply_text=AsyncMock())
     return SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id)), message
+
+
+def _test1_assessment(user_id: int) -> dict:
+    assessment = create_assessment("Test1", user_id=user_id)
+    add_assessment_target(assessment["id"], "Hellosundaykids.com")
+    evidence_by_tool = {
+        "nmap": {"open_ports": [{"port": 80, "protocol": "tcp", "service": "http"}, {"port": 443, "protocol": "tcp", "service": "https"}, {"port": 8080, "protocol": "tcp", "service": "http-proxy"}]},
+        "nuclei": {"nuclei_findings": [{"template_id": "tech-detect", "severity": "info", "matched_at": "https://Hellosundaykids.com"}]},
+        "httpx": {"httpx_results": [{"url": "https://Hellosundaykids.com", "status_code": 403}]},
+        "testssl.sh": {"testssl_findings": [{"id": "early_data", "severity": "HIGH", "finding": "potentially VULNERABLE"}]},
+        "metasploit": {"metasploit_evidence": {"execution_state": "completed", "session_established": False}},
+        "tshark": {"tshark_evidence": {"packet_count": 76, "observed_protocols": [{"protocol": "tls", "packet_count": 24}], "handshake_success": "not established"}},
+    }
+    for tool, evidence in evidence_by_tool.items():
+        finding = add_finding(
+            user_id=user_id,
+            finding={"source": tool, "target": "Hellosundaykids.com", "status": "completed", **evidence},
+        )
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+    return assessment
 
 
 def test_enter_and_restart_resume_latest_db_conversation() -> None:
@@ -167,6 +188,58 @@ def test_assessment_conversation_wins_generic_ask_collision() -> None:
     assessment_ai.assert_called_once()
     generic_ai.assert_not_called()
     clear_ai_waiting(user_id)
+
+
+def test_live_test1_conversation_recovers_safe_answers_through_telegram_path() -> None:
+    user_id = 1017
+    assessment = _test1_assessment(user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    conversation_id = context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"]
+    # Persisted history reproduces the production condition before these turns.
+    append_message(conversation_id, user_id=user_id, role="user", content="What does httpx do?")
+    append_message(
+        conversation_id,
+        user_id=user_id,
+        role="assistant",
+        content="httpx records observed HTTP response metadata; that does not prove a vulnerability.",
+    )
+    generated = iter(
+        [
+            "The site is vulnerable, so run Katana next.",
+            "The target appears insecure because web ports are exposed.",
+            "The application is vulnerable because Katana has not run.",
+            "Yes, that is a vulnerability.",
+            "The target is secure because the completed scans found nothing critical.",
+        ]
+    )
+
+    answers = []
+    fallback_reasons = []
+    with patch("app.services.assessment_conversation_ai.ask_ai", side_effect=lambda *_args, **_kwargs: next(generated)):
+        for question in ("Ok what next?", "Anything worrying so far?", "Why?", "Is that a vulnerability?", "So are we secure?"):
+            update, message = _text(question, user_id)
+            asyncio.run(scan_target_handler(update, context))
+            answers.append(message.reply_text.call_args_list[-1].args[0])
+
+    stored = list_recent_messages(user_id, conversation_id)
+    fallback_reasons = [
+        item.get("metadata", {}).get("fallback_reason")
+        for item in stored
+        if item.get("role") == "assistant" and item.get("content") in answers
+    ]
+    assert "Katana next" in answers[0]
+    assert "httpx next" not in answers[0]
+    assert "Gitleaks" not in answers[0] and "Prowler" not in answers[0]
+    assert "worth investigating" in answers[1]
+    assert "does not by itself establish" in answers[1]
+    assert "Katana was suggested because" in answers[2]
+    assert "not enough to conclude" in answers[3]
+    assert "not enough to conclude" in answers[4]
+    assert all("withheld" not in answer.lower() for answer in answers)
+    assert all(reason == "grounded_conversation_fallback" for reason in fallback_reasons)
+    assert [item["content"] for item in stored if item["role"] == "user"][-5:] == [
+        "Ok what next?", "Anything worrying so far?", "Why?", "Is that a vulnerability?", "So are we secure?",
+    ]
 
 
 def test_ai_failure_preserves_user_and_persists_safe_fallback() -> None:

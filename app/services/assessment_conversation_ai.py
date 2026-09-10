@@ -31,7 +31,8 @@ PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER = (
     "explicit user review and approval."
 )
 UNSUPPORTED_CONVERSATION_CLAIM_PATTERNS = (
-    re.compile(r"\b(?:target|host|system|application|site|service|aws account|cloud account|environment|resource)\s+(?:is|appears|looks|seems)\s+(?:safe|secure|hardened|protected|vulnerable|exploitable|compromised)\b"),
+    re.compile(r"\b(?:target|host|system|application|site|service|aws account|cloud account|environment|resource)\s+(?:is|appears|looks|seems)\s+(?:safe|secure|insecure|hardened|protected|vulnerable|exploitable|compromised)\b"),
+    re.compile(r"\b(?:this|that)\s+(?:is|appears|looks|seems)\s+(?:a\s+)?(?:vulnerability|exploit|compromise)\b"),
     re.compile(r"\b(?:no|zero)\s+(?:vulnerabilities|security issues|security risks|misconfigurations|attack paths)\s+(?:exist|were found|were detected|are present)\b"),
     re.compile(r"\b(?:exploit|exploitation)\s+(?:succeeded|worked|was successful)\b"),
     re.compile(r"\b(?:target|host|system|repository|environment|resource)\s+(?:was|is|has been)\s+(?:compromised|owned|exploited)\b"),
@@ -975,10 +976,78 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
                 "The appropriate Mongrel capture or PCAP-analysis mode depends on the traffic available. This is a "
                 "recommendation only; it does not claim packets exist or run a capture."
             )
+        if preferred == ["katana"]:
+            return (
+                "I would use Mongrel's Katana next. Stored evidence identifies a web-associated service surface and "
+                "httpx has already been completed, while no Katana crawl coverage is stored. Katana can add observed "
+                "URLs, paths, forms, and linked resources. That would expand coverage; it would not by itself prove a "
+                "vulnerability, and this answer does not run the tool."
+            )
+        if preferred == ["playwright"]:
+            return (
+                "I would use Mongrel's Playwright next because no stored browser-observation coverage is present for "
+                "the observed web surface. It can record rendered pages and browser-visible behavior. That is an "
+                "investigation recommendation, not a vulnerability claim, and this answer runs nothing."
+            )
+        if preferred == ["ffuf"]:
+            return (
+                "I would use Mongrel's ffuf next because bounded path-discovery coverage is not stored for the observed "
+                "web surface. Its path, status, and size observations could close that gap, but would not automatically "
+                "prove sensitive exposure or a vulnerability. This answer runs nothing."
+            )
+    if intent == "significance_interpretation":
+        recommendation = context.get("recommendation_context") or {}
+        if recommendation.get("web_services_observed_by_nmap"):
+            completed = {str(tool) for tool in recommendation.get("completed_tools") or []}
+            gaps = [tool for tool in ("katana", "playwright", "ffuf") if tool not in completed]
+            gap_text = (
+                " Web-application coverage remains incomplete because no stored results exist for "
+                + ", ".join(gaps)
+                + "."
+                if gaps
+                else ""
+            )
+            return (
+                "The observed web-associated service surface is worth investigating, but the stored evidence does not "
+                "by itself establish a confirmed vulnerability, exploitability, or compromise."
+                + gap_text
+                + " That means there is relevant attack surface and remaining uncertainty, not proof that the target is safe or vulnerable."
+            )
+    if intent in {"follow_up_reference", "explanation"}:
+        follow_up = _build_follow_up_fallback(context)
+        if follow_up:
+            return follow_up
     if intent == "uncertainty_safety":
         return (
             "The stored assessment evidence is not enough to conclude that the target is secure or vulnerable overall. "
             "It establishes only the observations recorded by completed tools; untested areas remain evidence gaps."
+        )
+    return None
+
+
+def _build_follow_up_fallback(context: dict) -> str | None:
+    messages = ((context.get("conversation") or {}).get("recent_messages") or [])
+    previous = next(
+        (
+            str(message.get("content") or "")
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "assistant"
+        ),
+        "",
+    ).lower()
+    recommendation = context.get("recommendation_context") or {}
+    completed = {str(tool) for tool in recommendation.get("completed_tools") or []}
+    if "katana" in previous and "katana" not in completed:
+        return (
+            "Katana was suggested because stored evidence identifies a web-associated surface, but no Katana crawl "
+            "coverage is stored. It can add observed URLs, paths, forms, and linked resources. Those observations would "
+            "improve coverage; they would not by themselves prove a vulnerability, and this answer runs nothing."
+        )
+    if "httpx" in previous and "httpx" not in completed:
+        return (
+            "httpx was suggested because stored Nmap evidence identifies a web-associated surface, while no httpx "
+            "response observations are stored. It can characterize responding HTTP(S) endpoints; that would fill an "
+            "evidence gap, not prove a vulnerability, and this answer runs nothing."
         )
     return None
 

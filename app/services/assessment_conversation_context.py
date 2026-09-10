@@ -104,7 +104,10 @@ FOLLOW_UP_PATTERNS = (
 PRIORITIZATION_TERMS = ("which one first", "what first", "prioriti", "highest priority", "most important")
 COVERAGE_GAP_TERMS = ("anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing")
 SIGNIFICANCE_TERMS = ("anything worrying", "is that bad", "does that matter", "how serious", "why should i care")
-UNCERTAINTY_TERMS = ("are we secure", "is it secure", "do we know it's vulnerable", "do we know it is vulnerable", "is it vulnerable", "are we safe")
+UNCERTAINTY_TERMS = (
+    "are we secure", "is it secure", "do we know it's vulnerable", "do we know it is vulnerable", "is it vulnerable",
+    "is that a vulnerability", "does that mean it is vulnerable", "does that mean it's vulnerable", "are we safe",
+)
 SIMPLIFY_TERMS = ("like i'm new", "like i am new", "simply", "simple terms", "plain english", "beginner")
 
 
@@ -488,7 +491,7 @@ def _build_recommendation_context(
     novice_intent = any(term in normalized_question for term in NOVICE_QUESTION_TERMS)
     preferred_next_tools = []
     rationale = []
-    if traffic_intent:
+    if traffic_intent and "tshark" not in completed_tools:
         preferred_next_tools.append("tshark")
         rationale.append("TShark is Mongrel's packet/capture capability; explain the mode that addresses the evidence gap without claiming packets already exist.")
     elif web_services_observed and "httpx" not in completed_tools and (
@@ -497,6 +500,25 @@ def _build_recommendation_context(
     ):
         preferred_next_tools.append("httpx")
         rationale.append("Nmap already identified web-associated exposed services; httpx can test which HTTP(S) endpoints respond and characterize them.")
+    elif web_services_observed and question_intent in {"next_step_recommendation", "prioritization"}:
+        if "katana" not in completed_tools:
+            preferred_next_tools.append("katana")
+            rationale.append(
+                "The assessment has a web-associated surface and httpx coverage, but no stored Katana crawl coverage; "
+                "Katana can add URL, path, form, and linked-resource observations."
+            )
+        elif "playwright" not in completed_tools:
+            preferred_next_tools.append("playwright")
+            rationale.append(
+                "The assessment has web discovery coverage but no stored browser-observation coverage; Playwright can "
+                "observe rendered pages and browser-visible behavior."
+            )
+        elif "ffuf" not in completed_tools:
+            preferred_next_tools.append("ffuf")
+            rationale.append(
+                "The assessment has web characterization and crawl coverage but no stored bounded path-discovery "
+                "coverage; ffuf can add path/status/size observations."
+            )
 
     return {
         "completed_tools": completed_tools,
