@@ -233,7 +233,7 @@ def test_live_test1_conversation_recovers_safe_answers_through_telegram_path() -
     assert "worth investigating" in answers[1]
     assert "does not by itself establish" in answers[1]
     assert "Katana was suggested because" in answers[2]
-    assert "not enough to conclude" in answers[3]
+    assert "confirmed vulnerability" in answers[3]
     assert "not enough to conclude" in answers[4]
     assert all("withheld" not in answer.lower() for answer in answers)
     assert all(reason == "grounded_conversation_fallback" for reason in fallback_reasons)

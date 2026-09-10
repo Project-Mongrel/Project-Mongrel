@@ -116,7 +116,11 @@ UNCERTAINTY_PATTERNS = (
     re.compile(r"\bis\s+(?:this|that|it)\s+(?:a\s+)?vulnerability\b"),
     re.compile(r"\bdoes\s+(?:this|that|it)\s+mean\s+(?:(?:it\s+is|it'?s)\s+)?vulnerable\b"),
     re.compile(r"\bcan\s+(?:this|that|it)\s+be\s+exploit(?:ed|able)\b"),
+    re.compile(r"\bcould\s+(?:someone|an?\s+attacker)\s+exploit\s+(?:this|that|it)\b"),
+    re.compile(r"\bcan\s+an?\s+attacker\s+(?:actually\s+)?use\s+(?:this|that|it)\b"),
     re.compile(r"\bare\s+we\s+(?:safe|secure)\b"),
+    re.compile(r"\bis\s+(?:the\s+)?(?:site|target|system|application)\s+(?:safe|secure)\b"),
+    re.compile(r"\b(?:so\s+)?everything\s+is\s+safe\b"),
 )
 SIMPLIFY_TERMS = ("like i'm new", "like i am new", "simply", "simple terms", "plain english", "beginner")
 
@@ -140,6 +144,7 @@ def build_assessment_conversation_context(
     )
     selected_tools = detect_question_tools(question)
     question_intent = classify_assessment_conversation_intent(question, selected_tools=selected_tools)
+    uncertainty_subtype = classify_uncertainty_subtype(question) if question_intent == "uncertainty_safety" else None
     full_assessment = not selected_tools
     evidence = _build_evidence_context(assessment_context, selected_tools)
     provenance = _build_provenance(
@@ -156,6 +161,7 @@ def build_assessment_conversation_context(
         "schema_version": CONTEXT_SCHEMA_VERSION,
         "current_question": str(question or "").strip(),
         "question_intent": question_intent,
+        "uncertainty_subtype": uncertainty_subtype,
         "priority_rules": [
             "current_user_question",
             "stored_normalized_assessment_evidence",
@@ -213,6 +219,8 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "product_self_knowledge"
     if "tshark" in tools and any(term in normalized for term in ("can mongrel", "can you", "what can")):
         return "individual_tool_explanation"
+    if classify_uncertainty_subtype(normalized):
+        return "uncertainty_safety"
     if any(term in normalized for term in ATTACKER_QUESTION_TERMS):
         return "attacker_informed_defensive_reasoning"
     if any(term in normalized for term in RECOMMENDATION_QUESTION_TERMS):
@@ -249,6 +257,17 @@ def _normalize_intent_text(question: str) -> str:
     for pattern, replacement in CASUAL_SECURITY_TERM_ALIASES:
         normalized = pattern.sub(replacement, normalized)
     return normalized
+
+
+def classify_uncertainty_subtype(question: str) -> str | None:
+    normalized = _normalize_intent_text(question)
+    if re.search(r"\b(?:exploit(?:ed|able)?|attacker\s+(?:actually\s+)?use)\b", normalized):
+        return "exploitability"
+    if re.search(r"\b(?:vulnerability|vulnerable)\b", normalized):
+        return "vulnerability"
+    if re.search(r"\b(?:safe|secure|security)\b", normalized):
+        return "overall_security"
+    return None
 
 
 def build_context_digest(context: dict) -> str:

@@ -6,6 +6,7 @@ from app.services.assessment_context import build_assessment_context
 from app.services.assessment_conversation_context import (
     build_assessment_conversation_context,
     classify_assessment_conversation_intent,
+    classify_uncertainty_subtype,
     detect_question_tools,
 )
 from app.services.assessment_conversation_store import append_message, create_conversation, update_summary_status
@@ -101,6 +102,25 @@ def test_natural_conversation_intents(question: str, expected: str) -> None:
 )
 def test_casual_security_uncertainty_variants_share_safe_intent(question: str) -> None:
     assert classify_assessment_conversation_intent(question) == "uncertainty_safety"
+
+
+@pytest.mark.parametrize(
+    ("question", "subtype"),
+    [
+        ("is that a vunerability?", "vulnerability"),
+        ("is that a vuln?", "vulnerability"),
+        ("does that mean its vulnerable?", "vulnerability"),
+        ("is it exploitable?", "exploitability"),
+        ("could someone exploit that?", "exploitability"),
+        ("can an attacker actually use that?", "exploitability"),
+        ("are we secure?", "overall_security"),
+        ("is the site secure?", "overall_security"),
+        ("so everything is safe?", "overall_security"),
+    ],
+)
+def test_uncertainty_subtypes_are_compact_and_semantic(question: str, subtype: str) -> None:
+    assert classify_assessment_conversation_intent(question) == "uncertainty_safety"
+    assert classify_uncertainty_subtype(question) == subtype
 
 
 def test_stored_summary_represents_older_conversation() -> None:

@@ -1018,10 +1018,48 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
         if follow_up:
             return follow_up
     if intent == "uncertainty_safety":
+        subtype = str(context.get("uncertainty_subtype") or "overall_security")
+        reference = _safe_uncertainty_reference(context)
+        if subtype == "vulnerability":
+            subject = reference or "the referenced observation"
+            return (
+                f"The stored evidence does not establish {subject} as a confirmed vulnerability. It is something worth "
+                "investigating, but further validation would be required before making that conclusion."
+            )
+        if subtype == "exploitability":
+            subject = reference or "the referenced observation"
+            if _metasploit_session_established(context):
+                return (
+                    f"The question alone does not establish that {subject} is exploitable. Stored Metasploit session "
+                    "evidence must be attributed to that specific observation before drawing such a conclusion; the "
+                    "reference in the conversation is not evidence of that link."
+                )
+            return (
+                f"The stored evidence does not establish {subject} as exploitable. No completed evidence currently "
+                "proves a successful exploitation path for it; further validation would be required before claiming exploitability."
+            )
         return (
             "The stored assessment evidence is not enough to conclude that the target is secure or vulnerable overall. "
             "It establishes only the observations recorded by completed tools; untested areas remain evidence gaps."
         )
+    return None
+
+
+def _safe_uncertainty_reference(context: dict) -> str | None:
+    messages = ((context.get("conversation") or {}).get("recent_messages") or [])
+    previous = next(
+        (
+            str(message.get("content") or "").lower()
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "assistant"
+        ),
+        "",
+    )
+    recommendation = context.get("recommendation_context") or {}
+    if recommendation.get("web_services_observed_by_nmap") and any(
+        phrase in previous for phrase in ("web-associated service surface", "web-associated surface", "web-facing surface")
+    ):
+        return "the observed web-associated service surface"
     return None
 
 

@@ -189,20 +189,23 @@ def test_natural_what_is_next_recovers_grounded_advice_from_unsafe_model_output(
 
 
 @pytest.mark.parametrize(
-    "question",
+    ("question", "expected"),
     [
-        "is that a vulnerability?",
-        "is that a vulnerabilty?",
-        "is that a vunerability?",
-        "is that a vuln?",
-        "does that mean its vulnerable?",
-        "can that be exploited?",
-        "can that be exploitible?",
-        "are we safe?",
-        "are we secure?",
+        ("is that a vulnerability?", "confirmed vulnerability"),
+        ("is that a vulnerabilty?", "confirmed vulnerability"),
+        ("is that a vunerability?", "confirmed vulnerability"),
+        ("is that a vuln?", "confirmed vulnerability"),
+        ("does that mean its vulnerable?", "confirmed vulnerability"),
+        ("can that be exploited?", "successful exploitation path"),
+        ("can that be exploitible?", "successful exploitation path"),
+        ("could someone exploit that?", "successful exploitation path"),
+        ("can an attacker actually use that?", "successful exploitation path"),
+        ("are we safe?", "secure or vulnerable overall"),
+        ("are we secure?", "secure or vulnerable overall"),
+        ("is the site secure?", "secure or vulnerable overall"),
     ],
 )
-def test_casual_uncertainty_questions_recover_bounded_answer(question: str) -> None:
+def test_casual_uncertainty_questions_recover_contextual_bounded_answer(question: str, expected: str) -> None:
     assessment = create_assessment("Casual uncertainty", user_id=1001)
     _add_nmap_scan(assessment["id"], user_id=1001, port=8080, service="http-proxy")
 
@@ -218,9 +221,41 @@ def test_casual_uncertainty_questions_recover_bounded_answer(question: str) -> N
         )
 
     assert result["fallback_reason"] == "grounded_conversation_fallback"
-    assert "not enough to conclude" in result["answer"]
-    assert "secure or vulnerable overall" in result["answer"]
+    assert expected in result["answer"]
     assert "withheld" not in result["answer"].lower()
+
+
+def test_uncertainty_reference_is_named_only_when_history_and_evidence_support_it() -> None:
+    assessment = create_assessment("Supported reference", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=8080, service="http-proxy")
+    conversation = create_conversation(assessment["id"], user_id=1001)
+    append_message(
+        conversation["id"], user_id=1001, role="assistant",
+        content="The observed web-associated service surface is worth investigating.",
+    )
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Yes, that is a vulnerability."):
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=conversation["id"],
+            question="Is that a vulnerability?",
+        )
+
+    assert "the observed web-associated service surface as a confirmed vulnerability" in result["answer"]
+
+
+def test_unresolved_uncertainty_reference_is_not_invented() -> None:
+    assessment = create_assessment("Unresolved reference", user_id=1001)
+    conversation = create_conversation(assessment["id"], user_id=1001)
+    append_message(conversation["id"], user_id=1001, role="assistant", content="That deserves another look.")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="The target is exploitable."):
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=conversation["id"],
+            question="Can that be exploited?",
+        )
+
+    assert "the referenced observation" in result["answer"]
+    assert "web-associated" not in result["answer"]
 
 
 @pytest.mark.parametrize("question", ["Why?", "Which one?", "What will that tell me?", "What did you mean by that?", "And 8080?"])
@@ -434,7 +469,7 @@ def test_unavailable_ai_response_produces_safe_fallback() -> None:
     assert result["fallback_reason"] == "ai_unavailable"
 
 
-def test_unsupported_broad_security_conclusion_is_withheld() -> None:
+def test_unsupported_broad_security_conclusion_is_replaced_with_bounded_uncertainty() -> None:
     assessment = create_assessment("Guarded", user_id=1001)
 
     with patch("app.services.assessment_conversation_ai.ask_ai", return_value="The target is secure. No vulnerabilities were found."):
@@ -445,8 +480,9 @@ def test_unsupported_broad_security_conclusion_is_withheld() -> None:
             question="Is this secure?",
         )
 
-    assert result["answer"] == TRUTHFULNESS_FALLBACK_ANSWER
-    assert result["fallback_reason"] == "truthfulness_guard"
+    assert "not enough to conclude" in result["answer"]
+    assert "secure or vulnerable overall" in result["answer"]
+    assert result["fallback_reason"] == "grounded_conversation_fallback"
 
 
 def test_guard_allows_evidence_scoped_negative_wording() -> None:
