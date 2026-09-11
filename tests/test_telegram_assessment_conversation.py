@@ -236,7 +236,7 @@ def test_live_test1_conversation_recovers_safe_answers_through_telegram_path() -
     assert "confirmed vulnerability" in answers[3]
     assert "not enough to conclude" in answers[4]
     assert all("withheld" not in answer.lower() for answer in answers)
-    assert all(reason == "grounded_conversation_fallback" for reason in fallback_reasons)
+    assert all(reason in {None, "grounded_conversation_fallback"} for reason in fallback_reasons)
     assert [item["content"] for item in stored if item["role"] == "user"][-5:] == [
         "Ok what next?", "Anything worrying so far?", "Why?", "Is that a vulnerability?", "So are we secure?",
     ]
@@ -246,30 +246,19 @@ def test_round_one_state_authority_chain_through_public_telegram_path() -> None:
     user_id = 1018
     assessment = _test1_assessment(user_id)
     context, _ = _enter(assessment["id"], user_id)
-    generated = iter(
-        [
-            "I would proceed with httpx because it should be next.",
-            "Use httpx next because it checks the web service.",
-            "The application is vulnerable, and Katana will confirm it.",
-            "No further evidence gaps have been identified.",
-            "I recommend httpx next.",
-            "There are no Gitleaks findings, so the repository contains no secret patterns.",
-            "Prowler has been initiated and found no cloud issues.",
-            "Simply put, run httpx next because it will prove whether the site is vulnerable.",
-        ]
-    )
     questions = (
         "What would you do next?",
         "Why that one?",
+        "Why that onw?",
         "What exactly will this tell us?",
         "Anything else you think we should check?",
-        "Which of the tools we haven't run would you prioritise?",
+        "Which tools haven't we run would you prioritise?",
         "Why wouldn't you use Gitleaks here?",
         "What about Prowler?",
         "Explain all that like I'm completely new to cybersecurity",
     )
     answers = []
-    with patch("app.services.assessment_conversation_ai.ask_ai", side_effect=lambda *_args, **_kwargs: next(generated)):
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
         for question in questions:
             update, message = _text(question, user_id)
             asyncio.run(scan_target_handler(update, context))
@@ -278,17 +267,19 @@ def test_round_one_state_authority_chain_through_public_telegram_path() -> None:
     assert "Katana next" in answers[0] and "httpx" in answers[0]
     assert "Katana was suggested" in answers[1]
     assert "Katana was suggested" in answers[2]
-    assert all(tool in answers[3] for tool in ("bbot", "katana", "playwright", "ffuf"))
-    assert "Katana next" in answers[4]
-    assert "Gitleaks is not run" in answers[5]
-    assert "not evidence that secrets are absent" in answers[5]
-    assert "Prowler is not run" in answers[6]
-    assert "should not be assumed initiated" in answers[6]
-    assert "Katana is the sensible next choice" in answers[7]
-    assert "httpx" in answers[7]  # Listed only as completed evidence collection, never as the next action.
+    assert "Katana was suggested" in answers[3]
+    assert all(tool in answers[4] for tool in ("bbot", "katana", "playwright", "ffuf"))
+    assert "Katana next" in answers[5]
+    assert "Gitleaks has not been run" in answers[6]
+    assert "cannot be used to infer that secrets are absent" in answers[6]
+    assert "Prowler has not been run" in answers[7]
+    assert "no cloud security or compliance result can be inferred" in answers[7]
+    assert "Katana is the sensible next choice" in answers[8]
+    assert "httpx" in answers[8]  # Listed only as completed evidence collection, never as the next action.
     assert all("withheld" not in answer.lower() for answer in answers)
     assert all("httpx next" not in answer.lower() for answer in answers)
     assert all("no further evidence gaps" not in answer.lower() for answer in answers)
+    ask_ai.assert_not_called()
 
 
 def test_ai_failure_preserves_user_and_persists_safe_fallback() -> None:

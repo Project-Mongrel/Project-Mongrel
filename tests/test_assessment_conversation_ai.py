@@ -273,6 +273,29 @@ def test_tool_state_contradictions_are_rejected_deterministically() -> None:
     assert violates_conversation_truthfulness("httpx is completed; I would use Katana next.", context) is False
 
 
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Nmap identified vulnerabilities.",
+        "httpx identified the target's security posture.",
+        "Nuclei identified vulnerabilities.",
+        "testssl.sh identified insecure configurations.",
+        "Metasploit identified vulnerabilities and weaknesses.",
+        "TShark detected suspicious activity.",
+    ],
+)
+def test_completed_tool_capabilities_cannot_be_rewritten_as_findings(claim: str) -> None:
+    assessment = create_assessment("Semantic guard", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=443, service="https")
+    for tool in ("nuclei", "httpx", "testssl", "metasploit", "tshark"):
+        record_assessment_scan(assessment["id"], tool=tool, status="completed")
+    context = build_assessment_conversation_context(
+        user_id=1001, assessment_id=assessment["id"], question="Summarise what the tools established.",
+    )
+
+    assert violates_conversation_truthfulness(claim, context) is True
+
+
 @pytest.mark.parametrize("question", ["Why?", "Which one?", "What will that tell me?", "What did you mean by that?", "And 8080?"])
 def test_short_followups_receive_bounded_persisted_history(question: str) -> None:
     assessment = create_assessment("Natural Follow-up", user_id=1001)
@@ -295,10 +318,14 @@ def test_short_followups_receive_bounded_persisted_history(question: str) -> Non
             question=question,
         )
 
-    prompt = ask_ai.call_args.args[0]
-    assert "I would investigate the web-associated surface with httpx next." in prompt
-    assert question in prompt
-    assert result["answer"] == response
+    if question in {"Why?", "Which one?", "What will that tell me?"}:
+        ask_ai.assert_not_called()
+        assert "httpx was suggested because" in result["answer"]
+    else:
+        prompt = ask_ai.call_args.args[0]
+        assert "I would investigate the web-associated surface with httpx next." in prompt
+        assert question in prompt
+        assert result["answer"] == response
     assert len(result["evidence_refs"]["history_message_ids"]) == 2
 
 

@@ -67,6 +67,12 @@ INSTALL_OR_RAW_COMMAND_PATTERNS = (
 )
 EVIDENCE_LANGUAGE_OVERCLAIM_PATTERNS = (
     re.compile(r"\bhttpx\b.{0,80}\b(?:proves?|confirms?|establishes?|shows?)\b.{0,60}\b(?:vulnerab|misconfigur)"),
+    re.compile(r"\bnmap\b.{0,80}\b(?:identified|found|detected|confirmed)\b.{0,50}\bvulnerab"),
+    re.compile(r"\bhttpx\b.{0,80}\b(?:identified|determined|assessed|showed)\b.{0,50}\b(?:security posture|vulnerab)"),
+    re.compile(r"\bnuclei\b.{0,80}\b(?:proved|confirmed|identified)\b.{0,50}\b(?:exploitab|vulnerab)"),
+    re.compile(r"\btestssl(?:\.sh)?\b.{0,80}\b(?:identified|confirmed|proved)\b.{0,50}\b(?:insecure|exploitab|vulnerab)"),
+    re.compile(r"\bmetasploit\b.{0,80}\b(?:identified|confirmed|proved)\b.{0,50}\b(?:weakness|exploitab|vulnerab|session|compromise)"),
+    re.compile(r"\btshark\b.{0,80}\b(?:detected|confirmed|proved)\b.{0,50}\b(?:suspicious activity|attack|exploit|compromise|tls success)"),
     re.compile(r"\btshark\b.{0,80}\b(?:will|can)\s+(?:prove|confirm|establish|determine|verify)\b.{0,80}\b(?:encryption security|secure encryption|exploitab|compromise|application security|vulnerab)"),
     re.compile(r"\b(?:two|2)\s+(?:independent(?:ly discovered)?\s+)?hosts?\b.{0,100}\b(?:hostname|domain)\b.{0,100}\b(?:resolved\s+)?ip\b"),
     re.compile(r"\bscoutsuite\s*/\s*prowler\b"),
@@ -123,6 +129,7 @@ def answer_assessment_conversation_question(
         or _build_direct_httpx_evidence_answer(context)
         or _build_direct_testssl_evidence_answer(context)
         or _build_direct_tshark_evidence_answer(context)
+        or _build_state_grounded_answer(context)
     )
     if direct_evidence_answer:
         return _result(
@@ -964,6 +971,62 @@ def _plain_value(value: object) -> str:
     return str(value)
 
 
+def _build_state_grounded_answer(context: dict) -> str | None:
+    intent = str(context.get("question_intent") or "")
+    question = str(context.get("current_question") or "").lower()
+    recommendation = context.get("recommendation_context") or {}
+    states = recommendation.get("tool_states") or {}
+    preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
+    if intent in {"next_step_recommendation", "prioritization"} and preferred not in (["httpx"], ["tshark"]):
+        return _build_grounded_conversational_fallback(context)
+    if intent == "remaining_coverage_gaps":
+        return _build_grounded_conversational_fallback(context)
+    if intent == "simplify_explanation" and states.get("httpx") == "COMPLETED":
+        return _build_grounded_conversational_fallback(context)
+    if intent == "follow_up_reference" and re.search(
+        r"\b(?:why|which one|what (?:exactly )?(?:will|would) (?:this|that) (?:tell|show|mean))\b", question
+    ):
+        return _build_follow_up_fallback(context)
+    if intent == "individual_tool_explanation" and (
+        "what about" in question or re.search(r"\bwhy\s+(?:not|wouldn'?t|would not)\b", question)
+    ):
+        return _build_individual_tool_state_answer(context)
+    return None
+
+
+def _build_individual_tool_state_answer(context: dict) -> str | None:
+    selected = [str(tool) for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    if not selected:
+        return None
+    tool = selected[0]
+    recommendation = context.get("recommendation_context") or {}
+    state = str((recommendation.get("tool_states") or {}).get(tool, "NOT_RUN"))
+    names = {name.lower().removesuffix(".sh"): name for name in get_mongrel_tool_names()}
+    display = names.get(tool, tool)
+    state_sentence = {
+        "NOT_RUN": f"{display} has not been run in this assessment.",
+        "COMPLETED": f"{display} is recorded as completed in this assessment.",
+        "PARTIAL": f"{display} has partial or interrupted assessment state.",
+        "FAILED": f"{display} is recorded as failed in this assessment.",
+        "SKIPPED": f"{display} is recorded as skipped in this assessment.",
+    }.get(state, f"{display} has assessment state {state}.")
+    if tool == "gitleaks":
+        return (
+            state_sentence
+            + " Gitleaks scans an authorized repository or filesystem input for secret-pattern matches. The current "
+            "domain evidence does not establish suitable repository or filesystem input, and its not-run state cannot "
+            "be used to infer that secrets are absent."
+        )
+    if tool == "prowler":
+        return (
+            state_sentence
+            + " Prowler performs cloud security and configuration checks using authorized cloud context and credentials. "
+            "The current domain evidence does not establish that context, and no cloud security or compliance result can be inferred."
+        )
+    capability = str((context.get("mongrel_capabilities") or {}).get(tool) or "")
+    return state_sentence + (" " + capability if capability else "")
+
+
 def _build_grounded_conversational_fallback(context: dict) -> str | None:
     attacker_answer = _build_attacker_reasoning_fallback(context)
     if attacker_answer:
@@ -973,21 +1036,13 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
     recommendation = context.get("recommendation_context") or {}
     states = {str(tool): str(state) for tool, state in (recommendation.get("tool_states") or {}).items()}
     selected = [str(tool) for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
-    if intent == "individual_tool_explanation" and selected:
-        tool = selected[0]
-        state = states.get(tool, "NOT_RUN")
-        if tool == "gitleaks":
-            return (
-                f"Gitleaks is {state.replace('_', ' ').lower()} in this assessment. It scans an authorized repository "
-                "or filesystem input for secret-pattern matches; a domain target alone does not provide that input. "
-                "Because it has not run here, there are no Gitleaks results to interpret—not evidence that secrets are absent."
-            )
-        if tool == "prowler":
-            return (
-                f"Prowler is {state.replace('_', ' ').lower()} in this assessment. It evaluates supported cloud checks "
-                "against an authorized cloud context and credentials. This domain assessment does not establish that "
-                "cloud context, so Prowler should not be assumed initiated and no Prowler result can be inferred."
-            )
+    question = str(context.get("current_question") or "").lower()
+    if intent == "individual_tool_explanation" and selected and (
+        "what about" in question or re.search(r"\bwhy\s+(?:not|wouldn'?t|would not)\b", question)
+    ):
+        tool_state_answer = _build_individual_tool_state_answer(context)
+        if tool_state_answer:
+            return tool_state_answer
     if intent in {"next_step_recommendation", "prioritization"}:
         preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
         if preferred == ["httpx"]:

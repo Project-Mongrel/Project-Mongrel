@@ -115,6 +115,7 @@ UNCERTAINTY_TERMS = (
 CASUAL_SECURITY_TERM_ALIASES = (
     (re.compile(r"\b(?:vulnerabilty|vunerability|vuln)\b"), "vulnerability"),
     (re.compile(r"\bexploitible\b"), "exploitable"),
+    (re.compile(r"\bonw\b"), "one"),
 )
 UNCERTAINTY_PATTERNS = (
     re.compile(r"\bis\s+(?:this|that|it)\s+(?:a\s+)?vulnerability\b"),
