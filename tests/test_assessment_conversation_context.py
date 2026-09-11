@@ -123,6 +123,48 @@ def test_uncertainty_subtypes_are_compact_and_semantic(question: str, subtype: s
     assert classify_uncertainty_subtype(question) == subtype
 
 
+@pytest.mark.parametrize(
+    ("question", "intent"),
+    [
+        ("what next?", "next_step_recommendation"),
+        ("what would you do next?", "next_step_recommendation"),
+        ("what should we do?", "next_step_recommendation"),
+        ("where do we go from here?", "next_step_recommendation"),
+        ("which tool next?", "next_step_recommendation"),
+        ("what haven't we done?", "remaining_coverage_gaps"),
+        ("anything else?", "remaining_coverage_gaps"),
+        ("what remains?", "remaining_coverage_gaps"),
+        ("What exactly will this tell us?", "follow_up_reference"),
+        ("And after that?", "follow_up_reference"),
+        ("Why wouldn't you use Gitleaks here?", "individual_tool_explanation"),
+        ("What about Prowler?", "individual_tool_explanation"),
+    ],
+)
+def test_state_aware_conversation_phrase_variants(question: str, intent: str) -> None:
+    assert classify_assessment_conversation_intent(question) == intent
+
+
+def test_context_carries_explicit_authoritative_state_for_all_tools() -> None:
+    assessment = create_assessment("Tool states", user_id=1001)
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed")
+    record_assessment_scan(assessment["id"], tool="bbot", status="partial")
+    record_assessment_scan(assessment["id"], tool="nuclei", status="failed")
+    record_assessment_scan(assessment["id"], tool="prowler", status="skipped")
+
+    context = build_assessment_conversation_context(
+        user_id=1001, assessment_id=assessment["id"], question="What remains?",
+    )
+
+    states = context["recommendation_context"]["tool_states"]
+    assert len(states) == 12
+    assert states["nmap"] == "COMPLETED"
+    assert states["bbot"] == "PARTIAL"
+    assert states["nuclei"] == "FAILED"
+    assert states["prowler"] == "SKIPPED"
+    assert states["httpx"] == "NOT_RUN"
+    assert states["testssl"] == "NOT_RUN"
+
+
 def test_stored_summary_represents_older_conversation() -> None:
     assessment = create_assessment("Summary Context", user_id=1001)
     conversation = create_conversation(assessment["id"], user_id=1001)

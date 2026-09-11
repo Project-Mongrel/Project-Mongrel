@@ -12,7 +12,7 @@ from app.services.assessment_conversation_store import (
 )
 from app.services.assessment_guard import build_assessment_guard, build_guard_prompt_section
 from app.services.assessment_store import get_user_assessment
-from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile
+from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile, get_mongrel_tool_names
 
 CONTEXT_SCHEMA_VERSION = "assessment_conversation_context.v1"
 DEFAULT_RECENT_MESSAGE_LIMIT = 8
@@ -79,7 +79,7 @@ TELEGRAM_CAPABILITY_GUIDANCE = {
 }
 WEB_QUESTION_TERMS = ("web", "website", "http", "https", "url", "endpoint", "service", "services")
 TRAFFIC_QUESTION_TERMS = ("traffic", "packet", "packets", "pcap", "capture", "network conversation")
-NOVICE_QUESTION_TERMS = ("novice", "beginner", "don't know", "do not know", "new to", "what should i do next")
+NOVICE_QUESTION_TERMS = ("novice", "beginner", "don't know", "do not know", "new to", "completely new", "what should i do next")
 WEB_SERVICE_PORTS = {80, 443, 8080, 8443}
 PRODUCT_QUESTION_PATTERNS = (
     "what can mongrel", "what does mongrel do", "what are your tools", "what tools do you have",
@@ -87,7 +87,8 @@ PRODUCT_QUESTION_PATTERNS = (
 )
 RECOMMENDATION_QUESTION_TERMS = (
     "what next", "what is next", "do next", "run next", "should i run", "which tool", "which mongrel tool",
-    "recommend", "what would you investigate", "would you investigate", "how do i investigate",
+    "recommend", "what would you investigate", "would you investigate", "how do i investigate", "what should we do",
+    "where do we go from here", "where should we go from here",
 )
 ASSESSMENT_QUESTION_TERMS = ("what did", "what was found", "what have we found", "current assessment", "assessment evidence", "scan result")
 SECURITY_CONCEPT_TERMS = (
@@ -98,11 +99,14 @@ ATTACKER_QUESTION_TERMS = ("think like an attacker", "attacker", "attack path", 
 TOOL_EXPLANATION_TERMS = ("what does", "why would i use", "what can", "explain", "what is")
 FOLLOW_UP_PATTERNS = (
     r"^(?:and\s+)?(?:why|why (?:that|this) one|which one|after that|what do you mean|what did you mean by that)\??$",
-    r"^(?:and\s+)?what (?:will|would) that (?:tell|show|mean)(?: me)?\??$",
+    r"^(?:and\s+)?what (?:exactly\s+)?(?:will|would) (?:this|that) (?:tell|show|mean)(?: me| us)?\??$",
     r"^and (?:what about )?(?:port\s+)?\d{1,5}\??$",
 )
 PRIORITIZATION_TERMS = ("which one first", "what first", "prioriti", "highest priority", "most important")
-COVERAGE_GAP_TERMS = ("anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing")
+COVERAGE_GAP_TERMS = (
+    "anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing",
+    "what haven't we done", "what have we not done", "what remains",
+)
 SIGNIFICANCE_TERMS = ("anything worrying", "is that bad", "does that matter", "how serious", "why should i care")
 UNCERTAINTY_TERMS = (
     "are we secure", "is it secure", "do we know it's vulnerable", "do we know it is vulnerable", "is it vulnerable",
@@ -122,7 +126,7 @@ UNCERTAINTY_PATTERNS = (
     re.compile(r"\bis\s+(?:the\s+)?(?:site|target|system|application)\s+(?:safe|secure)\b"),
     re.compile(r"\b(?:so\s+)?everything\s+is\s+safe\b"),
 )
-SIMPLIFY_TERMS = ("like i'm new", "like i am new", "simply", "simple terms", "plain english", "beginner")
+SIMPLIFY_TERMS = ("like i'm new", "like i am new", "new to cybersecurity", "completely new", "simply", "simple terms", "plain english", "beginner")
 
 
 def build_assessment_conversation_context(
@@ -241,6 +245,8 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "simplify_explanation"
     if any(re.search(pattern, normalized) for pattern in FOLLOW_UP_PATTERNS):
         return "follow_up_reference"
+    if tools and ("what about" in normalized or re.search(r"\bwhy\s+(?:wouldn'?t|would not)\s+(?:you|we)\s+use\b", normalized)):
+        return "individual_tool_explanation"
     if tools and any(term in normalized for term in TOOL_EXPLANATION_TERMS):
         return "individual_tool_explanation"
     if any(term in normalized for term in ASSESSMENT_QUESTION_TERMS):
@@ -517,11 +523,26 @@ def _build_recommendation_context(
     question_intent: str = "current_assessment_evidence",
 ) -> dict:
     normalized_question = str(question or "").lower()
-    completed_tools = []
+    tool_states = {_normalize_tool(name): "NOT_RUN" for name in get_mongrel_tool_names()}
     for scan in assessment_context.get("scans") or []:
         tool = _normalize_tool(scan.get("tool"))
-        if str(scan.get("status") or "").lower() == "completed" and tool and tool not in completed_tools:
-            completed_tools.append(tool)
+        if tool not in tool_states:
+            continue
+        status = str(scan.get("status") or "").strip().lower()
+        tool_states[tool] = {
+            "completed": "COMPLETED",
+            "partial": "PARTIAL",
+            "active": "PARTIAL",
+            "running": "PARTIAL",
+            "in_progress": "PARTIAL",
+            "interrupted": "PARTIAL",
+            "failed": "FAILED",
+            "error": "FAILED",
+            "skipped": "SKIPPED",
+            "cancelled": "SKIPPED",
+            "canceled": "SKIPPED",
+        }.get(status, "PARTIAL" if status else "NOT_RUN")
+    completed_tools = [tool for tool, state in tool_states.items() if state == "COMPLETED"]
 
     web_services_observed = _has_nmap_web_service(assessment_context)
     traffic_intent = any(term in normalized_question for term in TRAFFIC_QUESTION_TERMS)
@@ -559,7 +580,13 @@ def _build_recommendation_context(
             )
 
     return {
+        "tool_states": tool_states,
         "completed_tools": completed_tools,
+        "relevant_unperformed_tools": [
+            tool for tool in ("bbot", "katana", "playwright", "ffuf") if tool_states.get(tool) != "COMPLETED"
+        ] if web_services_observed else [],
+        "repository_context_present": False,
+        "cloud_context_present": False,
         "web_services_observed_by_nmap": web_services_observed,
         "question_intents": {"web": web_intent, "traffic": traffic_intent, "novice": novice_intent},
         "preferred_next_tools": preferred_next_tools,

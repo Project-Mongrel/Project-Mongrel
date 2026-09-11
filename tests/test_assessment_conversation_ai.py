@@ -258,6 +258,21 @@ def test_unresolved_uncertainty_reference_is_not_invented() -> None:
     assert "web-associated" not in result["answer"]
 
 
+def test_tool_state_contradictions_are_rejected_deterministically() -> None:
+    assessment = create_assessment("State guard", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=443, service="https")
+    record_assessment_scan(assessment["id"], tool="httpx", status="completed")
+    context = build_assessment_conversation_context(
+        user_id=1001, assessment_id=assessment["id"], question="What would you do next?",
+    )
+
+    assert violates_conversation_truthfulness("I recommend httpx next.", context) is True
+    assert violates_conversation_truthfulness("Prowler has been initiated.", context) is True
+    assert violates_conversation_truthfulness("There are no Gitleaks findings.", context) is True
+    assert violates_conversation_truthfulness("No further evidence gaps have been identified.", context) is True
+    assert violates_conversation_truthfulness("httpx is completed; I would use Katana next.", context) is False
+
+
 @pytest.mark.parametrize("question", ["Why?", "Which one?", "What will that tell me?", "What did you mean by that?", "And 8080?"])
 def test_short_followups_receive_bounded_persisted_history(question: str) -> None:
     assessment = create_assessment("Natural Follow-up", user_id=1001)

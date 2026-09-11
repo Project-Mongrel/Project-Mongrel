@@ -290,6 +290,8 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
         return True
     if _claims_unrun_tool(normalized, context or {}):
         return True
+    if _contradicts_assessment_tool_state(normalized, context or {}):
+        return True
     if OWASP_MAPPING_PATTERN.search(normalized) and not _owasp_mapping_supported(context or {}):
         return True
     if SESSION_CLAIM_PATTERN.search(normalized) and not _metasploit_session_established(context or {}):
@@ -400,12 +402,19 @@ def _build_prompt_context(context: dict) -> dict:
             for name, details in (profile.get("tools") or {}).items()
             if name.lower().removesuffix(".sh") in selected
         }
+        states = recommendation.get("tool_states") or {}
+        prompt_context["selected_tool_state"] = {tool: states.get(tool, "NOT_RUN") for tool in selected}
         return prompt_context
     if intent == "security_concept":
         prompt_context["concepts"] = profile.get("security_knowledge") or []
         return prompt_context
 
     prompt_context["stored_evidence"] = _evidence_for_generation(assessment_context, intent)
+    if intent in {
+        "next_step_recommendation", "prioritization", "remaining_coverage_gaps", "follow_up_reference",
+        "explanation", "simplify_explanation",
+    }:
+        prompt_context["tool_state"] = recommendation.get("tool_states") or {}
     semantics = get_represented_evidence_semantics(assessment_context.get("findings") or [])
     if semantics:
         prompt_context["evidence_semantics"] = semantics
@@ -961,8 +970,25 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
         return attacker_answer
 
     intent = str(context.get("question_intent") or "")
+    recommendation = context.get("recommendation_context") or {}
+    states = {str(tool): str(state) for tool, state in (recommendation.get("tool_states") or {}).items()}
+    selected = [str(tool) for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    if intent == "individual_tool_explanation" and selected:
+        tool = selected[0]
+        state = states.get(tool, "NOT_RUN")
+        if tool == "gitleaks":
+            return (
+                f"Gitleaks is {state.replace('_', ' ').lower()} in this assessment. It scans an authorized repository "
+                "or filesystem input for secret-pattern matches; a domain target alone does not provide that input. "
+                "Because it has not run here, there are no Gitleaks results to interpret—not evidence that secrets are absent."
+            )
+        if tool == "prowler":
+            return (
+                f"Prowler is {state.replace('_', ' ').lower()} in this assessment. It evaluates supported cloud checks "
+                "against an authorized cloud context and credentials. This domain assessment does not establish that "
+                "cloud context, so Prowler should not be assumed initiated and no Prowler result can be inferred."
+            )
     if intent in {"next_step_recommendation", "prioritization"}:
-        recommendation = context.get("recommendation_context") or {}
         preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
         if preferred == ["httpx"]:
             return (
@@ -996,7 +1022,6 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
                 "prove sensitive exposure or a vulnerability. This answer runs nothing."
             )
     if intent == "significance_interpretation":
-        recommendation = context.get("recommendation_context") or {}
         if recommendation.get("web_services_observed_by_nmap"):
             completed = {str(tool) for tool in recommendation.get("completed_tools") or []}
             gaps = [tool for tool in ("katana", "playwright", "ffuf") if tool not in completed]
@@ -1017,6 +1042,28 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
         follow_up = _build_follow_up_fallback(context)
         if follow_up:
             return follow_up
+    if intent == "remaining_coverage_gaps":
+        gaps = [str(tool) for tool in recommendation.get("relevant_unperformed_tools") or []]
+        if gaps:
+            return (
+                "Relevant coverage remains incomplete. The stored assessment state shows "
+                + ", ".join(gaps)
+                + " have not been completed. For this web target, Katana, Playwright, and ffuf cover different web "
+                "discovery or browser-observation gaps; BBOT can add bounded reconnaissance. Gitleaks and Prowler are "
+                "not automatically appropriate without repository or cloud context."
+            )
+    if intent == "simplify_explanation":
+        completed = [tool for tool, state in states.items() if state == "COMPLETED"]
+        gaps = [str(tool) for tool in recommendation.get("relevant_unperformed_tools") or []]
+        if recommendation.get("web_services_observed_by_nmap"):
+            return (
+                "In simple terms: Mongrel has already collected evidence with "
+                + ", ".join(completed)
+                + ". That evidence shows a web-associated surface worth examining, but it does not prove a vulnerability "
+                "or that the target is safe. Useful web coverage is still missing from "
+                + ", ".join(gaps)
+                + ". Katana is the sensible next choice because it can discover reachable pages and paths; it has not run yet."
+            )
     if intent == "uncertainty_safety":
         subtype = str(context.get("uncertainty_subtype") or "overall_security")
         reference = _safe_uncertainty_reference(context)
@@ -1076,6 +1123,12 @@ def _build_follow_up_fallback(context: dict) -> str | None:
     recommendation = context.get("recommendation_context") or {}
     completed = {str(tool) for tool in recommendation.get("completed_tools") or []}
     if "katana" in previous and "katana" not in completed:
+        if re.search(r"\bafter (?:this|that)\b", str(context.get("current_question") or "").lower()):
+            return (
+                "After Katana has added crawl observations, I would review what it found before choosing another action. "
+                "If browser-rendered behavior is still an evidence gap, Mongrel's Playwright would be a reasonable next "
+                "investigation. That is a conditional recommendation; neither tool is run by this answer."
+            )
         return (
             "Katana was suggested because stored evidence identifies a web-associated surface, but no Katana crawl "
             "coverage is stored. It can add observed URLs, paths, forms, and linked resources. Those observations would "
@@ -1143,6 +1196,49 @@ def _claims_unrun_tool(answer: str, context: dict) -> bool:
             continue
         if tool not in supported_tools:
             return True
+    return False
+
+
+def _contradicts_assessment_tool_state(answer: str, context: dict) -> bool:
+    recommendation = context.get("recommendation_context") or {}
+    states = {
+        str(tool).lower().removesuffix(".sh"): str(state)
+        for tool, state in (recommendation.get("tool_states") or {}).items()
+    }
+    recommended_tools = {
+        match.lower().removesuffix(".sh")
+        for match in re.findall(
+            r"\b(?:recommend|use|run|try|choose|proceed with|start with)\s+(?:mongrel(?:'s)?\s+)?(?:the\s+)?(?:run\s+)?"
+            r"(nmap|bbot|nuclei|httpx|playwright|katana|ffuf|testssl(?:\.sh)?|gitleaks|prowler|metasploit|tshark)\b",
+            answer,
+        )
+    }
+    for tool, state in states.items():
+        display = r"testssl(?:\.sh)?" if tool == "testssl" else re.escape(tool)
+        if state == "NOT_RUN":
+            false_state = re.search(
+                rf"(?:\b{display}\b.{{0,80}}\b(?:was initiated|has been initiated|ran|was run|completed|scanned|"
+                r"found no|no findings|nothing found|no secrets|no cloud issues)\b|"
+                rf"\b(?:no|zero)\s+{display}\s+(?:findings|results|issues|secrets)\b)",
+                answer,
+            )
+            if false_state and not re.search(
+                rf"\b{display}\b.{{0,45}}\b(?:not|never|hasn'?t|has not|wasn'?t|was not|didn'?t|did not)\b",
+                false_state.group(0),
+            ):
+                return True
+        if state == "COMPLETED" and not re.search(r"\b(?:re-?run|run again|repeat|recheck|re-scan)\b", answer):
+            completed_as_next = re.search(
+                rf"\b{display}\b\s+(?:(?:is|should be)\s+)?next\b",
+                answer,
+            )
+            if context.get("question_intent") in {"next_step_recommendation", "prioritization"}:
+                completed_as_next = completed_as_next or tool in recommended_tools
+            if completed_as_next and not re.search(rf"\b(?:do not|don'?t|wouldn'?t|would not)\b.{{0,35}}\b{display}\b", answer):
+                return True
+    relevant_gaps = recommendation.get("relevant_unperformed_tools") or []
+    if relevant_gaps and re.search(r"\b(?:no|not any)\s+(?:further\s+)?(?:evidence\s+|coverage\s+)?gaps?\b|\bnothing (?:else )?(?:remains|to check)\b", answer):
+        return True
     return False
 
 
