@@ -116,6 +116,15 @@ CASUAL_SECURITY_TERM_ALIASES = (
     (re.compile(r"\b(?:vulnerabilty|vunerability|vuln)\b"), "vulnerability"),
     (re.compile(r"\bexploitible\b"), "exploitable"),
     (re.compile(r"\bonw\b"), "one"),
+    (re.compile(r"\bwouldnt\b"), "wouldn't"),
+)
+TOOL_RELEVANCE_PATTERNS = (
+    re.compile(r"\b(?:why|what)\s+wouldn'?t\s+(?:you|we)\s+(?:use|run)\b"),
+    re.compile(r"\bwhy\s+not\b"),
+    re.compile(r"\bshould\s+(?:you|we|i)\s+(?:use|run)\b"),
+    re.compile(r"\bdo\s+(?:you|we|i)\s+need\b"),
+    re.compile(r"\bis\s+.+\s+useful(?:\s+here)?\b"),
+    re.compile(r"\bwhat\s+about\b"),
 )
 UNCERTAINTY_PATTERNS = (
     re.compile(r"\bis\s+(?:this|that|it)\s+(?:a\s+)?vulnerability\b"),
@@ -246,7 +255,7 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "simplify_explanation"
     if any(re.search(pattern, normalized) for pattern in FOLLOW_UP_PATTERNS):
         return "follow_up_reference"
-    if tools and ("what about" in normalized or re.search(r"\bwhy\s+(?:wouldn'?t|would not)\s+(?:you|we)\s+use\b", normalized)):
+    if tools and has_explicit_tool_name(normalized) and is_tool_relevance_question(normalized):
         return "individual_tool_explanation"
     if tools and any(term in normalized for term in TOOL_EXPLANATION_TERMS):
         return "individual_tool_explanation"
@@ -264,6 +273,19 @@ def _normalize_intent_text(question: str) -> str:
     for pattern, replacement in CASUAL_SECURITY_TERM_ALIASES:
         normalized = pattern.sub(replacement, normalized)
     return normalized
+
+
+def is_tool_relevance_question(question: str) -> bool:
+    normalized = _normalize_intent_text(question)
+    return any(pattern.search(normalized) for pattern in TOOL_RELEVANCE_PATTERNS)
+
+
+def has_explicit_tool_name(question: str) -> bool:
+    normalized = _normalize_intent_text(question)
+    return any(
+        re.search(rf"(?<!\w){re.escape(name.lower())}(?!\w)", normalized)
+        for name in get_mongrel_tool_names()
+    )
 
 
 def classify_uncertainty_subtype(question: str) -> str | None:

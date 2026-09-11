@@ -6,7 +6,11 @@ from time import perf_counter
 from app.core.config import get_settings
 from app.services.ai_client import ask_ai
 from app.services.assessment_ai import AI_UNAVAILABLE_MESSAGES
-from app.services.assessment_conversation_context import build_assessment_conversation_context
+from app.services.assessment_conversation_context import (
+    build_assessment_conversation_context,
+    has_explicit_tool_name,
+    is_tool_relevance_question,
+)
 from app.services.assessment_evidence_semantics import get_represented_evidence_semantics
 from app.services.mongrel_self_knowledge import get_mongrel_tool_names
 
@@ -298,6 +302,12 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
     if _claims_unrun_tool(normalized, context or {}):
         return True
     if _contradicts_assessment_tool_state(normalized, context or {}):
+        return True
+    tool_states = ((context or {}).get("recommendation_context") or {}).get("tool_states") or {}
+    if any(state != "NOT_RUN" for state in tool_states.values()) and re.search(
+        r"\bno\s+(?:findings(?:\s+or\s+scans)?|scans(?:\s+or\s+findings)?)\s+(?:are\s+)?associated\s+with\s+(?:the\s+)?target\b",
+        normalized,
+    ):
         return True
     if OWASP_MAPPING_PATTERN.search(normalized) and not _owasp_mapping_supported(context or {}):
         return True
@@ -987,9 +997,7 @@ def _build_state_grounded_answer(context: dict) -> str | None:
         r"\b(?:why|which one|what (?:exactly )?(?:will|would) (?:this|that) (?:tell|show|mean))\b", question
     ):
         return _build_follow_up_fallback(context)
-    if intent == "individual_tool_explanation" and (
-        "what about" in question or re.search(r"\bwhy\s+(?:not|wouldn'?t|would not)\b", question)
-    ):
+    if intent == "individual_tool_explanation" and has_explicit_tool_name(question) and is_tool_relevance_question(question):
         return _build_individual_tool_state_answer(context)
     return None
 
@@ -1013,9 +1021,9 @@ def _build_individual_tool_state_answer(context: dict) -> str | None:
     if tool == "gitleaks":
         return (
             state_sentence
-            + " Gitleaks scans an authorized repository or filesystem input for secret-pattern matches. The current "
-            "domain evidence does not establish suitable repository or filesystem input, and its not-run state cannot "
-            "be used to infer that secrets are absent."
+            + " Gitleaks scans authorized repositories or filesystem content for secret-pattern matches. The current "
+            "domain assessment does not establish suitable repository or filesystem input, so it is not an automatic "
+            "next choice. Because it has not run, no conclusion about the presence or absence of secrets can be drawn."
         )
     if tool == "prowler":
         return (

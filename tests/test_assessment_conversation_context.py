@@ -144,6 +144,33 @@ def test_state_aware_conversation_phrase_variants(question: str, intent: str) ->
     assert classify_assessment_conversation_intent(question) == intent
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "why wouldn't you use gitleaks",
+        "why wouldnt you use gitleaks",
+        "what wouldn't you use gitleaks",
+        "what wouldnt you use gitleaks",
+        "why not gitleaks",
+        "should we use gitleaks",
+        "should we run gitleaks",
+        "do we need gitleaks",
+        "is gitleaks useful here",
+        "what about gitleaks",
+    ],
+)
+def test_messy_named_tool_relevance_variants(question: str) -> None:
+    assert classify_assessment_conversation_intent(question) == "individual_tool_explanation"
+
+
+@pytest.mark.parametrize(
+    "tool",
+    ["Nmap", "BBOT", "Nuclei", "httpx", "Playwright", "Katana", "ffuf", "testssl.sh", "Gitleaks", "Prowler", "Metasploit", "TShark"],
+)
+def test_relevance_shape_applies_to_every_locked_tool(tool: str) -> None:
+    assert classify_assessment_conversation_intent(f"Should we use {tool}?") == "individual_tool_explanation"
+
+
 def test_context_carries_explicit_authoritative_state_for_all_tools() -> None:
     assessment = create_assessment("Tool states", user_id=1001)
     record_assessment_scan(assessment["id"], tool="nmap", status="completed")

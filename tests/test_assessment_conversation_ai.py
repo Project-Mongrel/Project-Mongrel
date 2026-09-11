@@ -296,6 +296,35 @@ def test_completed_tool_capabilities_cannot_be_rewritten_as_findings(claim: str)
     assert violates_conversation_truthfulness(claim, context) is True
 
 
+def test_live_messy_gitleaks_relevance_is_deterministic_and_state_first() -> None:
+    assessment = create_assessment("Messy relevance", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=443, service="https")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None,
+            question="What wouldnt you use gitleaks",
+        )
+
+    ask_ai.assert_not_called()
+    assert result["answer"].startswith("Gitleaks has not been run in this assessment.")
+    assert "not an automatic next choice" in result["answer"]
+    assert "no conclusion about the presence or absence of secrets" in result["answer"]
+    assert "no findings or scans associated with the target" not in result["answer"].lower()
+
+
+def test_assessment_wide_no_scan_claim_is_rejected_when_scans_exist() -> None:
+    assessment = create_assessment("Existing scans", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=443, service="https")
+    context = build_assessment_conversation_context(
+        user_id=1001, assessment_id=assessment["id"], question="What about Gitleaks?",
+    )
+
+    assert violates_conversation_truthfulness(
+        "There are no findings or scans associated with the target.", context,
+    ) is True
+
+
 @pytest.mark.parametrize("question", ["Why?", "Which one?", "What will that tell me?", "What did you mean by that?", "And 8080?"])
 def test_short_followups_receive_bounded_persisted_history(question: str) -> None:
     assessment = create_assessment("Natural Follow-up", user_id=1001)

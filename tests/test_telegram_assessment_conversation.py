@@ -271,7 +271,7 @@ def test_round_one_state_authority_chain_through_public_telegram_path() -> None:
     assert all(tool in answers[4] for tool in ("bbot", "katana", "playwright", "ffuf"))
     assert "Katana next" in answers[5]
     assert "Gitleaks has not been run" in answers[6]
-    assert "cannot be used to infer that secrets are absent" in answers[6]
+    assert "no conclusion about the presence or absence of secrets" in answers[6]
     assert "Prowler has not been run" in answers[7]
     assert "no cloud security or compliance result can be inferred" in answers[7]
     assert "Katana is the sensible next choice" in answers[8]
