@@ -882,10 +882,10 @@ def test_assessment_chat_followup_does_not_call_generic_ask_mongrel() -> None:
     ):
         _run_scan_handler_and_wait(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8136)), context)
 
-    assessment_ask_ai.assert_called_once()
+    assessment_ask_ai.assert_not_called()
     generic_ask_ai.assert_not_called()
     assert message.reply_text.call_args_list[0].args[0] == "Reviewing assessment evidence..."
-    assert message.reply_text.call_args_list[1].args[0] == "Assessment evidence shows 22/tcp ssh."
+    assert "22/tcp (ssh)" in message.reply_text.call_args_list[1].args[0]
     assert ASSESSMENT_CHAT_STATE_KEY in context.user_data
 
 

@@ -2253,6 +2253,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if update.effective_user is not None:
         clear_finding_analysis_context(update.effective_user.id)
+    clear_assessment_flow_state(context)
 
     await update.message.reply_text(
         build_scan_text(),

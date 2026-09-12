@@ -30,6 +30,7 @@ from app.services.assessment_conversation_store import (
 from app.services.assessment_context import build_assessment_context
 from app.services.assessment_markdown_report import generate_assessment_markdown_report
 from app.services.icon_helper import icon_label, section_label
+from app.services.mongrel_self_knowledge import get_mongrel_tool_names
 
 ASSESSMENT_FLOW_STATE_KEY = "assessment_flow_state"
 ASSESSMENT_CHAT_STATE_KEY = "assessment_chat_state"
@@ -258,6 +259,7 @@ def _previous_assessment_entries(user_id: int) -> list[dict]:
 async def previous_assessments_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_user is None:
         return
+    clear_assessment_flow_state(context)
     await _send_previous_assessments(update.message, user_id=update.effective_user.id, page=0, edit=False)
 
 
@@ -379,6 +381,7 @@ async def new_assessment_handler(update: Update, context: ContextTypes.DEFAULT_T
     if update.message is None:
         return
 
+    clear_assessment_flow_state(context)
     context.user_data[ASSESSMENT_FLOW_STATE_KEY] = {"stage": ASSESSMENT_STAGE_NAME}
     await update.message.reply_text(build_new_assessment_name_prompt(), reply_markup=build_main_menu_keyboard())
 
@@ -446,10 +449,15 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
     conversation_id = str(state.get("conversation_id") or "").strip()
     lookup_started = perf_counter()
     assessment = get_user_assessment(user_id, assessment_id) if user_id is not None else None
+    conversation = None
     if user_id is not None and conversation_id:
-        get_user_conversation(user_id, conversation_id)
+        conversation = get_user_conversation(user_id, conversation_id)
     lookup_ms = _assessment_ask_elapsed_ms(lookup_started)
-    if assessment is None or not conversation_id:
+    if (
+        assessment is None
+        or conversation is None
+        or int(conversation.get("assessment_id")) != assessment_id
+    ):
         clear_assessment_chat_state(context)
         await update.message.reply_text("Assessment conversation not found.", reply_markup=build_main_menu_keyboard())
         return True
@@ -522,6 +530,7 @@ async def _complete_assessment_ask_turn(
             question=question,
         )
     except asyncio.CancelledError:
+        _finish_assessment_ask_turn(context, conversation_id, turn_id)
         return
     except Exception:
         result = {
@@ -532,7 +541,17 @@ async def _complete_assessment_ask_turn(
             "fallback_reason": "exception",
         }
 
+    if not isinstance(result, dict):
+        result = {
+            "answer": FALLBACK_ANSWER,
+            "evidence_refs": {},
+            "evidence_context_digest": None,
+            "provenance": {"assessment_id": assessment_id, "user_id": user_id, "conversation_id": conversation_id},
+            "fallback_reason": "malformed_result",
+        }
+
     if not _assessment_ask_turn_is_current(context, conversation_id, turn_id):
+        _finish_assessment_ask_turn(context, conversation_id, turn_id)
         return
     answer = str(result.get("answer") or FALLBACK_ANSWER)
     assistant_persistence_started = perf_counter()
@@ -551,20 +570,35 @@ async def _complete_assessment_ask_turn(
                 "Ask Mongrel generated a response, but I could not save it. The response was not added to this conversation; please try again.",
                 reply_markup=build_assessment_chat_keyboard(assessment_id),
             )
+        _finish_assessment_ask_turn(context, conversation_id, turn_id)
         return
     assistant_persistence_ms = _assessment_ask_elapsed_ms(assistant_persistence_started)
 
     if not _assessment_ask_turn_is_current(context, conversation_id, turn_id):
+        _finish_assessment_ask_turn(context, conversation_id, turn_id)
         return
-    await update.message.reply_text(answer, reply_markup=build_assessment_chat_keyboard(assessment_id))
+    try:
+        await update.message.reply_text(answer, reply_markup=build_assessment_chat_keyboard(assessment_id))
+    except Exception as error:
+        logger.warning("Assessment Ask response delivery failed: type=%s", type(error).__name__)
+        return
+    finally:
+        _finish_assessment_ask_turn(context, conversation_id, turn_id)
     _log_assessment_ask_timing(
         assessment_id=assessment_id, conversation_id=conversation_id, lookup_ms=lookup_ms,
         user_persistence_ms=user_persistence_ms, assistant_persistence_ms=assistant_persistence_ms,
         total_ms=_assessment_ask_elapsed_ms(turn_started), instrumentation=result.get("instrumentation") or {},
         fallback_reason=result.get("fallback_reason"),
     )
+
+
+def _finish_assessment_ask_turn(context: ContextTypes.DEFAULT_TYPE, conversation_id: str, turn_id: str) -> None:
     state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
-    if isinstance(state, dict) and state.get("active_turn_id") == turn_id:
+    if (
+        isinstance(state, dict)
+        and state.get("conversation_id") == conversation_id
+        and state.get("active_turn_id") == turn_id
+    ):
         state.pop("active_turn_id", None)
     if context.user_data.get(ASSESSMENT_ASK_TASK_KEY) is asyncio.current_task():
         context.user_data.pop(ASSESSMENT_ASK_TASK_KEY, None)
@@ -681,6 +715,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         if user_id is None:
             await query.edit_message_text("Previous assessments are unavailable.")
             return
+        clear_assessment_flow_state(context)
         try:
             page = int(parts[-1])
         except ValueError:
@@ -730,6 +765,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     if action == "ask":
+        clear_assessment_chat_state(context)
         targets = list_assessment_targets(assessment_id)
         try:
             conversation = get_or_create_assessment_conversation(
@@ -797,6 +833,10 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     tool = parts[2]
+    allowed_tools = {name.lower().removesuffix(".sh") for name in get_mongrel_tool_names()}
+    if tool not in allowed_tools:
+        await query.edit_message_text("Unsupported assessment action.")
+        return
     targets = list_assessment_targets(assessment_id)
 
     user_id = update.effective_user.id if update.effective_user is not None else None

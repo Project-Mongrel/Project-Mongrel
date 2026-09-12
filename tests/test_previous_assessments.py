@@ -155,7 +155,7 @@ def test_dashboard_has_scoped_ask_entry_and_restart_resumes_or_creates_conversat
     assert reconstructed_context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"] == first_conversation_id
 
 
-@pytest.mark.parametrize("action", ["dashboard", "history", "ask", "run:nmap"])
+@pytest.mark.parametrize("action", ["dashboard", "history", "ask", "ai_report", "markdown", "run:nmap"])
 def test_forged_assessment_callbacks_cannot_open_another_users_assessment(action: str) -> None:
     assessment = create_assessment("Private evidence", user_id=4205)
     add_assessment_target(assessment["id"], "secret.example")

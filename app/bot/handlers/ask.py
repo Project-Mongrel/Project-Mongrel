@@ -28,7 +28,9 @@ def build_ask_text() -> str:
 async def ask_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
-    context.user_data.pop(ASSESSMENT_CHAT_CLOSED_KEY, None)
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        user_data.pop(ASSESSMENT_CHAT_CLOSED_KEY, None)
 
     if is_assessment_chat_active(context):
         state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
@@ -60,9 +62,11 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message is None:
         return
 
-    already_closed = bool(context.user_data.get(ASSESSMENT_CHAT_CLOSED_KEY))
+    user_data = getattr(context, "user_data", None)
+    user_data = user_data if isinstance(user_data, dict) else {}
+    already_closed = bool(user_data.get(ASSESSMENT_CHAT_CLOSED_KEY))
     assessment_exited = bool(
-        context.user_data.get(ASSESSMENT_CHAT_STATE_KEY) or context.user_data.get(ASSESSMENT_ASK_TASK_KEY)
+        user_data.get(ASSESSMENT_CHAT_STATE_KEY) or user_data.get(ASSESSMENT_ASK_TASK_KEY)
     )
     if assessment_exited:
         clear_assessment_chat_state(context)
