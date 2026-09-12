@@ -10,6 +10,7 @@ from app.services.assessment_conversation_context import (
     build_assessment_conversation_context,
     has_explicit_tool_name,
     is_tool_relevance_question,
+    is_tool_state_question,
 )
 from app.services.assessment_evidence_semantics import get_represented_evidence_semantics
 from app.services.mongrel_self_knowledge import get_mongrel_tool_names
@@ -73,7 +74,11 @@ EVIDENCE_LANGUAGE_OVERCLAIM_PATTERNS = (
     re.compile(r"\bhttpx\b.{0,80}\b(?:proves?|confirms?|establishes?|shows?)\b.{0,60}\b(?:vulnerab|misconfigur)"),
     re.compile(r"\bnmap\b.{0,80}\b(?:identified|found|detected|confirmed)\b.{0,50}\bvulnerab"),
     re.compile(r"\bhttpx\b.{0,80}\b(?:identified|determined|assessed|showed)\b.{0,50}\b(?:security posture|vulnerab)"),
-    re.compile(r"\bnuclei\b.{0,80}\b(?:proved|confirmed|identified)\b.{0,50}\b(?:exploitab|vulnerab)"),
+    re.compile(r"\bbbot\b.{0,80}\b(?:proved|confirmed|established|identified)\b.{0,50}\b(?:ownership|breach|vulnerab|exploit)"),
+    re.compile(r"\bnuclei\b.{0,80}\b(?:proved|confirmed|identified)\b.{0,50}\b(?:exploitab|vulnerab|xss|sqli|sql injection)"),
+    re.compile(r"\bplaywright\b.{0,80}\b(?:proved|confirmed|identified|found)\b.{0,50}\b(?:xss|sqli|sql injection|csrf|vulnerab|safe|secure)"),
+    re.compile(r"\bkatana\b.{0,80}\b(?:proved|confirmed|identified|found)\b.{0,50}\b(?:vulnerab|all hidden|complete coverage)"),
+    re.compile(r"\bffuf\b.{0,80}\b(?:proved|confirmed|identified|found)\b.{0,50}\b(?:sensitive exposure|injection|vulnerab)"),
     re.compile(r"\btestssl(?:\.sh)?\b.{0,80}\b(?:identified|confirmed|proved)\b.{0,50}\b(?:insecure|exploitab|vulnerab)"),
     re.compile(r"\bmetasploit\b.{0,80}\b(?:identified|confirmed|proved)\b.{0,50}\b(?:weakness|exploitab|vulnerab|session|compromise)"),
     re.compile(r"\btshark\b.{0,80}\b(?:detected|confirmed|proved)\b.{0,50}\b(?:suspicious activity|attack|exploit|compromise|tls success)"),
@@ -988,18 +993,24 @@ def _build_state_grounded_answer(context: dict) -> str | None:
     recommendation = context.get("recommendation_context") or {}
     states = recommendation.get("tool_states") or {}
     preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
-    if intent in {"next_step_recommendation", "prioritization"} and preferred not in (["httpx"], ["tshark"]):
+    if intent in {"next_step_recommendation", "prioritization"} and preferred:
         return _build_grounded_conversational_fallback(context)
     if intent == "remaining_coverage_gaps":
         return _build_grounded_conversational_fallback(context)
+    if intent in {"significance_interpretation", "uncertainty_safety"}:
+        return _build_grounded_conversational_fallback(context)
     if intent == "simplify_explanation" and states.get("httpx") == "COMPLETED":
         return _build_grounded_conversational_fallback(context)
-    if intent == "follow_up_reference" and re.search(
-        r"\b(?:why|which one|what (?:exactly )?(?:will|would) (?:this|that) (?:tell|show|mean))\b", question
-    ):
+    if intent == "follow_up_reference":
         return _build_follow_up_fallback(context)
     if intent == "individual_tool_explanation" and has_explicit_tool_name(question) and is_tool_relevance_question(question):
         return _build_individual_tool_state_answer(context)
+    if intent == "individual_tool_state" and has_explicit_tool_name(question) and is_tool_state_question(question):
+        return _build_named_tool_evidence_answer(context)
+    if intent == "current_assessment_evidence" and has_explicit_tool_name(question) and is_tool_state_question(question):
+        return _build_named_tool_evidence_answer(context)
+    if intent == "unsupported_premise_check":
+        return _build_false_premise_correction(context)
     return None
 
 
@@ -1116,6 +1127,107 @@ def _build_individual_tool_state_answer(context: dict) -> str | None:
     return state_sentence + (" " + capability if capability else "")
 
 
+def _build_named_tool_evidence_answer(context: dict) -> str | None:
+    selected = [str(tool) for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    if not selected:
+        return None
+    tool = selected[0]
+    recommendation = context.get("recommendation_context") or {}
+    state = str((recommendation.get("tool_states") or {}).get(tool, "NOT_RUN"))
+    names = {name.lower().removesuffix(".sh"): name for name in get_mongrel_tool_names()}
+    display = names.get(tool, tool)
+    question = str(context.get("current_question") or "").lower()
+    if state != "COMPLETED":
+        label = state.replace("_", " ").lower()
+        return (
+            f"{display} is {label} in this assessment. Because it is not recorded as completed, there are no completed "
+            f"{display} results to report; that is tool state, not evidence of a clean result or absence of findings."
+        )
+    if re.search(r"\bdid\s+(?:we|you)\s+run\b|\bhas\s+.+\s+been\s+run\b", question):
+        return f"Yes. {display} is recorded as completed in this assessment. Completion alone does not imply a vulnerability, successful exploitation, or a clean result."
+
+    findings = _tool_findings(context, tool)
+    if tool == "nmap":
+        ports = [
+            f"{item.get('port')}/{item.get('protocol') or 'tcp'} ({item.get('service') or 'unknown'})"
+            for finding in findings for item in (finding.get("open_ports") or []) if isinstance(item, dict)
+        ]
+        return f"Nmap is recorded as completed. Stored service observations: {', '.join(ports) if ports else 'none are normalized in the stored result'}. Service classifications do not establish vulnerabilities."
+    if tool == "nuclei":
+        matches = [item for finding in findings for item in (finding.get("nuclei_findings") or []) if isinstance(item, dict)]
+        if not matches:
+            return "Nuclei is recorded as completed with zero stored template matches. Zero matches do not establish that the target is safe."
+        rendered = [f"{item.get('template_id') or item.get('name') or 'template'} ({str(item.get('severity') or 'unknown').upper()})" for item in matches[:10]]
+        return "Nuclei stored template matches: " + ", ".join(rendered) + ". Their scanner severities are preserved; a match does not automatically establish exploitability."
+    if tool == "httpx":
+        items = [item for finding in findings for key in ("httpx_services", "httpx_results") for item in (finding.get(key) or []) if isinstance(item, dict)]
+        rendered = [str(item.get("url") or item.get("host") or "endpoint") + (f" (status {item.get('status_code')})" if item.get("status_code") is not None else "") for item in items[:10]]
+        return "httpx stored response metadata for " + (", ".join(rendered) if rendered else "no normalized responding endpoints") + ". This does not establish vulnerability, security posture, or that an unresponsive host is down."
+    if tool == "metasploit":
+        return (
+            "Metasploit is recorded as completed. Stored validation metadata "
+            + ("includes explicit session evidence." if _metasploit_session_established(context) else "does not establish successful exploitation or a session.")
+        )
+    if tool == "tshark":
+        evidence = _tshark_evidence(context)
+        packets = sum(int(item.get("packet_count") or 0) for item in evidence)
+        return f"TShark is recorded as completed and stored metadata for {packets} packet(s). Packets do not by themselves establish an attack, exploitation, compromise, or a completed TLS handshake."
+    if tool == "gitleaks":
+        count = sum(int((finding.get("gitleaks_evidence") or {}).get("finding_count") or 0) for finding in findings)
+        return f"Gitleaks is recorded as completed with {count} redacted secret-pattern match(es). A match does not establish an active or usable credential, and raw secret values are not shown."
+    if tool == "prowler":
+        checks = [item for finding in findings for item in ((finding.get("prowler_evidence") or {}).get("findings") or []) if isinstance(item, dict)]
+        rendered = [f"{item.get('check_id') or 'check'}={item.get('status') or 'unknown'}" for item in checks[:10]]
+        return "Prowler is recorded as completed. Stored check results: " + (", ".join(rendered) if rendered else "no normalized checks") + ". Each PASS/FAIL is check-scoped and does not establish organization-wide security or compliance."
+    if tool in {"bbot", "katana", "ffuf"}:
+        field = {"bbot": "bbot_observations", "katana": "katana_observations", "ffuf": "ffuf_results"}[tool]
+        items = [item for finding in findings for item in (finding.get(field) or []) if isinstance(item, dict)]
+        return f"{display} is recorded as completed with {len(items)} stored observation item(s). These discovery observations do not automatically establish ownership, vulnerability, sensitive exposure, or complete coverage."
+    if tool == "playwright":
+        observations = [finding.get("playwright_observation") for finding in findings if isinstance(finding.get("playwright_observation"), dict)]
+        return f"Playwright is recorded as completed with {len(observations)} stored browser observation(s). Rendered state does not establish XSS, SQL injection, CSRF, safety, or complete application coverage."
+    if tool == "testssl":
+        items = [
+            item for finding in findings for key in ("testssl_findings",)
+            for item in (finding.get(key) or []) if isinstance(item, dict)
+        ]
+        rendered = [_scanner_record(item) for item in items[:10]]
+        return "testssl.sh is recorded as completed. Stored scanner observations: " + ("; ".join(rendered) if rendered else "no normalized finding items") + ". Scanner wording does not establish confirmed exploitability or overall TLS security."
+    capability = str((context.get("mongrel_capabilities") or {}).get(tool) or "")
+    observation_count = sum(
+        len(value) for finding in findings for key, value in finding.items()
+        if key.endswith(("_observations", "_results")) and isinstance(value, list)
+    )
+    return f"{display} is recorded as completed with {observation_count} normalized observation item(s). {capability} Completion or observations do not automatically establish a vulnerability or complete coverage."
+
+
+def _build_false_premise_correction(context: dict) -> str:
+    question = str(context.get("current_question") or "").lower()
+    states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
+    if "metasploit" in question:
+        state = states.get("metasploit", "NOT_RUN").replace("_", " ").lower()
+        session = _metasploit_session_established(context)
+        return (
+            f"No—not from that premise. Metasploit is {state} in this assessment. "
+            + ("Stored evidence includes an explicit session, but it must still be attributed to the claimed issue." if session else "Its stored state does not establish successful exploitation, a session, or compromise.")
+        )
+    boundaries = {
+        "nmap": "Nmap port and service classifications do not establish vulnerability or exploitability.",
+        "tshark": "TShark packet or correlation evidence does not establish exploitation, compromise, suspicious activity, or TLS-handshake success.",
+        "nuclei": "A Nuclei template match preserves its scanner severity but does not by itself prove XSS or exploitability.",
+        "testssl": "testssl.sh scanner observations do not by themselves prove insecure TLS or confirmed exploitability.",
+        "gitleaks": "Gitleaks results cannot prove that no secrets exist; a not-run scan provides no secret-absence evidence.",
+        "prowler": "Prowler PASS/FAIL results are check-scoped and cannot prove organization-wide cloud compliance or security.",
+    }
+    for tool, boundary in boundaries.items():
+        if tool in question:
+            return "No. " + boundary
+    return (
+        "No. The stored assessment evidence does not establish the claimed vulnerability, exploitability, compromise, "
+        "or overall security conclusion. Completed tools provide bounded observations; missing coverage remains uncertainty."
+    )
+
+
 def _build_grounded_conversational_fallback(context: dict) -> str | None:
     attacker_answer = _build_attacker_reasoning_fallback(context)
     if attacker_answer:
@@ -1229,6 +1341,12 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
                 f"The stored evidence does not establish {subject} as exploitable. No completed evidence currently "
                 "proves a successful exploitation path for it; further validation would be required before claiming exploitability."
             )
+        if subtype == "compromise":
+            return (
+                "No. The stored assessment evidence does not establish that the target was compromised. Tool completion, "
+                "scanner observations, packet capture, and validation metadata are not compromise evidence unless stored "
+                "results explicitly establish access or impact."
+            )
         return (
             "The stored assessment evidence is not enough to conclude that the target is secure or vulnerable overall. "
             "It establishes only the observations recorded by completed tools; untested areas remain evidence gaps."
@@ -1266,8 +1384,9 @@ def _build_follow_up_fallback(context: dict) -> str | None:
     ).lower()
     recommendation = context.get("recommendation_context") or {}
     completed = {str(tool) for tool in recommendation.get("completed_tools") or []}
+    question = str(context.get("current_question") or "").lower()
     if "katana" in previous and "katana" not in completed:
-        if re.search(r"\bafter (?:this|that)\b", str(context.get("current_question") or "").lower()):
+        if re.search(r"\bafter (?:this|that)\b", question):
             return (
                 "After Katana has added crawl observations, I would review what it found before choosing another action. "
                 "If browser-rendered behavior is still an evidence gap, Mongrel's Playwright would be a reasonable next "
@@ -1284,6 +1403,10 @@ def _build_follow_up_fallback(context: dict) -> str | None:
             "response observations are stored. It can characterize responding HTTP(S) endpoints; that would fill an "
             "evidence gap, not prove a vulnerability, and this answer runs nothing."
         )
+    if "how do you know" in question or "what evidence supports" in question:
+        summary_context = dict(context)
+        summary_context["question_intent"] = "assessment_summary"
+        return _build_grounded_assessment_summary(summary_context)
     return None
 
 

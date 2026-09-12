@@ -93,14 +93,21 @@ RECOMMENDATION_QUESTION_TERMS = (
 ASSESSMENT_QUESTION_TERMS = ("what did", "what was found", "what have we found", "current assessment", "assessment evidence", "scan result")
 ASSESSMENT_SUMMARY_TERMS = (
     "what have we established", "what do we actually know", "what have we found so far", "summarize what we know",
-    "summarise what we know", "what evidence do we have",
+    "summarise what we know", "what evidence do we have", "what do we know", "what have we found",
+    "summarize this assessment", "summarise this assessment", "what does all this tell us",
 )
 ASSESSMENT_HIGHLIGHT_TERMS = (
-    "most interesting thing", "what stands out", "most significant", "what should i pay attention to",
+    "most interesting thing", "what stands out", "most significant", "what's significant", "what is significant",
+    "what should i pay attention to", "which evidence matters most",
 )
 ASSESSMENT_SUMMARY_PATTERNS = (
     re.compile(r"\bwhat\s+have\s+we\s+(?:actually\s+)?established\b"),
     re.compile(r"\bwhat\s+do\s+we\s+(?:actually\s+)?know\b"),
+)
+FALSE_PREMISE_PATTERNS = (
+    re.compile(r"\b(?:confirmed|proved|proves?|definitely)\b.{0,80}\b(?:vulnerab|exploit|compromis|insecure|secure|compliant|no secrets|xss|sqli|sql injection)"),
+    re.compile(r"\b(?:vulnerab|exploit|compromis)\w*\b.{0,30}\bright\b"),
+    re.compile(r"\bscans?\s+found\s+everything\b"),
 )
 SECURITY_CONCEPT_TERMS = (
     "owasp", "ssrf", "injection", "path traversal", "file upload", "access control", "authentication",
@@ -109,14 +116,18 @@ SECURITY_CONCEPT_TERMS = (
 ATTACKER_QUESTION_TERMS = ("think like an attacker", "attacker", "attack path", "attack chain")
 TOOL_EXPLANATION_TERMS = ("what does", "why would i use", "what can", "explain", "what is")
 FOLLOW_UP_PATTERNS = (
-    r"^(?:and\s+)?(?:why|why (?:that|this) one|which one|after that|what do you mean|what did you mean by that)\??$",
+    r"^(?:and\s+)?(?:why|why (?:that|this) one|which one|after that|what do you mean|what did you mean(?: by that)?)\??$",
     r"^(?:and\s+)?what (?:exactly\s+)?(?:will|would) (?:this|that) (?:tell|show|mean)(?: me| us)?\??$",
     r"^and (?:what about )?(?:port\s+)?\d{1,5}\??$",
+    r"^(?:and\s+)?what about (?:this|that|it)\??$",
+    r"^(?:and\s+)?how do you know\??$",
+    r"^(?:and\s+)?what evidence supports (?:this|that|it)\??$",
 )
 PRIORITIZATION_TERMS = ("which one first", "what first", "prioriti", "highest priority", "most important")
 COVERAGE_GAP_TERMS = (
     "anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing",
-    "what haven't we done", "what have we not done", "what remains",
+    "what haven't we done", "what have we not done", "what remains", "biggest unknown", "what don't we know",
+    "what do we not know",
 )
 SIGNIFICANCE_TERMS = ("anything worrying", "is that bad", "does that matter", "how serious", "why should i care")
 UNCERTAINTY_TERMS = (
@@ -137,6 +148,12 @@ TOOL_RELEVANCE_PATTERNS = (
     re.compile(r"\bis\s+.+\s+useful(?:\s+here)?\b"),
     re.compile(r"\bwhat\s+about\b"),
 )
+TOOL_STATE_QUESTION_PATTERNS = (
+    re.compile(r"\bdid\s+(?:we|you)\s+run\b"),
+    re.compile(r"\bhas\s+.+\s+been\s+run\b"),
+    re.compile(r"\bwhat\s+did\s+.+\s+(?:find|report|observe|add|prove|establish)\b"),
+    re.compile(r"\bdid\s+.+\s+find\s+anything\b"),
+)
 UNCERTAINTY_PATTERNS = (
     re.compile(r"\bis\s+(?:this|that|it)\s+(?:a\s+)?vulnerability\b"),
     re.compile(r"\bdoes\s+(?:this|that|it)\s+mean\s+(?:(?:it\s+is|it'?s)\s+)?vulnerable\b"),
@@ -146,6 +163,8 @@ UNCERTAINTY_PATTERNS = (
     re.compile(r"\bare\s+we\s+(?:safe|secure)\b"),
     re.compile(r"\bis\s+(?:the\s+)?(?:site|target|system|application)\s+(?:safe|secure)\b"),
     re.compile(r"\b(?:so\s+)?everything\s+is\s+safe\b"),
+    re.compile(r"\bare\s+we\s+insecure\b"),
+    re.compile(r"\bhave\s+we\s+compromised\s+(?:this|that|it|the\s+(?:site|target|system))\b"),
 )
 SIMPLIFY_TERMS = ("like i'm new", "like i am new", "new to cybersecurity", "completely new", "simply", "simple terms", "plain english", "beginner")
 
@@ -244,6 +263,10 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "product_self_knowledge"
     if "tshark" in tools and any(term in normalized for term in ("can mongrel", "can you", "what can")):
         return "individual_tool_explanation"
+    if "think like an attacker" in normalized:
+        return "attacker_informed_defensive_reasoning"
+    if any(pattern.search(normalized) for pattern in FALSE_PREMISE_PATTERNS):
+        return "unsupported_premise_check"
     if classify_uncertainty_subtype(normalized):
         return "uncertainty_safety"
     if any(term in normalized for term in ASSESSMENT_SUMMARY_TERMS) or any(
@@ -272,6 +295,10 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "simplify_explanation"
     if any(re.search(pattern, normalized) for pattern in FOLLOW_UP_PATTERNS):
         return "follow_up_reference"
+    if tools and has_explicit_tool_name(normalized) and re.search(
+        r"\bdid\s+(?:we|you)\s+run\b|\bhas\s+.+\s+been\s+run\b", normalized
+    ):
+        return "individual_tool_state"
     if tools and has_explicit_tool_name(normalized) and is_tool_relevance_question(normalized):
         return "individual_tool_explanation"
     if tools and any(term in normalized for term in TOOL_EXPLANATION_TERMS):
@@ -297,11 +324,17 @@ def is_tool_relevance_question(question: str) -> bool:
     return any(pattern.search(normalized) for pattern in TOOL_RELEVANCE_PATTERNS)
 
 
+def is_tool_state_question(question: str) -> bool:
+    normalized = _normalize_intent_text(question)
+    return any(pattern.search(normalized) for pattern in TOOL_STATE_QUESTION_PATTERNS)
+
+
 def has_explicit_tool_name(question: str) -> bool:
     normalized = _normalize_intent_text(question)
     return any(
-        re.search(rf"(?<!\w){re.escape(name.lower())}(?!\w)", normalized)
-        for name in get_mongrel_tool_names()
+        re.search(rf"(?<!\w){re.escape(alias.strip())}(?!\w)", normalized)
+        for aliases in TOOL_ALIASES.values()
+        for alias in aliases
     )
 
 
@@ -311,7 +344,9 @@ def classify_uncertainty_subtype(question: str) -> str | None:
         return "exploitability"
     if re.search(r"\b(?:vulnerability|vulnerable)\b", normalized):
         return "vulnerability"
-    if re.search(r"\b(?:safe|secure|security)\b", normalized):
+    if re.search(r"\bcompromis(?:e|ed|ing)\b", normalized):
+        return "compromise"
+    if re.search(r"\b(?:safe|secure|security|insecure)\b", normalized):
         return "overall_security"
     return None
 
