@@ -57,4 +57,6 @@ async def home_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         build_home_text(),
         reply_markup=build_main_menu_keyboard(),
     )
-    context.user_data.pop(ASSESSMENT_CHAT_CLOSED_KEY, None)
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        user_data.pop(ASSESSMENT_CHAT_CLOSED_KEY, None)
