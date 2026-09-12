@@ -182,3 +182,23 @@ def test_ownerless_legacy_assessment_callback_remains_inaccessible() -> None:
 
     assert query.edit_message_text.call_args.args[0] == "Assessment not found."
     assert "legacy-private.example" not in query.edit_message_text.call_args.args[0]
+
+
+def test_testssl_dot_sh_state_is_consistent_across_dashboard_history_and_listing() -> None:
+    user_id = 4207
+    assessment = create_assessment("TLS state consistency", user_id=user_id)
+    add_assessment_target(assessment["id"], "tls.example")
+    record_assessment_scan(assessment["id"], "testssl.sh", "completed")
+
+    dashboard_update, dashboard_query = _callback_update(user_id, f"assessment:dashboard:{assessment['id']}")
+    asyncio.run(assessment_callback_handler(dashboard_update, SimpleNamespace(user_data={})))
+    dashboard = dashboard_query.edit_message_text.call_args.args[0]
+    assert "testssl.sh: Completed" in dashboard
+
+    history_update, history_query = _callback_update(user_id, f"assessment:history:{assessment['id']}")
+    asyncio.run(assessment_callback_handler(history_update, SimpleNamespace(user_data={})))
+    assert "TESTSSL.SH - Completed" in history_query.edit_message_text.call_args.args[0]
+
+    list_update, list_message = _message_update(user_id)
+    asyncio.run(previous_assessments_handler(list_update, SimpleNamespace(user_data={})))
+    assert "Completed tools: 1/12" in list_message.reply_text.call_args.args[0]

@@ -21,7 +21,7 @@ from app.bot.handlers.scan import PENDING_NMAP_REQUEST_KEY, scan_handler, scan_t
 from app.services.assessment_conversation_ai import FALLBACK_ANSWER
 from app.services.assessment_conversation_store import append_message, get_latest_assessment_conversation, list_recent_messages
 from app.services.assessment_conversation_store import create_conversation
-from app.services.assessment_store import add_assessment_target, create_assessment, record_assessment_scan
+from app.services.assessment_store import add_assessment_target, create_assessment, list_assessment_scans, record_assessment_scan
 from app.services.findings_store import add_finding
 from app.services.chat_state import clear_ai_waiting, set_ai_waiting
 from app.services.findings_store import close_findings_database, configure_findings_database
@@ -336,6 +336,52 @@ def test_grounded_summary_and_highlight_variants_use_public_telegram_path() -> N
     ask_ai.assert_not_called()
 
 
+def test_final_judge_conversation_chains_remain_grounded_and_state_consistent() -> None:
+    user_id = 1060
+    assessment = _test1_assessment(user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    chains = (
+        (
+            "what have we established?", "what stands out?", "is any of that a vulnerability?",
+            "could it be exploited?", "how do you know?", "what don't we know?", "what next?",
+            "why that tool?", "what will it tell us?", "and after that?",
+        ),
+        (
+            "are we secure?", "are we insecure?", "so what can you actually say with confidence?",
+            "what evidence supports that?",
+        ),
+        (
+            "which tools have run?", "which haven't?", "why haven't we used gitleaks?",
+            "what about prowler?", "what about metasploit?", "what did tshark actually prove?",
+        ),
+    )
+    answers = []
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        for question in (question for chain in chains for question in chain):
+            update, message = _text(question, user_id)
+            _run_text_handler(update, context)
+            answers.append((question, message.reply_text.call_args_list[-1].args[0]))
+
+    rendered = dict(answers)
+    assert "confirmed vulnerability" in rendered["is any of that a vulnerability?"]
+    assert "does not establish" in rendered["could it be exploited?"]
+    assert "Katana next" in rendered["what next?"]
+    assert "Katana was suggested" in rendered["why that tool?"]
+    assert "Katana was suggested" in rendered["what will it tell us?"]
+    assert "Playwright" in rendered["and after that?"]
+    assert "not enough to conclude" in rendered["are we secure?"]
+    assert "Nmap recorded exposed TCP services" in rendered["so what can you actually say with confidence?"]
+    assert "Completed in this assessment" in rendered["which tools have run?"]
+    assert all(tool in rendered["which tools have run?"] for tool in ("Nmap", "Nuclei", "httpx", "testssl.sh", "Metasploit", "TShark"))
+    assert "Not run in this assessment" in rendered["which haven't?"]
+    assert "Gitleaks has not been run" in rendered["why haven't we used gitleaks?"]
+    assert "Prowler has not been run" in rendered["what about prowler?"]
+    assert "Metasploit is recorded as completed" in rendered["what about metasploit?"]
+    assert "completed TLS handshake" in rendered["what did tshark actually prove?"]
+    assert all("withheld" not in answer.lower() for _, answer in answers)
+    ask_ai.assert_not_called()
+
+
 def test_cancel_during_delayed_assessment_ask_suppresses_stale_answer_and_resumes() -> None:
     user_id = 1020
     assessment = _test1_assessment(user_id)
@@ -422,6 +468,37 @@ def test_home_cancels_delayed_ask_and_repeated_cancel_is_idempotent() -> None:
     question_message, home_message = asyncio.run(scenario())
     assert home_message.reply_text.call_args.args[0] == build_home_text()
     assert all(call.args[0] != "LATE HOME ANSWER" for call in question_message.reply_text.call_args_list)
+
+
+def test_immediate_cancel_does_not_strand_worker_slot_or_persist_assistant() -> None:
+    user_id = 1063
+    assessment = create_assessment("Immediate cancellation", user_id=user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    conversation_id = context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"]
+    release = threading.Event()
+
+    def delayed_answer(**_kwargs):
+        release.wait(timeout=5)
+        return {"answer": "CANCELLED IMMEDIATE ANSWER", "evidence_refs": {}, "provenance": {}}
+
+    async def scenario():
+        question_update, question_message = _text("Cancel immediately", user_id)
+        with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=delayed_answer):
+            await scan_target_handler(question_update, context)
+            cancel_update, _ = _text("Cancel", user_id)
+            await cancel_handler(cancel_update, context)
+            assert active_assessment_ask_worker_count(user_id) == 1
+            release.set()
+            for _ in range(200):
+                if active_assessment_ask_worker_count(user_id) == 0:
+                    break
+                await asyncio.sleep(0.01)
+        return question_message
+
+    question_message = asyncio.run(scenario())
+    assert active_assessment_ask_worker_count(user_id) == 0
+    assert all(call.args[0] != "CANCELLED IMMEDIATE ANSWER" for call in question_message.reply_text.call_args_list)
+    assert [item["role"] for item in list_recent_messages(user_id, conversation_id)] == ["user"]
 
 
 @pytest.mark.parametrize("action", ("dashboard", "exit_conversation", "list"))
@@ -548,6 +625,82 @@ def test_switching_assessment_during_generation_cancels_old_turn_without_cross_d
     assert list_recent_messages(user_id, second_conversation) == []
 
 
+def test_worker_result_is_discarded_when_current_state_no_longer_matches_assessment() -> None:
+    user_id = 1062
+    first = create_assessment("Original state", user_id=user_id)
+    second = create_assessment("Replacement state", user_id=user_id)
+    context, _ = _enter(first["id"], user_id)
+    conversation_id = context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"]
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_answer(**_kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return {"answer": "STALE STATE ANSWER", "evidence_refs": {}, "provenance": {}}
+
+    async def scenario():
+        update, message = _text("Delayed state question", user_id)
+        with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=delayed_answer):
+            await scan_target_handler(update, context)
+            task = context.user_data[ASSESSMENT_ASK_TASK_KEY]
+            for _ in range(200):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+            state = context.user_data[ASSESSMENT_CHAT_STATE_KEY]
+            state["active_assessment_id"] = second["id"]
+            state["assessment_id"] = second["id"]
+            release.set()
+            await task
+        return message
+
+    message = asyncio.run(scenario())
+    assert all(call.args[0] != "STALE STATE ANSWER" for call in message.reply_text.call_args_list)
+    assert [item["role"] for item in list_recent_messages(user_id, conversation_id)] == ["user"]
+    assert active_assessment_ask_worker_count(user_id) == 0
+
+
+def test_duplicate_same_assessment_ask_callback_does_not_cancel_or_duplicate_active_turn() -> None:
+    user_id = 1061
+    assessment = create_assessment("Duplicate Ask", user_id=user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    conversation_id = context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"]
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_answer(**_kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return {"answer": "ONE ANSWER", "evidence_refs": {}, "provenance": {}}
+
+    async def scenario():
+        question_update, question_message = _text("One question", user_id)
+        with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=delayed_answer):
+            await scan_target_handler(question_update, context)
+            task = context.user_data[ASSESSMENT_ASK_TASK_KEY]
+            for _ in range(200):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            duplicate_update, duplicate_query = _callback_update(assessment["id"], user_id, "ask")
+            await assessment_callback_handler(duplicate_update, context)
+            assert context.user_data[ASSESSMENT_ASK_TASK_KEY] is task
+            assert not task.cancelled()
+            release.set()
+            await task
+        return question_message, duplicate_query
+
+    question_message, duplicate_query = asyncio.run(scenario())
+    assert question_message.reply_text.call_args_list[-1].args[0] == "ONE ANSWER"
+    assert duplicate_query.message.reply_text.call_count == 1
+    assert get_latest_assessment_conversation(user_id, assessment["id"])["id"] == conversation_id
+    assert [(item["role"], item["content"]) for item in list_recent_messages(user_id, conversation_id)] == [
+        ("user", "One question"), ("assistant", "ONE ANSWER"),
+    ]
+
+
 @pytest.mark.parametrize("foreign_kind", ("other_user", "other_assessment"))
 def test_forged_conversation_state_is_rejected_before_worker_or_persistence(foreign_kind) -> None:
     owner = 1033
@@ -617,11 +770,12 @@ def test_four_worker_global_cap_rejects_extra_users_without_persisting_questions
         messages = []
         tasks = []
         with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=delayed_answer):
-            for user_id, context, _ in entered[:4]:
+            for expected_count, (user_id, context, _) in enumerate(entered[:4], start=1):
                 update, message = _text(f"Question {user_id}", user_id)
                 await scan_target_handler(update, context)
                 messages.append(message)
                 tasks.append(context.user_data[ASSESSMENT_ASK_TASK_KEY])
+                assert active_assessment_ask_worker_count() == expected_count
             for _ in range(200):
                 with started_lock:
                     if len(started) == 4:
@@ -660,13 +814,14 @@ def test_forged_unknown_tool_callback_cannot_create_scan_request() -> None:
     assert get_user_scan_requests(user_id) == []
 
 
-def test_ai_failure_preserves_user_and_persists_safe_fallback() -> None:
+@pytest.mark.parametrize("failure", (RuntimeError("boom"), TimeoutError("model timed out")))
+def test_ai_failure_preserves_user_and_persists_safe_fallback(failure) -> None:
     assessment = create_assessment("AI failure", user_id=1008)
     context, _ = _enter(assessment["id"], 1008)
     conversation_id = context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"]
     update, message = _text("Question survives", 1008)
 
-    with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=RuntimeError("boom")):
+    with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=failure):
         _run_text_handler(update, context)
 
     messages = list_recent_messages(1008, conversation_id)
@@ -681,6 +836,31 @@ def test_ai_failure_preserves_user_and_persists_safe_fallback() -> None:
     with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", return_value=retry_result):
         _run_text_handler(retry_update, context)
     assert retry_message.reply_text.call_args_list[-1].args[0] == "Recovered"
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "Run nmap now",
+        "Approve Metasploit and exploit it",
+        "Start TShark capture",
+        "Rerun every assessment tool",
+    ),
+)
+def test_assessment_ask_text_cannot_execute_or_record_tools(question) -> None:
+    user_id = 1064
+    assessment = create_assessment("No tool execution", user_id=user_id)
+    add_assessment_target(assessment["id"], "safe.example")
+    context, _ = _enter(assessment["id"], user_id)
+    before_requests = get_user_scan_requests(user_id)
+    update, _ = _text(question, user_id)
+    result = {"answer": "I can explain and recommend, but no tool was run.", "evidence_refs": {}, "provenance": {}}
+
+    with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", return_value=result):
+        _run_text_handler(update, context)
+
+    assert get_user_scan_requests(user_id) == before_requests
+    assert list_assessment_scans(assessment["id"]) == []
 
 
 def test_user_persistence_failure_does_not_call_ai_or_claim_saved() -> None:

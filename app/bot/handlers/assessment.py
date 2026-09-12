@@ -550,7 +550,7 @@ async def _complete_assessment_ask_turn(
             "fallback_reason": "malformed_result",
         }
 
-    if not _assessment_ask_turn_is_current(context, conversation_id, turn_id):
+    if not _assessment_ask_turn_is_current(context, assessment_id, conversation_id, turn_id):
         _finish_assessment_ask_turn(context, conversation_id, turn_id)
         return
     answer = str(result.get("answer") or FALLBACK_ANSWER)
@@ -565,7 +565,7 @@ async def _complete_assessment_ask_turn(
             },
         )
     except Exception:
-        if _assessment_ask_turn_is_current(context, conversation_id, turn_id):
+        if _assessment_ask_turn_is_current(context, assessment_id, conversation_id, turn_id):
             await update.message.reply_text(
                 "Ask Mongrel generated a response, but I could not save it. The response was not added to this conversation; please try again.",
                 reply_markup=build_assessment_chat_keyboard(assessment_id),
@@ -574,7 +574,7 @@ async def _complete_assessment_ask_turn(
         return
     assistant_persistence_ms = _assessment_ask_elapsed_ms(assistant_persistence_started)
 
-    if not _assessment_ask_turn_is_current(context, conversation_id, turn_id):
+    if not _assessment_ask_turn_is_current(context, assessment_id, conversation_id, turn_id):
         _finish_assessment_ask_turn(context, conversation_id, turn_id)
         return
     try:
@@ -604,9 +604,24 @@ def _finish_assessment_ask_turn(context: ContextTypes.DEFAULT_TYPE, conversation
         context.user_data.pop(ASSESSMENT_ASK_TASK_KEY, None)
 
 
-def _assessment_ask_turn_is_current(context: ContextTypes.DEFAULT_TYPE, conversation_id: str, turn_id: str) -> bool:
+def _assessment_ask_turn_is_current(
+    context: ContextTypes.DEFAULT_TYPE,
+    assessment_id: int,
+    conversation_id: str,
+    turn_id: str,
+) -> bool:
     state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
-    return bool(isinstance(state, dict) and state.get("conversation_id") == conversation_id and state.get("active_turn_id") == turn_id)
+    if not isinstance(state, dict):
+        return False
+    try:
+        current_assessment_id = int(state.get(ACTIVE_ASSESSMENT_ID_KEY) or state.get("assessment_id"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        current_assessment_id == assessment_id
+        and state.get("conversation_id") == conversation_id
+        and state.get("active_turn_id") == turn_id
+    )
 
 
 async def _run_assessment_answer_off_loop(*, worker_user_id: int, worker_token: str, **kwargs) -> dict:
@@ -765,6 +780,32 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     if action == "ask":
+        current_state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
+        if isinstance(current_state, dict):
+            try:
+                current_assessment_id = int(
+                    current_state.get(ACTIVE_ASSESSMENT_ID_KEY) or current_state.get("assessment_id")
+                )
+            except (TypeError, ValueError):
+                current_assessment_id = None
+            current_conversation_id = str(current_state.get("conversation_id") or "")
+            current_conversation = (
+                get_user_conversation(user_id, current_conversation_id) if current_conversation_id else None
+            )
+            if (
+                current_assessment_id == assessment_id
+                and current_conversation is not None
+                and int(current_conversation.get("assessment_id")) == assessment_id
+            ):
+                targets = list_assessment_targets(assessment_id)
+                prompt = build_assessment_chat_intro(assessment, targets)
+                message = getattr(query, "message", None)
+                reply_text = getattr(message, "reply_text", None)
+                if reply_text is not None:
+                    await reply_text(prompt, reply_markup=build_assessment_chat_keyboard(assessment_id))
+                else:
+                    await query.edit_message_text(prompt, reply_markup=build_assessment_chat_keyboard(assessment_id))
+                return
         clear_assessment_chat_state(context)
         targets = list_assessment_targets(assessment_id)
         try:
@@ -960,7 +1001,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
 def _scan_statuses(scans: list[dict]) -> dict[str, str]:
     statuses = {"nmap": "Not run", "bbot": "Not run", "nuclei": "Not run", "httpx": "Not run", "katana": "Not run", "playwright": "Not run", "ffuf": "Not run", "testssl": "Not run", "gitleaks": "Not run", "prowler": "Not run", "metasploit": "Not run", "tshark": "Not run"}
     for scan in scans:
-        tool = str(scan.get("tool") or "").lower()
+        tool = str(scan.get("tool") or "").lower().removesuffix(".sh")
         if tool in statuses:
             statuses[tool] = str(scan.get("status") or "unknown").title()
     return statuses
