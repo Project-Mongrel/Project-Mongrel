@@ -171,6 +171,25 @@ def test_relevance_shape_applies_to_every_locked_tool(tool: str) -> None:
     assert classify_assessment_conversation_intent(f"Should we use {tool}?") == "individual_tool_explanation"
 
 
+@pytest.mark.parametrize(
+    ("question", "intent"),
+    [
+        ("what have we established?", "assessment_summary"),
+        ("what have we actually established about this targer", "assessment_summary"),
+        ("what do we actually know?", "assessment_summary"),
+        ("what have we found so far?", "assessment_summary"),
+        ("summarize what we know", "assessment_summary"),
+        ("what evidence do we have?", "assessment_summary"),
+        ("what's the most interesting thing?", "assessment_highlight"),
+        ("what stands out?", "assessment_highlight"),
+        ("what's most significant?", "assessment_highlight"),
+        ("what should I pay attention to?", "assessment_highlight"),
+    ],
+)
+def test_grounded_summary_and_highlight_intents(question: str, intent: str) -> None:
+    assert classify_assessment_conversation_intent(question) == intent
+
+
 def test_context_carries_explicit_authoritative_state_for_all_tools() -> None:
     assessment = create_assessment("Tool states", user_id=1001)
     record_assessment_scan(assessment["id"], tool="nmap", status="completed")

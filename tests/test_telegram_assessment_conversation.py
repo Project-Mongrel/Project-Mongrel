@@ -1,10 +1,19 @@
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.bot.handlers.assessment import ASSESSMENT_CHAT_STATE_KEY, assessment_callback_handler
+from app.bot.handlers.assessment import (
+    ASSESSMENT_ASK_TASK_KEY,
+    ASSESSMENT_CHAT_STATE_KEY,
+    MAX_ACTIVE_ASSESSMENT_ASK_WORKERS,
+    active_assessment_ask_worker_count,
+    assessment_callback_handler,
+)
+from app.bot.handlers.ask import cancel_handler
+from app.bot.handlers.home import build_home_text, home_handler
 from app.bot.handlers.scan import PENDING_NMAP_REQUEST_KEY, scan_target_handler
 from app.services.assessment_conversation_ai import FALLBACK_ANSWER
 from app.services.assessment_conversation_store import append_message, get_latest_assessment_conversation, list_recent_messages
@@ -44,6 +53,16 @@ def _enter(assessment_id: int, user_id: int, context=None):
 def _text(text: str, user_id: int):
     message = SimpleNamespace(text=text, reply_text=AsyncMock())
     return SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id)), message
+
+
+def _run_text_handler(update, context) -> None:
+    async def run() -> None:
+        await scan_target_handler(update, context)
+        task = context.user_data.get(ASSESSMENT_ASK_TASK_KEY)
+        if isinstance(task, asyncio.Task):
+            await task
+
+    asyncio.run(run())
 
 
 def _test1_assessment(user_id: int) -> dict:
@@ -93,7 +112,7 @@ def test_turn_persists_user_assistant_refs_digest_and_provenance_and_stays_activ
     }
 
     with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", return_value=result):
-        asyncio.run(scan_target_handler(update, context))
+        _run_text_handler(update, context)
 
     messages = list_recent_messages(1002, conversation_id)
     assert [(item["role"], item["content"]) for item in messages] == [
@@ -144,7 +163,7 @@ def test_pending_scan_input_is_not_stolen_by_assessment_or_generic_ask() -> None
         patch("app.bot.handlers.assessment.answer_assessment_conversation_question") as assessment_ai,
         patch("app.bot.handlers.scan.ask_ai") as generic_ai,
     ):
-        asyncio.run(scan_target_handler(update, context))
+        _run_text_handler(update, context)
 
     assessment_ai.assert_not_called()
     generic_ai.assert_not_called()
@@ -165,7 +184,7 @@ def test_metasploit_approval_input_is_not_stolen_by_conversation() -> None:
         patch("app.bot.handlers.scan._handle_metasploit_request", new=AsyncMock()) as approval_input,
         patch("app.bot.handlers.assessment.answer_assessment_conversation_question") as assessment_ai,
     ):
-        asyncio.run(scan_target_handler(update, context))
+        _run_text_handler(update, context)
 
     approval_input.assert_awaited_once()
     assessment_ai.assert_not_called()
@@ -183,7 +202,7 @@ def test_assessment_conversation_wins_generic_ask_collision() -> None:
         patch("app.bot.handlers.assessment.answer_assessment_conversation_question", return_value=result) as assessment_ai,
         patch("app.bot.handlers.scan.ask_ai") as generic_ai,
     ):
-        asyncio.run(scan_target_handler(update, context))
+        _run_text_handler(update, context)
 
     assessment_ai.assert_called_once()
     generic_ai.assert_not_called()
@@ -218,7 +237,7 @@ def test_live_test1_conversation_recovers_safe_answers_through_telegram_path() -
     with patch("app.services.assessment_conversation_ai.ask_ai", side_effect=lambda *_args, **_kwargs: next(generated)):
         for question in ("Ok what next?", "Anything worrying so far?", "Why?", "Is that a vulnerability?", "So are we secure?"):
             update, message = _text(question, user_id)
-            asyncio.run(scan_target_handler(update, context))
+            _run_text_handler(update, context)
             answers.append(message.reply_text.call_args_list[-1].args[0])
 
     stored = list_recent_messages(user_id, conversation_id)
@@ -261,7 +280,7 @@ def test_round_one_state_authority_chain_through_public_telegram_path() -> None:
     with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
         for question in questions:
             update, message = _text(question, user_id)
-            asyncio.run(scan_target_handler(update, context))
+            _run_text_handler(update, context)
             answers.append(message.reply_text.call_args_list[-1].args[0])
 
     assert "Katana next" in answers[0] and "httpx" in answers[0]
@@ -282,6 +301,124 @@ def test_round_one_state_authority_chain_through_public_telegram_path() -> None:
     ask_ai.assert_not_called()
 
 
+def test_grounded_summary_and_highlight_variants_use_public_telegram_path() -> None:
+    user_id = 1019
+    assessment = _test1_assessment(user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    questions = (
+        "What have we actually established about this target?",
+        "What have we actually established about this targer",
+        "What do we actually know?",
+        "What is the most interesting thing we have observed?",
+        "What stands out?",
+    )
+    answers = []
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        for question in questions:
+            update, message = _text(question, user_id)
+            _run_text_handler(update, context)
+            answers.append(message.reply_text.call_args_list[-1].args[0])
+
+    assert all("withheld" not in answer.lower() for answer in answers)
+    assert "Nmap recorded exposed TCP services" in answers[0]
+    assert "scanner severity INFO" in answers[0]
+    assert "Relevant unperformed coverage remains" in answers[0]
+    assert "Nmap recorded exposed TCP services" in answers[1]
+    assert "Nmap recorded exposed TCP services" in answers[2]
+    assert "prioritization of an observed surface" in answers[3]
+    assert "prioritization of an observed surface" in answers[4]
+    assert all("secure overall" not in answer.lower() for answer in answers)
+    ask_ai.assert_not_called()
+
+
+def test_cancel_during_delayed_assessment_ask_suppresses_stale_answer_and_resumes() -> None:
+    user_id = 1020
+    assessment = _test1_assessment(user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    conversation_id = context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"]
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_answer(**_kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return {"answer": "STALE ANSWER", "evidence_refs": {}, "evidence_context_digest": "stale", "provenance": {}}
+
+    async def scenario() -> tuple:
+        question_update, question_message = _text("Explain the assessment", user_id)
+        with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=delayed_answer):
+            await scan_target_handler(question_update, context)
+            for _ in range(200):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+            cancel_update, cancel_message = _text("Cancel", user_id)
+            await cancel_handler(cancel_update, context)
+            duplicate_messages = []
+            for _ in range(3):
+                duplicate_update, duplicate_message = _text("Cancel", user_id)
+                await cancel_handler(duplicate_update, context)
+                duplicate_messages.append(duplicate_message)
+            reenter_update, _ = _callback_update(assessment["id"], user_id)
+            await assessment_callback_handler(reenter_update, context)
+            second_update, second_message = _text("Start another question", user_id)
+            await scan_target_handler(second_update, context)
+            assert active_assessment_ask_worker_count(user_id) == 1
+            release.set()
+            for _ in range(200):
+                if active_assessment_ask_worker_count(user_id) == 0:
+                    break
+                await asyncio.sleep(0.01)
+        return question_message, cancel_message, duplicate_messages, second_message
+
+    question_message, cancel_message, duplicate_messages, second_message = asyncio.run(scenario())
+    assert cancel_message.reply_text.call_count == 1
+    assert cancel_message.reply_text.call_args.args[0] == "Ask Mongrel session closed."
+    assert all(call.args[0] != "STALE ANSWER" for call in question_message.reply_text.call_args_list)
+    assert sum(message.reply_text.call_count for message in duplicate_messages) == 0
+    assert "previous Ask Mongrel request is still finishing" in second_message.reply_text.call_args.args[0]
+    assert active_assessment_ask_worker_count(user_id) == 0
+    assert active_assessment_ask_worker_count() <= MAX_ACTIVE_ASSESSMENT_ASK_WORKERS
+    messages = list_recent_messages(user_id, conversation_id)
+    assert [(item["role"], item["content"]) for item in messages[-1:]] == [("user", "Explain the assessment")]
+
+    resumed_context, _ = _enter(assessment["id"], user_id, SimpleNamespace(user_data={}))
+    assert resumed_context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"] == conversation_id
+
+
+def test_home_cancels_delayed_ask_and_repeated_cancel_is_idempotent() -> None:
+    user_id = 1021
+    assessment = _test1_assessment(user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_answer(**_kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return {"answer": "LATE HOME ANSWER", "evidence_refs": {}, "evidence_context_digest": "late", "provenance": {}}
+
+    async def scenario() -> tuple:
+        question_update, question_message = _text("Tell me more", user_id)
+        with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=delayed_answer):
+            await scan_target_handler(question_update, context)
+            for _ in range(200):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+            home_update, home_message = _text("Home", user_id)
+            await home_handler(home_update, context)
+            release.set()
+            await asyncio.sleep(0.05)
+        return question_message, home_message
+
+    question_message, home_message = asyncio.run(scenario())
+    assert home_message.reply_text.call_args.args[0] == build_home_text()
+    assert all(call.args[0] != "LATE HOME ANSWER" for call in question_message.reply_text.call_args_list)
+
+
 def test_ai_failure_preserves_user_and_persists_safe_fallback() -> None:
     assessment = create_assessment("AI failure", user_id=1008)
     context, _ = _enter(assessment["id"], 1008)
@@ -289,7 +426,7 @@ def test_ai_failure_preserves_user_and_persists_safe_fallback() -> None:
     update, message = _text("Question survives", 1008)
 
     with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=RuntimeError("boom")):
-        asyncio.run(scan_target_handler(update, context))
+        _run_text_handler(update, context)
 
     messages = list_recent_messages(1008, conversation_id)
     assert [item["content"] for item in messages] == ["Question survives", FALLBACK_ANSWER]
@@ -306,7 +443,7 @@ def test_user_persistence_failure_does_not_call_ai_or_claim_saved() -> None:
         patch("app.bot.handlers.assessment.append_message", side_effect=RuntimeError("disk full")),
         patch("app.bot.handlers.assessment.answer_assessment_conversation_question") as assessment_ai,
     ):
-        asyncio.run(scan_target_handler(update, context))
+        _run_text_handler(update, context)
 
     assessment_ai.assert_not_called()
     assert "could not save your question" in message.reply_text.call_args.args[0]
@@ -322,7 +459,7 @@ def test_assistant_persistence_failure_surfaces_unsaved_response() -> None:
         patch("app.bot.handlers.assessment.append_message", side_effect=[{"id": "user"}, RuntimeError("disk full")]),
         patch("app.bot.handlers.assessment.answer_assessment_conversation_question", return_value=result),
     ):
-        asyncio.run(scan_target_handler(update, context))
+        _run_text_handler(update, context)
 
     assert "could not save it" in message.reply_text.call_args_list[-1].args[0]
     assert "Unsaved generated text" not in message.reply_text.call_args_list[-1].args[0]
@@ -356,7 +493,7 @@ def test_successful_turn_emits_safe_complete_timing_summary(caplog) -> None:
 
     caplog.set_level("INFO", logger="app.bot.handlers.assessment")
     with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", return_value=result):
-        asyncio.run(scan_target_handler(update, context))
+        _run_text_handler(update, context)
 
     timing_logs = [record.getMessage() for record in caplog.records if "assessment_ask_timing" in record.getMessage()]
     assert len(timing_logs) == 1

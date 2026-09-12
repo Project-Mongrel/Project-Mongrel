@@ -134,6 +134,7 @@ def answer_assessment_conversation_question(
         or _build_direct_testssl_evidence_answer(context)
         or _build_direct_tshark_evidence_answer(context)
         or _build_state_grounded_answer(context)
+        or _build_grounded_assessment_summary(context)
     )
     if direct_evidence_answer:
         return _result(
@@ -1000,6 +1001,86 @@ def _build_state_grounded_answer(context: dict) -> str | None:
     if intent == "individual_tool_explanation" and has_explicit_tool_name(question) and is_tool_relevance_question(question):
         return _build_individual_tool_state_answer(context)
     return None
+
+
+def _build_grounded_assessment_summary(context: dict) -> str | None:
+    intent = str(context.get("question_intent") or "")
+    if intent not in {"assessment_summary", "assessment_highlight"}:
+        return None
+    findings = [
+        finding for finding in ((context.get("assessment_context") or {}).get("findings") or [])
+        if isinstance(finding, dict)
+    ]
+    nmap_ports = []
+    for finding in findings:
+        if str(finding.get("source") or "").lower() != "nmap":
+            continue
+        for item in finding.get("open_ports") or []:
+            if isinstance(item, dict) and item.get("port") is not None:
+                nmap_ports.append(
+                    f"{item.get('port')}/{item.get('protocol') or 'tcp'} ({item.get('service') or 'unknown'})"
+                )
+    if intent == "assessment_highlight":
+        if nmap_ports:
+            return (
+                "The clearest observation to pay attention to is the exposed service surface Nmap recorded: "
+                + ", ".join(nmap_ports[:10])
+                + ". It stands out because exposed services provide concrete surfaces for further investigation. This "
+                "is prioritization of an observed surface, not proof of a vulnerability, exploitability, or insecurity."
+            )
+        return (
+            "The stored evidence does not contain a sufficiently specific observation to name one item as most "
+            "significant. That uncertainty is not evidence that the target is safe."
+        )
+
+    statements = []
+    if nmap_ports:
+        statements.append("Nmap recorded exposed TCP services: " + ", ".join(nmap_ports[:10]) + ".")
+    httpx_items = [
+        item for finding in findings if str(finding.get("source") or "").lower() == "httpx"
+        for key in ("httpx_services", "httpx_results") for item in (finding.get(key) or []) if isinstance(item, dict)
+    ]
+    if httpx_items:
+        observed = []
+        for item in httpx_items[:10]:
+            label = str(item.get("url") or item.get("host") or "HTTP endpoint")
+            if item.get("status_code") is not None:
+                label += f" (status {item.get('status_code')})"
+            observed.append(label)
+        statements.append("httpx recorded HTTP response metadata for " + ", ".join(observed) + ".")
+    nuclei_matches = [
+        item for finding in findings if str(finding.get("source") or "").lower() == "nuclei"
+        for item in (finding.get("nuclei_findings") or []) if isinstance(item, dict)
+    ]
+    if nuclei_matches:
+        severities = [str(item.get("severity") or "unknown").upper() for item in nuclei_matches]
+        statements.append(
+            f"Nuclei stored {len(nuclei_matches)} template match(es) with scanner severity "
+            + ", ".join(dict.fromkeys(severities))
+            + "; template matches do not automatically establish exploitability."
+        )
+    if any(str(finding.get("source") or "").lower().removesuffix(".sh") == "testssl" for finding in findings):
+        statements.append("testssl.sh stored scanner TLS observations; they do not establish exploitability or overall TLS security.")
+    metasploit = [finding for finding in findings if str(finding.get("source") or "").lower() == "metasploit"]
+    if metasploit:
+        session = _metasploit_session_established(context)
+        statements.append(
+            "Metasploit stored validation metadata"
+            + (" including explicit session evidence." if session else "; it does not establish successful exploitation or a session.")
+        )
+    tshark_items = _tshark_evidence(context)
+    if tshark_items:
+        packets = sum(int(item.get("packet_count") or 0) for item in tshark_items)
+        statements.append(
+            f"TShark stored packet/network metadata covering {packets} packet(s); packet presence does not establish an attack, exploitation, or compromise."
+        )
+    recommendation = context.get("recommendation_context") or {}
+    gaps = [str(tool) for tool in recommendation.get("relevant_unperformed_tools") or []]
+    if gaps:
+        statements.append("Relevant unperformed coverage remains: " + ", ".join(gaps) + ".")
+    if not statements:
+        return "No normalized observations are stored yet. That does not establish that the target is safe or free of vulnerabilities."
+    return " ".join(statements) + " These are bounded stored observations, not an overall secure, insecure, or vulnerable conclusion."
 
 
 def _build_individual_tool_state_answer(context: dict) -> str | None:

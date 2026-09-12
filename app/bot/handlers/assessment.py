@@ -1,6 +1,10 @@
+import asyncio
 import logging
+import queue
+import threading
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
@@ -29,6 +33,8 @@ from app.services.icon_helper import icon_label, section_label
 
 ASSESSMENT_FLOW_STATE_KEY = "assessment_flow_state"
 ASSESSMENT_CHAT_STATE_KEY = "assessment_chat_state"
+ASSESSMENT_ASK_TASK_KEY = "assessment_ask_task"
+ASSESSMENT_CHAT_CLOSED_KEY = "assessment_chat_closed"
 ASSESSMENT_SCAN_CONTEXT_KEY = "assessment_scan_context"
 ASSESSMENT_STAGE_NAME = "awaiting_name"
 ASSESSMENT_STAGE_TARGET = "awaiting_target"
@@ -36,6 +42,9 @@ ASSESSMENT_CALLBACK_PREFIX = "assessment"
 ACTIVE_ASSESSMENT_ID_KEY = "active_assessment_id"
 PREVIOUS_ASSESSMENTS_PAGE_SIZE = 5
 logger = logging.getLogger(__name__)
+MAX_ACTIVE_ASSESSMENT_ASK_WORKERS = 4
+_assessment_ask_workers: dict[int, str] = {}
+_assessment_ask_workers_lock = threading.Lock()
 
 
 def build_assessment_chat_intro(assessment: dict, targets: list[dict] | None = None) -> str:
@@ -338,14 +347,27 @@ def is_assessment_flow_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
 def clear_assessment_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     user_data = getattr(context, "user_data", None)
     if isinstance(user_data, dict):
+        _cancel_assessment_ask_task(user_data)
         user_data.pop(ASSESSMENT_FLOW_STATE_KEY, None)
         user_data.pop(ASSESSMENT_CHAT_STATE_KEY, None)
 
 
-def clear_assessment_chat_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+def clear_assessment_chat_state(context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_data = getattr(context, "user_data", None)
     if isinstance(user_data, dict):
+        had_state = bool(user_data.get(ASSESSMENT_CHAT_STATE_KEY) or user_data.get(ASSESSMENT_ASK_TASK_KEY))
+        _cancel_assessment_ask_task(user_data)
         user_data.pop(ASSESSMENT_CHAT_STATE_KEY, None)
+        if had_state:
+            user_data[ASSESSMENT_CHAT_CLOSED_KEY] = True
+        return had_state
+    return False
+
+
+def _cancel_assessment_ask_task(user_data: dict) -> None:
+    task = user_data.pop(ASSESSMENT_ASK_TASK_KEY, None)
+    if isinstance(task, asyncio.Task) and not task.done():
+        task.cancel()
 
 
 def is_assessment_chat_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -432,6 +454,18 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("Assessment conversation not found.", reply_markup=build_main_menu_keyboard())
         return True
 
+    active_task = context.user_data.get(ASSESSMENT_ASK_TASK_KEY)
+    if isinstance(active_task, asyncio.Task) and not active_task.done():
+        await update.message.reply_text("Ask Mongrel is already reviewing a question. Cancel or wait for it to finish.")
+        return True
+
+    turn_id = uuid4().hex
+    if not _reserve_assessment_ask_worker(user_id, turn_id):
+        await update.message.reply_text(
+            "A previous Ask Mongrel request is still finishing. Please try again shortly; no new question was started."
+        )
+        return True
+
     user_persistence_started = perf_counter()
     try:
         append_message(
@@ -443,6 +477,7 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
             metadata={"source": "telegram"},
         )
     except Exception:
+        _release_assessment_ask_worker(user_id, turn_id)
         await update.message.reply_text(
             "I could not save your question, so it was not sent to Ask Mongrel. Please try again.",
             reply_markup=build_assessment_chat_keyboard(assessment_id),
@@ -451,13 +486,43 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
     user_persistence_ms = _assessment_ask_elapsed_ms(user_persistence_started)
 
     await update.message.reply_text("Reviewing assessment evidence...")
-    try:
-        result = answer_assessment_conversation_question(
+    state["active_turn_id"] = turn_id
+    context.user_data[ASSESSMENT_ASK_TASK_KEY] = asyncio.create_task(
+        _complete_assessment_ask_turn(
+            update=update,
+            context=context,
             user_id=user_id,
             assessment_id=assessment_id,
             conversation_id=conversation_id,
             question=text,
+            turn_id=turn_id,
+            turn_started=turn_started,
+            lookup_ms=lookup_ms,
+            user_persistence_ms=user_persistence_ms,
         )
+    )
+    # Let the scoped task start its registered worker before this update completes,
+    # so an immediately following cancellation cannot strand a reserved slot.
+    await asyncio.sleep(0)
+    return True
+
+
+async def _complete_assessment_ask_turn(
+    *, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, assessment_id: int,
+    conversation_id: str, question: str, turn_id: str, turn_started: float, lookup_ms: float,
+    user_persistence_ms: float,
+) -> None:
+    try:
+        result = await _run_assessment_answer_off_loop(
+            worker_user_id=user_id,
+            worker_token=turn_id,
+            user_id=user_id,
+            assessment_id=assessment_id,
+            conversation_id=conversation_id,
+            question=question,
+        )
+    except asyncio.CancelledError:
+        return
     except Exception:
         result = {
             "answer": FALLBACK_ANSWER,
@@ -467,43 +532,92 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
             "fallback_reason": "exception",
         }
 
+    if not _assessment_ask_turn_is_current(context, conversation_id, turn_id):
+        return
     answer = str(result.get("answer") or FALLBACK_ANSWER)
     assistant_persistence_started = perf_counter()
     try:
         append_message(
-            conversation_id,
-            user_id,
-            "assistant",
-            answer,
-            assessment_id=assessment_id,
-            evidence_refs=result.get("evidence_refs"),
-            evidence_context_digest=result.get("evidence_context_digest"),
+            conversation_id, user_id, "assistant", answer, assessment_id=assessment_id,
+            evidence_refs=result.get("evidence_refs"), evidence_context_digest=result.get("evidence_context_digest"),
             metadata={
-                "source": "telegram",
-                "provenance": result.get("provenance") or {},
+                "source": "telegram", "provenance": result.get("provenance") or {},
                 "fallback_reason": result.get("fallback_reason"),
             },
         )
     except Exception:
-        await update.message.reply_text(
-            "Ask Mongrel generated a response, but I could not save it. The response was not added to this conversation; please try again.",
-            reply_markup=build_assessment_chat_keyboard(assessment_id),
-        )
-        return True
+        if _assessment_ask_turn_is_current(context, conversation_id, turn_id):
+            await update.message.reply_text(
+                "Ask Mongrel generated a response, but I could not save it. The response was not added to this conversation; please try again.",
+                reply_markup=build_assessment_chat_keyboard(assessment_id),
+            )
+        return
     assistant_persistence_ms = _assessment_ask_elapsed_ms(assistant_persistence_started)
 
+    if not _assessment_ask_turn_is_current(context, conversation_id, turn_id):
+        return
     await update.message.reply_text(answer, reply_markup=build_assessment_chat_keyboard(assessment_id))
     _log_assessment_ask_timing(
-        assessment_id=assessment_id,
-        conversation_id=conversation_id,
-        lookup_ms=lookup_ms,
-        user_persistence_ms=user_persistence_ms,
-        assistant_persistence_ms=assistant_persistence_ms,
-        total_ms=_assessment_ask_elapsed_ms(turn_started),
-        instrumentation=result.get("instrumentation") or {},
+        assessment_id=assessment_id, conversation_id=conversation_id, lookup_ms=lookup_ms,
+        user_persistence_ms=user_persistence_ms, assistant_persistence_ms=assistant_persistence_ms,
+        total_ms=_assessment_ask_elapsed_ms(turn_started), instrumentation=result.get("instrumentation") or {},
         fallback_reason=result.get("fallback_reason"),
     )
-    return True
+    state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
+    if isinstance(state, dict) and state.get("active_turn_id") == turn_id:
+        state.pop("active_turn_id", None)
+    if context.user_data.get(ASSESSMENT_ASK_TASK_KEY) is asyncio.current_task():
+        context.user_data.pop(ASSESSMENT_ASK_TASK_KEY, None)
+
+
+def _assessment_ask_turn_is_current(context: ContextTypes.DEFAULT_TYPE, conversation_id: str, turn_id: str) -> bool:
+    state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
+    return bool(isinstance(state, dict) and state.get("conversation_id") == conversation_id and state.get("active_turn_id") == turn_id)
+
+
+async def _run_assessment_answer_off_loop(*, worker_user_id: int, worker_token: str, **kwargs) -> dict:
+    results: queue.SimpleQueue = queue.SimpleQueue()
+
+    def run() -> None:
+        try:
+            result = answer_assessment_conversation_question(**kwargs)
+        except BaseException as error:
+            results.put((None, error))
+        else:
+            results.put((result, None))
+        finally:
+            _release_assessment_ask_worker(worker_user_id, worker_token)
+
+    threading.Thread(target=run, name="mongrel-assessment-ask", daemon=True).start()
+    while results.empty():
+        await asyncio.sleep(0.02)
+    result, error = results.get()
+    if error is not None:
+        if isinstance(error, Exception):
+            raise error
+        raise RuntimeError("Assessment answer worker stopped unexpectedly.") from error
+    return result
+
+
+def _reserve_assessment_ask_worker(user_id: int, token: str) -> bool:
+    with _assessment_ask_workers_lock:
+        if user_id in _assessment_ask_workers or len(_assessment_ask_workers) >= MAX_ACTIVE_ASSESSMENT_ASK_WORKERS:
+            return False
+        _assessment_ask_workers[user_id] = token
+        return True
+
+
+def _release_assessment_ask_worker(user_id: int, token: str) -> None:
+    with _assessment_ask_workers_lock:
+        if _assessment_ask_workers.get(user_id) == token:
+            _assessment_ask_workers.pop(user_id, None)
+
+
+def active_assessment_ask_worker_count(user_id: int | None = None) -> int:
+    with _assessment_ask_workers_lock:
+        if user_id is None:
+            return len(_assessment_ask_workers)
+        return int(user_id in _assessment_ask_workers)
 
 
 def _log_assessment_ask_timing(
@@ -598,7 +712,8 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     if action == "exit_conversation":
-        clear_assessment_chat_state(context)
+        if not clear_assessment_chat_state(context) and context.user_data.get(ASSESSMENT_CHAT_CLOSED_KEY):
+            return
         message = getattr(query, "message", None)
         reply_text = getattr(message, "reply_text", None)
         if reply_text is not None:
@@ -626,6 +741,7 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         except Exception:
             await query.edit_message_text("Assessment conversation could not be opened. Please try again.")
             return
+        context.user_data.pop(ASSESSMENT_CHAT_CLOSED_KEY, None)
         context.user_data[ASSESSMENT_CHAT_STATE_KEY] = {
             "assessment_chat": True,
             ACTIVE_ASSESSMENT_ID_KEY: assessment_id,

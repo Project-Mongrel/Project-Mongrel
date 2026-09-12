@@ -15,6 +15,7 @@ from app.bot.auth import is_admin
 from app.bot.bot import SCAN_CALLBACK_PATTERN
 from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
 from app.bot.handlers.assessment import (
+    ASSESSMENT_ASK_TASK_KEY,
     ASSESSMENT_CHAT_STATE_KEY,
     ASSESSMENT_FLOW_STATE_KEY,
     ASSESSMENT_SCAN_CONTEXT_KEY,
@@ -125,6 +126,16 @@ from app.bot.handlers.upload import (
     upload_callback_handler,
     upload_document_handler,
 )
+
+
+def _run_scan_handler_and_wait(update, context) -> None:
+    async def run() -> None:
+        await scan_target_handler(update, context)
+        task = context.user_data.get(ASSESSMENT_ASK_TASK_KEY)
+        if isinstance(task, asyncio.Task):
+            await task
+
+    asyncio.run(run())
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
 from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edit_text
 from app.core.config import Settings
@@ -839,7 +850,7 @@ def test_assessment_ask_mongrel_answers_with_assessment_evidence() -> None:
     message = SimpleNamespace(text="What ports are open?", reply_text=AsyncMock())
 
     with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Observed evidence shows 22/tcp ssh."):
-        asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8130)), context))
+        _run_scan_handler_and_wait(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8130)), context)
 
     assert message.reply_text.call_args_list[0].args[0] == "Reviewing assessment evidence..."
     assert message.reply_text.call_args_list[1].args[0] == "Observed evidence shows 22/tcp ssh."
@@ -869,7 +880,7 @@ def test_assessment_chat_followup_does_not_call_generic_ask_mongrel() -> None:
         patch("app.services.assessment_conversation_ai.ask_ai", return_value="Assessment evidence shows 22/tcp ssh.") as assessment_ask_ai,
         patch("app.bot.handlers.scan.ask_ai", side_effect=AssertionError("generic Ask Mongrel should not be called")) as generic_ask_ai,
     ):
-        asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8136)), context))
+        _run_scan_handler_and_wait(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8136)), context)
 
     assessment_ask_ai.assert_called_once()
     generic_ask_ai.assert_not_called()

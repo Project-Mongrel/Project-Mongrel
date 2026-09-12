@@ -91,6 +91,17 @@ RECOMMENDATION_QUESTION_TERMS = (
     "where do we go from here", "where should we go from here",
 )
 ASSESSMENT_QUESTION_TERMS = ("what did", "what was found", "what have we found", "current assessment", "assessment evidence", "scan result")
+ASSESSMENT_SUMMARY_TERMS = (
+    "what have we established", "what do we actually know", "what have we found so far", "summarize what we know",
+    "summarise what we know", "what evidence do we have",
+)
+ASSESSMENT_HIGHLIGHT_TERMS = (
+    "most interesting thing", "what stands out", "most significant", "what should i pay attention to",
+)
+ASSESSMENT_SUMMARY_PATTERNS = (
+    re.compile(r"\bwhat\s+have\s+we\s+(?:actually\s+)?established\b"),
+    re.compile(r"\bwhat\s+do\s+we\s+(?:actually\s+)?know\b"),
+)
 SECURITY_CONCEPT_TERMS = (
     "owasp", "ssrf", "injection", "path traversal", "file upload", "access control", "authentication",
     "lateral movement", "persistence", "privilege", "attack chain",
@@ -235,6 +246,12 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "individual_tool_explanation"
     if classify_uncertainty_subtype(normalized):
         return "uncertainty_safety"
+    if any(term in normalized for term in ASSESSMENT_SUMMARY_TERMS) or any(
+        pattern.search(normalized) for pattern in ASSESSMENT_SUMMARY_PATTERNS
+    ):
+        return "assessment_summary"
+    if any(term in normalized for term in ASSESSMENT_HIGHLIGHT_TERMS):
+        return "assessment_highlight"
     if any(term in normalized for term in ATTACKER_QUESTION_TERMS):
         return "attacker_informed_defensive_reasoning"
     if any(term in normalized for term in RECOMMENDATION_QUESTION_TERMS):

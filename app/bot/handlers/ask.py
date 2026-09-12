@@ -4,11 +4,14 @@ from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
 from app.bot.handlers.assessment import (
+    ASSESSMENT_ASK_TASK_KEY,
+    ASSESSMENT_CHAT_CLOSED_KEY,
     ASSESSMENT_CHAT_STATE_KEY,
     ACTIVE_ASSESSMENT_ID_KEY,
     build_assessment_chat_intro,
     build_assessment_chat_keyboard,
     clear_assessment_flow_state,
+    clear_assessment_chat_state,
     is_assessment_chat_active,
 )
 from app.services.active_scan_state import cancel_active_scan, clear_active_scan
@@ -25,6 +28,7 @@ def build_ask_text() -> str:
 async def ask_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
+    context.user_data.pop(ASSESSMENT_CHAT_CLOSED_KEY, None)
 
     if is_assessment_chat_active(context):
         state = context.user_data.get(ASSESSMENT_CHAT_STATE_KEY)
@@ -54,6 +58,15 @@ def build_cancel_text() -> str:
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
+        return
+
+    already_closed = bool(context.user_data.get(ASSESSMENT_CHAT_CLOSED_KEY))
+    assessment_exited = bool(
+        context.user_data.get(ASSESSMENT_CHAT_STATE_KEY) or context.user_data.get(ASSESSMENT_ASK_TASK_KEY)
+    )
+    if assessment_exited:
+        clear_assessment_chat_state(context)
+    elif already_closed:
         return
 
     cancelled_scan = None

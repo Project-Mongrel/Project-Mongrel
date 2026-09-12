@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
-from app.bot.handlers.assessment import clear_assessment_flow_state
+from app.bot.handlers.assessment import ASSESSMENT_CHAT_CLOSED_KEY, clear_assessment_flow_state
 from app.services.active_scan_state import cancel_active_scan, clear_active_scan
 from app.services.chat_state import clear_ai_waiting, clear_finding_analysis_context, is_finding_analysis_active
 
@@ -57,3 +57,4 @@ async def home_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         build_home_text(),
         reply_markup=build_main_menu_keyboard(),
     )
+    context.user_data.pop(ASSESSMENT_CHAT_CLOSED_KEY, None)
