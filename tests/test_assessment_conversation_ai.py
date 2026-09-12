@@ -43,12 +43,9 @@ def test_beginner_open_port_question_recommends_and_explains_nmap() -> None:
             question="What tool should I use if I want to see open ports?",
         )
 
-    prompt = ask_ai.call_args.args[0]
-    assert "Adapt depth to the user: plain English for beginner questions" in prompt
-    assert "You may recommend tools, but every recommendation must explain why" in prompt
-    assert "What tool should I use if I want to see open ports?" in prompt
-    assert result["answer"] == response
-    assert "because" in result["answer"].lower()
+    ask_ai.assert_not_called()
+    assert "Nmap has not been run" in result["answer"]
+    assert "host reachability" in result["answer"]
 
 
 def test_novice_next_step_uses_current_evidence() -> None:
@@ -123,9 +120,9 @@ def test_insufficient_evidence_produces_uncertainty_not_invention() -> None:
             question="Is anything vulnerable?",
         )
 
-    assert '"scans": []' in ask_ai.call_args.args[0]
-    assert "insufficient evidence" in result["answer"].lower()
-    assert "vulnerable" not in result["answer"].lower()
+    ask_ai.assert_not_called()
+    assert "does not establish" in result["answer"].lower()
+    assert "confirmed vulnerability" in result["answer"].lower()
 
 
 def test_stale_assistant_claim_loses_to_newer_evidence() -> None:
@@ -182,7 +179,7 @@ def test_natural_what_is_next_recovers_grounded_advice_from_unsafe_model_output(
             question="What is next",
         )
 
-    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert result["fallback_reason"] is None
     assert "httpx next" in result["answer"]
     assert "not evidence of a vulnerability" in result["answer"]
     assert "withheld" not in result["answer"].lower()
@@ -220,7 +217,7 @@ def test_casual_uncertainty_questions_recover_contextual_bounded_answer(question
             question=question,
         )
 
-    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert result["fallback_reason"] is None
     assert expected in result["answer"]
     assert "withheld" not in result["answer"].lower()
 
@@ -347,14 +344,13 @@ def test_short_followups_receive_bounded_persisted_history(question: str) -> Non
             question=question,
         )
 
-    if question in {"Why?", "Which one?", "What will that tell me?"}:
+    if question != "And 8080?":
         ask_ai.assert_not_called()
         assert "httpx was suggested because" in result["answer"]
     else:
-        prompt = ask_ai.call_args.args[0]
-        assert "I would investigate the web-associated surface with httpx next." in prompt
-        assert question in prompt
-        assert result["answer"] == response
+        ask_ai.assert_not_called()
+        assert "8080/tcp classified as http-proxy" in result["answer"]
+        assert "does not establish vulnerability" in result["answer"]
     assert len(result["evidence_refs"]["history_message_ids"]) == 2
 
 
@@ -372,7 +368,8 @@ def test_domain_recommendation_does_not_blindly_add_repository_or_cloud_tools() 
             question="What should we investigate next?",
         )
 
-    assert result["answer"] == response
+    ask_ai.assert_not_called()
+    assert "httpx next" in result["answer"]
     assert "gitleaks" not in result["answer"].lower()
     assert "prowler" not in result["answer"].lower()
 
@@ -553,7 +550,7 @@ def test_unsupported_broad_security_conclusion_is_replaced_with_bounded_uncertai
 
     assert "not enough to conclude" in result["answer"]
     assert "secure or vulnerable overall" in result["answer"]
-    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert result["fallback_reason"] is None
 
 
 def test_guard_allows_evidence_scoped_negative_wording() -> None:
@@ -691,9 +688,7 @@ def test_web_service_next_step_prefers_httpx_after_nmap_with_rationale() -> None
             question="Which Mongrel tool should investigate these web services next?",
         )
 
-    prompt = ask_ai.call_args.args[0]
-    assert '"suggested_action": "httpx"' in prompt
-    assert "do not simply repeat Nmap" in prompt
+    ask_ai.assert_not_called()
     assert "httpx" in result["answer"].lower()
     assert "because" in result["answer"].lower()
     assert "run nmap" not in result["answer"].lower()
@@ -752,7 +747,7 @@ def test_novice_guidance_is_plain_mongrel_specific_and_gap_driven() -> None:
             question="I'm a complete novice. What have we learned and what should I do next?",
         )
 
-    assert '"suggested_action": "httpx"' in ask_ai.call_args.args[0]
+    ask_ai.assert_not_called()
     assert "httpx" in result["answer"].lower()
     assert "because" in result["answer"].lower()
     assert "generic security" not in result["answer"].lower()
@@ -795,10 +790,8 @@ def test_httpx_guidance_uses_verified_mongrel_workflow_not_install_or_cli() -> N
             question="How do I investigate these web services?",
         )
 
-    prompt = ask_ai.call_args.args[0]
-    assert '"assessment_action": "Run httpx"' in prompt
-    assert "Never tell the user to install Mongrel's tools" in prompt
-    assert result["answer"] == response
+    ask_ai.assert_not_called()
+    assert "httpx next because" in result["answer"]
     assert "install" not in result["answer"].lower()
     assert "httpx -" not in result["answer"].lower()
 
@@ -886,7 +879,7 @@ def test_native_guidance_remains_advice_only_and_executes_nothing() -> None:
             question="What should I do next for these web services?",
         )
 
-    assert result["answer"] == response
+    assert "httpx next because" in result["answer"]
     runner.assert_not_called()
 
 

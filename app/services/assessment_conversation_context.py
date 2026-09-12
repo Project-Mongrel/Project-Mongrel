@@ -95,6 +95,7 @@ ASSESSMENT_SUMMARY_TERMS = (
     "what have we established", "what do we actually know", "what have we found so far", "summarize what we know",
     "summarise what we know", "what evidence do we have", "what do we know", "what have we found",
     "summarize this assessment", "summarise this assessment", "what does all this tell us",
+    "what can you actually say with confidence", "what can we say with confidence",
 )
 ASSESSMENT_HIGHLIGHT_TERMS = (
     "most interesting thing", "what stands out", "most significant", "what's significant", "what is significant",
@@ -108,6 +109,14 @@ FALSE_PREMISE_PATTERNS = (
     re.compile(r"\b(?:confirmed|proved|proves?|definitely)\b.{0,80}\b(?:vulnerab|exploit|compromis|insecure|secure|compliant|no secrets|xss|sqli|sql injection)"),
     re.compile(r"\b(?:vulnerab|exploit|compromis)\w*\b.{0,30}\bright\b"),
     re.compile(r"\bscans?\s+found\s+everything\b"),
+    re.compile(r"\b(?:the\s+)?exploit\s+(?:worked|succeeded)\b"),
+    re.compile(r"\btshark\b.{0,50}\b(?:proved|confirmed)\b.{0,50}\bmetasploit\b.{0,30}\b(?:worked|succeeded|exploited)\b"),
+    re.compile(r"\b(?:there\s+(?:were|are)|we\s+found)\s+no\s+secrets\b"),
+    re.compile(r"\b(?:the\s+)?cloud\s+(?:passed|is\s+compliant|is\s+clean)\b"),
+    re.compile(r"\btls\s+handshake\s+(?:completed|succeeded)\b"),
+    re.compile(r"\bno\s+(?:other\s+)?vulnerabilit(?:y|ies)\s+(?:exist|remain|were\s+found)\b"),
+    re.compile(r"\bnothing\s+else\s+(?:needs?|requires?)\s+(?:testing|checking|validation)\b"),
+    re.compile(r"\b(?:credentials?|tokens?|keys?|secrets?)\s+(?:works?|are\s+(?:active|valid|usable))\b"),
 )
 SECURITY_CONCEPT_TERMS = (
     "owasp", "ssrf", "injection", "path traversal", "file upload", "access control", "authentication",
@@ -116,8 +125,8 @@ SECURITY_CONCEPT_TERMS = (
 ATTACKER_QUESTION_TERMS = ("think like an attacker", "attacker", "attack path", "attack chain")
 TOOL_EXPLANATION_TERMS = ("what does", "why would i use", "what can", "explain", "what is")
 FOLLOW_UP_PATTERNS = (
-    r"^(?:and\s+)?(?:why|why (?:that|this) one|which one|after that|what do you mean|what did you mean(?: by that)?)\??$",
-    r"^(?:and\s+)?what (?:exactly\s+)?(?:will|would) (?:this|that) (?:tell|show|mean)(?: me| us)?\??$",
+    r"^(?:and\s+)?(?:why|why (?:that|this) (?:one|tool)|which one|after that|what do you mean|what did you mean(?: by that)?)\??$",
+    r"^(?:and\s+)?what (?:exactly\s+)?(?:will|would) (?:this|that|it) (?:tell|show|mean)(?: me| us)?\??$",
     r"^and (?:what about )?(?:port\s+)?\d{1,5}\??$",
     r"^(?:and\s+)?what about (?:this|that|it)\??$",
     r"^(?:and\s+)?how do you know\??$",
@@ -147,6 +156,16 @@ TOOL_RELEVANCE_PATTERNS = (
     re.compile(r"\bdo\s+(?:you|we|i)\s+need\b"),
     re.compile(r"\bis\s+.+\s+useful(?:\s+here)?\b"),
     re.compile(r"\bwhat\s+about\b"),
+    re.compile(r"\bwhy\s+haven'?t\s+(?:you|we)\s+(?:used|run)\b"),
+)
+TOOL_STATE_OVERVIEW_PATTERNS = (
+    re.compile(r"\bwhich\s+tools?\s+(?:have|has)\s+(?:run|been\s+run)\b"),
+    re.compile(r"\bwhich\s+tools?\s+(?:haven'?t|have\s+not)\s+(?:run|been\s+run)\b"),
+    re.compile(r"\bwhich\s+(?:ones|tools?)\s+haven'?t\b"),
+    re.compile(r"^which\s+haven'?t\??$"),
+)
+CROSS_TOOL_CONFIRMATION_PATTERNS = (
+    re.compile(r"\bdo\s+(?:these|the)\s+(?:findings|results|observations)\s+confirm\s+each\s+other\b"),
 )
 TOOL_STATE_QUESTION_PATTERNS = (
     re.compile(r"\bdid\s+(?:we|you)\s+run\b"),
@@ -265,10 +284,20 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         return "individual_tool_explanation"
     if "think like an attacker" in normalized:
         return "attacker_informed_defensive_reasoning"
+    if "tls" in normalized and "handshake" in normalized and any(
+        term in normalized for term in ("packet", "capture", "tshark")
+    ):
+        return "current_assessment_evidence"
     if any(pattern.search(normalized) for pattern in FALSE_PREMISE_PATTERNS):
         return "unsupported_premise_check"
+    if any(pattern.search(normalized) for pattern in CROSS_TOOL_CONFIRMATION_PATTERNS):
+        return "cross_tool_confirmation"
     if classify_uncertainty_subtype(normalized):
         return "uncertainty_safety"
+    if any(pattern.search(normalized) for pattern in TOOL_STATE_OVERVIEW_PATTERNS) and not any(
+        term in normalized for term in PRIORITIZATION_TERMS
+    ):
+        return "tool_state_overview"
     if any(term in normalized for term in ASSESSMENT_SUMMARY_TERMS) or any(
         pattern.search(normalized) for pattern in ASSESSMENT_SUMMARY_PATTERNS
     ):
@@ -340,13 +369,15 @@ def has_explicit_tool_name(question: str) -> bool:
 
 def classify_uncertainty_subtype(question: str) -> str | None:
     normalized = _normalize_intent_text(question)
-    if re.search(r"\b(?:exploit(?:ed|able)?|attacker\s+(?:actually\s+)?use)\b", normalized):
+    if re.search(r"\b(?:exploit(?:ed|able|ation)?|attacker\s+(?:actually\s+)?use)\b", normalized):
         return "exploitability"
-    if re.search(r"\b(?:vulnerability|vulnerable)\b", normalized):
+    if re.search(r"\b(?:vulnerabilit(?:y|ies)|vulnerable)\b", normalized):
         return "vulnerability"
     if re.search(r"\bcompromis(?:e|ed|ing)\b", normalized):
         return "compromise"
-    if re.search(r"\b(?:safe|secure|security|insecure)\b", normalized):
+    if re.search(r"\b(?:safe|secure|security|insecure)\b", normalized) or re.search(
+        r"\btrust\b.{0,30}\b(?:site|target|system|application)\b|\btrust\s+(?:it|this|that)\b", normalized
+    ):
         return "overall_security"
     return None
 

@@ -236,3 +236,74 @@ def test_compromise_and_insecurity_questions_receive_distinct_bounded_answers():
     assert "not enough to conclude" in insecure["answer"].lower()
     compromised_model.assert_not_called()
     insecure_model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "question,marker",
+    (
+        ("you already said it was vulnerable", "does not establish"),
+        ("the exploit worked though", "does not establish"),
+        ("tshark proved metasploit succeeded", "does not establish"),
+        ("nuclei confirmed xss", "does not by itself prove xss"),
+        ("there were no secrets", "does not establish"),
+        ("the cloud passed", "does not establish"),
+        ("no other vulnerabilities exist", "does not establish"),
+        ("all ports are secure", "not enough to conclude"),
+        ("the tls handshake completed", "does not establish"),
+        ("no findings means we're safe", "not enough to conclude"),
+        ("nothing else needs testing", "does not establish"),
+        ("does this mean the credentials work?", "does not establish"),
+    ),
+)
+def test_final_judge_false_premises_are_corrected_deterministically(question, marker):
+    assessment = create_assessment("final false premises", user_id=USER_ID)
+    result, model = _answer(assessment["id"], question)
+
+    assert marker in result["answer"].lower()
+    assert result["answer"] != TRUTHFULNESS_FALLBACK_ANSWER
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "question,marker",
+    (
+        ("do these findings confirm each other?", "not automatically"),
+        ("is port 443 vulnerable?", "does not establish"),
+        ("did metasploit and tshark confirm exploitation?", "does not establish"),
+        ("is the TLS configuration safe?", "not enough to conclude"),
+        ("can we trust the site now?", "not enough to conclude"),
+    ),
+)
+def test_cross_tool_judge_questions_do_not_turn_combined_evidence_into_proof(question, marker):
+    assessment = create_assessment("cross-tool judge", user_id=USER_ID)
+    _record(assessment["id"], "nmap", open_ports=[{"port": 443, "protocol": "tcp", "service": "https"}])
+    _record(assessment["id"], "metasploit", metasploit_evidence={"module_executed": True, "session_established": False})
+    _record(assessment["id"], "tshark", tshark_evidence={"packet_count": 8, "handshake_success": "not established"})
+
+    result, model = _answer(assessment["id"], question)
+
+    assert marker in result["answer"].lower()
+    assert "compromised" not in result["answer"].lower()
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    (
+        "The credentials work.",
+        "These credentials are valid and usable.",
+        "Nothing else needs testing.",
+    ),
+)
+def test_final_judge_guard_rejects_credential_and_coverage_absolutes(unsafe):
+    assessment = create_assessment("final output guard", user_id=USER_ID)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=unsafe):
+        result = answer_assessment_conversation_question(
+            user_id=USER_ID,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Give me your overall interpretation",
+        )
+
+    assert result["answer"] != unsafe

@@ -41,10 +41,11 @@ UNSUPPORTED_CONVERSATION_CLAIM_PATTERNS = (
     re.compile(r"\b(?:no|zero)\s+(?:vulnerabilities|security issues|security risks|misconfigurations|attack paths)\s+(?:exist|were found|were detected|are present)\b"),
     re.compile(r"\b(?:exploit|exploitation)\s+(?:succeeded|worked|was successful)\b"),
     re.compile(r"\b(?:target|host|system|repository|environment|resource)\s+(?:was|is|has been)\s+(?:compromised|owned|exploited)\b"),
-    re.compile(r"\b(?:credential|token|key|secret)\s+(?:is|was|has been)\s+(?:active|valid|usable|confirmed)\b"),
+    re.compile(r"\b(?:credentials?|tokens?|keys?|secrets?)\s+(?:(?:is|are|was|were|has been|have been)\s+(?:active|valid|usable|confirmed)|works?)\b"),
     re.compile(r"\b(?:tls|ssl)\s+configuration\s+(?:is|appears|looks|seems)\s+(?:secure|robust|hardened)\b"),
     re.compile(r"\b(?:http\s+transaction|tls\s+handshake)\s+(?:completed|succeeded|was successful)\b"),
     re.compile(r"\b(?:organization|company|aws account|cloud account)\s+(?:is|was)\s+(?:compliant|non-compliant)\b"),
+    re.compile(r"\bnothing\s+else\s+(?:needs?|requires?)\s+(?:testing|checking|validation)\b"),
 )
 SESSION_CLAIM_PATTERN = re.compile(r"\b(?:shell|session)\s+(?:was|is)\s+(?:obtained|opened|established)\b")
 SERVICE_LABEL_OVERCLAIM_PATTERNS = (
@@ -997,6 +998,10 @@ def _build_state_grounded_answer(context: dict) -> str | None:
         return _build_grounded_conversational_fallback(context)
     if intent == "remaining_coverage_gaps":
         return _build_grounded_conversational_fallback(context)
+    if intent == "tool_state_overview":
+        return _build_tool_state_overview(context)
+    if intent == "cross_tool_confirmation":
+        return _build_cross_tool_confirmation(context)
     if intent in {"significance_interpretation", "uncertainty_safety"}:
         return _build_grounded_conversational_fallback(context)
     if intent == "simplify_explanation" and states.get("httpx") == "COMPLETED":
@@ -1211,6 +1216,13 @@ def _build_false_premise_correction(context: dict) -> str:
             f"No—not from that premise. Metasploit is {state} in this assessment. "
             + ("Stored evidence includes an explicit session, but it must still be attributed to the claimed issue." if session else "Its stored state does not establish successful exploitation, a session, or compromise.")
         )
+    if re.search(r"\b(?:credentials?|tokens?|keys?|secrets?)\b", question) and not re.search(
+        r"\bno\s+secrets?\b", question
+    ):
+        return (
+            "No. Stored secret-pattern evidence does not establish that any credential, token, key, or secret is "
+            "active, valid, or usable. Raw secret values are not exposed, and authorized validation would be required."
+        )
     boundaries = {
         "nmap": "Nmap port and service classifications do not establish vulnerability or exploitability.",
         "tshark": "TShark packet or correlation evidence does not establish exploitation, compromise, suspicious activity, or TLS-handshake success.",
@@ -1225,6 +1237,45 @@ def _build_false_premise_correction(context: dict) -> str:
     return (
         "No. The stored assessment evidence does not establish the claimed vulnerability, exploitability, compromise, "
         "or overall security conclusion. Completed tools provide bounded observations; missing coverage remains uncertainty."
+    )
+
+
+def _build_tool_state_overview(context: dict) -> str:
+    states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
+    names = {name.lower().removesuffix(".sh"): name for name in get_mongrel_tool_names()}
+    grouped = {}
+    for tool, state in states.items():
+        grouped.setdefault(str(state), []).append(names.get(str(tool), str(tool)))
+    question = str(context.get("current_question") or "").lower()
+    if "haven't" in question or "havent" in question or "have not" in question:
+        missing = grouped.get("NOT_RUN", [])
+        return (
+            "Not run in this assessment: " + (", ".join(missing) if missing else "none") + ". NOT_RUN is tool state, "
+            "not evidence of a clean result or absence of findings."
+        )
+    completed = grouped.get("COMPLETED", [])
+    qualifiers = [
+        f"{state.lower().replace('_', ' ')}: {', '.join(grouped[state])}"
+        for state in ("PARTIAL", "FAILED", "SKIPPED") if grouped.get(state)
+    ]
+    answer = "Completed in this assessment: " + (", ".join(completed) if completed else "none") + "."
+    if qualifiers:
+        answer += " Other recorded states — " + "; ".join(qualifiers) + "."
+    return answer + " Completion records execution state; it does not establish findings, exploitation, or security."
+
+
+def _build_cross_tool_confirmation(context: dict) -> str:
+    represented = sorted({
+        str(finding.get("source") or "").lower()
+        for finding in ((context.get("assessment_context") or {}).get("findings") or [])
+        if isinstance(finding, dict) and finding.get("source")
+    })
+    attribution = ", ".join(represented) if represented else "the completed tools"
+    return (
+        f"Not automatically. {attribution} provide different kinds of stored observations. They can support a bounded "
+        "cross-tool interpretation only where they refer to the same endpoint or event, but one tool's capability or "
+        "metadata does not turn another tool's observation into proof of vulnerability, exploitability, handshake "
+        "completion, or compromise."
     )
 
 
@@ -1248,7 +1299,7 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
         preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
         if preferred == ["httpx"]:
             return (
-                "I would use Mongrel's httpx next. Stored Nmap evidence identified web-associated exposed services, "
+                "I would use Mongrel's httpx next because stored Nmap evidence identified web-associated exposed services, "
                 "while httpx can check which HTTP(S) endpoints respond and record response metadata. That is a grounded "
                 "investigation recommendation, not evidence of a vulnerability, and no tool has been run by this answer."
             )
@@ -1385,6 +1436,28 @@ def _build_follow_up_fallback(context: dict) -> str | None:
     recommendation = context.get("recommendation_context") or {}
     completed = {str(tool) for tool in recommendation.get("completed_tools") or []}
     question = str(context.get("current_question") or "").lower()
+    port_match = re.search(r"\b(?:port\s+)?(\d{1,5})\b", question)
+    if port_match:
+        port = int(port_match.group(1))
+        observations = []
+        for finding in _tool_findings(context, "nmap"):
+            for item in finding.get("open_ports") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    observed_port = int(item.get("port"))
+                except (TypeError, ValueError):
+                    continue
+                if observed_port == port:
+                    observations.append(
+                        f"{observed_port}/{item.get('protocol') or 'tcp'} classified as {item.get('service') or 'unknown'}"
+                    )
+        if observations:
+            return (
+                "For port " + str(port) + ", stored Nmap evidence reported " + ", ".join(observations)
+                + ". That service classification does not establish vulnerability, exploitability, TLS quality, or application behavior."
+            )
+        return f"There is no stored normalized Nmap observation for port {port}. That absence is not evidence that the port is closed or safe."
     if "katana" in previous and "katana" not in completed:
         if re.search(r"\bafter (?:this|that)\b", question):
             return (
