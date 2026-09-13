@@ -4,6 +4,7 @@ from copy import deepcopy
 from time import perf_counter
 
 from app.core.config import get_settings
+from app.parsers.katana_parser import summarize_katana_observations
 from app.services.ai_client import ask_ai
 from app.services.assessment_ai import AI_UNAVAILABLE_MESSAGES
 from app.services.assessment_conversation_context import (
@@ -1087,8 +1088,22 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
             + ", ".join(dict.fromkeys(severities))
             + "; template matches do not automatically establish exploitability."
         )
-    if any(str(finding.get("source") or "").lower().removesuffix(".sh") == "testssl" for finding in findings):
+    testssl_findings = [
+        finding
+        for finding in findings
+        if str(finding.get("source") or "").lower().removesuffix(".sh") == "testssl"
+    ]
+    if any(_has_structured_tool_evidence(finding, "testssl") for finding in testssl_findings):
         statements.append("testssl.sh stored scanner TLS observations; they do not establish exploitability or overall TLS security.")
+    elif testssl_findings:
+        testssl_state = str(
+            ((context.get("recommendation_context") or {}).get("tool_states") or {}).get("testssl", "NOT_RUN")
+        )
+        missing_evidence = _build_missing_structured_evidence_statement(
+            "testssl.sh", "TLS configuration", testssl_state
+        )
+        if missing_evidence:
+            statements.append(missing_evidence)
     metasploit = [finding for finding in findings if str(finding.get("source") or "").lower() == "metasploit"]
     if metasploit:
         session = _metasploit_session_established(context)
@@ -1109,6 +1124,35 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
     if not statements:
         return "No normalized observations are stored yet. That does not establish that the target is safe or free of vulnerabilities."
     return " ".join(statements) + " These are bounded stored observations, not an overall secure, insecure, or vulnerable conclusion."
+
+
+def _has_structured_tool_evidence(finding: dict, tool: str) -> bool:
+    """Distinguish normalized observations from status/error-only finding records."""
+
+    normalized_tool = str(tool).lower().removesuffix(".sh")
+    keys = (
+        f"{normalized_tool}_evidence",
+        f"{normalized_tool}_findings",
+        f"{normalized_tool}_results",
+        f"{normalized_tool}_services",
+        f"{normalized_tool}_observations",
+    )
+    return any(isinstance(finding.get(key), (dict, list, tuple)) and bool(finding.get(key)) for key in keys)
+
+
+def _build_missing_structured_evidence_statement(display: str, evidence_kind: str, state: str) -> str | None:
+    if state == "FAILED":
+        return (
+            f"{display} did not complete successfully, so this assessment does not contain completed structured "
+            f"{evidence_kind} evidence from {display}."
+        )
+    if state == "PARTIAL":
+        return (
+            f"{display} has partial or interrupted state, but no applicable structured {evidence_kind} evidence is stored."
+        )
+    if state == "NOT_RUN":
+        return f"{display} has not run, so no applicable structured {evidence_kind} evidence is stored."
+    return None
 
 
 def _build_individual_tool_state_answer(context: dict) -> str | None:
@@ -1196,8 +1240,24 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
         checks = [item for finding in findings for item in ((finding.get("prowler_evidence") or {}).get("findings") or []) if isinstance(item, dict)]
         rendered = [f"{item.get('check_id') or 'check'}={item.get('status') or 'unknown'}" for item in checks[:10]]
         return "Prowler is recorded as completed. Stored check results: " + (", ".join(rendered) if rendered else "no normalized checks") + ". Each PASS/FAIL is check-scoped and does not establish organization-wide security or compliance."
-    if tool in {"bbot", "katana", "ffuf"}:
-        field = {"bbot": "bbot_observations", "katana": "katana_observations", "ffuf": "ffuf_results"}[tool]
+    if tool == "katana":
+        observations = [
+            item
+            for finding in findings
+            for item in (finding.get("katana_observations") or [])
+            if isinstance(item, dict)
+        ]
+        summary = summarize_katana_observations(observations)
+        return (
+            "Katana is recorded as completed. Its normalized crawl evidence contains "
+            f"{summary['url_count']} URL/endpoint observation(s), {summary['host_count']} unique host(s), "
+            f"{summary['javascript_count']} JavaScript files, {summary['query_parameter_count']} query parameters, "
+            f"and {summary['form_count']} forms/actions; the maximum observed crawl depth was {summary['max_depth']}. "
+            "These are bounded crawl observations. Zero counts do not prove those features are absent, and the crawl "
+            "does not by itself establish a vulnerability or complete coverage."
+        )
+    if tool in {"bbot", "ffuf"}:
+        field = {"bbot": "bbot_observations", "ffuf": "ffuf_results"}[tool]
         items = [item for finding in findings for item in (finding.get(field) or []) if isinstance(item, dict)]
         return f"{display} is recorded as completed with {len(items)} stored observation item(s). These discovery observations do not automatically establish ownership, vulnerability, sensitive exposure, or complete coverage."
     if tool == "playwright":
@@ -1464,6 +1524,8 @@ def _build_follow_up_fallback(context: dict) -> str | None:
     ).lower()
     recommendation = context.get("recommendation_context") or {}
     completed = {str(tool) for tool in recommendation.get("completed_tools") or []}
+    states = {str(tool): str(state) for tool, state in (recommendation.get("tool_states") or {}).items()}
+    preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
     question = str(context.get("current_question") or "").lower()
     port_match = re.search(r"\b(?:port\s+)?(\d{1,5})\b", question)
     if port_match:
@@ -1487,18 +1549,32 @@ def _build_follow_up_fallback(context: dict) -> str | None:
                 + ". That service classification does not establish vulnerability, exploitability, TLS quality, or application behavior."
             )
         return f"There is no stored normalized Nmap observation for port {port}. That absence is not evidence that the port is closed or safe."
-    if "katana" in previous and "katana" not in completed:
-        if re.search(r"\bafter (?:this|that)(?: one)?\b", question):
+    if "katana" in previous:
+        after_katana = bool(re.search(r"\bafter (?:this|that)(?: one)?\b", question))
+        if (
+            "katana" in completed
+            and after_katana
+            and states.get("playwright") == "NOT_RUN"
+            and (not preferred or preferred == ["playwright"])
+        ):
+            return (
+                "After reviewing Katana's completed crawl observations, I would use Mongrel's Playwright next because "
+                "browser-rendered behavior remains an authoritative coverage gap for this web surface. Playwright can "
+                "record rendered pages and browser-visible behavior; that would add bounded observations, not prove a "
+                "vulnerability or complete coverage. This is a recommendation only and runs nothing."
+            )
+        if "katana" not in completed and after_katana:
             return (
                 "After Katana has added crawl observations, I would review what it found before choosing another action. "
                 "If browser-rendered behavior is still an evidence gap, Mongrel's Playwright would be a reasonable next "
                 "investigation. That is a conditional recommendation; neither tool is run by this answer."
             )
-        return (
-            "Katana was suggested because stored evidence identifies a web-associated surface, but no Katana crawl "
-            "coverage is stored. It can add observed URLs, paths, forms, and linked resources. Those observations would "
-            "improve coverage; they would not by themselves prove a vulnerability, and this answer runs nothing."
-        )
+        if "katana" not in completed:
+            return (
+                "Katana was suggested because stored evidence identifies a web-associated surface, but no Katana crawl "
+                "coverage is stored. It can add observed URLs, paths, forms, and linked resources. Those observations would "
+                "improve coverage; they would not by themselves prove a vulnerability, and this answer runs nothing."
+            )
     if "httpx" in previous and "httpx" not in completed:
         return (
             "httpx was suggested because stored Nmap evidence identifies a web-associated surface, while no httpx "

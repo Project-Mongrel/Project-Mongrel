@@ -1126,6 +1126,65 @@ def test_live_wording_variants_are_deterministic_and_evidence_scoped() -> None:
     model.assert_not_called()
 
 
+def test_failed_testssl_without_structured_evidence_is_not_summarized_as_tls_observations() -> None:
+    user_id = 1093
+    assessment = create_assessment("Failed TLS scan", user_id=user_id)
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "testssl",
+            "target": "example.test",
+            "status": "failed",
+            "summary": "No structured testssl.sh evidence was stored.",
+            "error": "testssl.sh scan timed out.",
+        },
+    )
+    record_assessment_scan(assessment["id"], "testssl", "failed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we actually established about this target?",
+        )
+
+    answer = result["answer"].lower()
+    assert "stored scanner tls observations" not in answer
+    assert "did not complete successfully" in answer
+    assert "does not contain completed structured tls configuration evidence" in answer
+    model.assert_not_called()
+
+
+def test_partial_testssl_with_structured_evidence_preserves_tls_observations() -> None:
+    user_id = 1094
+    assessment = create_assessment("Partial TLS evidence", user_id=user_id)
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "testssl",
+            "target": "example.test",
+            "status": "partial",
+            "testssl_evidence": {
+                "target": "example.test",
+                "protocols": [{"id": "TLS1_2", "finding": "offered"}],
+            },
+        },
+    )
+    record_assessment_scan(assessment["id"], "testssl", "partial", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we actually established about this target?",
+        )
+
+    assert "testssl.sh stored scanner TLS observations" in result["answer"]
+    model.assert_not_called()
+
+
 def test_after_that_one_continues_prior_katana_recommendation() -> None:
     user_id = 1092
     assessment = create_assessment("Continuation", user_id=user_id)
@@ -1140,6 +1199,89 @@ def test_after_that_one_continues_prior_katana_recommendation() -> None:
 
     assert "after katana" in result["answer"].lower()
     assert "conditional recommendation" in result["answer"].lower()
+    model.assert_not_called()
+
+
+def test_completed_katana_evidence_then_followup_advances_to_playwright() -> None:
+    user_id = 1095
+    assessment = create_assessment("Completed crawl continuation", user_id=user_id)
+    conversation = create_conversation(assessment["id"], user_id)
+    nmap = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nmap",
+            "target": "example.test",
+            "open_ports": [{"port": 443, "protocol": "tcp", "service": "https"}],
+        },
+    )
+    record_assessment_scan(assessment["id"], "nmap", "completed", finding_id=nmap["id"])
+    for tool in ("httpx", "nuclei"):
+        record_assessment_scan(assessment["id"], tool, "completed")
+    record_assessment_scan(assessment["id"], "testssl", "failed")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        recommendation_answer = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=conversation["id"],
+            question="What should we do next",
+        )["answer"]
+        append_message(conversation["id"], user_id, "user", "What should we do next")
+        append_message(conversation["id"], user_id, "assistant", recommendation_answer)
+        katana = add_finding(
+            user_id=user_id,
+            finding={
+                "source": "katana",
+                "target": "https://example.test",
+                "katana_observations": [
+                    {
+                        "url": "https://example.test/",
+                        "host": "example.test",
+                        "depth": 0,
+                        "endpoint_type": "url",
+                        "query_parameters": [],
+                        "forms": [],
+                    }
+                ],
+                "katana_summary": {
+                    "url_count": 1,
+                    "host_count": 1,
+                    "javascript_count": 0,
+                    "query_parameter_count": 0,
+                    "form_count": 0,
+                    "max_depth": 0,
+                },
+            },
+        )
+        record_assessment_scan(assessment["id"], "katana", "completed", finding_id=katana["id"])
+        evidence_answer = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=conversation["id"],
+            question="What did Katana add",
+        )["answer"]
+        append_message(conversation["id"], user_id, "user", "What did Katana add")
+        append_message(conversation["id"], user_id, "assistant", evidence_answer)
+        followup_answer = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=conversation["id"],
+            question="And after that one?",
+        )["answer"]
+
+    assert "Katana next" in recommendation_answer
+    assert "1 URL/endpoint" in evidence_answer
+    assert "1 unique host" in evidence_answer
+    assert "0 JavaScript files" in evidence_answer
+    assert "0 query parameters" in evidence_answer
+    assert "0 forms/actions" in evidence_answer
+    assert "maximum observed crawl depth was 0" in evidence_answer
+    assert "do not prove those features are absent" in evidence_answer
+    assert "Playwright" in followup_answer
+    assert "Katana next" not in followup_answer
+    assert "testssl.sh" not in followup_answer
+    assert "recommendation" in followup_answer.lower()
+    assert "runs nothing" in followup_answer.lower()
     model.assert_not_called()
 
 
