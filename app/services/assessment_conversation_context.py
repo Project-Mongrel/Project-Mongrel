@@ -136,7 +136,7 @@ PRIORITIZATION_TERMS = ("which one first", "what first", "prioriti", "highest pr
 COVERAGE_GAP_TERMS = (
     "anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing",
     "what haven't we done", "what have we not done", "what remains", "biggest unknown", "what don't we know",
-    "what do we not know", "gaps remain",
+    "what do we not know", "gaps remain", "remaining gaps",
 )
 SIGNIFICANCE_TERMS = ("anything worrying", "is that bad", "does that matter", "how serious", "why should i care")
 UNCERTAINTY_TERMS = (
@@ -209,6 +209,12 @@ def build_assessment_conversation_context(
     )
     selected_tools = detect_question_tools(question)
     question_intent = classify_assessment_conversation_intent(question, selected_tools=selected_tools)
+    inherited_scope = False
+    if not selected_tools and _is_referential_follow_up(question, question_intent):
+        selected_tools = _tools_from_immediately_relevant_history(recent_messages, question)
+        inherited_scope = bool(selected_tools)
+        if inherited_scope:
+            recent_messages = _relevant_follow_up_messages(recent_messages, question)
     uncertainty_subtype = classify_uncertainty_subtype(question) if question_intent == "uncertainty_safety" else None
     full_assessment = not selected_tools
     evidence = _build_evidence_context(assessment_context, selected_tools)
@@ -241,6 +247,7 @@ def build_assessment_conversation_context(
         "selection": {
             "mode": "full_assessment" if full_assessment else "tool_relevant",
             "selected_tools": selected_tools,
+            "inherited_evidence_scope": inherited_scope,
         },
         "conversation": {
             "id": conversation["id"] if conversation is not None else None,
@@ -273,6 +280,53 @@ def build_assessment_conversation_context(
     }
     context["evidence_context_digest"] = build_context_digest(context)
     return context
+
+
+def _is_referential_follow_up(question: str, intent: str) -> bool:
+    normalized = _normalize_intent_text(question)
+    referential = bool(re.search(
+        r"\b(?:that|it|this finding|this conclusion|that conclusion|why|how confident|what does (?:that|it) mean)\b",
+        normalized,
+    ))
+    return referential and intent in {
+        "follow_up_reference", "explanation", "simplify_explanation", "significance_interpretation",
+        "uncertainty_safety", "current_assessment_evidence",
+    }
+
+
+def _tools_from_immediately_relevant_history(recent_messages: list[dict], current_question: str) -> list[str]:
+    skipped_current = False
+    for message in reversed(recent_messages):
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        content = str(message.get("content") or "")
+        if not skipped_current and _normalize_intent_text(content) == _normalize_intent_text(current_question):
+            skipped_current = True
+            continue
+        tools = detect_question_tools(content)
+        if tools:
+            return tools
+    return []
+
+
+def _relevant_follow_up_messages(recent_messages: list[dict], current_question: str) -> list[dict]:
+    """Keep the prior referent exchange plus the current question, not unrelated history."""
+    prior_user_index = None
+    skipped_current = False
+    for index in range(len(recent_messages) - 1, -1, -1):
+        message = recent_messages[index]
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        content = str(message.get("content") or "")
+        if not skipped_current and _normalize_intent_text(content) == _normalize_intent_text(current_question):
+            skipped_current = True
+            continue
+        if detect_question_tools(content):
+            prior_user_index = index
+            break
+    if prior_user_index is None:
+        return recent_messages[-3:]
+    return recent_messages[prior_user_index:][-3:]
 
 
 def classify_assessment_conversation_intent(question: str, *, selected_tools: list[str] | None = None) -> str:

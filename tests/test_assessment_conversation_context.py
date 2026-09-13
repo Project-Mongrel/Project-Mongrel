@@ -288,7 +288,9 @@ def test_tool_specific_question_selects_relevant_evidence() -> None:
     context = build_assessment_conversation_context(user_id=1001, assessment_id=assessment["id"], question="What did Nmap find?")
 
     assert detect_question_tools("What did Nmap find?") == ["nmap"]
-    assert context["selection"] == {"mode": "tool_relevant", "selected_tools": ["nmap"]}
+    assert context["selection"] == {
+        "mode": "tool_relevant", "selected_tools": ["nmap"], "inherited_evidence_scope": False,
+    }
     assert [finding["source"] for finding in context["assessment_context"]["findings"]] == ["nmap"]
 
 

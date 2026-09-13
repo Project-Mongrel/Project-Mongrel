@@ -684,7 +684,9 @@ def _log_assessment_ask_timing(
         "assessment_ask_timing assessment_id=%s conversation_id=%s ownership_conversation_lookup_ms=%.3f context_ms=%.3f prompt_ms=%.3f "
         "ai_ms=%.3f postprocess_ms=%.3f user_persistence_ms=%.3f assistant_persistence_ms=%.3f persistence_ms=%.3f "
         "telegram_send_ms=%.3f total_ms=%.3f prompt_chars=%s context_chars=%s history_message_count=%s evidence_scan_count=%s "
-        "evidence_finding_count=%s evidence_artifact_count=%s output_token_budget=%s fallback_reason=%s",
+        "evidence_finding_count=%s evidence_artifact_count=%s output_token_budget=%s inherited_evidence_scope=%s "
+        "prompt_budget_reduced=%s prompt_budget_input_tokens=%s evidence_items_before_budget=%s "
+        "evidence_items_after_budget=%s fallback_reason=%s",
         assessment_id,
         conversation_id,
         lookup_ms,
@@ -704,6 +706,11 @@ def _log_assessment_ask_timing(
         int(instrumentation.get("evidence_finding_count") or 0),
         int(instrumentation.get("evidence_artifact_count") or 0),
         int(instrumentation.get("output_token_budget") or 0),
+        bool(instrumentation.get("inherited_evidence_scope")),
+        bool(instrumentation.get("prompt_budget_reduced")),
+        int(instrumentation.get("prompt_budget_input_tokens") or 0),
+        int(instrumentation.get("evidence_items_before_budget") or 0),
+        int(instrumentation.get("evidence_items_after_budget") or 0),
         str(fallback_reason or "none"),
     )
 

@@ -22,6 +22,8 @@ from app.services.mongrel_self_knowledge import get_mongrel_tool_names
 FALLBACK_ANSWER = (
     "Ask Mongrel is unavailable. Review the assessment dashboard, scan history, stored findings, and reports for next steps."
 )
+ASSESSMENT_PROMPT_INPUT_TOKEN_BUDGET = 2800
+ASSESSMENT_PROMPT_MAX_CHARS = ASSESSMENT_PROMPT_INPUT_TOKEN_BUDGET * 4
 TRUTHFULNESS_FALLBACK_ANSWER = (
     "Ask Mongrel withheld a generated answer because it made a security conclusion that was not supported by the stored "
     "assessment evidence. Review the current assessment evidence and rerun the question with a narrower scope."
@@ -163,11 +165,37 @@ def answer_assessment_conversation_question(
             ),
         )
     prompt_context = _build_prompt_context(context)
+    evidence_before = _prompt_evidence_item_counts(prompt_context)
+    prompt_context, budget_reduced = _apply_prompt_budget(context, prompt_context)
+    evidence_after = _prompt_evidence_item_counts(prompt_context)
     context_chars = len(json.dumps(prompt_context, default=_json_default, sort_keys=True))
     prompt_started = perf_counter()
     prompt = build_assessment_conversation_prompt(context, prompt_context=prompt_context)
     prompt_ms = _elapsed_ms(prompt_started)
     output_token_budget = _conversation_num_predict()
+    budget_metadata = {
+        "budget_reduced": budget_reduced, "evidence_before": evidence_before,
+        "evidence_after": evidence_after,
+    }
+    if len(prompt) > ASSESSMENT_PROMPT_MAX_CHARS:
+        answer = _build_grounded_conversational_fallback(context) or TRUTHFULNESS_FALLBACK_ANSWER
+        return _result(
+            answer,
+            context,
+            fallback_reason="prompt_budget_guard",
+            instrumentation=_instrumentation(
+                context,
+                context_ms=context_ms,
+                prompt_ms=prompt_ms,
+                ai_ms=0.0,
+                postprocess_ms=0.0,
+                engine_ms=_elapsed_ms(engine_started),
+                context_chars=context_chars,
+                prompt_chars=len(prompt),
+                output_token_budget=output_token_budget,
+                prompt_budget_metadata=budget_metadata,
+            ),
+        )
     ai_started = perf_counter()
     try:
         response = ask_ai(prompt, num_predict=output_token_budget, path="assessment_ask")
@@ -186,6 +214,7 @@ def answer_assessment_conversation_question(
                 context_chars=context_chars,
                 prompt_chars=len(prompt),
                 output_token_budget=output_token_budget,
+                prompt_budget_metadata=budget_metadata,
             ),
         )
 
@@ -228,6 +257,7 @@ def answer_assessment_conversation_question(
             context_chars=context_chars,
             prompt_chars=len(prompt),
             output_token_budget=output_token_budget,
+            prompt_budget_metadata=budget_metadata,
         ),
     )
 
@@ -466,6 +496,170 @@ def _build_prompt_context(context: dict) -> dict:
         guidance = context.get("telegram_capability_guidance") or {}
         prompt_context["user_actions"] = {tool: guidance[tool] for tool in preferred if tool in guidance}
     return prompt_context
+
+
+def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, bool]:
+    """Structurally reduce optional context while preserving current and referenced evidence."""
+    candidate = deepcopy(prompt_context)
+    if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) <= ASSESSMENT_PROMPT_MAX_CHARS:
+        return candidate, False
+
+    prior = candidate.get("prior_exchange")
+    if isinstance(prior, dict):
+        prior["messages"] = list(prior.get("messages") or [])[-2:]
+        summary = prior.get("summary")
+        if isinstance(summary, str) and len(summary) > 600:
+            prior["summary"] = summary[:600].rstrip() + "... [truncated]"
+
+    evidence = candidate.get("stored_evidence")
+    if isinstance(evidence, dict):
+        evidence["targets"] = list(evidence.get("targets") or [])[:2]
+        evidence["scans"] = _latest_generation_scans(evidence.get("scans") or [])
+        evidence["findings"] = _prioritized_generation_findings(context, evidence.get("findings") or [])
+        candidate["stored_evidence"] = _compact_generation_evidence(evidence, list_limit=5, text_limit=600)
+        candidate["tool_state"] = (context.get("recommendation_context") or {}).get("tool_states") or {}
+
+    if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) > ASSESSMENT_PROMPT_MAX_CHARS:
+        candidate.pop("evidence_semantics", None)
+        prior = candidate.get("prior_exchange")
+        if isinstance(prior, dict):
+            prior.pop("summary", None)
+        if isinstance(candidate.get("stored_evidence"), dict):
+            candidate["stored_evidence"] = _compact_generation_evidence(
+                candidate["stored_evidence"], list_limit=3, text_limit=300
+            )
+    if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) > ASSESSMENT_PROMPT_MAX_CHARS:
+        if isinstance(candidate.get("stored_evidence"), dict):
+            candidate["stored_evidence"] = _compact_generation_evidence(
+                candidate["stored_evidence"], list_limit=2, text_limit=160
+            )
+        prior = candidate.get("prior_exchange")
+        if isinstance(prior, dict):
+            prior["messages"] = list(prior.get("messages") or [])[-2:]
+    return candidate, True
+
+
+def _latest_generation_scans(scans: list[dict]) -> list[dict]:
+    tools = sorted({str(scan.get("tool") or "unknown").lower().removesuffix(".sh") for scan in scans})
+    return [latest for tool in tools if (latest := select_latest_tool_scan(scans, tool)) is not None]
+
+
+_SEVERITY_PRIORITY = {"critical": 5, "high": 4, "medium": 3, "moderate": 3, "low": 2, "info": 1, "informational": 1}
+_REFERENCE_STOPWORDS = {
+    "about", "assessment", "confidence", "conclusion", "explain", "finding", "have", "how", "should",
+    "that", "this", "what", "when", "where", "which", "with", "would", "your",
+}
+
+
+def _prioritized_generation_findings(context: dict, findings: list[dict]) -> list[dict]:
+    """Rank useful evidence deterministically while bounding any one noisy tool."""
+    reference_terms = _generation_reference_terms(context)
+    selected: list[dict] = []
+    per_tool: dict[str, int] = {}
+    for finding in sorted(
+        findings,
+        key=lambda item: _generation_finding_rank(item, reference_terms),
+        reverse=True,
+    ):
+        tool = str(finding.get("source") or "unknown").lower().removesuffix(".sh")
+        if per_tool.get(tool, 0) >= 2:
+            continue
+        per_tool[tool] = per_tool.get(tool, 0) + 1
+        selected.append(finding)
+    return selected
+
+
+def _generation_reference_terms(context: dict) -> set[str]:
+    selection = context.get("selection") or {}
+    if not selection.get("selected_tools") and not selection.get("inherited_evidence_scope"):
+        return set()
+    question = str(context.get("current_question") or "")
+    if selection.get("inherited_evidence_scope"):
+        messages = (context.get("conversation") or {}).get("recent_messages") or []
+        prior_users = [str(message.get("content") or "") for message in messages[:-1] if message.get("role") == "user"]
+        if prior_users:
+            question = f"{prior_users[-1]} {question}"
+    return {
+        term for term in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", question.lower())
+        if term not in _REFERENCE_STOPWORDS
+    }
+
+
+def _generation_finding_rank(finding: dict, reference_terms: set[str]) -> tuple:
+    serialized = json.dumps(finding, sort_keys=True, default=str).lower()
+    reference_score = sum(term in serialized for term in reference_terms)
+    severities = [
+        _SEVERITY_PRIORITY.get(value, 0)
+        for value in re.findall(r'"(?:severity|risk_level)"\s*:\s*"([^"\\]+)"', serialized)
+    ]
+    severity_score = max(severities, default=0)
+    confidence = finding.get("confidence_score") or finding.get("confidence")
+    try:
+        confidence_score = float(confidence)
+    except (TypeError, ValueError):
+        confidence_score = 1.0 if str(confidence).lower() in {"high", "strong", "confirmed"} else 0.0
+    evidence_score = sum(
+        bool(finding.get(key))
+        for key in (
+            "open_ports", "nuclei_findings", "httpx_services", "katana_observations", "playwright_observation",
+            "ffuf_results", "testssl_findings", "packet_observations", "observations",
+        )
+    )
+    tool = str(finding.get("source") or "unknown").lower().removesuffix(".sh")
+    try:
+        finding_id = int(finding.get("id") or 0)
+    except (TypeError, ValueError):
+        finding_id = 0
+    # Reference relevance intentionally precedes stored severity so a narrow
+    # follow-up cannot lose its subject to an unrelated higher-severity item.
+    return reference_score, severity_score, confidence_score, evidence_score, tool, finding_id, serialized
+
+
+def _compact_generation_evidence(evidence: dict, *, list_limit: int, text_limit: int) -> dict:
+    """Compact detail while retaining one latest scan state for every represented tool."""
+    compact = {
+        key: _compact_generation_value(value, list_limit=list_limit, text_limit=text_limit)
+        for key, value in evidence.items()
+        if key not in {"scans", "findings"}
+    }
+    compact["scans"] = [
+        {
+            key: _compact_generation_value(scan[key], list_limit=list_limit, text_limit=text_limit)
+            for key in ("id", "tool", "status", "finding_id", "created_at", "started_at", "updated_at")
+            if key in scan
+        }
+        for scan in evidence.get("scans") or []
+    ]
+    compact["findings"] = [
+        _compact_generation_value(finding, list_limit=list_limit, text_limit=text_limit)
+        for finding in (evidence.get("findings") or [])[:list_limit]
+    ]
+    return compact
+
+
+def _compact_generation_value(value: object, *, list_limit: int, text_limit: int) -> object:
+    if isinstance(value, list):
+        return [
+            _compact_generation_value(item, list_limit=list_limit, text_limit=text_limit)
+            for item in value[:list_limit]
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _compact_generation_value(item, list_limit=list_limit, text_limit=text_limit)
+            for key, item in value.items()
+        }
+    if isinstance(value, str) and len(value) > text_limit:
+        return value[:text_limit].rstrip() + "... [truncated]"
+    return value
+
+
+def _prompt_evidence_item_counts(prompt_context: dict) -> dict[str, int]:
+    evidence = prompt_context.get("stored_evidence") or {}
+    return {
+        "scans": len(evidence.get("scans") or []),
+        "findings": len(evidence.get("findings") or []),
+        "history": len(((prompt_context.get("prior_exchange") or {}).get("messages") or [])),
+    }
 
 
 def _question_needs_history(question: str, *, intent: str = "") -> bool:
@@ -1844,10 +2038,14 @@ def _instrumentation(
     context_chars: int,
     prompt_chars: int,
     output_token_budget: int,
+    prompt_budget_metadata: dict | None = None,
 ) -> dict:
     provenance = context.get("provenance") or {}
     counts = provenance.get("evidence_counts") or {}
     recent_messages = ((context.get("conversation") or {}).get("recent_messages") or [])
+    budget_metadata = prompt_budget_metadata or {}
+    before = budget_metadata.get("evidence_before") or {}
+    after = budget_metadata.get("evidence_after") or {}
     return {
         "context_ms": context_ms,
         "prompt_ms": prompt_ms,
@@ -1861,6 +2059,11 @@ def _instrumentation(
         "evidence_finding_count": int(counts.get("findings") or 0),
         "evidence_artifact_count": int(counts.get("artifacts") or 0),
         "output_token_budget": int(output_token_budget),
+        "inherited_evidence_scope": bool((context.get("selection") or {}).get("inherited_evidence_scope")),
+        "prompt_budget_reduced": bool(budget_metadata.get("budget_reduced")),
+        "prompt_budget_input_tokens": ASSESSMENT_PROMPT_INPUT_TOKEN_BUDGET,
+        "evidence_items_before_budget": int(before.get("scans", 0)) + int(before.get("findings", 0)),
+        "evidence_items_after_budget": int(after.get("scans", 0)) + int(after.get("findings", 0)),
     }
 
 

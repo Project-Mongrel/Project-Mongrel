@@ -5,10 +5,13 @@ import pytest
 
 from app.core.config import Settings
 from app.services.assessment_conversation_ai import (
+    ASSESSMENT_PROMPT_MAX_CHARS,
     FALLBACK_ANSWER,
     NATIVE_GUIDANCE_FALLBACK_ANSWER,
     TRUTHFULNESS_FALLBACK_ANSWER,
     answer_assessment_conversation_question,
+    _apply_prompt_budget,
+    _build_prompt_context,
     build_assessment_conversation_prompt,
     violates_conversation_truthfulness,
     violates_mongrel_native_guidance,
@@ -1010,9 +1013,10 @@ def test_assessment_answer_returns_safe_latency_stages_and_sizes() -> None:
     assert set(instrumentation) == {
         "context_ms", "prompt_ms", "ai_ms", "postprocess_ms", "engine_ms",
         "prompt_chars", "context_chars", "history_message_count",
-        "evidence_scan_count", "evidence_finding_count", "evidence_artifact_count",
-        "output_token_budget",
-    }
+            "evidence_scan_count", "evidence_finding_count", "evidence_artifact_count",
+            "output_token_budget", "inherited_evidence_scope", "prompt_budget_reduced",
+            "prompt_budget_input_tokens", "evidence_items_before_budget", "evidence_items_after_budget",
+        }
     assert all(instrumentation[key] >= 0 for key in ("context_ms", "prompt_ms", "ai_ms", "postprocess_ms", "engine_ms"))
     assert instrumentation["prompt_chars"] > instrumentation["context_chars"] > 0
     assert instrumentation["history_message_count"] == 1
@@ -1594,3 +1598,168 @@ def _add_live_web_nmap_scan(assessment_id: int, *, user_id: int) -> dict:
         },
     )
     return record_assessment_scan(assessment_id, tool="nmap", status="completed", finding_id=finding["id"])
+
+
+def test_referential_confidence_followup_inherits_nuclei_scope_and_stays_bounded() -> None:
+    user_id = 1101
+    assessment = create_assessment("Follow-up scope", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    tools = ["nmap", "httpx", "nuclei", "katana", "playwright", "ffuf", "testssl", "bbot", "gitleaks", "prowler", "metasploit", "tshark"]
+    for index, tool in enumerate(tools):
+        finding = add_finding(
+            user_id=user_id,
+            finding={
+                "source": tool,
+                "target": "example.com",
+                "summary": f"UNRELATED-{tool}-EVIDENCE " + ("x" * 900),
+                "nuclei_findings": [{"name": "Weak HSTS", "template_id": "weak-hsts", "severity": "info"}]
+                if tool == "nuclei" else [],
+            },
+        )
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+
+    conversation = create_conversation(assessment["id"], user_id, "Scoped follow-up")
+    for index in range(2):
+        append_message(conversation["id"], user_id, "user", f"Older unrelated question {index}")
+        append_message(conversation["id"], user_id, "assistant", f"Older unrelated answer {index}")
+    first_question = "Explain why the Weak HSTS Nuclei match matters in this assessment."
+    append_message(conversation["id"], user_id, "user", first_question)
+    append_message(conversation["id"], user_id, "assistant", "It is an INFO template observation requiring validation.")
+    follow_up = "How confident should I be in that conclusion, and why?"
+    append_message(conversation["id"], user_id, "user", follow_up)
+
+    context = build_assessment_conversation_context(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=conversation["id"], question=follow_up,
+    )
+    prompt = build_assessment_conversation_prompt(context)
+
+    assert context["selection"] == {
+        "mode": "tool_relevant", "selected_tools": ["nuclei"], "inherited_evidence_scope": True,
+    }
+    assert context["provenance"]["evidence_counts"]["scans"] == 1
+    assert context["provenance"]["evidence_counts"]["findings"] == 1
+    assert "Weak HSTS" in prompt and first_question in prompt and follow_up in prompt
+    assert "UNRELATED-nmap-EVIDENCE" not in prompt
+    assert "UNRELATED-httpx-EVIDENCE" not in prompt
+    assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
+
+    with patch(
+        "app.services.assessment_conversation_ai.ask_ai",
+        return_value="Confidence is limited to the stored INFO Weak HSTS template observation; validation is still required.",
+    ) as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=conversation["id"],
+            question=follow_up,
+        )
+
+    model_prompt = ask_ai.call_args.args[0]
+    assert len(model_prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
+    assert "Weak HSTS" in model_prompt and "UNRELATED-nmap-EVIDENCE" not in model_prompt
+    assert result["instrumentation"]["inherited_evidence_scope"] is True
+    assert result["instrumentation"]["prompt_budget_input_tokens"] == 2800
+    assert result["instrumentation"]["prompt_chars"] < 10_000
+
+
+def test_genuinely_broad_remaining_gaps_question_keeps_assessment_wide_state() -> None:
+    user_id = 1102
+    assessment = create_assessment("Broad gaps", user_id=user_id)
+    for tool in ("nmap", "httpx", "nuclei"):
+        finding = add_finding(user_id=user_id, finding={"source": tool, "target": "example.com", "summary": tool})
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        question="What are the biggest remaining gaps in this assessment?",
+    )
+
+    assert context["question_intent"] == "remaining_coverage_gaps"
+    assert context["selection"]["mode"] == "full_assessment"
+    assert context["selection"]["inherited_evidence_scope"] is False
+    assert context["provenance"]["evidence_counts"]["scans"] == 3
+
+
+def test_broad_prompt_budget_prioritizes_severity_and_preserves_tool_coverage() -> None:
+    user_id = 1103
+    assessment = create_assessment("Importance-aware budget", user_id=user_id)
+    info = add_finding(user_id=user_id, finding={
+        "source": "nuclei", "target": "example.com",
+        "nuclei_findings": [{"name": "Technology fingerprint", "severity": "info"}],
+        "observations": ["low-value " + ("i" * 1100)] * 10,
+    })
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed", finding_id=info["id"])
+    high = add_finding(user_id=user_id, finding={
+        "source": "nuclei", "target": "example.com",
+        "nuclei_findings": [{"name": "Stored high-severity template", "severity": "high"}],
+        "observations": ["direct evidence " + ("h" * 1100)] * 10,
+    })
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed", finding_id=high["id"])
+    for tool in ("nmap", "httpx", "katana", "playwright", "ffuf", "bbot"):
+        finding = add_finding(user_id=user_id, finding={
+            "source": tool, "target": "example.com", "observations": [f"{tool}-noise " + ("x" * 1100)] * 10,
+        })
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+    record_assessment_scan(assessment["id"], tool="testssl", status="failed")
+
+    context = build_assessment_conversation_context(
+        user_id=user_id, assessment_id=assessment["id"],
+        question="Give me a broad assessment-wide review of the evidence and priorities.",
+    )
+    budgeted, reduced = _apply_prompt_budget(context, _build_prompt_context(context))
+    prompt = build_assessment_conversation_prompt(context, prompt_context=budgeted)
+    findings = budgeted["stored_evidence"]["findings"]
+
+    assert reduced is True
+    rendered_findings = json.dumps(findings, default=str)
+    assert "Stored high-severity template" in rendered_findings
+    assert "Technology fingerprint" in rendered_findings
+    assert rendered_findings.index("Stored high-severity template") < rendered_findings.index("Technology fingerprint")
+    assert budgeted["tool_state"]["testssl"] == "FAILED"
+    assert set((budgeted.get("tool_state") or {})) == {
+        "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl",
+        "gitleaks", "prowler", "metasploit", "tshark",
+    }
+    assert any(scan["tool"] == "testssl" and scan["status"] == "failed" for scan in budgeted["stored_evidence"]["scans"])
+    assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
+
+
+def test_narrow_prompt_budget_keeps_referenced_info_ahead_of_unrelated_high() -> None:
+    user_id = 1104
+    assessment = create_assessment("Reference-first budget", user_id=user_id)
+    referenced = add_finding(user_id=user_id, finding={
+        "source": "nuclei", "target": "example.com",
+        "nuclei_findings": [{"name": "Weak HSTS", "template_id": "weak-hsts", "severity": "info"}],
+        "observations": ["referenced " + ("r" * 1100)] * 10,
+    })
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed", finding_id=referenced["id"])
+    unrelated = add_finding(user_id=user_id, finding={
+        "source": "nuclei", "target": "example.com",
+        "nuclei_findings": [{"name": "Unrelated high item", "template_id": "other", "severity": "high"}],
+        "observations": ["unrelated " + ("u" * 1100)] * 10,
+    })
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed", finding_id=unrelated["id"])
+    conversation = create_conversation(assessment["id"], user_id, "Reference priority")
+    append_message(
+        conversation["id"], user_id, "user",
+        "Explain why the Weak HSTS Nuclei match matters in this assessment.",
+    )
+    append_message(
+        conversation["id"], user_id, "assistant",
+        "The stored Weak HSTS INFO match is an observation, not proof of exploitability.",
+    )
+
+    context = build_assessment_conversation_context(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=conversation["id"],
+        question="How confident should I be in that conclusion, and why?",
+    )
+    budgeted, reduced = _apply_prompt_budget(context, _build_prompt_context(context))
+    rendered = json.dumps(budgeted["stored_evidence"]["findings"], default=str)
+    prompt = build_assessment_conversation_prompt(context, prompt_context=budgeted)
+
+    assert reduced is True
+    assert "Weak HSTS" in rendered
+    assert "Unrelated high item" in rendered
+    assert rendered.index("Weak HSTS") < rendered.index("Unrelated high item")
+    assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
