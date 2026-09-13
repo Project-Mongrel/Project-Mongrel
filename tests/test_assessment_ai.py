@@ -2,6 +2,7 @@ from unittest.mock import patch
 from datetime import UTC, datetime
 
 from app.services.assessment_ai import (
+    ASSESSMENT_AI_REPORT_NUM_PREDICT,
     FALLBACK_ANSWER,
     FALLBACK_REPORT,
     answer_assessment_question,
@@ -413,8 +414,9 @@ def test_assessment_ai_report_prompt_includes_required_sections_and_limitations(
 def test_generate_assessment_ai_report_success_returns_report() -> None:
     response = "✦ Assessment AI Report\n\nExecutive Summary\nEvidence reviewed."
 
-    with patch("app.services.assessment_ai.ask_ai", return_value=response):
+    with patch("app.services.assessment_ai.ask_ai", return_value=response) as ask:
         assert generate_assessment_ai_report({"assessment": {"name": "A"}}) == response
+    assert ask.call_args.kwargs["num_predict"] == ASSESSMENT_AI_REPORT_NUM_PREDICT
 
 
 def test_generate_assessment_ai_report_unavailable_returns_fallback() -> None:
@@ -456,4 +458,3 @@ def test_ai_report_uses_latest_tool_evidence_and_corrects_scanner_semantics() ->
     assert "no hidden content found" not in report.lower()
     assert "3 template match(es)" in report and "INFO" in report
     assert "testssl.sh: FAILED" in report and "no completed structured TLS" in report
-

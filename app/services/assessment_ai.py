@@ -18,6 +18,7 @@ FALLBACK_ANSWER = "Assessment AI is unavailable. Review the assessment dashboard
 FALLBACK_REPORT = (
     "Assessment AI report unavailable. Review the assessment dashboard, scan history, and stored findings for next steps."
 )
+ASSESSMENT_AI_REPORT_NUM_PREDICT = 1536
 
 
 def answer_assessment_question(question: str, context: dict) -> str:
@@ -41,7 +42,7 @@ def answer_assessment_question(question: str, context: dict) -> str:
 def generate_assessment_ai_report(context: dict) -> str:
     prompt = build_assessment_ai_report_prompt(context)
     try:
-        response = ask_ai(prompt)
+        response = ask_ai(prompt, num_predict=ASSESSMENT_AI_REPORT_NUM_PREDICT)
     except Exception:
         return FALLBACK_REPORT
 

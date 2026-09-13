@@ -242,12 +242,16 @@ def split_report_text(report: str, max_length: int = MAX_REPORT_MESSAGE_LENGTH) 
     remaining = report
     while len(remaining) > max_length:
         split_at = remaining.rfind("\n\n", 0, max_length)
+        delimiter_length = 2
         if split_at <= 0:
             split_at = remaining.rfind("\n", 0, max_length)
+            delimiter_length = 1
         if split_at <= 0:
             split_at = max_length
-        chunks.append(remaining[:split_at].strip())
-        remaining = remaining[split_at:].strip()
+            delimiter_length = 0
+        split_at += delimiter_length
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
     if remaining:
         chunks.append(remaining)
     return chunks

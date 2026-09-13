@@ -1093,12 +1093,12 @@ def test_assessment_ai_report_callback_splits_long_reports() -> None:
         edit_message_text=AsyncMock(),
         message=query_message,
     )
-    report = "\u2726 Assessment AI Report\n\n" + ("Evidence reviewed.\n" * 500)
+    report = "\u2726 Assessment AI Report\n\n" + "\n\n".join(
+        f"Section {index}\nEvidence paragraph {index}: " + (chr(65 + index % 26) * 700)
+        for index in range(12)
+    )
 
-    with (
-        patch("app.services.assessment_ai.ask_ai", return_value=report),
-        patch("app.bot.handlers.reports.split_report_text", return_value=["chunk one", "chunk two"]) as splitter,
-    ):
+    with patch("app.services.assessment_ai.ask_ai", return_value=report):
         asyncio.run(
             assessment_callback_handler(
                 SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8135)),
@@ -1106,12 +1106,45 @@ def test_assessment_ai_report_callback_splits_long_reports() -> None:
             )
         )
 
-    assert splitter.call_count == 1
-    assert splitter.call_args.args[0].startswith("\u2726 Assessment AI Report")
-    assert "Evidence reviewed." in splitter.call_args.args[0]
-    assert [call.args[0] for call in query_message.reply_text.call_args_list] == [
-        "Generating assessment AI report...", "chunk one", "chunk two", "Assessment report actions"
-    ]
+    calls = query_message.reply_text.call_args_list
+    delivered_chunks = [call.args[0] for call in calls[1:-1]]
+    assert len(delivered_chunks) > 1
+    assert delivered_chunks[0].startswith("\u2726 Assessment AI Report")
+    assert "Section 11" in delivered_chunks[-1]
+    assert "".join(delivered_chunks) == report
+    assert all(len(chunk) <= 3800 for chunk in delivered_chunks)
+    assert calls[-1].args[0] == "Assessment report actions"
+    assert "reply_markup" in calls[-1].kwargs
+
+
+def test_assessment_markdown_report_callback_splits_long_report_without_discarding_content() -> None:
+    assessment = create_assessment("Assessment Markdown Long Report", user_id=81351)
+    query_message = SimpleNamespace(reply_text=AsyncMock())
+    query = SimpleNamespace(
+        data=f"assessment:markdown:{assessment['id']}", answer=AsyncMock(),
+        edit_message_text=AsyncMock(), message=query_message,
+    )
+    report = "# Assessment Report\n\n" + "\n\n".join(
+        f"## Section {index}\nStored evidence {index}: " + (chr(65 + index % 26) * 700)
+        for index in range(12)
+    )
+
+    with patch("app.bot.handlers.assessment.generate_assessment_markdown_report", return_value=report):
+        asyncio.run(assessment_callback_handler(
+            SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=81351)),
+            SimpleNamespace(user_data={}),
+        ))
+
+    calls = query_message.reply_text.call_args_list
+    delivered_chunks = [call.args[0] for call in calls[1:-1]]
+    assert calls[0].args[0] == "Generating Markdown report..."
+    assert len(delivered_chunks) > 1
+    assert delivered_chunks[0].startswith("# Assessment Report")
+    assert "## Section 11" in delivered_chunks[-1]
+    assert "".join(delivered_chunks) == report
+    assert all(len(chunk) <= 3800 for chunk in delivered_chunks)
+    assert calls[-1].args[0] == "Assessment report actions"
+    assert "reply_markup" in calls[-1].kwargs
 
 
 def test_assessment_markdown_report_callback_edits_when_message_missing() -> None:
