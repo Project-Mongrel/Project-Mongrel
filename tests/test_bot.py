@@ -346,7 +346,7 @@ def test_new_assessment_flow_creates_assessment_target_and_dashboard() -> None:
     assert "Mission 10.11 Assessment" in dashboard
     assert "example.com" in dashboard
     assert "Nmap: Not run" in dashboard
-    assert keyboard.inline_keyboard[0][0].text == "Run Nmap"
+    assert keyboard.inline_keyboard[0][0].text == "Nmap Scan"
 
     assessment = list_assessments()[-1]
     assert assessment["name"] == "Mission 10.11 Assessment"
@@ -785,7 +785,7 @@ def test_assessment_dashboard_shows_tshark_button_and_status() -> None:
     buttons = [button.text for row in keyboard.inline_keyboard for button in row]
 
     assert "TShark: Completed" in dashboard
-    assert "Run TShark" in buttons
+    assert "TShark PCAP" in buttons
 
 
 def test_assessment_history_callback_lists_recorded_scans() -> None:
