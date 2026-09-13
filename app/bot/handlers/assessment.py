@@ -575,6 +575,7 @@ async def _complete_assessment_ask_turn(
     if not _assessment_ask_turn_is_current(context, assessment_id, conversation_id, turn_id):
         _finish_assessment_ask_turn(context, conversation_id, turn_id)
         return
+    delivery_started = perf_counter()
     try:
         await update.message.reply_text(answer, reply_markup=build_assessment_chat_keyboard(assessment_id))
     except Exception as error:
@@ -586,7 +587,7 @@ async def _complete_assessment_ask_turn(
         assessment_id=assessment_id, conversation_id=conversation_id, lookup_ms=lookup_ms,
         user_persistence_ms=user_persistence_ms, assistant_persistence_ms=assistant_persistence_ms,
         total_ms=_assessment_ask_elapsed_ms(turn_started), instrumentation=result.get("instrumentation") or {},
-        fallback_reason=result.get("fallback_reason"),
+        fallback_reason=result.get("fallback_reason"), delivery_ms=_assessment_ask_elapsed_ms(delivery_started),
     )
 
 
@@ -677,11 +678,12 @@ def _log_assessment_ask_timing(
     total_ms: float,
     instrumentation: dict,
     fallback_reason: object,
+    delivery_ms: float,
 ) -> None:
     logger.info(
         "assessment_ask_timing assessment_id=%s conversation_id=%s ownership_conversation_lookup_ms=%.3f context_ms=%.3f prompt_ms=%.3f "
         "ai_ms=%.3f postprocess_ms=%.3f user_persistence_ms=%.3f assistant_persistence_ms=%.3f persistence_ms=%.3f "
-        "total_ms=%.3f prompt_chars=%s context_chars=%s history_message_count=%s evidence_scan_count=%s "
+        "telegram_send_ms=%.3f total_ms=%.3f prompt_chars=%s context_chars=%s history_message_count=%s evidence_scan_count=%s "
         "evidence_finding_count=%s evidence_artifact_count=%s output_token_budget=%s fallback_reason=%s",
         assessment_id,
         conversation_id,
@@ -693,6 +695,7 @@ def _log_assessment_ask_timing(
         user_persistence_ms,
         assistant_persistence_ms,
         user_persistence_ms + assistant_persistence_ms,
+        delivery_ms,
         total_ms,
         int(instrumentation.get("prompt_chars") or 0),
         int(instrumentation.get("context_chars") or 0),
@@ -833,25 +836,39 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     if action == "ai_report":
+        request_started = perf_counter()
         effective_user = getattr(update, "effective_user", None)
         user_id = effective_user.id if effective_user is not None else 0
         message = getattr(query, "message", None)
         reply_text = getattr(message, "reply_text", None)
         if reply_text is not None:
             await reply_text("Generating assessment AI report...")
+        context_started = perf_counter()
         try:
             assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
+            context_ms = _assessment_ask_elapsed_ms(context_started)
+            generation_started = perf_counter()
             report = generate_assessment_ai_report(assessment_context)
+            generation_ms = _assessment_ask_elapsed_ms(generation_started)
         except Exception:
+            context_ms = _assessment_ask_elapsed_ms(context_started)
+            generation_ms = 0.0
             report = FALLBACK_REPORT
         from app.bot.handlers.reports import split_report_text
 
         if reply_text is not None:
+            delivery_started = perf_counter()
             for chunk in split_report_text(report):
                 await reply_text(chunk)
             await reply_text(
                 "Assessment report actions",
                 reply_markup=build_assessment_report_navigation_keyboard(assessment_id),
+            )
+            logger.info(
+                "AI telegram timing path=assessment_ai_report assessment_id=%s context_ms=%.3f "
+                "generation_ms=%.3f telegram_send_ms=%.3f total_ms=%.3f",
+                assessment_id, context_ms, generation_ms, _assessment_ask_elapsed_ms(delivery_started),
+                _assessment_ask_elapsed_ms(request_started),
             )
         else:
             await query.edit_message_text(split_report_text(report)[0])

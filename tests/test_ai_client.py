@@ -5,7 +5,46 @@ from unittest.mock import patch
 import httpx
 
 from app.core.config import Settings
-from app.services.ai_client import ask_ai, ask_ollama, build_mongrel_prompt, build_ollama_messages
+from app.services.ai_client import (
+    ask_ai,
+    ask_ollama,
+    build_mongrel_prompt,
+    build_ollama_messages,
+    parse_ollama_latency,
+)
+
+
+def test_parse_ollama_latency_uses_native_nanosecond_telemetry() -> None:
+    telemetry = parse_ollama_latency(
+        {
+            "model": "qwen2.5:3b",
+            "total_duration": 12_000_000_000,
+            "load_duration": 2_000_000_000,
+            "prompt_eval_count": 300,
+            "prompt_eval_duration": 3_000_000_000,
+            "eval_count": 70,
+            "eval_duration": 7_000_000_000,
+        },
+        path="assessment_ask",
+        model="fallback-model",
+        ollama_ms=12_250.5,
+    )
+
+    assert telemetry == {
+        "path": "assessment_ask", "model": "qwen2.5:3b", "status": "ok",
+        "ollama_ms": 12250.5, "total_ms": 12000.0, "load_ms": 2000.0,
+        "prompt_eval_ms": 3000.0, "eval_ms": 7000.0, "prompt_tokens": 300,
+        "output_tokens": 70, "tokens_per_second": 10.0,
+    }
+
+
+def test_parse_ollama_latency_tolerates_missing_telemetry() -> None:
+    telemetry = parse_ollama_latency({}, path="generic_ask", model="qwen2.5:3b", ollama_ms=4.25)
+
+    assert telemetry["ollama_ms"] == 4.25
+    assert telemetry["load_ms"] is None
+    assert telemetry["prompt_tokens"] is None
+    assert telemetry["tokens_per_second"] is None
 
 
 def test_ai_disabled_returns_fallback() -> None:
@@ -246,6 +285,37 @@ def test_ollama_success_returns_response_text() -> None:
     assert payload["options"]["num_predict"] == 256
     assert payload["options"]["temperature"] == 0.2
     assert payload["options"]["think"] is False
+
+
+def test_ollama_latency_log_is_metadata_only_and_response_is_unchanged(caplog) -> None:
+    secret_prompt = "Evidence token=super-secret-value"
+    answer = "Bounded response containing private assessment prose."
+    settings = Settings(ai_enabled=True, ollama_base_url="https://ollama.example", ollama_model="qwen2.5:3b")
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {
+            "model": "qwen2.5:3b", "done": True,
+            "total_duration": 5_000_000_000, "load_duration": 500_000_000,
+            "prompt_eval_count": 120, "prompt_eval_duration": 1_500_000_000,
+            "eval_count": 30, "eval_duration": 3_000_000_000,
+            "message": {"role": "assistant", "content": answer},
+        },
+    )
+    captured = []
+
+    with (
+        caplog.at_level(logging.INFO, logger="app.services.ai_client"),
+        patch("app.services.ai_client.get_settings", return_value=settings),
+        patch("app.services.ai_client.httpx.post", return_value=response),
+    ):
+        actual = ask_ollama(secret_prompt, path="assessment_ask", telemetry_sink=captured.append)
+
+    assert actual == answer
+    assert captured[0]["load_ms"] == 500.0
+    assert captured[0]["tokens_per_second"] == 10.0
+    assert "AI latency path=assessment_ask model=qwen2.5:3b" in caplog.text
+    assert "super-secret-value" not in caplog.text
+    assert "private assessment prose" not in caplog.text
 
 
 def test_ollama_optional_num_predict_overrides_default() -> None:

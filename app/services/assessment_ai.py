@@ -1,3 +1,6 @@
+import logging
+from time import perf_counter
+
 from app.services.ai_client import ask_ai
 from app.services.assessment_guard import SECURE_PREAMBLE, build_guard_prompt_section, is_secure_question
 from app.services.assessment_scan_selection import select_latest_scans
@@ -19,12 +22,13 @@ FALLBACK_REPORT = (
     "Assessment AI report unavailable. Review the assessment dashboard, scan history, and stored findings for next steps."
 )
 ASSESSMENT_AI_REPORT_NUM_PREDICT = 1536
+logger = logging.getLogger(__name__)
 
 
 def answer_assessment_question(question: str, context: dict) -> str:
     prompt = build_assessment_ai_prompt(question, context)
     try:
-        response = ask_ai(prompt)
+        response = ask_ai(prompt, path="assessment_question")
     except Exception:
         return FALLBACK_ANSWER
 
@@ -40,17 +44,38 @@ def answer_assessment_question(question: str, context: dict) -> str:
 
 
 def generate_assessment_ai_report(context: dict) -> str:
+    total_started = perf_counter()
+    prompt_started = perf_counter()
     prompt = build_assessment_ai_report_prompt(context)
+    prompt_ms = (perf_counter() - prompt_started) * 1000
+    ai_started = perf_counter()
     try:
-        response = ask_ai(prompt, num_predict=ASSESSMENT_AI_REPORT_NUM_PREDICT)
+        response = ask_ai(
+            prompt,
+            num_predict=ASSESSMENT_AI_REPORT_NUM_PREDICT,
+            path="assessment_ai_report",
+        )
     except Exception:
         return FALLBACK_REPORT
+    ai_ms = (perf_counter() - ai_started) * 1000
 
     if _is_unavailable_response(response):
         return FALLBACK_REPORT
 
+    postprocess_started = perf_counter()
     report = str(response or "").strip()
-    return _sanitize_assessment_ai_report(report, context) if report else FALLBACK_REPORT
+    result = _sanitize_assessment_ai_report(report, context) if report else FALLBACK_REPORT
+    postprocess_ms = (perf_counter() - postprocess_started) * 1000
+    logger.info(
+        "AI path timing path=assessment_ai_report total_ms=%.3f context_ms=0.000 prompt_ms=%.3f "
+        "ai_ms=%.3f postprocess_ms=%.3f prompt_chars=%s",
+        (perf_counter() - total_started) * 1000,
+        prompt_ms,
+        ai_ms,
+        postprocess_ms,
+        len(prompt),
+    )
+    return result
 
 
 def build_assessment_ai_prompt(question: str, context: dict) -> str:

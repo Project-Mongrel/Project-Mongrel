@@ -172,7 +172,7 @@ def format_report_ai_assessment(scan_runs: list[dict], target: str | None) -> li
 
     prompt = build_report_ai_assessment_prompt(scan_runs, target)
     try:
-        assessment = ask_ai(prompt)
+        assessment = ask_ai(prompt, path="standalone_ai_report")
     except Exception as exc:
         return [f"AI assessment unavailable: {exc}", "", "The deterministic report remains based on persisted scan history."]
 

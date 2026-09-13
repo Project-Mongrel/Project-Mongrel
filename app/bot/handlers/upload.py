@@ -1845,7 +1845,7 @@ async def upload_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     prompt = build_upload_ai_prompt(summary)
     try:
         logger.info("Upload findings AI explanation started for user_id=%s", user_id)
-        ai_response = await asyncio.to_thread(ask_ai, prompt)
+        ai_response = await asyncio.to_thread(ask_ai, prompt, path="upload_explanation")
         logger.info("Upload findings AI explanation completed for user_id=%s", user_id)
     except Exception:
         logger.exception("Upload findings AI explanation failed for user_id=%s", user_id)

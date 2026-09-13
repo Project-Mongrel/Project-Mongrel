@@ -1614,7 +1614,7 @@ def test_ai_question_triggers_ask_ai_and_keeps_state() -> None:
     with patch("app.bot.handlers.scan.ask_ai", return_value="AI integration is not configured yet.") as ask_ai:
         asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
 
-    ask_ai.assert_called_once_with("How do I harden SSH?")
+    ask_ai.assert_called_once_with("How do I harden SSH?", path="generic_ask")
     assert is_ai_waiting(7002) is True
     assert message.reply_text.call_args_list[0].args[0] == "Analyzing..."
     assert message.reply_text.call_args_list[1].args[0] == "AI integration is not configured yet."

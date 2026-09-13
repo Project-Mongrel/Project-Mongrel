@@ -2593,7 +2593,7 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             prompt = build_finding_followup_ai_prompt(finding_analysis_context, update.message.text or "")
             try:
                 logger.info("AI request started for finding analysis user_id=%s", user_id)
-                ai_response = await asyncio.to_thread(ask_ai, prompt)
+                ai_response = await asyncio.to_thread(ask_ai, prompt, path="finding_followup")
                 logger.info("AI request completed for finding analysis user_id=%s", user_id)
             except Exception:
                 logger.exception("Finding analysis AI request failed for user_id=%s", user_id)
@@ -2614,24 +2614,40 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
     if not pending_scan_input and user_id is not None and is_ai_waiting(user_id):
+        request_started = time.perf_counter()
         logger.info("Ask Mongrel question received for user_id=%s", user_id)
         await update.message.reply_text("Analyzing...")
         question = update.message.text or ""
+        context_started = time.perf_counter()
         direct_answer = answer_standalone_product_question(question, get_ai_conversation_history(user_id))
+        context_ms = (time.perf_counter() - context_started) * 1000
+        ai_ms = 0.0
         try:
             if direct_answer is not None:
                 ai_response = direct_answer
             else:
                 logger.info("AI request started for user_id=%s", user_id)
-                ai_response = await asyncio.to_thread(ask_ai, question)
+                ai_started = time.perf_counter()
+                ai_response = await asyncio.to_thread(ask_ai, question, path="generic_ask")
+                ai_ms = (time.perf_counter() - ai_started) * 1000
                 logger.info("AI request completed for user_id=%s", user_id)
         except Exception:
             logger.exception("AI request failed for user_id=%s", user_id)
             await update.message.reply_text("AI request failed. Check bot logs.")
             return
 
+        postprocess_started = time.perf_counter()
         append_ai_conversation_exchange(user_id, question, ai_response)
+        postprocess_ms = (time.perf_counter() - postprocess_started) * 1000
+        send_started = time.perf_counter()
         await update.message.reply_text(ai_response)
+        send_ms = (time.perf_counter() - send_started) * 1000
+        if direct_answer is None:
+            logger.info(
+                "AI path timing path=generic_ask user_id=%s total_ms=%.3f context_ms=%.3f prompt_ms=0.000 "
+                "ai_ms=%.3f postprocess_ms=%.3f telegram_send_ms=%.3f",
+                user_id, (time.perf_counter() - request_started) * 1000, context_ms, ai_ms, postprocess_ms, send_ms,
+            )
         return
 
     if update.message.text in MAIN_MENU_BUTTONS:

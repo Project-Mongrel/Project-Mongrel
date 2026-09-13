@@ -170,7 +170,7 @@ def answer_assessment_conversation_question(
     output_token_budget = _conversation_num_predict()
     ai_started = perf_counter()
     try:
-        response = ask_ai(prompt, num_predict=output_token_budget)
+        response = ask_ai(prompt, num_predict=output_token_budget, path="assessment_ask")
     except Exception:
         return _result(
             FALLBACK_ANSWER,

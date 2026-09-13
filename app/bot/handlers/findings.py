@@ -661,7 +661,7 @@ async def _explain_finding_callback(update: Update, user_id: int, finding_id: st
 
     await query.message.reply_text("Mongrel is analyzing this finding...")
     try:
-        ai_response = await asyncio.to_thread(ask_ai, prompt)
+        ai_response = await asyncio.to_thread(ask_ai, prompt, path="finding_analysis")
     except Exception:
         logger.exception("Finding AI explanation failed for user_id=%s finding_id=%s", user_id, finding_id)
         await query.message.reply_text("AI explanation failed. Check bot logs.")

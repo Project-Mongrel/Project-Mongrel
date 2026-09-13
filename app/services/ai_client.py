@@ -1,4 +1,7 @@
 import logging
+import inspect
+from time import perf_counter
+from typing import Callable
 
 import httpx
 
@@ -34,7 +37,13 @@ MONGREL_IDENTITY_PROMPT = (
 )
 
 
-def ask_ai(prompt: str, num_predict: int | None = None) -> str:
+def ask_ai(
+    prompt: str,
+    num_predict: int | None = None,
+    *,
+    path: str | None = None,
+    telemetry_sink: Callable[[dict], None] | None = None,
+) -> str:
     settings = get_settings()
     if not settings.ai_enabled:
         return "AI integration is not configured yet."
@@ -45,9 +54,10 @@ def ask_ai(prompt: str, num_predict: int | None = None) -> str:
     if not settings.ollama_base_url:
         return "Ollama base URL is not configured."
 
+    kwargs = {"path": path, "telemetry_sink": telemetry_sink} if path or telemetry_sink else {}
     if num_predict is None:
-        return ask_ollama(prompt)
-    return ask_ollama(prompt, num_predict=num_predict)
+        return ask_ollama(prompt, **kwargs)
+    return ask_ollama(prompt, num_predict=num_predict, **kwargs)
 
 
 def build_mongrel_prompt(user_question: str) -> str:
@@ -67,9 +77,17 @@ def build_ollama_messages(user_question: str) -> list[dict[str, str]]:
     ]
 
 
-def ask_ollama(user_question: str, num_predict: int | None = None) -> str:
+def ask_ollama(
+    user_question: str,
+    num_predict: int | None = None,
+    *,
+    path: str | None = None,
+    telemetry_sink: Callable[[dict], None] | None = None,
+) -> str:
     settings = get_settings()
     prediction_budget = int(num_predict) if num_predict is not None else 256
+    latency_path = path or _infer_latency_path()
+    request_started = perf_counter()
     try:
         response = httpx.post(
             f"{settings.ollama_base_url.rstrip('/')}/api/chat",
@@ -88,18 +106,24 @@ def ask_ollama(user_question: str, num_predict: int | None = None) -> str:
         response.raise_for_status()
         payload = response.json()
     except httpx.TimeoutException:
+        _record_latency({}, latency_path, settings.ollama_model, request_started, "timeout", telemetry_sink)
         return "AI request timed out."
     except httpx.ConnectError:
+        _record_latency({}, latency_path, settings.ollama_model, request_started, "connect_error", telemetry_sink)
         return "Unable to connect to Ollama server."
     except httpx.HTTPError:
+        _record_latency({}, latency_path, settings.ollama_model, request_started, "http_error", telemetry_sink)
         return "AI request failed."
     except (ValueError, TypeError):
+        _record_latency({}, latency_path, settings.ollama_model, request_started, "malformed_response", telemetry_sink)
         return "Malformed Ollama response."
 
     if not isinstance(payload, dict):
+        _record_latency({}, latency_path, settings.ollama_model, request_started, "malformed_payload", telemetry_sink)
         return "Malformed Ollama response."
 
     _log_ollama_response_metadata(payload)
+    _record_latency(payload, latency_path, settings.ollama_model, request_started, "ok", telemetry_sink)
 
     message = payload.get("message")
     if not isinstance(message, dict):
@@ -118,6 +142,76 @@ def ask_ollama(user_question: str, num_predict: int | None = None) -> str:
         return "Empty AI response."
 
     return answer
+
+
+def parse_ollama_latency(payload: dict, *, path: str, model: str, ollama_ms: float, status: str = "ok") -> dict:
+    """Extract non-sensitive timing/token metadata from an Ollama response."""
+    eval_count = _optional_int(payload.get("eval_count"))
+    eval_duration_ns = _optional_int(payload.get("eval_duration"))
+    tokens_per_second = None
+    if eval_count is not None and eval_duration_ns and eval_duration_ns > 0:
+        tokens_per_second = round(eval_count / (eval_duration_ns / 1_000_000_000), 3)
+    return {
+        "path": path,
+        "model": str(payload.get("model") or model),
+        "status": status,
+        "ollama_ms": round(ollama_ms, 3),
+        "total_ms": _ns_to_ms(payload.get("total_duration")),
+        "load_ms": _ns_to_ms(payload.get("load_duration")),
+        "prompt_eval_ms": _ns_to_ms(payload.get("prompt_eval_duration")),
+        "eval_ms": _ns_to_ms(payload.get("eval_duration")),
+        "prompt_tokens": _optional_int(payload.get("prompt_eval_count")),
+        "output_tokens": eval_count,
+        "tokens_per_second": tokens_per_second,
+    }
+
+
+def _record_latency(
+    payload: dict,
+    path: str,
+    model: str,
+    request_started: float,
+    status: str,
+    telemetry_sink: Callable[[dict], None] | None,
+) -> None:
+    telemetry = parse_ollama_latency(
+        payload,
+        path=path,
+        model=model,
+        ollama_ms=(perf_counter() - request_started) * 1000,
+        status=status,
+    )
+    logger.info(
+        "AI latency path=%s model=%s status=%s ollama_ms=%s total_ms=%s load_ms=%s "
+        "prompt_eval_ms=%s eval_ms=%s prompt_tokens=%s output_tokens=%s tokens_per_second=%s",
+        telemetry["path"], telemetry["model"], telemetry["status"], telemetry["ollama_ms"],
+        telemetry["total_ms"], telemetry["load_ms"], telemetry["prompt_eval_ms"], telemetry["eval_ms"],
+        telemetry["prompt_tokens"], telemetry["output_tokens"], telemetry["tokens_per_second"],
+    )
+    if telemetry_sink is not None:
+        telemetry_sink(dict(telemetry))
+
+
+def _infer_latency_path() -> str:
+    for frame in inspect.stack()[2:10]:
+        module = str(frame.frame.f_globals.get("__name__") or "")
+        if module == __name__:
+            continue
+        short_module = module.removeprefix("app.").replace(".", "_")
+        return f"{short_module}.{frame.function}" if short_module else frame.function
+    return "unknown"
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _ns_to_ms(value: object) -> float | None:
+    nanoseconds = _optional_int(value)
+    return round(nanoseconds / 1_000_000, 3) if nanoseconds is not None else None
 
 
 def _log_ollama_response_metadata(payload: dict) -> None:
