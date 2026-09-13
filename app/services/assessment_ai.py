@@ -1,5 +1,6 @@
 from app.services.ai_client import ask_ai
 from app.services.assessment_guard import SECURE_PREAMBLE, build_guard_prompt_section, is_secure_question
+from app.services.assessment_scan_selection import select_latest_scans
 
 AI_UNAVAILABLE_MESSAGES = (
     "AI integration is not configured yet.",
@@ -47,7 +48,8 @@ def generate_assessment_ai_report(context: dict) -> str:
     if _is_unavailable_response(response):
         return FALLBACK_REPORT
 
-    return str(response or "").strip() or FALLBACK_REPORT
+    report = str(response or "").strip()
+    return _sanitize_assessment_ai_report(report, context) if report else FALLBACK_REPORT
 
 
 def build_assessment_ai_prompt(question: str, context: dict) -> str:
@@ -113,6 +115,10 @@ def build_assessment_ai_report_prompt(context: dict) -> str:
             "- Do not infer exploit success, compromise, shell access, vulnerability confirmation, or vulnerability absence from Metasploit subprocess success, compatibility, failed validation, or no session.",
             "- Treat TShark evidence as packet metadata only; do not infer exploitation, compromise, vulnerability, ownership, authentication success, successful TLS handshakes, or completed HTTP transactions from packet observations alone.",
             "- Never imply a clean Nuclei scan means the target is secure.",
+            "- Describe Nuclei matches as template matches/observations with their stored severity; do not relabel INFO matches as issues or confirmed vulnerabilities.",
+            "- Playwright is passive browser-state evidence and cannot establish that hidden content is absent.",
+            "- The latest authoritative same-tool scan wins; do not merge metadata from older runs.",
+            "- A failed tool without structured evidence supplies failure/coverage state only, not clean or completed scanner evidence.",
             "- If evidence is missing, explain what has not yet been assessed.",
             "- Include completed and partial scans as represented evidence, clearly labeling partial evidence as partial.",
             "- Base conclusions only on Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, Gitleaks, Prowler, Metasploit, TShark, assessment history, artifacts, and notes in the supplied context.",
@@ -163,7 +169,7 @@ def _format_assessment_context(context: dict) -> str:
     else:
         lines.append("- Targets: none supplied")
 
-    scans = context.get("scans") or []
+    scans = select_latest_scans(context.get("scans") or [])
     if scans:
         lines.append("- Scan history:")
         for scan in scans[:20]:
@@ -183,7 +189,7 @@ def _format_assessment_context(context: dict) -> str:
     else:
         lines.append("- Scan history: no scans recorded")
 
-    findings = context.get("findings") or []
+    findings = _findings_for_latest_scans(scans, context.get("findings") or [])
     if findings:
         lines.append("- Stored findings:")
         for finding in findings[:20]:
@@ -227,6 +233,50 @@ def _format_scan(scan: dict) -> str:
     return " ".join(parts)
 
 
+def _findings_for_latest_scans(scans: list[dict], flattened_findings: list[dict]) -> list[dict]:
+    findings: list[dict] = []
+    for scan in scans:
+        finding = scan.get("finding")
+        if not finding:
+            tool = str(scan.get("tool") or "").lower().removesuffix(".sh")
+            matches = [
+                item for item in flattened_findings
+                if str(item.get("source") or "").lower().removesuffix(".sh") == tool
+            ]
+            finding = matches[-1] if matches else None
+        if finding:
+            findings.append(finding)
+    return findings
+
+
+def _sanitize_assessment_ai_report(report: str, context: dict) -> str:
+    """Correct narrow scanner-semantic contradictions in model-authored reports."""
+    latest = select_latest_scans(context.get("scans") or [])
+    latest_by_tool = {str(scan.get("tool") or "").lower().removesuffix(".sh"): scan for scan in latest}
+    lines: list[str] = []
+    for line in report.splitlines():
+        lowered = line.lower()
+        if "playwright" in lowered and "no hidden content" in lowered:
+            line = "Playwright: passive browser observation was recorded; it does not establish that hidden content is absent."
+        if "nuclei" in lowered and "issue" in lowered:
+            scan = latest_by_tool.get("nuclei") or {}
+            matches = ((scan.get("finding") or {}).get("nuclei_findings") or [])
+            if matches:
+                severities = sorted({str(item.get("severity") or "info").upper() for item in matches})
+                line = (
+                    f"Nuclei: {len(matches)} template match(es) were stored ({', '.join(severities)}); "
+                    "these observations do not automatically establish a confirmed vulnerability or exploitability."
+                )
+        if "testssl" in lowered:
+            scan = latest_by_tool.get("testssl") or {}
+            status = str(scan.get("status") or "").lower()
+            evidence = (scan.get("finding") or {}).get("testssl_evidence") or {}
+            if status == "failed" and not evidence and any(term in lowered for term in ("clean", "no finding", "completed", "stored tls", "tls observations")):
+                line = "testssl.sh: FAILED; no completed structured TLS configuration evidence was stored."
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def _format_finding(finding: dict) -> list[str]:
     lines = [
         f"  - tool={_clean(finding.get('source') or 'unknown')} target={_clean(finding.get('target') or 'unknown')} "
@@ -242,10 +292,10 @@ def _format_finding(finding: dict) -> list[str]:
             )
     nuclei_findings = finding.get("nuclei_findings") or []
     if nuclei_findings:
-        lines.append("    Nuclei findings:")
+        lines.append("    Nuclei template matches:")
         for item in nuclei_findings[:20]:
             lines.append(
-                f"    - {_clean(item.get('template_id') or item.get('name') or 'finding')} "
+                f"    - {_clean(item.get('template_id') or item.get('name') or 'template match')} "
                 f"severity={_clean(item.get('severity') or 'unknown')} "
                 f"matched={_clean(item.get('matched_at') or item.get('host') or 'unknown')}"
             )
@@ -312,8 +362,21 @@ def _format_finding(finding: dict) -> list[str]:
         parts.append(f"console_issues={int(playwright_observation.get('console_issue_count') or 0)}")
         parts.append(f"network_issues={int(playwright_observation.get('network_issue_count') or 0)}")
         lines.append("    - " + " ".join(parts))
-        lines.append("    - boundary=passive returned browser state only; does not test XSS, SQL injection, CSRF, authentication flaws, vulnerability absence, or complete application behavior")
+        lines.append("    - boundary=passive returned browser state only; does not test XSS, SQL injection, CSRF, authentication flaws, hidden-content absence, vulnerability absence, or complete application behavior")
     ffuf_results = finding.get("ffuf_results") or []
+    if ffuf_results or str(finding.get("source") or "").lower() == "ffuf":
+        metadata = finding.get("metadata") or {}
+        lines.append(
+            "    ffuf run scope: "
+            f"profile={_clean(metadata.get('ffuf_profile_label') or metadata.get('profile') or 'not recorded')} "
+            f"wordlist={_clean(metadata.get('wordlist_path') or metadata.get('wordlist') or 'not recorded')} "
+            f"wordlist_source={_clean(metadata.get('wordlist_source') or 'not recorded')} "
+            f"wordlist_entries={_clean(metadata.get('wordlist_count') if metadata.get('wordlist_count') is not None else 'not recorded')} "
+            f"timeout={_clean(metadata.get('timeout_seconds') if metadata.get('timeout_seconds') is not None else 'not recorded')}"
+        )
+        lines.append(f"    ffuf structured response observations: {len(ffuf_results)}")
+        if not ffuf_results:
+            lines.append("    - boundary=zero structured response observations does not establish that hidden content is absent")
     if ffuf_results:
         lines.append("    ffuf response observations:")
         for result in ffuf_results[:20]:

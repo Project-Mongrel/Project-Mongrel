@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime
 
+from app.services.assessment_scan_selection import select_latest_scans, select_latest_tool_scan
+
 
 def generate_assessment_markdown_report(context: dict) -> str:
     assessment = context.get("assessment") or {}
@@ -8,7 +10,8 @@ def generate_assessment_markdown_report(context: dict) -> str:
     scans = context.get("scans") or []
     artifacts = context.get("artifacts") or []
     scans = _attach_tshark_artifacts(scans, artifacts)
-    findings = context.get("findings") or []
+    latest_scans = select_latest_scans(scans)
+    findings = [scan.get("finding") for scan in latest_scans if scan.get("finding")]
 
     lines = [
         "# Assessment Report",
@@ -82,7 +85,7 @@ def _format_targets(targets: list[dict]) -> list[str]:
 def _format_executive_summary(context: dict) -> list[str]:
     targets = context.get("targets") or []
     scans = context.get("scans") or []
-    represented_scans = _represented_scans(scans)
+    represented_scans = _represented_scans(select_latest_scans(scans))
     highest_risk = _highest_risk(represented_scans)
     target_text = ", ".join(_clean(target.get("address") or "unknown") for target in targets) or "the configured scope"
 
@@ -104,7 +107,7 @@ def _format_executive_summary(context: dict) -> list[str]:
 def _format_assessment_overview(context: dict) -> list[str]:
     targets = context.get("targets") or []
     scans = context.get("scans") or []
-    represented_scans = _represented_scans(scans)
+    represented_scans = _represented_scans(select_latest_scans(scans))
     tools = ", ".join(sorted({str(scan.get("tool") or "unknown").upper() for scan in represented_scans})) or "None completed or partial"
     status = _clean((context.get("assessment") or {}).get("status") or "unknown").title()
     return [
@@ -115,16 +118,15 @@ def _format_assessment_overview(context: dict) -> list[str]:
 
 
 def _format_scan_summary(scans: list[dict]) -> list[str]:
-    completed = _represented_scans(scans)
-    if not completed:
-        return ["No completed or partial scans are recorded yet."]
+    latest_scans = select_latest_scans(scans)
+    if not latest_scans:
+        return ["No scans are recorded yet."]
 
     lines: list[str] = []
     for tool in ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf", "testssl", "gitleaks", "prowler", "metasploit", "tshark"):
-        tool_scans = [scan for scan in completed if str(scan.get("tool") or "").lower() == tool]
-        if not tool_scans:
+        latest = select_latest_tool_scan(latest_scans, tool)
+        if not latest:
             continue
-        latest = tool_scans[-1]
         finding = latest.get("finding") or {}
         lines.extend(
             [
@@ -165,7 +167,7 @@ def _format_observed_assets(targets: list[dict], findings: list[dict]) -> list[s
 
 
 def _format_key_findings(scans: list[dict]) -> list[str]:
-    completed = _represented_scans(scans)
+    completed = _represented_scans(select_latest_scans(scans))
     if not completed:
         return ["No key findings are available because no completed or partial scans are recorded."]
 
@@ -189,7 +191,11 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         if open_ports:
             lines.append(f"- {tool}: {len(open_ports)} open service(s) observed.")
         elif nuclei_findings:
-            lines.append(f"- {tool}: {len(nuclei_findings)} matched finding(s) observed.")
+            severities = sorted({_clean(item.get("severity") or "info").upper() for item in nuclei_findings})
+            lines.append(
+                f"- {tool}: {len(nuclei_findings)} template match(es) stored ({', '.join(severities)}); "
+                "these observations do not automatically establish a confirmed vulnerability or exploitability."
+            )
         elif httpx_services:
             lines.append(f"- {tool}: {len(httpx_services)} HTTP response/URL observation(s) recorded.")
         elif katana_observations:
@@ -236,7 +242,7 @@ def _format_assessment_history(scans: list[dict]) -> list[str]:
 
 
 def _format_recommended_next_actions(scans: list[dict]) -> list[str]:
-    completed = _represented_scans(scans)
+    completed = _represented_scans(select_latest_scans(scans))
     if not completed:
         return [
             "- Run authorized Nmap, BBOT, Nuclei, httpx, Katana, Playwright, ffuf, testssl.sh, and Gitleaks scans for the assessment scope.",
@@ -299,11 +305,20 @@ def _represented_scans(scans: list[dict]) -> list[dict]:
 
 def _scan_summary(scan: dict) -> str:
     finding = scan.get("finding") or {}
+    tool = str(scan.get("tool") or "").lower()
+    status = str(scan.get("status") or "").lower()
+    if status == "failed" and not _has_structured_evidence(tool, finding):
+        label = "testssl.sh" if tool == "testssl" else _tool_label(tool)
+        return f"{label} did not complete successfully; no completed structured evidence was stored."
     summary = finding.get("summary")
     if summary:
+        if tool == "playwright" and "no hidden content" in str(summary).lower():
+            return "Passive browser observation recorded; it does not establish that hidden content is absent."
+        if tool == "nuclei" and finding.get("nuclei_findings"):
+            matches = finding["nuclei_findings"]
+            severities = sorted({_clean(item.get("severity") or "info").upper() for item in matches})
+            return f"{len(matches)} Nuclei template match(es) stored ({', '.join(severities)}); matches do not automatically prove exploitability."
         return _clean(summary)
-
-    tool = str(scan.get("tool") or "").lower()
     if tool == "nuclei":
         return "No matching Nuclei findings were observed with the selected template/profile."
     if tool == "bbot":
@@ -341,6 +356,16 @@ def _scan_summary(scan: dict) -> str:
         evidence = scan.get("tshark_evidence") or finding.get("tshark_evidence") or {}
         return f"TShark normalized {int(evidence.get('packet_count') or 0)} packet metadata observation(s)." if evidence else "TShark completed with no normalized PCAP evidence."
     return "Completed scan evidence recorded."
+
+
+def _has_structured_evidence(tool: str, finding: dict) -> bool:
+    keys = {
+        "nmap": "open_ports", "bbot": "observation_counts", "nuclei": "nuclei_findings",
+        "httpx": "httpx_services", "katana": "katana_observations", "playwright": "playwright_observation",
+        "ffuf": "ffuf_results", "testssl": "testssl_evidence", "gitleaks": "gitleaks_evidence",
+        "prowler": "prowler_evidence", "metasploit": "metasploit_evidence", "tshark": "tshark_evidence",
+    }
+    return bool(finding.get(keys.get(tool, "")))
 
 
 def _scan_risk(scan: dict) -> str:
@@ -436,11 +461,22 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
         return lines
 
     ffuf_results = finding.get("ffuf_results") or []
-    if ffuf_results:
+    if str(scan.get("tool") or "").lower() == "ffuf":
         summary = finding.get("ffuf_summary") or {}
+        metadata = finding.get("metadata") or {}
+        profile = metadata.get("ffuf_profile_label") or metadata.get("profile")
+        wordlist = metadata.get("wordlist_path") or metadata.get("wordlist")
+        wordlist_source = metadata.get("wordlist_source")
+        wordlist_count = metadata.get("wordlist_count")
+        timeout_seconds = metadata.get("timeout_seconds")
         status_codes = summary.get("status_codes") or {}
         lines = [
             f"- Target/base URL: {_clean(finding.get('target') or 'unknown')}",
+            f"- Selected profile: {_clean(profile or 'not recorded')}",
+            f"- Wordlist: {_clean(str(wordlist).replace('\\', '/').split('/')[-1] if wordlist else 'not recorded')}",
+            f"- Wordlist source: {_clean(wordlist_source or 'not recorded')}",
+            f"- Wordlist entries: {_clean(wordlist_count if wordlist_count is not None else 'not recorded')}",
+            f"- Timeout: {_clean(str(timeout_seconds) + 's' if timeout_seconds is not None else 'not recorded')}",
             f"- ffuf response observations: {len(ffuf_results)}",
             "- Status codes: " + (", ".join(f"{_clean(code)}={int(count or 0)}" for code, count in sorted(status_codes.items())) if status_codes else "none"),
             f"- Redirects: {int(summary.get('redirect_count') or 0)}",
@@ -448,6 +484,8 @@ def _scan_observations(scan: dict, finding: dict) -> list[str]:
             f"- Server-error responses: {int(summary.get('server_error_count') or 0)}",
             "- Limitation: Conservative bounded wordlist discovery only. ffuf response observations are not confirmed vulnerabilities, exploitability, sensitive exposure, authentication bypass, or complete discovery coverage.",
         ]
+        if not ffuf_results:
+            lines.append("- Zero structured response observations does not establish that hidden content is absent.")
         for result in ffuf_results[:10]:
             detail = f"- {_clean(result.get('url') or result.get('path') or 'unknown')} status={_clean(result.get('status_code') or 'unknown')}"
             if result.get("content_length") is not None:

@@ -29,6 +29,32 @@ def test_assessment_markdown_report_handles_empty_assessment() -> None:
     assert "- Absence of findings is not evidence of security." in report
 
 
+def test_report_uses_latest_runs_and_preserves_playwright_nuclei_testssl_boundaries() -> None:
+    def scan(scan_id: int, tool: str, status: str, day: int, finding: dict) -> dict:
+        return {"id": scan_id, "tool": tool, "status": status, "created_at": datetime(2026, 1, day, tzinfo=UTC), "finding": finding}
+
+    report = generate_assessment_markdown_report({
+        "assessment": {"name": "Competition Final", "status": "active"}, "targets": [{"address": "example.com"}],
+        "scans": [
+            scan(9, "ffuf", "completed", 1, {"source": "ffuf", "metadata": {"ffuf_profile_label": "Custom", "wordlist_path": "ffuf_default.txt", "wordlist_count": 19}}),
+            scan(2, "playwright", "completed", 2, {"source": "playwright", "summary": "Passive browser observation completed, no hidden content found.", "playwright_observation": {"final_url": "https://example.com", "load_status": "loaded", "forms_count": 0}}),
+            scan(3, "nuclei", "completed", 3, {"source": "nuclei", "summary": "No matching Nuclei findings were observed", "nuclei_findings": [{"name": f"info-{i}", "severity": "info"} for i in range(3)]}),
+            scan(4, "ffuf", "completed", 4, {"source": "ffuf", "metadata": {"ffuf_profile_label": "Standard", "wordlist_path": "/opt/seclists/ffuf-standard.txt", "wordlist_source": "SecLists", "wordlist_count": 2570, "timeout_seconds": 120}, "ffuf_results": []}),
+            scan(5, "testssl", "failed", 5, {"source": "testssl", "summary": "testssl.sh scan timed out."}),
+        ], "findings": [], "artifacts": [], "notes": [],
+    })
+
+    assert "no hidden content found" not in report.lower()
+    assert "does not establish that hidden content is absent" in report
+    assert "3 Nuclei template match(es) stored (INFO)" in report
+    assert "No matching Nuclei findings were observed" not in report
+    assert "Scan status\nFailed" in report
+    assert "testssl.sh did not complete successfully; no completed structured evidence was stored" in report
+    assert "Selected profile: Standard" in report and "Wordlist: ffuf-standard.txt" in report
+    assert "Wordlist entries: 2570" in report
+    assert "Selected profile: Custom" not in report and "ffuf_default.txt" not in report
+
+
 def test_assessment_markdown_report_renders_multi_tool_evidence() -> None:
     context = {
         "assessment": {

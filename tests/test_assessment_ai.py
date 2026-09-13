@@ -1,4 +1,5 @@
 from unittest.mock import patch
+from datetime import UTC, datetime
 
 from app.services.assessment_ai import (
     FALLBACK_ANSWER,
@@ -419,4 +420,40 @@ def test_generate_assessment_ai_report_success_returns_report() -> None:
 def test_generate_assessment_ai_report_unavailable_returns_fallback() -> None:
     with patch("app.services.assessment_ai.ask_ai", return_value="AI request timed out."):
         assert generate_assessment_ai_report({"assessment": {"name": "A"}}) == FALLBACK_REPORT
+
+
+def test_ai_report_uses_latest_tool_evidence_and_corrects_scanner_semantics() -> None:
+    older = {
+        "id": 10, "tool": "ffuf", "status": "completed", "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "finding": {"source": "ffuf", "metadata": {"ffuf_profile_label": "Custom", "wordlist_path": "ffuf_default.txt", "wordlist_count": 19}},
+    }
+    newer = {
+        "id": 20, "tool": "ffuf", "status": "completed", "created_at": datetime(2026, 1, 2, tzinfo=UTC),
+        "finding": {"source": "ffuf", "metadata": {"ffuf_profile_label": "Standard", "wordlist_path": "/opt/ffuf-standard.txt", "wordlist_count": 2570}},
+    }
+    context = {
+        "assessment": {"name": "Final", "status": "active"}, "targets": [],
+        "scans": [newer, older, {
+            "id": 30, "tool": "nuclei", "status": "completed", "created_at": datetime(2026, 1, 3, tzinfo=UTC),
+            "finding": {"source": "nuclei", "nuclei_findings": [{"severity": "info"}] * 3},
+        }, {
+            "id": 40, "tool": "testssl", "status": "failed", "created_at": datetime(2026, 1, 4, tzinfo=UTC),
+            "finding": {"source": "testssl", "summary": "scan timed out"},
+        }], "artifacts": [], "notes": [],
+    }
+    response = "\n".join([
+        "Playwright Scan: Passive browser observation completed, no hidden content found.",
+        "Nuclei found 3 issues.",
+        "testssl.sh completed with no findings.",
+    ])
+
+    prompt = build_assessment_ai_report_prompt(context)
+    with patch("app.services.assessment_ai.ask_ai", return_value=response):
+        report = generate_assessment_ai_report(context)
+
+    assert "profile=Standard" in prompt and "wordlist_entries=2570" in prompt
+    assert "profile=Custom" not in prompt and "wordlist_entries=19" not in prompt
+    assert "no hidden content found" not in report.lower()
+    assert "3 template match(es)" in report and "INFO" in report
+    assert "testssl.sh: FAILED" in report and "no completed structured TLS" in report
 

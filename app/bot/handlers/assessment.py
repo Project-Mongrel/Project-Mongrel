@@ -167,6 +167,15 @@ def build_assessment_dashboard_keyboard(assessment_id: int) -> InlineKeyboardMar
     )
 
 
+def build_assessment_report_navigation_keyboard(assessment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Back / Assessment Dashboard", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:dashboard:{assessment_id}")],
+            [InlineKeyboardButton("Ask Mongrel about this assessment", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ask:{assessment_id}")],
+        ]
+    )
+
+
 def build_previous_assessments_text(entries: list[dict], *, page: int, total: int) -> str:
     lines = [section_label("history", "Previous Assessments"), ""]
     if not entries:
@@ -828,6 +837,8 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         user_id = effective_user.id if effective_user is not None else 0
         message = getattr(query, "message", None)
         reply_text = getattr(message, "reply_text", None)
+        if reply_text is not None:
+            await reply_text("Generating assessment AI report...")
         try:
             assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
             report = generate_assessment_ai_report(assessment_context)
@@ -838,6 +849,10 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         if reply_text is not None:
             for chunk in split_report_text(report):
                 await reply_text(chunk)
+            await reply_text(
+                "Assessment report actions",
+                reply_markup=build_assessment_report_navigation_keyboard(assessment_id),
+            )
         else:
             await query.edit_message_text(split_report_text(report)[0])
         return
@@ -847,6 +862,8 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         user_id = effective_user.id if effective_user is not None else 0
         message = getattr(query, "message", None)
         reply_text = getattr(message, "reply_text", None)
+        if reply_text is not None:
+            await reply_text("Generating Markdown report...")
         assessment_context = build_assessment_context(assessment_id=assessment_id, user_id=user_id)
         report = generate_assessment_markdown_report(assessment_context)
         from app.bot.handlers.reports import split_report_text
@@ -854,6 +871,10 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         if reply_text is not None:
             for chunk in split_report_text(report):
                 await reply_text(chunk)
+            await reply_text(
+                "Assessment report actions",
+                reply_markup=build_assessment_report_navigation_keyboard(assessment_id),
+            )
         else:
             await query.edit_message_text(split_report_text(report)[0])
         return

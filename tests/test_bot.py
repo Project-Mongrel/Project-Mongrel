@@ -12,7 +12,7 @@ from telegram.error import BadRequest
 from telegram.error import TimedOut
 
 from app.bot.auth import is_admin
-from app.bot.bot import SCAN_CALLBACK_PATTERN
+from app.bot.bot import SCAN_CALLBACK_PATTERN, build_application
 from app.bot.handlers.ask import ask_handler, build_ask_text, cancel_handler
 from app.bot.handlers.assessment import (
     ASSESSMENT_ASK_TASK_KEY,
@@ -996,10 +996,16 @@ def test_assessment_markdown_report_callback_sends_report() -> None:
 
     query.answer.assert_called_once()
     query.edit_message_text.assert_not_called()
-    report = query_message.reply_text.call_args.args[0]
+    calls = query_message.reply_text.call_args_list
+    assert calls[0].args[0] == "Generating Markdown report..."
+    report = calls[1].args[0]
     assert report.startswith("# Assessment Report")
     assert "Markdown Assessment" in report
     assert "## Evidence Limitations" in report
+    buttons = [button for row in calls[-1].kwargs["reply_markup"].inline_keyboard for button in row]
+    assert {button.callback_data for button in buttons} == {
+        f"assessment:dashboard:{assessment['id']}", f"assessment:ask:{assessment['id']}"
+    }
 
 
 def test_assessment_ai_report_callback_sends_assessment_report() -> None:
@@ -1043,7 +1049,13 @@ def test_assessment_ai_report_callback_sends_assessment_report() -> None:
 
     query.answer.assert_called_once()
     query.edit_message_text.assert_not_called()
-    query_message.reply_text.assert_called_once_with(response)
+    calls = query_message.reply_text.call_args_list
+    assert calls[0].args[0] == "Generating assessment AI report..."
+    assert calls[1].args[0] == response
+    buttons = [button for row in calls[-1].kwargs["reply_markup"].inline_keyboard for button in row]
+    assert {button.callback_data for button in buttons} == {
+        f"assessment:dashboard:{assessment['id']}", f"assessment:ask:{assessment['id']}"
+    }
 
 
 def test_assessment_ai_report_callback_returns_fallback_when_ai_unavailable() -> None:
@@ -1066,7 +1078,10 @@ def test_assessment_ai_report_callback_returns_fallback_when_ai_unavailable() ->
 
     query.answer.assert_called_once()
     query.edit_message_text.assert_not_called()
-    assert "Assessment AI report unavailable." in query_message.reply_text.call_args.args[0]
+    assert any(
+        "Assessment AI report unavailable." in call.args[0]
+        for call in query_message.reply_text.call_args_list
+    )
 
 
 def test_assessment_ai_report_callback_splits_long_reports() -> None:
@@ -1094,7 +1109,9 @@ def test_assessment_ai_report_callback_splits_long_reports() -> None:
     assert splitter.call_count == 1
     assert splitter.call_args.args[0].startswith("\u2726 Assessment AI Report")
     assert "Evidence reviewed." in splitter.call_args.args[0]
-    assert [call.args[0] for call in query_message.reply_text.call_args_list] == ["chunk one", "chunk two"]
+    assert [call.args[0] for call in query_message.reply_text.call_args_list] == [
+        "Generating assessment AI report...", "chunk one", "chunk two", "Assessment report actions"
+    ]
 
 
 def test_assessment_markdown_report_callback_edits_when_message_missing() -> None:
@@ -2026,6 +2043,61 @@ def test_ffuf_back_returns_to_mode_specific_parent_and_enforces_owner() -> None:
         SimpleNamespace(callback_query=forged_selection, effective_user=SimpleNamespace(id=attacker)), forged_context
     ))
     assert forged_selection.edit_message_text.call_args.args[0] == "Assessment not found."
+
+
+def test_registered_callbacks_route_assessment_dashboard_to_ffuf_profile_and_standard_launch() -> None:
+    user_id = 17225
+    assessment = create_assessment("Registered assessment ffuf route", user_id=user_id)
+    add_assessment_target(assessment["id"], address="https://example.test")
+    context = SimpleNamespace(user_data={})
+    application = build_application(Settings(telegram_bot_token="123456789:test-token-value"))
+
+    async def dispatch(data: str, query: object) -> None:
+        handler = next(
+            candidate
+            for candidates in application.handlers.values()
+            for candidate in candidates
+            if getattr(candidate, "pattern", None) is not None and candidate.pattern.match(data)
+        )
+        query.data = data
+        await handler.callback(
+            SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=user_id)),
+            context,
+        )
+
+    dashboard_query = SimpleNamespace(answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    asyncio.run(dispatch(f"assessment:dashboard:{assessment['id']}", dashboard_query))
+    dashboard_keyboard = dashboard_query.edit_message_text.call_args.kwargs["reply_markup"]
+    ffuf_callback = next(
+        button.callback_data
+        for row in dashboard_keyboard.inline_keyboard
+        for button in row
+        if button.text == "ffuf Discovery"
+    )
+
+    ffuf_query = SimpleNamespace(answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    with patch("app.bot.handlers.scan.run_ffuf_scan") as runner:
+        asyncio.run(dispatch(ffuf_callback, ffuf_query))
+    runner.assert_not_called()
+    profile_keyboard = ffuf_query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert [button.text for row in profile_keyboard.inline_keyboard for button in row] == [
+        "⚡ Quick", "Standard", "Deep", "⚙ Settings", "Back",
+    ]
+    standard_callback = next(
+        button.callback_data
+        for row in profile_keyboard.inline_keyboard
+        for button in row
+        if button.text == "Standard"
+    )
+
+    standard_query = SimpleNamespace(answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+    with patch("app.bot.handlers.scan.scan_target_handler", new_callable=AsyncMock) as launch:
+        asyncio.run(dispatch(standard_callback, standard_query))
+
+    request_id = context.user_data[PENDING_NMAP_REQUEST_KEY]
+    assert _ffuf_scan_profiles[request_id] == "standard"
+    assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["assessment_id"] == assessment["id"]
+    launch.assert_awaited_once()
 
 
 def test_ffuf_profile_selection_review_and_execution_context(tmp_path: Path) -> None:
