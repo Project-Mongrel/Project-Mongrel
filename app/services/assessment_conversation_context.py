@@ -441,9 +441,22 @@ def _build_evidence_context(assessment_context: dict, selected_tools: list[str])
             findings_by_tool[tool] = count + 1
             finding_ids.add(finding_id)
 
+    source_findings = list(assessment_context.get("findings") or [])
+    latest_selected_finding_ids = {
+        str(scan.get("finding_id"))
+        for tool in selected_tools
+        for scan in [select_latest_tool_scan(assessment_context.get("scans") or [], tool)]
+        if scan is not None and scan.get("finding_id") is not None
+    }
+    if latest_selected_finding_ids:
+        source_findings.sort(
+            key=lambda finding: str(finding.get("id")) in latest_selected_finding_ids,
+            reverse=True,
+        )
+
     findings = []
     included_finding_ids = set()
-    for finding in assessment_context.get("findings") or []:
+    for finding in source_findings:
         tool = _normalize_tool(finding.get("source"))
         if not _include_tool(tool, selected_tools, full_assessment):
             continue
@@ -632,9 +645,9 @@ def _build_recommendation_context(
 ) -> dict:
     normalized_question = str(question or "").lower()
     tool_states = {_normalize_tool(name): "NOT_RUN" for name in get_mongrel_tool_names()}
-    for scan in assessment_context.get("scans") or []:
-        tool = _normalize_tool(scan.get("tool"))
-        if tool not in tool_states:
+    for tool in tool_states:
+        scan = select_latest_tool_scan(assessment_context.get("scans") or [], tool)
+        if scan is None:
             continue
         status = str(scan.get("status") or "").strip().lower()
         tool_states[tool] = {
@@ -707,6 +720,35 @@ def _build_recommendation_context(
             "A recommendation is advice only and must never trigger tool execution.",
         ],
     }
+
+
+def select_latest_tool_scan(scans: list[dict], tool: str) -> dict | None:
+    """Select a tool's authoritative latest scan by stored chronology and ID."""
+
+    normalized_tool = _normalize_tool(tool)
+    candidates = [
+        scan for scan in scans
+        if isinstance(scan, dict) and _normalize_tool(scan.get("tool")) == normalized_tool
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=_scan_chronology_key)
+
+
+def _scan_chronology_key(scan: dict) -> tuple[float, int]:
+    value = scan.get("created_at") or scan.get("started_at") or scan.get("updated_at")
+    if isinstance(value, datetime):
+        timestamp = value.timestamp()
+    else:
+        try:
+            timestamp = datetime.fromisoformat(str(value)).timestamp()
+        except (TypeError, ValueError):
+            timestamp = float("-inf")
+    try:
+        scan_id = int(scan.get("id") or 0)
+    except (TypeError, ValueError):
+        scan_id = 0
+    return timestamp, scan_id
 
 
 def _has_nmap_web_service(assessment_context: dict) -> bool:

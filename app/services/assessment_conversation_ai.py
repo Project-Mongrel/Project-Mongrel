@@ -14,6 +14,7 @@ from app.services.assessment_conversation_context import (
     has_explicit_tool_name,
     is_tool_relevance_question,
     is_tool_state_question,
+    select_latest_tool_scan,
 )
 from app.services.assessment_evidence_semantics import get_represented_evidence_semantics
 from app.services.mongrel_self_knowledge import get_mongrel_tool_names
@@ -1200,6 +1201,9 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
     names = {name.lower().removesuffix(".sh"): name for name in get_mongrel_tool_names()}
     display = names.get(tool, tool)
     question = str(context.get("current_question") or "").lower()
+    findings = _tool_findings(context, tool)
+    if tool == "ffuf":
+        return _build_named_ffuf_evidence_answer(context, state, findings)
     if state != "COMPLETED":
         label = state.replace("_", " ").lower()
         return (
@@ -1209,7 +1213,6 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
     if re.search(r"\bdid\s+(?:we|you)\s+run\b|\bhas\s+.+\s+been\s+run\b", question):
         return f"Yes. {display} is recorded as completed in this assessment. Completion alone does not imply a vulnerability, successful exploitation, or a clean result."
 
-    findings = _tool_findings(context, tool)
     if tool == "nmap":
         ports = [
             f"{item.get('port')}/{item.get('protocol') or 'tcp'} ({item.get('service') or 'unknown'})"
@@ -1262,48 +1265,6 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
         field = "bbot_observations"
         items = [item for finding in findings for item in (finding.get(field) or []) if isinstance(item, dict)]
         return f"{display} is recorded as completed with {len(items)} stored observation item(s). These discovery observations do not automatically establish ownership, vulnerability, sensitive exposure, or complete coverage."
-    if tool == "ffuf":
-        finding = findings[-1] if findings else {}
-        observations = [item for item in (finding.get("ffuf_results") or []) if isinstance(item, dict)]
-        summary = finding.get("ffuf_summary") if isinstance(finding.get("ffuf_summary"), dict) else {}
-        metadata = finding.get("metadata") if isinstance(finding.get("metadata"), dict) else {}
-        scope = []
-        profile = metadata.get("ffuf_profile_label") or metadata.get("ffuf_profile")
-        if profile:
-            scope.append(f"profile {profile}")
-        wordlist_path = str(metadata.get("wordlist_path") or "").strip()
-        if wordlist_path:
-            scope.append(f"wordlist {Path(wordlist_path).name}")
-        if metadata.get("wordlist_source"):
-            scope.append(f"source {metadata['wordlist_source']}")
-        if metadata.get("wordlist_count") is not None:
-            scope.append(f"{metadata['wordlist_count']} wordlist entries")
-        if metadata.get("timeout_seconds") is not None:
-            scope.append(f"timeout {metadata['timeout_seconds']} seconds")
-        status_codes = summary.get("status_codes") if isinstance(summary.get("status_codes"), dict) else {}
-        status_text = (
-            " Stored status-code summary: "
-            + ", ".join(f"{code}={count}" for code, count in status_codes.items())
-            + "."
-            if status_codes
-            else ""
-        )
-        limitations = [str(item) for item in (summary.get("limitations") or []) if str(item).strip()]
-        limitation_text = " Stored limitation: " + " ".join(limitations[:3]) if limitations else ""
-        observation_text = (
-            f"{len(observations)} structured ffuf response observation(s) were stored."
-            if observations
-            else "No structured ffuf response observations were stored."
-        )
-        return (
-            "ffuf is recorded as completed"
-            + (" with run scope: " + "; ".join(scope) if scope else "")
-            + ". "
-            + observation_text
-            + status_text
-            + limitation_text
-            + " This bounded result does not establish that hidden content is absent, that no vulnerability exists, or that coverage was complete."
-        )
     if tool == "playwright":
         playwright_findings = [
             finding
@@ -1366,6 +1327,63 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
         if key.endswith(("_observations", "_results")) and isinstance(value, list)
     )
     return f"{display} is recorded as completed with {observation_count} normalized observation item(s). {capability} Completion or observations do not automatically establish a vulnerability or complete coverage."
+
+
+def _build_named_ffuf_evidence_answer(context: dict, state: str, findings: list[dict]) -> str:
+    scans = (context.get("assessment_context") or {}).get("scans") or []
+    latest_scan = select_latest_tool_scan(scans, "ffuf")
+    latest_finding_id = str((latest_scan or {}).get("finding_id") or "")
+    finding = next(
+        (item for item in findings if latest_finding_id and str(item.get("id") or "") == latest_finding_id),
+        {},
+    )
+    observations = [item for item in (finding.get("ffuf_results") or []) if isinstance(item, dict)]
+    summary = finding.get("ffuf_summary") if isinstance(finding.get("ffuf_summary"), dict) else {}
+    metadata = finding.get("metadata") if isinstance(finding.get("metadata"), dict) else {}
+    scope = []
+    profile = metadata.get("ffuf_profile_label") or metadata.get("ffuf_profile")
+    if profile:
+        scope.append(f"profile {profile}")
+    wordlist_path = str(metadata.get("wordlist_path") or "").strip()
+    if wordlist_path:
+        scope.append(f"wordlist {Path(wordlist_path).name}")
+    if metadata.get("wordlist_source"):
+        scope.append(f"source {metadata['wordlist_source']}")
+    if metadata.get("wordlist_count") is not None:
+        scope.append(f"{metadata['wordlist_count']} wordlist entries")
+    if metadata.get("timeout_seconds") is not None:
+        scope.append(f"timeout {metadata['timeout_seconds']} seconds")
+    status_codes = summary.get("status_codes") if isinstance(summary.get("status_codes"), dict) else {}
+    status_text = (
+        " Stored status-code summary: "
+        + ", ".join(f"{code}={count}" for code, count in status_codes.items())
+        + "."
+        if status_codes
+        else ""
+    )
+    limitations = [str(item) for item in (summary.get("limitations") or []) if str(item).strip()]
+    limitation_text = " Stored limitation: " + " ".join(limitations[:3]) if limitations else ""
+    observation_text = (
+        f"{len(observations)} structured ffuf response observation(s) were stored."
+        if observations
+        else "No structured ffuf response observations were stored."
+    )
+    state_text = {
+        "COMPLETED": "recorded as completed",
+        "FAILED": "failed",
+        "PARTIAL": "partial or interrupted",
+        "NOT_RUN": "not run",
+        "SKIPPED": "skipped",
+    }.get(state, f"in state {state}")
+    return (
+        f"ffuf is {state_text} for the newest assessment run"
+        + (" with run scope: " + "; ".join(scope) if scope else "")
+        + ". "
+        + observation_text
+        + status_text
+        + limitation_text
+        + " This bounded result does not establish that hidden content is absent, that no vulnerability exists, or that coverage was complete."
+    )
 
 
 def _build_false_premise_correction(context: dict) -> str:

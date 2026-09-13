@@ -1486,6 +1486,82 @@ def test_important_remaining_gaps_are_deterministic_and_state_aware() -> None:
     model.assert_not_called()
 
 
+def test_named_ffuf_uses_newest_scan_linked_evidence_only() -> None:
+    user_id = 1100
+    assessment = create_assessment("Repeated ffuf", user_id=user_id)
+    older = add_finding(user_id=user_id, finding={
+        "source": "ffuf", "target": "https://example.test/FUZZ", "ffuf_results": [],
+        "ffuf_summary": {"result_count": 0, "status_codes": {}},
+        "metadata": {"ffuf_profile_label": "Custom", "wordlist_path": "ffuf_default.txt", "wordlist_count": 19},
+    })
+    record_assessment_scan(assessment["id"], "ffuf", "completed", finding_id=older["id"])
+    newer = add_finding(user_id=user_id, finding={
+        "source": "ffuf", "target": "https://example.test/FUZZ",
+        "ffuf_results": [{"url": "https://example.test/admin", "status_code": 403}],
+        "ffuf_summary": {"result_count": 1, "status_codes": {"403": 1}},
+        "metadata": {
+            "ffuf_profile_label": "Standard", "wordlist_path": "/opt/seclists/raft-medium.txt",
+            "wordlist_source": "Configured Standard SecLists wordlist", "wordlist_count": 30000,
+            "timeout_seconds": 120,
+        },
+    })
+    record_assessment_scan(assessment["id"], "ffuf", "completed", finding_id=newer["id"])
+
+    answer = answer_assessment_conversation_question(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What did ffuf add?",
+    )["answer"]
+
+    assert all(value in answer for value in ("Standard", "raft-medium.txt", "30000", "timeout 120", "403=1"))
+    assert all(value not in answer for value in ("Custom", "ffuf_default.txt", "19 wordlist entries"))
+
+
+def test_named_ffuf_keeps_newest_failed_state_and_does_not_fall_back_to_older_completed_run() -> None:
+    user_id = 1101
+    assessment = create_assessment("Failed latest ffuf", user_id=user_id)
+    older = add_finding(user_id=user_id, finding={
+        "source": "ffuf", "target": "https://example.test/FUZZ", "ffuf_results": [{"status_code": 200}],
+        "metadata": {"ffuf_profile_label": "Custom", "wordlist_path": "ffuf_default.txt", "wordlist_count": 19},
+    })
+    record_assessment_scan(assessment["id"], "ffuf", "completed", finding_id=older["id"])
+    latest = add_finding(user_id=user_id, finding={
+        "source": "ffuf", "target": "https://example.test/FUZZ", "status": "failed", "ffuf_results": [],
+        "metadata": {"ffuf_profile_label": "Standard", "wordlist_count": 30000, "error": "timed out"},
+    })
+    record_assessment_scan(assessment["id"], "ffuf", "failed", finding_id=latest["id"])
+
+    answer = answer_assessment_conversation_question(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What did ffuf add?",
+    )["answer"]
+
+    assert "ffuf is failed" in answer
+    assert "Standard" in answer and "30000" in answer
+    assert all(value not in answer for value in ("Custom", "ffuf_default.txt", "19 wordlist entries"))
+
+
+def test_named_ffuf_preserves_newest_partial_run_evidence() -> None:
+    user_id = 1102
+    assessment = create_assessment("Partial latest ffuf", user_id=user_id)
+    older = add_finding(user_id=user_id, finding={
+        "source": "ffuf", "ffuf_results": [{"status_code": 200}],
+        "metadata": {"ffuf_profile_label": "Custom", "wordlist_count": 19},
+    })
+    record_assessment_scan(assessment["id"], "ffuf", "completed", finding_id=older["id"])
+    latest = add_finding(user_id=user_id, finding={
+        "source": "ffuf", "status": "partial", "ffuf_results": [{"status_code": 403}],
+        "ffuf_summary": {"result_count": 1, "status_codes": {"403": 1}},
+        "metadata": {"ffuf_profile_label": "Deep", "wordlist_count": 60000},
+    })
+    record_assessment_scan(assessment["id"], "ffuf", "partial", finding_id=latest["id"])
+
+    answer = answer_assessment_conversation_question(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What did ffuf add?",
+    )["answer"]
+
+    assert "ffuf is partial or interrupted" in answer
+    assert "Deep" in answer and "60000" in answer and "403=1" in answer
+    assert "Custom" not in answer and "19 wordlist entries" not in answer
+
+
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:
     finding = add_finding(
         user_id=user_id,
