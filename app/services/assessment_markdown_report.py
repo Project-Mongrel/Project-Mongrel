@@ -310,14 +310,17 @@ def _scan_summary(scan: dict) -> str:
     if status == "failed" and not _has_structured_evidence(tool, finding):
         label = "testssl.sh" if tool == "testssl" else _tool_label(tool)
         return f"{label} did not complete successfully; no completed structured evidence was stored."
+    if tool == "nuclei" and finding.get("nuclei_findings"):
+        matches = finding["nuclei_findings"]
+        severities = sorted({_clean(item.get("severity") or "info").upper() for item in matches})
+        return (
+            f"{len(matches)} Nuclei template match(es) stored ({', '.join(severities)}); "
+            "these matches do not automatically establish a confirmed vulnerability or exploitability."
+        )
     summary = finding.get("summary")
     if summary:
         if tool == "playwright" and "no hidden content" in str(summary).lower():
             return "Passive browser observation recorded; it does not establish that hidden content is absent."
-        if tool == "nuclei" and finding.get("nuclei_findings"):
-            matches = finding["nuclei_findings"]
-            severities = sorted({_clean(item.get("severity") or "info").upper() for item in matches})
-            return f"{len(matches)} Nuclei template match(es) stored ({', '.join(severities)}); matches do not automatically prove exploitability."
         return _clean(summary)
     if tool == "nuclei":
         return "No matching Nuclei findings were observed with the selected template/profile."

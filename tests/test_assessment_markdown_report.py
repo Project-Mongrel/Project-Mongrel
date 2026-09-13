@@ -55,6 +55,34 @@ def test_report_uses_latest_runs_and_preserves_playwright_nuclei_testssl_boundar
     assert "Selected profile: Custom" not in report and "ffuf_default.txt" not in report
 
 
+def test_nuclei_scan_summary_prefers_normalized_info_matches_over_legacy_no_findings_summary() -> None:
+    report = generate_assessment_markdown_report({
+        "assessment": {"name": "Nuclei summary precedence", "status": "active"},
+        "targets": [{"address": "example.com"}],
+        "scans": [{
+            "id": 101,
+            "tool": "nuclei",
+            "status": "completed",
+            "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+            "risk": "info",
+            "finding": {
+                "source": "nuclei",
+                "summary": "No matching Nuclei findings were observed with the selected template/profile.",
+                "nuclei_findings": [
+                    {"name": "Microsoft Azure Domain Tenant ID - Detect", "severity": "info"},
+                    {"name": "WAF Detection", "severity": "info"},
+                    {"name": "Weak HTTP Strict-Transport-Security - Detect", "severity": "info"},
+                ],
+            },
+        }],
+        "findings": [], "artifacts": [], "notes": [],
+    })
+
+    assert "No matching Nuclei findings" not in report
+    assert "Summary\n3 Nuclei template match(es) stored (INFO)" in report
+    assert "do not automatically establish a confirmed vulnerability or exploitability" in report
+
+
 def test_assessment_markdown_report_renders_multi_tool_evidence() -> None:
     context = {
         "assessment": {
