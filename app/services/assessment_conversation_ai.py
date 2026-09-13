@@ -802,13 +802,22 @@ def _build_httpx_waf_semantic_answer(context: dict) -> str | None:
 
 
 def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
-    if context.get("question_intent") != "current_assessment_evidence" or _selected_tools(context) != {"testssl"}:
-        return None
     question = str(context.get("current_question") or "").lower()
-    if not any(term in question for term in ("what did", "actually establish", "actually report")):
+    direct_question = context.get("question_intent") == "current_assessment_evidence" and any(
+        term in question for term in ("what did", "actually establish", "actually report")
+    )
+    tls_safety_question = context.get("question_intent") == "uncertainty_safety" and any(
+        term in question for term in ("safe", "secure", "insecure")
+    )
+    if _selected_tools(context) != {"testssl"} or not (direct_question or tls_safety_question):
         return None
     findings = _tool_findings(context, "testssl")
-    evidence_items = [finding.get("testssl_evidence") for finding in findings if isinstance(finding.get("testssl_evidence"), dict)]
+    evidence_items = []
+    for finding in findings:
+        if isinstance(finding.get("testssl_evidence"), dict):
+            evidence_items.append(finding["testssl_evidence"])
+        elif isinstance(finding.get("testssl_findings"), list):
+            evidence_items.append({"target": finding.get("target"), "vulnerabilities": finding["testssl_findings"]})
     if not evidence_items:
         return None
     sections = []
@@ -1058,11 +1067,14 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
     ]
     if httpx_items:
         observed = []
+        seen = set()
         for item in httpx_items[:10]:
             label = str(item.get("url") or item.get("host") or "HTTP endpoint")
             if item.get("status_code") is not None:
                 label += f" (status {item.get('status_code')})"
-            observed.append(label)
+            if label not in seen:
+                seen.add(label)
+                observed.append(label)
         statements.append("httpx recorded HTTP response metadata for " + ", ".join(observed) + ".")
     nuclei_matches = [
         item for finding in findings if str(finding.get("source") or "").lower() == "nuclei"
@@ -1223,6 +1235,13 @@ def _build_false_premise_correction(context: dict) -> str:
             "No. Stored secret-pattern evidence does not establish that any credential, token, key, or secret is "
             "active, valid, or usable. Raw secret values are not exposed, and authorized validation would be required."
         )
+    if re.search(r"\bnothing\s+else\s+(?:needs?|requires?)\s+(?:testing|checking|validation)\b", question):
+        gaps = [
+            str(tool)
+            for tool in ((context.get("recommendation_context") or {}).get("relevant_unperformed_tools") or [])
+        ]
+        detail = " Relevant authoritative missing coverage includes " + ", ".join(gaps) + "." if gaps else ""
+        return "No. The stored assessment evidence does not establish that testing is complete." + detail
     boundaries = {
         "nmap": "Nmap port and service classifications do not establish vulnerability or exploitability.",
         "tshark": "TShark packet or correlation evidence does not establish exploitation, compromise, suspicious activity, or TLS-handshake success.",
@@ -1271,6 +1290,16 @@ def _build_cross_tool_confirmation(context: dict) -> str:
         if isinstance(finding, dict) and finding.get("source")
     })
     attribution = ", ".join(represented) if represented else "the completed tools"
+    question = str(context.get("current_question") or "").lower()
+    if "metasploit" in question and "tshark" in question:
+        states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
+        metasploit_state = str(states.get("metasploit", "NOT_RUN")).replace("_", " ").lower()
+        tshark_state = str(states.get("tshark", "NOT_RUN")).replace("_", " ").lower()
+        return (
+            f"No. Metasploit is {metasploit_state}; its execution and validation metadata does not establish successful "
+            f"exploitation or a session. TShark is {tshark_state}; packet or correlation evidence does not establish "
+            "exploitation or compromise. Neither source confirms exploitation unless explicit stored evidence proves it."
+        )
     return (
         f"Not automatically. {attribution} provide different kinds of stored observations. They can support a bounded "
         "cross-tool interpretation only where they refer to the same endpoint or event, but one tool's capability or "
@@ -1459,7 +1488,7 @@ def _build_follow_up_fallback(context: dict) -> str | None:
             )
         return f"There is no stored normalized Nmap observation for port {port}. That absence is not evidence that the port is closed or safe."
     if "katana" in previous and "katana" not in completed:
-        if re.search(r"\bafter (?:this|that)\b", question):
+        if re.search(r"\bafter (?:this|that)(?: one)?\b", question):
             return (
                 "After Katana has added crawl observations, I would review what it found before choosing another action. "
                 "If browser-rendered behavior is still an evidence gap, Mongrel's Playwright would be a reasonable next "

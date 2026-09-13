@@ -125,7 +125,7 @@ SECURITY_CONCEPT_TERMS = (
 ATTACKER_QUESTION_TERMS = ("think like an attacker", "attacker", "attack path", "attack chain")
 TOOL_EXPLANATION_TERMS = ("what does", "why would i use", "what can", "explain", "what is")
 FOLLOW_UP_PATTERNS = (
-    r"^(?:and\s+)?(?:why|why (?:that|this) (?:one|tool)|which one|after that|what do you mean|what did you mean(?: by that)?)\??$",
+    r"^(?:and\s+)?(?:why|why (?:that|this) (?:one|tool)|which one|after that(?: one)?|what do you mean|what did you mean(?: by that)?)\??$",
     r"^(?:and\s+)?what (?:exactly\s+)?(?:will|would) (?:this|that|it) (?:tell|show|mean)(?: me| us)?\??$",
     r"^and (?:what about )?(?:port\s+)?\d{1,5}\??$",
     r"^(?:and\s+)?what about (?:this|that|it)\??$",
@@ -148,6 +148,7 @@ CASUAL_SECURITY_TERM_ALIASES = (
     (re.compile(r"\bexploitible\b"), "exploitable"),
     (re.compile(r"\bonw\b"), "one"),
     (re.compile(r"\bwouldnt\b"), "wouldn't"),
+    (re.compile(r"\bdont\b"), "don't"),
 )
 TOOL_RELEVANCE_PATTERNS = (
     re.compile(r"\b(?:why|what)\s+wouldn'?t\s+(?:you|we)\s+(?:use|run)\b"),
@@ -166,6 +167,7 @@ TOOL_STATE_OVERVIEW_PATTERNS = (
 )
 CROSS_TOOL_CONFIRMATION_PATTERNS = (
     re.compile(r"\bdo\s+(?:these|the)\s+(?:findings|results|observations)\s+confirm\s+each\s+other\b"),
+    re.compile(r"\bmetasploit\b.{0,80}\btshark\b.{0,80}\bconfirm\w*\b.{0,40}\bexploit"),
 )
 TOOL_STATE_QUESTION_PATTERNS = (
     re.compile(r"\bdid\s+(?:we|you)\s+run\b"),
@@ -454,7 +456,7 @@ def _build_evidence_context(assessment_context: dict, selected_tools: list[str])
 
     artifacts = []
     selected_scan_ids = {scan.get("id") for scan in scans}
-    for artifact in assessment_context.get("artifacts") or []:
+    for artifact in reversed(assessment_context.get("artifacts") or []):
         if not _include_artifact(artifact, selected_tools, full_assessment, selected_scan_ids):
             continue
         artifacts.append(_artifact_for_context(artifact))

@@ -1069,6 +1069,100 @@ def test_default_assessment_ask_budget_is_isolated_and_conservative() -> None:
     assert result["instrumentation"]["output_token_budget"] == 384
 
 
+def test_newest_tshark_artifact_survives_context_budget_and_drives_answer() -> None:
+    user_id = 1090
+    assessment = create_assessment("Latest capture wins", user_id=user_id)
+    for index in range(8):
+        scan = record_assessment_scan(assessment["id"], "tshark", "completed")
+        add_assessment_artifact(
+            assessment["id"], "tshark_normalized_evidence", f"Older capture {index}",
+            content=json.dumps({"source": "tshark", "packet_count": 0, "byte_count": 0}), scan_id=scan["id"],
+        )
+    latest_scan = record_assessment_scan(assessment["id"], "tshark", "completed")
+    add_assessment_artifact(
+        assessment["id"], "tshark_normalized_evidence", "Latest capture",
+        content=json.dumps({"source": "tshark", "packet_count": 37, "byte_count": 4096}), scan_id=latest_scan["id"],
+    )
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None,
+            question="What did TShark actually capture?",
+        )
+
+    assert "captured 37 packets (4096 bytes)" in result["answer"]
+    model.assert_not_called()
+
+
+def test_live_wording_variants_are_deterministic_and_evidence_scoped() -> None:
+    user_id = 1091
+    assessment = create_assessment("Live wording", user_id=user_id)
+    evidence = {
+        "nmap": {"open_ports": [{"port": 443, "protocol": "tcp", "service": "https"}]},
+        "httpx": {"httpx_services": [{"url": "https://example.test", "status_code": 403}]},
+        "testssl": {"testssl_findings": [{"id": "cipher", "severity": "MEDIUM", "finding": "scanner observation"}]},
+        "metasploit": {"metasploit_evidence": {"module_executed": True, "session_established": False}},
+    }
+    for tool, values in evidence.items():
+        finding = add_finding(user_id=user_id, finding={"source": tool, "target": "example.test", **values})
+        record_assessment_scan(assessment["id"], tool, "completed", finding_id=finding["id"])
+    tshark_scan = record_assessment_scan(assessment["id"], "tshark", "completed")
+    add_assessment_artifact(assessment["id"], "tshark_normalized_evidence", "Capture", content=json.dumps({"packet_count": 12, "byte_count": 900}), scan_id=tshark_scan["id"])
+
+    questions = (
+        "What dont we know", "Is the TLS configuration safe?",
+        "Did metasploit and tshark actually confirm exploitation", "Nothing else needs testing right?",
+    )
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answers = {question: answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question=question,
+        )["answer"].lower() for question in questions}
+
+    assert "coverage remains incomplete" in answers[questions[0]] and "katana" in answers[questions[0]]
+    assert "testssl.sh" in answers[questions[1]] and "overall tls security" in answers[questions[1]]
+    assert all(source in answers[questions[2]] for source in ("metasploit", "tshark"))
+    assert "does not establish successful exploitation" in answers[questions[2]]
+    assert "katana" in answers[questions[3]]
+    model.assert_not_called()
+
+
+def test_after_that_one_continues_prior_katana_recommendation() -> None:
+    user_id = 1092
+    assessment = create_assessment("Continuation", user_id=user_id)
+    conversation = create_conversation(assessment["id"], user_id)
+    append_message(conversation["id"], user_id, "assistant", "I would use Mongrel's Katana next.")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=conversation["id"],
+            question="And after that one",
+        )
+
+    assert "after katana" in result["answer"].lower()
+    assert "conditional recommendation" in result["answer"].lower()
+    model.assert_not_called()
+
+
+def test_confidence_summary_deduplicates_httpx_and_omits_unknown_status() -> None:
+    user_id = 1093
+    assessment = create_assessment("Summary rendering", user_id=user_id)
+    finding = add_finding(user_id=user_id, finding={
+        "source": "httpx", "target": "example.test",
+        "httpx_services": [{"url": "https://example.test", "status_code": 200}, {"url": "https://example.test", "status_code": 200}],
+        "httpx_results": [{"url": "https://other.example"}, {"url": "https://other.example"}],
+    })
+    record_assessment_scan(assessment["id"], "httpx", "completed", finding_id=finding["id"])
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=None,
+        question="What can you actually say with confidence?",
+    )
+
+    assert result["answer"].count("https://example.test (status 200)") == 1
+    assert result["answer"].count("https://other.example") == 1
+    assert "status None" not in result["answer"]
+
+
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:
     finding = add_finding(
         user_id=user_id,
