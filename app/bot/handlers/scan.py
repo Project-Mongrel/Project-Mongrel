@@ -277,7 +277,7 @@ def build_ffuf_profile_text() -> str:
             "Quick: Fast smoke test with minimal coverage.",
             "Standard: Recommended default for normal discovery.",
             "Deep: Broader discovery with more requests and longer runtime.",
-            "Custom: Use FFUF_WORDLIST_PATH.",
+            "Settings: Use the configured custom FFUF_WORDLIST_PATH.",
         ]
     )
 
@@ -291,8 +291,9 @@ def build_ffuf_profile_keyboard(scan_request_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("Deep", callback_data=f"{FFUF_PROFILE_CALLBACK_PREFIX}:{FFUF_PROFILE_DEEP}:{scan_request_id}"),
-                InlineKeyboardButton("⚙ Custom", callback_data=f"{FFUF_PROFILE_CALLBACK_PREFIX}:{FFUF_PROFILE_CUSTOM}:{scan_request_id}"),
+                InlineKeyboardButton("⚙ Settings", callback_data=f"{FFUF_PROFILE_CALLBACK_PREFIX}:{FFUF_PROFILE_CUSTOM}:{scan_request_id}"),
             ],
+            [InlineKeyboardButton("Back", callback_data=f"{FFUF_PROFILE_CALLBACK_PREFIX}:back:{scan_request_id}")],
         ]
     )
 
@@ -2440,16 +2441,71 @@ async def _handle_ffuf_profile_callback(query: object, user_id: int, context: Co
     if len(parts) != 3:
         await query.edit_message_text("Unsupported ffuf profile selection.")
         return
-    profile = normalize_ffuf_profile(parts[1])
+    action = parts[1]
     scan_request_id = parts[2]
     scan_request = get_scan_request(user_id=user_id, scan_request_id=scan_request_id)
     if scan_request is None or scan_request.scan_type != "ffuf":
         await query.edit_message_text("ffuf scan request was not found or has expired.")
         return
+    assessment_scan_context = _current_assessment_scan_context(context, "ffuf")
+    if assessment_scan_context is not None and str(assessment_scan_context.get("scan_request_id") or "") != scan_request_id:
+        assessment_scan_context = None
+    if action == "back":
+        context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
+        _ffuf_scan_profiles.pop(scan_request_id, None)
+        if assessment_scan_context is not None:
+            from app.bot.handlers.assessment import build_assessment_dashboard_keyboard, build_assessment_dashboard_text
+            from app.services.assessment_store import get_user_assessment, list_assessment_scans, list_assessment_targets
+
+            assessment_id = int(assessment_scan_context.get("assessment_id") or 0)
+            assessment = get_user_assessment(user_id, assessment_id)
+            if assessment is None:
+                await query.edit_message_text("Assessment not found.")
+                return
+            await query.edit_message_text(
+                build_assessment_dashboard_text(
+                    assessment, list_assessment_targets(assessment_id), list_assessment_scans(assessment_id)
+                ),
+                reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+            )
+            return
+        await query.edit_message_text(build_scan_text(), reply_markup=build_scan_type_keyboard())
+        return
+    profile = normalize_ffuf_profile(action)
     _ffuf_scan_profiles[scan_request_id] = profile
     mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request_id)
     context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request_id
-    await query.edit_message_text(build_ffuf_target_prompt(profile))
+    if assessment_scan_context is None:
+        await query.edit_message_text(build_ffuf_target_prompt(profile))
+        return
+    from app.services.assessment_store import get_user_assessment, list_assessment_targets
+
+    assessment_id = int(assessment_scan_context.get("assessment_id") or 0)
+    assessment = get_user_assessment(user_id, assessment_id)
+    targets = list_assessment_targets(assessment_id) if assessment is not None else []
+    target_id = assessment_scan_context.get("target_id")
+    owned_target = next((item for item in targets if item.get("id") == target_id), None)
+    if owned_target is None:
+        await query.edit_message_text("Assessment not found.")
+        return
+    target = str(assessment_scan_context.get("primary_target") or "").strip()
+    if target != str(owned_target.get("address") or "").strip():
+        await query.edit_message_text("Assessment target no longer matches this ffuf request.")
+        return
+    message = getattr(query, "message", None)
+    if not target or message is None or not callable(getattr(message, "reply_text", None)):
+        await query.edit_message_text("Unable to launch assessment ffuf scan.")
+        return
+    await query.edit_message_text(f"Launching ffuf {FFUF_PROFILE_LABELS[profile]} for assessment target:\n{target}")
+    synthetic_update = type(
+        "AssessmentFfufUpdate",
+        (),
+        {
+            "message": type("AssessmentFfufMessage", (), {"text": target, "reply_text": message.reply_text})(),
+            "effective_user": type("AssessmentFfufUser", (), {"id": user_id})(),
+        },
+    )()
+    await scan_target_handler(synthetic_update, context)
 
 
 async def _handle_scan_recovery_callback(query: object, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -11,6 +11,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
+from app.bot.keyboards.scan_menu import build_scan_tool_rows
 from app.services.assessment_store import (
     add_assessment_target,
     create_assessment,
@@ -149,21 +150,9 @@ def build_assessment_dashboard_text(assessment: dict, targets: list[dict] | None
 
 def build_assessment_dashboard_keyboard(assessment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Run Nmap", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:nmap:{assessment_id}"),
-                InlineKeyboardButton("Run BBOT", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:bbot:{assessment_id}"),
-            ],
-            [InlineKeyboardButton("Run Nuclei", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:nuclei:{assessment_id}")],
-            [InlineKeyboardButton("Run httpx", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:httpx:{assessment_id}")],
-            [InlineKeyboardButton("Run Katana", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:katana:{assessment_id}")],
-            [InlineKeyboardButton("Run Playwright", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:playwright:{assessment_id}")],
-            [InlineKeyboardButton("Run ffuf", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:ffuf:{assessment_id}")],
-            [InlineKeyboardButton("Run testssl.sh", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:testssl:{assessment_id}")],
-            [InlineKeyboardButton("Run Gitleaks", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:gitleaks:{assessment_id}")],
-            [InlineKeyboardButton("Run Prowler", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:prowler:{assessment_id}")],
-            [InlineKeyboardButton("Run Metasploit", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:metasploit:{assessment_id}")],
-            [InlineKeyboardButton("Run TShark", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:run:tshark:{assessment_id}")],
+        build_scan_tool_rows(
+            lambda tool: f"{ASSESSMENT_CALLBACK_PREFIX}:run:{tool}:{assessment_id}"
+        ) + [
             [
                 InlineKeyboardButton("Ask Mongrel about this assessment", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ask:{assessment_id}"),
                 InlineKeyboardButton("Generate AI Report", callback_data=f"{ASSESSMENT_CALLBACK_PREFIX}:ai_report:{assessment_id}"),
@@ -930,18 +919,12 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         )
         return
 
-    await query.edit_message_text(
-        f"Launching {tool.upper()} for assessment target:\n{target_address}",
-        reply_markup=build_assessment_dashboard_keyboard(assessment_id),
-    )
-    from app.bot.handlers.scan import PENDING_NMAP_REQUEST_KEY, scan_target_handler
+    from app.bot.handlers.scan import PENDING_NMAP_REQUEST_KEY, build_ffuf_profile_keyboard, build_ffuf_profile_text, scan_target_handler
     from app.services.scan_manager import create_scan_request, mark_scan_request_awaiting_target
 
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     context.user_data.pop(ASSESSMENT_SCAN_CONTEXT_KEY, None)
     scan_request = create_scan_request(user_id=user_id, scan_type=tool)
-    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
-    context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
     context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY] = {
         "assessment_id": assessment_id,
         "target_id": target["id"],
@@ -949,6 +932,19 @@ async def assessment_callback_handler(update: Update, context: ContextTypes.DEFA
         "primary_target": target_address,
         "tool": tool,
     }
+    if tool == "ffuf":
+        context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["scan_request_id"] = scan_request.id
+        await query.edit_message_text(
+            build_ffuf_profile_text(),
+            reply_markup=build_ffuf_profile_keyboard(scan_request.id),
+        )
+        return
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+    context.user_data[PENDING_NMAP_REQUEST_KEY] = scan_request.id
+    await query.edit_message_text(
+        f"Launching {tool.upper()} for assessment target:\n{target_address}",
+        reply_markup=build_assessment_dashboard_keyboard(assessment_id),
+    )
     if tool == "metasploit":
         from app.bot.handlers.scan import build_metasploit_mode_keyboard, build_metasploit_mode_text, build_metasploit_readiness_failure_text
         from app.tools.metasploit_runner import check_metasploit_readiness

@@ -257,6 +257,7 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     )
     keyboard = build_assessment_dashboard_keyboard(assessment["id"])
     rendered_buttons = [button.text for row in keyboard.inline_keyboard for button in row]
+    rendered_layout = [[button.text for button in row] for row in keyboard.inline_keyboard]
 
     assert "Assessment Dashboard" in dashboard
     assert "Acme External Assessment" in dashboard
@@ -276,24 +277,30 @@ def test_assessment_dashboard_renders_scan_statuses_and_actions() -> None:
     assert "Metasploit: Not run" in dashboard
     assert "TShark: Not run" in dashboard
     assert rendered_buttons == [
-        "Run Nmap",
-        "Run BBOT",
-        "Run Nuclei",
-        "Run httpx",
-        "Run Katana",
-        "Run Playwright",
-        "Run ffuf",
-        "Run testssl.sh",
-        "Run Gitleaks",
-        "Run Prowler",
-        "Run Metasploit",
-        "Run TShark",
+        "Nmap Scan",
+        "Nuclei Scan",
+        "BBOT Recon",
+        "httpx Fingerprint",
+        "Katana Crawl",
+        "Playwright Observe",
+        "ffuf Discovery",
+        "testssl.sh TLS",
+        "Gitleaks Secrets",
+        "Prowler Cloud",
+        "Metasploit Validation",
+        "TShark PCAP",
         "Ask Mongrel about this assessment",
         "Generate AI Report",
         "Markdown Report",
         "History",
         "Previous Assessments",
         "Home",
+    ]
+    assert rendered_layout[:4] == [
+        ["Nmap Scan", "Nuclei Scan", "BBOT Recon"],
+        ["httpx Fingerprint", "Katana Crawl", "Playwright Observe"],
+        ["ffuf Discovery", "testssl.sh TLS", "Gitleaks Secrets"],
+        ["Prowler Cloud", "Metasploit Validation", "TShark PCAP"],
     ]
 
 
@@ -535,9 +542,9 @@ def test_domain_assessment_skips_incompatible_gitleaks_and_prowler_without_findi
         assert "Assessment Dashboard" in query.message.reply_text.call_args.args[0]
         keyboard = query.message.reply_text.call_args.kwargs["reply_markup"]
         buttons = [button.text for row in keyboard.inline_keyboard for button in row]
-        assert "Run Gitleaks" in buttons
-        assert "Run Prowler" in buttons
-        assert "Run Metasploit" in buttons
+        assert "Gitleaks Secrets" in buttons
+        assert "Prowler Cloud" in buttons
+        assert "Metasploit Validation" in buttons
         gitleaks_runner.assert_not_called()
         prowler_runner.assert_not_called()
 
@@ -549,12 +556,12 @@ def test_assessment_dashboard_gitleaks_and_prowler_buttons_route_to_assessment_h
     keyboard = build_assessment_dashboard_keyboard(assessment["id"])
     callbacks = {button.text: button.callback_data for row in keyboard.inline_keyboard for button in row}
 
-    assert callbacks["Run Gitleaks"] == f"assessment:run:gitleaks:{assessment['id']}"
-    assert callbacks["Run Prowler"] == f"assessment:run:prowler:{assessment['id']}"
-    assert re.fullmatch(r"^assessment:.+", callbacks["Run Gitleaks"])
-    assert re.fullmatch(r"^assessment:.+", callbacks["Run Prowler"])
-    assert not re.fullmatch(SCAN_CALLBACK_PATTERN, callbacks["Run Gitleaks"])
-    assert not re.fullmatch(SCAN_CALLBACK_PATTERN, callbacks["Run Prowler"])
+    assert callbacks["Gitleaks Secrets"] == f"assessment:run:gitleaks:{assessment['id']}"
+    assert callbacks["Prowler Cloud"] == f"assessment:run:prowler:{assessment['id']}"
+    assert re.fullmatch(r"^assessment:.+", callbacks["Gitleaks Secrets"])
+    assert re.fullmatch(r"^assessment:.+", callbacks["Prowler Cloud"])
+    assert not re.fullmatch(SCAN_CALLBACK_PATTERN, callbacks["Gitleaks Secrets"])
+    assert not re.fullmatch(SCAN_CALLBACK_PATTERN, callbacks["Prowler Cloud"])
 
 
 def test_repeated_assessment_dashboard_render_handles_message_not_modified() -> None:
@@ -1909,7 +1916,7 @@ def test_ffuf_scan_callback_prompts_for_profile_selection() -> None:
 
     assert query.edit_message_text.call_args.args[0] == build_ffuf_profile_text()
     keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
-    assert [button.text for row in keyboard.inline_keyboard for button in row] == ["⚡ Quick", "Standard", "Deep", "⚙ Custom"]
+    assert [button.text for row in keyboard.inline_keyboard for button in row] == ["⚡ Quick", "Standard", "Deep", "⚙ Settings", "Back"]
     assert PENDING_NMAP_REQUEST_KEY not in context.user_data
 
 
@@ -1927,6 +1934,98 @@ def test_ffuf_profile_callback_prompts_for_target() -> None:
     assert profile_query.edit_message_text.call_args.args[0] == build_ffuf_target_prompt("standard")
     assert context.user_data[PENDING_NMAP_REQUEST_KEY] == scan_request_id
     assert _ffuf_scan_profiles[scan_request_id] == "standard"
+
+
+def test_assessment_ffuf_opens_profile_selector_without_execution() -> None:
+    user_id = 17220
+    assessment = create_assessment("Assessment ffuf profiles", user_id=user_id)
+    add_assessment_target(assessment["id"], address="https://example.test")
+    query = SimpleNamespace(
+        data=f"assessment:run:ffuf:{assessment['id']}", answer=AsyncMock(), edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    context = SimpleNamespace(user_data={})
+
+    with patch("app.bot.handlers.scan.run_ffuf_scan") as runner:
+        asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=user_id)), context))
+
+    runner.assert_not_called()
+    assert query.edit_message_text.call_args.args[0] == build_ffuf_profile_text()
+    assert PENDING_NMAP_REQUEST_KEY not in context.user_data
+    assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["assessment_id"] == assessment["id"]
+
+
+def test_assessment_ffuf_standard_and_deep_keep_assessment_context() -> None:
+    for offset, profile in enumerate(("standard", "deep")):
+        user_id = 17221 + offset
+        assessment = create_assessment(f"Assessment ffuf {profile}", user_id=user_id)
+        target = add_assessment_target(assessment["id"], address="https://example.test")
+        context = SimpleNamespace(user_data={})
+        start = SimpleNamespace(
+            data=f"assessment:run:ffuf:{assessment['id']}", answer=AsyncMock(), edit_message_text=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        asyncio.run(assessment_callback_handler(SimpleNamespace(callback_query=start, effective_user=SimpleNamespace(id=user_id)), context))
+        request_id = get_user_scan_requests(user_id)[-1].id
+        selection = SimpleNamespace(
+            data=f"ffufp:{profile}:{request_id}", answer=AsyncMock(), edit_message_text=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+
+        with patch("app.bot.handlers.scan.scan_target_handler", new_callable=AsyncMock) as launch:
+            asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=selection, effective_user=SimpleNamespace(id=user_id)), context))
+
+        assert _ffuf_scan_profiles[request_id] == profile
+        assert context.user_data[PENDING_NMAP_REQUEST_KEY] == request_id
+        assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY] == {
+            "assessment_id": assessment["id"], "target_id": target["id"],
+            "cloud_context": "assessment-https://example.test", "primary_target": "https://example.test", "tool": "ffuf",
+            "scan_request_id": request_id,
+        }
+        launch.assert_awaited_once()
+        launched_update, launched_context = launch.call_args.args
+        assert launched_update.message.text == "https://example.test"
+        assert launched_context is context
+
+
+def test_ffuf_back_returns_to_mode_specific_parent_and_enforces_owner() -> None:
+    standalone_user = 17223
+    clear_user_scan_requests(standalone_user)
+    standalone_request = create_scan_request(user_id=standalone_user, scan_type="ffuf")
+    standalone_query = SimpleNamespace(data=f"ffufp:back:{standalone_request.id}", answer=AsyncMock(), edit_message_text=AsyncMock())
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=standalone_query, effective_user=SimpleNamespace(id=standalone_user)), SimpleNamespace(user_data={})))
+    assert standalone_query.edit_message_text.call_args.args[0] == build_scan_text()
+
+    owner = 17224
+    assessment = create_assessment("Owned assessment", user_id=owner)
+    target = add_assessment_target(assessment["id"], address="example.test")
+    request = create_scan_request(user_id=owner, scan_type="ffuf")
+    context = SimpleNamespace(user_data={ASSESSMENT_SCAN_CONTEXT_KEY: {
+        "assessment_id": assessment["id"], "target_id": target["id"], "primary_target": "example.test", "tool": "ffuf",
+        "scan_request_id": request.id,
+    }})
+    assessment_query = SimpleNamespace(data=f"ffufp:back:{request.id}", answer=AsyncMock(), edit_message_text=AsyncMock())
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=assessment_query, effective_user=SimpleNamespace(id=owner)), context))
+    assert "Assessment Dashboard" in assessment_query.edit_message_text.call_args.args[0]
+    assert context.user_data[ASSESSMENT_SCAN_CONTEXT_KEY]["assessment_id"] == assessment["id"]
+
+    forged = SimpleNamespace(data=f"ffufp:back:{request.id}", answer=AsyncMock(), edit_message_text=AsyncMock())
+    asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=forged, effective_user=SimpleNamespace(id=owner + 1)), context))
+    assert "not found or has expired" in forged.edit_message_text.call_args.args[0]
+
+    attacker = owner + 1
+    attacker_request = create_scan_request(user_id=attacker, scan_type="ffuf")
+    forged_context = SimpleNamespace(user_data={ASSESSMENT_SCAN_CONTEXT_KEY: {
+        "assessment_id": assessment["id"], "target_id": target["id"], "primary_target": "example.test", "tool": "ffuf",
+        "scan_request_id": attacker_request.id,
+    }})
+    forged_selection = SimpleNamespace(
+        data=f"ffufp:standard:{attacker_request.id}", answer=AsyncMock(), edit_message_text=AsyncMock(),
+    )
+    asyncio.run(scan_callback_handler(
+        SimpleNamespace(callback_query=forged_selection, effective_user=SimpleNamespace(id=attacker)), forged_context
+    ))
+    assert forged_selection.edit_message_text.call_args.args[0] == "Assessment not found."
 
 
 def test_ffuf_profile_selection_review_and_execution_context(tmp_path: Path) -> None:
@@ -2017,7 +2116,7 @@ def test_ffuf_missing_standard_profile_path_offers_profile_selection_again(tmp_p
     keyboard = message.reply_text.call_args.kwargs["reply_markup"]
     assert "ffuf Standard profile wordlist is unavailable." in text
     assert str(missing) in text
-    assert [button.text for row in keyboard.inline_keyboard for button in row] == ["⚡ Quick", "Standard", "Deep", "⚙ Custom"]
+    assert [button.text for row in keyboard.inline_keyboard for button in row] == ["⚡ Quick", "Standard", "Deep", "⚙ Settings", "Back"]
 
 
 def test_ffuf_timeout_failure_keeps_progress_and_recovery_actions() -> None:
@@ -2161,6 +2260,7 @@ def test_scan_callback_pattern_routes_scan_recovery_actions() -> None:
 
 def test_scan_callback_pattern_routes_ffuf_profile_selection() -> None:
     assert re.fullmatch(SCAN_CALLBACK_PATTERN, "ffufp:quick:request-id")
+    assert re.fullmatch(SCAN_CALLBACK_PATTERN, "ffufp:back:request-id")
 
 
 def test_scan_callback_pattern_routes_evidence_vault_actions() -> None:
