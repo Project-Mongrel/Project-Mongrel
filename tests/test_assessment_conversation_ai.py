@@ -1105,7 +1105,9 @@ def test_live_wording_variants_are_deterministic_and_evidence_scoped() -> None:
     }
     for tool, values in evidence.items():
         finding = add_finding(user_id=user_id, finding={"source": tool, "target": "example.test", **values})
-        record_assessment_scan(assessment["id"], tool, "completed", finding_id=finding["id"])
+        record_assessment_scan(
+            assessment["id"], tool, "failed" if tool == "testssl" else "completed", finding_id=finding["id"]
+        )
     tshark_scan = record_assessment_scan(assessment["id"], "tshark", "completed")
     add_assessment_artifact(assessment["id"], "tshark_normalized_evidence", "Capture", content=json.dumps({"packet_count": 12, "byte_count": 900}), scan_id=tshark_scan["id"])
 
@@ -1118,7 +1120,15 @@ def test_live_wording_variants_are_deterministic_and_evidence_scoped() -> None:
             user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question=question,
         )["answer"].lower() for question in questions}
 
-    assert "coverage remains incomplete" in answers[questions[0]] and "katana" in answers[questions[0]]
+    gaps_answer = answers[questions[0]]
+    assert "completed core web coverage: nmap, httpx" in gaps_answer
+    assert "testssl.sh is failed" in gaps_answer
+    assert "completed structured tls configuration coverage remains missing" in gaps_answer
+    assert "bbot is not_run" in gaps_answer
+    assert "gitleaks and prowler are context-dependent, not required" in gaps_answer
+    assert "does not establish that the target is secure or insecure" in gaps_answer
+    assert "does not execute any tool" in gaps_answer
+    assert "completed core web coverage: nmap, httpx, testssl" not in gaps_answer
     assert "testssl.sh" in answers[questions[1]] and "overall tls security" in answers[questions[1]]
     assert all(source in answers[questions[2]] for source in ("metasploit", "tshark"))
     assert "does not establish successful exploitation" in answers[questions[2]]
