@@ -144,8 +144,8 @@ def test_standalone_ask_telegram_keeps_general_security_knowledge_path() -> None
     )
     message = SimpleNamespace(text="How does SSRF work?", reply_text=AsyncMock())
 
-    async def run_inline(function, *args):
-        return function(*args)
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
 
     with (
         patch("app.bot.handlers.scan.ask_ai", return_value="Grounded SSRF explanation") as ask_ai,
@@ -153,6 +153,6 @@ def test_standalone_ask_telegram_keeps_general_security_knowledge_path() -> None
     ):
         asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id)), context))
 
-    ask_ai.assert_called_once_with("How does SSRF work?")
+    ask_ai.assert_called_once_with("How does SSRF work?", path="generic_ask")
     assert message.reply_text.call_args_list[-1].args[0] == "Grounded SSRF explanation"
     clear_ai_waiting(user_id)

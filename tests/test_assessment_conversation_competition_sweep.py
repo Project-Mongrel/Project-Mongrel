@@ -79,7 +79,8 @@ def test_every_completed_tool_reports_state_without_turning_completion_into_succ
     result, model = _answer(assessment["id"], f"did we run {tool}?")
 
     assert "recorded as completed" in result["answer"].lower()
-    assert "does not imply" in result["answer"].lower()
+    boundary = "does not establish" if tool == "ffuf" else "does not imply"
+    assert boundary in result["answer"].lower()
     model.assert_not_called()
 
 
@@ -88,9 +89,9 @@ COMPLETED_EVIDENCE_CASES = (
     ("bbot", {"bbot_observations": [{"type": "DNS_NAME", "value": "www.example.test"}]}, "discovery observations"),
     ("nuclei", {"nuclei_findings": [{"template_id": "tech-detect", "severity": "info"}]}, "INFO"),
     ("httpx", {"httpx_services": [{"url": "https://example.test", "status_code": 403}]}, "status 403"),
-    ("playwright", {"playwright_observation": {"final_url": "https://example.test", "forms": [{}]}}, "does not establish XSS"),
-    ("katana", {"katana_observations": [{"url": "https://example.test/login"}]}, "discovery observations"),
-    ("ffuf", {"ffuf_results": [{"path": "/admin", "status": 200, "size": 123}]}, "sensitive exposure"),
+    ("playwright", {"playwright_observation": {"final_url": "https://example.test", "forms": [{}]}}, "does not establish vulnerability"),
+    ("katana", {"katana_observations": [{"url": "https://example.test/login"}]}, "normalized crawl evidence"),
+    ("ffuf", {"ffuf_results": [{"path": "/admin", "status": 200, "size": 123}]}, "structured ffuf response"),
     (
         "testssl",
         {"testssl_evidence": {"target": "example.test", "vulnerabilities": [{"id": "early_data", "severity": "HIGH", "finding": "potentially VULNERABLE"}]}},

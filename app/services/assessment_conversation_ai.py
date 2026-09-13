@@ -1201,6 +1201,8 @@ def _build_state_grounded_answer(context: dict) -> str | None:
     recommendation = context.get("recommendation_context") or {}
     states = recommendation.get("tool_states") or {}
     preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
+    if intent == "product_self_knowledge":
+        return PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER
     if intent in {"next_step_recommendation", "prioritization"} and preferred:
         return _build_grounded_conversational_fallback(context)
     if intent == "remaining_coverage_gaps":
@@ -1757,6 +1759,13 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
             parts.append(f"testssl.sh is {testssl_state}; completed structured TLS configuration coverage is not stored.")
         if states.get("bbot") == "NOT_RUN":
             parts.append("BBOT is NOT_RUN and could add bounded asset reconnaissance if broader reconnaissance is relevant.")
+        unperformed_web = [tool for tool in ("bbot", "katana", "playwright", "ffuf") if states.get(tool) != "COMPLETED"]
+        if unperformed_web:
+            parts.append(
+                "Relevant uncompleted web or reconnaissance coverage includes "
+                + ", ".join(unperformed_web)
+                + "; each should be considered only where it answers a current evidence gap."
+            )
         parts.append(
             "Gitleaks and Prowler are context-dependent, not required for a public web target without suitable repository/filesystem or cloud context."
         )

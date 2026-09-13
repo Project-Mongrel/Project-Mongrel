@@ -261,27 +261,17 @@ def test_current_question_intent_routes_to_distinct_behavior(question, expected)
 def test_exact_live_product_question_uses_product_context_and_returns_no_assessment_drift():
     context = _context("What can Mongrel actually do?")
     assessment_id = context["provenance"]["assessment_id"]
-    answer = (
-        "Mongrel is an evidence-driven security assessment platform with exactly 12 tools: Nmap, BBOT, Nuclei, "
-        "httpx, Playwright, Katana, ffuf, testssl.sh, Gitleaks, Prowler, Metasploit, and TShark. Assessment Mode "
-        "stores evidence, history, and reports; Tool Mode provides direct single-tool use; Ask Mongrel analyzes and "
-        "advises without automatic execution. Guided Metasploit validation requires explicit review and approval."
-    )
-    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=answer) as ask_ai:
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
         result = answer_assessment_conversation_question(
             user_id=1001, assessment_id=assessment_id, conversation_id=None, question="What can Mongrel actually do?"
         )
 
-    prompt = ask_ai.call_args.args[0]
-    model_json = prompt.split("Private reference data (use its facts; never quote its labels or format):\n", 1)[1].rsplit("\n\nAnswer:", 1)[0]
-    assert result["answer"] == answer
+    ask_ai.assert_not_called()
+    assert result["answer"] == PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER
     assert "12 tools" in result["answer"]
     assert "Assessment Mode" in result["answer"]
     assert "I recommend" not in result["answer"]
     assert "truthfulness_guard" not in result["answer"]
-    assert '"assessment_context"' not in model_json
-    assert '"recommendation_context"' not in model_json
-    assert '"conversation"' not in model_json
     assert "Tools Used" not in result["answer"]
 
 
@@ -378,15 +368,16 @@ def test_claimed_twelve_tool_enumeration_must_match_canonical_profile_exactly():
     "Mongrel has exactly 12 tools: Nmap, BBOT, Nuclei, httpx, Playwright, Katana, ffuf, Gitleaks, Prowler, Metasploit, and TShark.",
     "Mongrel has exactly 12 tools: Nmap, BBOT, Nuclei, httpx, Playwright, Katana, ffuf, testssl.sh, Gitleaks, Prowler, Metasploit, TShark, and Wireshark.",
 ])
-def test_bad_live_product_enumeration_is_replaced_with_canonical_answer(bad_answer):
+def test_product_question_uses_canonical_answer_without_model_enumeration_drift(bad_answer):
     context = _context("What can Mongrel actually do?")
     assessment_id = context["provenance"]["assessment_id"]
-    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=bad_answer):
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=bad_answer) as ask_ai:
         result = answer_assessment_conversation_question(
             user_id=1001, assessment_id=assessment_id, conversation_id=None, question=context["current_question"]
         )
+    ask_ai.assert_not_called()
     assert result["answer"] == PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER
-    assert result["fallback_reason"] == "product_tool_enumeration_guard"
+    assert result["fallback_reason"] is None
     assert all(name in result["answer"] for name in get_mongrel_tool_names())
     assert "Wireshark" not in result["answer"]
 

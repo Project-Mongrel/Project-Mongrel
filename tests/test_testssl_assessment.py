@@ -74,7 +74,7 @@ def test_dashboard_shows_testssl_status_and_button() -> None:
     buttons = [button.text for row in keyboard.inline_keyboard for button in row]
 
     assert "testssl.sh: Completed" in dashboard
-    assert "Run testssl.sh" in buttons
+    assert "testssl.sh TLS" in buttons
 
 
 def test_testssl_telegram_card_is_deterministic_and_not_raw_stdout() -> None:

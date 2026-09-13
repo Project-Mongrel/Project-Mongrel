@@ -56,7 +56,7 @@ def test_dashboard_shows_prowler_status_and_button() -> None:
     buttons = [button.text for row in keyboard.inline_keyboard for button in row]
 
     assert "Prowler: Completed" in dashboard
-    assert "Run Prowler" in buttons
+    assert "Prowler Cloud" in buttons
 
 
 def test_assessment_context_contains_normalized_prowler_evidence_only() -> None:

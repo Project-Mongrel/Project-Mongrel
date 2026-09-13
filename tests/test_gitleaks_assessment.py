@@ -191,7 +191,7 @@ def test_dashboard_shows_gitleaks_status_and_button() -> None:
     buttons = [button.text for row in keyboard.inline_keyboard for button in row]
 
     assert "Gitleaks: Completed" in dashboard
-    assert "Run Gitleaks" in buttons
+    assert "Gitleaks Secrets" in buttons
 
 
 def test_gitleaks_telegram_card_never_displays_raw_secret() -> None:
