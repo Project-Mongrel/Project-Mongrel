@@ -72,8 +72,8 @@ _PROFILE = {
             "approval": "Crawling remains within authorized scope.",
         },
         "ffuf": {
-            "purpose": "Bounded web content and path discovery.",
-            "evidence": "Responses associated with tested paths or input candidates.",
+            "purpose": "Bounded web fuzzing and content discovery at user-defined FUZZ positions, including supported paths, parameters, and hostnames.",
+            "evidence": "Responses associated with tested paths, parameters, hostnames, or other input candidates.",
             "not_proof": "Sensitive content, access-control failure, vulnerability, or exhaustive discovery.",
             "gaps": "Potential unlinked paths, files, and parameters.",
             "follow_ons": "Use httpx/Katana baselines; inspect behavior with Playwright; validate supported patterns with Nuclei.",

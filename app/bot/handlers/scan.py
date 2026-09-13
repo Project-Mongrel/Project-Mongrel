@@ -55,7 +55,13 @@ from app.services.active_scan_state import (
 )
 from app.services.bbot_ai_assessment import FALLBACK_LINES, generate_bbot_ai_assessment
 from app.services.bbot_summary import build_bbot_recon_summary, build_bbot_recon_summary_from_observations
-from app.services.chat_state import clear_finding_analysis_context, get_finding_analysis_context, is_ai_waiting
+from app.services.chat_state import (
+    append_ai_conversation_exchange,
+    clear_finding_analysis_context,
+    get_ai_conversation_history,
+    get_finding_analysis_context,
+    is_ai_waiting,
+)
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
 from app.services.findings_store import get_user_finding
@@ -110,6 +116,7 @@ from app.services.prowler_ai_assessment import generate_prowler_ai_assessment
 from app.services.testssl_ai_assessment import FALLBACK_LINES as TESTSSL_AI_FALLBACK_LINES
 from app.services.testssl_ai_assessment import generate_testssl_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
+from app.services.standalone_ask import answer_standalone_product_question
 from app.services.target_normalizer import normalize_for_bbot, normalize_for_ffuf, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_for_playwright, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS, run_nmap_scan
@@ -2553,15 +2560,21 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not pending_scan_input and user_id is not None and is_ai_waiting(user_id):
         logger.info("Ask Mongrel question received for user_id=%s", user_id)
         await update.message.reply_text("Analyzing...")
+        question = update.message.text or ""
+        direct_answer = answer_standalone_product_question(question, get_ai_conversation_history(user_id))
         try:
-            logger.info("AI request started for user_id=%s", user_id)
-            ai_response = await asyncio.to_thread(ask_ai, update.message.text or "")
-            logger.info("AI request completed for user_id=%s", user_id)
+            if direct_answer is not None:
+                ai_response = direct_answer
+            else:
+                logger.info("AI request started for user_id=%s", user_id)
+                ai_response = await asyncio.to_thread(ask_ai, question)
+                logger.info("AI request completed for user_id=%s", user_id)
         except Exception:
             logger.exception("AI request failed for user_id=%s", user_id)
             await update.message.reply_text("AI request failed. Check bot logs.")
             return
 
+        append_ai_conversation_exchange(user_id, question, ai_response)
         await update.message.reply_text(ai_response)
         return
 
