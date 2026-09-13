@@ -5,6 +5,7 @@ from time import perf_counter
 
 from app.core.config import get_settings
 from app.parsers.katana_parser import summarize_katana_observations
+from app.parsers.playwright_parser import summarize_playwright_observation
 from app.services.ai_client import ask_ai
 from app.services.assessment_ai import AI_UNAVAILABLE_MESSAGES
 from app.services.assessment_conversation_context import (
@@ -1261,8 +1262,54 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
         items = [item for finding in findings for item in (finding.get(field) or []) if isinstance(item, dict)]
         return f"{display} is recorded as completed with {len(items)} stored observation item(s). These discovery observations do not automatically establish ownership, vulnerability, sensitive exposure, or complete coverage."
     if tool == "playwright":
-        observations = [finding.get("playwright_observation") for finding in findings if isinstance(finding.get("playwright_observation"), dict)]
-        return f"Playwright is recorded as completed with {len(observations)} stored browser observation(s). Rendered state does not establish XSS, SQL injection, CSRF, safety, or complete application coverage."
+        playwright_findings = [
+            finding
+            for finding in findings
+            if isinstance(finding.get("playwright_observation"), dict)
+        ]
+        if not playwright_findings:
+            return (
+                "Playwright is recorded as completed, but no normalized browser observation is stored. That does not "
+                "establish that the application is safe, vulnerable, or completely covered."
+            )
+        rendered = []
+        for finding in playwright_findings[:5]:
+            observation = finding["playwright_observation"]
+            summary = summarize_playwright_observation(observation)
+            stored_summary = finding.get("playwright_summary")
+            if isinstance(stored_summary, dict):
+                for key in summary:
+                    if stored_summary.get(key) is not None:
+                        summary[key] = stored_summary[key]
+            facts = []
+            if summary.get("final_url"):
+                facts.append(f"final URL {summary['final_url']}")
+            if summary.get("status_code") is not None:
+                facts.append(f"status {summary['status_code']}")
+            if summary.get("title"):
+                facts.append(f"title {summary['title']}")
+            facts.append(f"load status {summary['load_status']}")
+            facts.extend(
+                (
+                    f"{summary['forms_count']} forms",
+                    f"{summary['inputs_count']} inputs",
+                    f"{summary['links_count']} links",
+                    f"{summary['network_events_count']} network events",
+                    f"{summary['console_issue_count']} console issues",
+                    f"{summary['network_issue_count']} network issues",
+                    f"{summary['page_error_count']} page errors",
+                    "Screenshot/artifact: " + ("present" if summary["screenshot_present"] else "not captured"),
+                    "Out-of-scope redirect: " + ("yes" if summary["redirected_out_of_scope"] else "no"),
+                )
+            )
+            rendered.append("; ".join(facts))
+        return (
+            "Playwright is recorded as completed. Its normalized passive browser observation recorded "
+            + ". ".join(rendered)
+            + ". Zero counts do not prove absence, and form/input counts do not establish what those elements are used for. "
+            "Console messages do not establish exploitability. Passive browser observation does not establish vulnerability, "
+            "safety, exploitability, XSS, SQL injection, CSRF, authentication flaws, or complete coverage; this answer executes nothing."
+        )
     if tool == "testssl":
         items = [
             item for finding in findings for key in ("testssl_findings",)

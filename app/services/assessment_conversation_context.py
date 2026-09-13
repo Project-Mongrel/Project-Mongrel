@@ -43,7 +43,7 @@ TOOL_ALIASES = {
     "nuclei": ("nuclei",),
     "httpx": ("httpx", "http fingerprint"),
     "katana": ("katana", "crawl", "crawler"),
-    "playwright": ("playwright", "browser", "dom"),
+    "playwright": ("playwright", "playright", "browser", "dom"),
     "ffuf": ("ffuf", "fuzz", "fuzzing"),
     "testssl": ("testssl", "testssl.sh", "tls", "ssl"),
     "gitleaks": ("gitleaks", "secret", "secrets"),

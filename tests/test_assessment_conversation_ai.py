@@ -1305,6 +1305,115 @@ def test_confidence_summary_deduplicates_httpx_and_omits_unknown_status() -> Non
     assert "status None" not in result["answer"]
 
 
+def test_completed_playwright_named_question_summarizes_normalized_browser_evidence() -> None:
+    user_id = 1096
+    assessment = create_assessment("Browser evidence", user_id=user_id)
+    observation = {
+        "requested_url": "https://btjoinery.ie/",
+        "final_url": "https://www.btjoinery.ie/",
+        "title": "BT Joinery Services Ireland",
+        "load_status": "loaded",
+        "status_code": 200,
+        "forms_count": 0,
+        "inputs_count": 12,
+        "links_count": 56,
+        "network_events": [{"url": f"https://www.btjoinery.ie/resource/{index}"} for index in range(25)],
+        "console_issue_count": 8,
+        "network_issue_count": 0,
+        "page_error_count": 0,
+        "screenshot": {"captured": True, "type": "png"},
+        "redirected_out_of_scope": True,
+    }
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "playwright",
+            "target": observation["requested_url"],
+            "playwright_observation": observation,
+            "playwright_summary": {
+                "final_url": observation["final_url"],
+                "title": observation["title"],
+                "load_status": "loaded",
+                "status_code": 200,
+                "forms_count": 0,
+                "inputs_count": 12,
+                "links_count": 56,
+                "network_events_count": 25,
+                "console_issue_count": 8,
+                "network_issue_count": 0,
+                "page_error_count": 0,
+                "screenshot_present": True,
+                "redirected_out_of_scope": True,
+            },
+        },
+    )
+    record_assessment_scan(assessment["id"], "playwright", "completed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="what did playwright add!",
+        )["answer"]
+
+    for expected in (
+        "https://www.btjoinery.ie/",
+        "BT Joinery Services Ireland",
+        "loaded",
+        "status 200",
+        "0 forms",
+        "12 inputs",
+        "56 links",
+        "25 network events",
+        "8 console issues",
+        "0 network issues",
+        "0 page errors",
+        "Screenshot/artifact: present",
+        "Out-of-scope redirect: yes",
+    ):
+        assert expected in answer
+    assert "passive browser observation" in answer
+    model.assert_not_called()
+
+
+def test_playright_typo_question_keeps_zero_counts_evidence_bounded() -> None:
+    user_id = 1097
+    assessment = create_assessment("Bounded browser evidence", user_id=user_id)
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "playwright",
+            "target": "https://example.test",
+            "playwright_observation": {
+                "final_url": "https://example.test/",
+                "load_status": "loaded",
+                "forms_count": 0,
+                "inputs_count": 0,
+                "links_count": 0,
+                "console_issue_count": 0,
+                "network_issue_count": 0,
+                "page_error_count": 0,
+            },
+        },
+    )
+    record_assessment_scan(assessment["id"], "playwright", "completed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="what did playright find?",
+        )["answer"]
+
+    assert "Playwright is recorded as completed" in answer
+    assert "Zero counts do not prove absence" in answer
+    assert "does not establish vulnerability, safety, exploitability" in answer
+    assert "or complete coverage" in answer
+    model.assert_not_called()
+
+
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:
     finding = add_finding(
         user_id=user_id,
