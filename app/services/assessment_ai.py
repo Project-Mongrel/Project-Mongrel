@@ -257,6 +257,49 @@ def _sanitize_assessment_ai_report(report: str, context: dict) -> str:
     lines: list[str] = []
     for line in report.splitlines():
         lowered = line.lower()
+        if ("ffuw" in lowered or "ffuf" in lowered) and "hidden content" in lowered and any(
+            term in lowered for term in ("no hidden", "zero hidden", "no structured", "no paths")
+        ):
+            scan = latest_by_tool.get("ffuf") or {}
+            finding = scan.get("finding") or {}
+            metadata = finding.get("metadata") or {}
+            results = finding.get("ffuf_results") or []
+            profile = metadata.get("ffuf_profile_label") or metadata.get("profile") or "recorded"
+            line = (
+                f"ffuf: the {profile} run stored {len(results)} structured response observation(s); "
+                "zero observations do not establish that hidden content or paths are absent."
+            )
+        if "hsts" in lowered and "secure" in lowered:
+            nuclei_scan = latest_by_tool.get("nuclei") or {}
+            matches = ((nuclei_scan.get("finding") or {}).get("nuclei_findings") or [])
+            hsts_matches = [
+                item for item in matches
+                if "hsts" in str(item.get("template_id") or item.get("name") or "").lower()
+            ]
+            hsts_severities = sorted({str(item.get("severity") or "info").upper() for item in hsts_matches})
+            detail = (
+                f" The assessment also contains {len(hsts_matches)} HSTS-related Nuclei template match(es) "
+                f"({', '.join(hsts_severities)}); their stored wording requires validation."
+                if hsts_matches else ""
+            )
+            line = "HSTS presence is a stored observation only and does not establish security." + detail
+        if "no findings indicate" in lowered and any(term in lowered for term in ("vulnerab", "exploit")):
+            line = "No confirmed vulnerability or exploitability conclusion is established by the stored evidence."
+        if "no immediate remediation" in lowered:
+            line = (
+                "Next actions should address failed or unperformed coverage and validate relevant stored observations; "
+                "this report does not execute tools or prescribe remediation without validation."
+            )
+        if "playwright" in lowered and "forms" in lowered:
+            scan = latest_by_tool.get("playwright") or {}
+            observation = ((scan.get("finding") or {}).get("playwright_observation") or {})
+            if observation and int(observation.get("forms_count") or 0) == 0:
+                inputs = int(observation.get("inputs_count") or 0)
+                links = int(observation.get("links_count") or 0)
+                line = (
+                    f"Playwright: the passive returned state recorded 0 forms, {inputs} inputs, and {links} links; "
+                    "zero forms in that returned state does not establish absence elsewhere."
+                )
         if "playwright" in lowered and "no hidden content" in lowered:
             line = "Playwright: passive browser observation was recorded; it does not establish that hidden content is absent."
         if "nuclei" in lowered and "issue" in lowered:

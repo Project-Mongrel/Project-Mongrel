@@ -150,7 +150,7 @@ def test_assessment_markdown_report_renders_multi_tool_evidence() -> None:
     assert "## Assessment History" in report
     assert "Nmap Completed - Risk: MEDIUM" in report
     assert "- Review SSH exposure, authentication policy, and network access restrictions." in report
-    assert "- Only completed and partial tools are represented in the scan summary." in report
+    assert "latest recorded state, including completed, partial, and failed runs" in report
 
 
 def test_assessment_markdown_report_includes_partial_bbot_evidence() -> None:

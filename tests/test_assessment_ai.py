@@ -437,15 +437,27 @@ def test_ai_report_uses_latest_tool_evidence_and_corrects_scanner_semantics() ->
         "assessment": {"name": "Final", "status": "active"}, "targets": [],
         "scans": [newer, older, {
             "id": 30, "tool": "nuclei", "status": "completed", "created_at": datetime(2026, 1, 3, tzinfo=UTC),
-            "finding": {"source": "nuclei", "nuclei_findings": [{"severity": "info"}] * 3},
+            "finding": {"source": "nuclei", "nuclei_findings": [
+                {"name": "Weak HSTS", "severity": "info"},
+                {"name": "Technology Detection", "severity": "info"},
+                {"name": "HTTP Metadata", "severity": "info"},
+            ]},
         }, {
             "id": 40, "tool": "testssl", "status": "failed", "created_at": datetime(2026, 1, 4, tzinfo=UTC),
             "finding": {"source": "testssl", "summary": "scan timed out"},
+        }, {
+            "id": 50, "tool": "playwright", "status": "completed", "created_at": datetime(2026, 1, 5, tzinfo=UTC),
+            "finding": {"source": "playwright", "playwright_observation": {"forms_count": 0, "inputs_count": 12, "links_count": 56}},
         }], "artifacts": [], "notes": [],
     }
     response = "\n".join([
         "Playwright Scan: Passive browser observation completed, no hidden content found.",
+        "Playwright observed links and forms.",
         "Nuclei found 3 issues.",
+        "FFUW: Observed no hidden content paths.",
+        "HSTS presence is generally considered secure.",
+        "No findings indicate any vulnerabilities or potential exploits.",
+        "No immediate remediation actions are recommended.",
         "testssl.sh completed with no findings.",
     ])
 
@@ -456,5 +468,15 @@ def test_ai_report_uses_latest_tool_evidence_and_corrects_scanner_semantics() ->
     assert "profile=Standard" in prompt and "wordlist_entries=2570" in prompt
     assert "profile=Custom" not in prompt and "wordlist_entries=19" not in prompt
     assert "no hidden content found" not in report.lower()
+    assert "ffuw" not in report.lower()
+    assert "zero observations do not establish that hidden content or paths are absent" in report
+    assert "generally considered secure" not in report.lower()
+    assert "HSTS presence is a stored observation only" in report
+    assert "1 HSTS-related Nuclei template match(es) (INFO)" in report
+    assert "no findings indicate" not in report.lower()
+    assert "No confirmed vulnerability or exploitability conclusion" in report
+    assert "No immediate remediation" not in report
+    assert "failed or unperformed coverage" in report
+    assert "0 forms, 12 inputs, and 56 links" in report
     assert "3 template match(es)" in report and "INFO" in report
     assert "testssl.sh: FAILED" in report and "no completed structured TLS" in report

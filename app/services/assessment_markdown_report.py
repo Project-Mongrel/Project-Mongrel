@@ -69,7 +69,7 @@ def generate_assessment_markdown_report(context: dict) -> str:
         "",
         "## Evidence Limitations",
         "",
-        "- Only completed and partial tools are represented in the scan summary.",
+        "- The scan summary represents each tool's latest recorded state, including completed, partial, and failed runs where present.",
         "- Absence of findings is not evidence of security.",
         "- Additional assessment activities may be required.",
     ]
