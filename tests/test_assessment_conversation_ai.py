@@ -1414,6 +1414,68 @@ def test_playright_typo_question_keeps_zero_counts_evidence_bounded() -> None:
     model.assert_not_called()
 
 
+def test_completed_ffuf_zero_results_reports_stored_run_scope_without_absence_claim() -> None:
+    user_id = 1098
+    assessment = create_assessment("Zero-result ffuf", user_id=user_id)
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "ffuf",
+            "target": "https://example.test/FUZZ",
+            "status": "completed",
+            "ffuf_results": [],
+            "ffuf_summary": {"result_count": 0, "status_codes": {}, "limitations": ["Bounded selected wordlist."]},
+            "metadata": {
+                "ffuf_profile": "standard",
+                "ffuf_profile_label": "Standard",
+                "wordlist_path": "/opt/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+                "wordlist_source": "Configured Standard SecLists wordlist",
+                "wordlist_count": 30000,
+                "timeout_seconds": 120,
+            },
+        },
+    )
+    record_assessment_scan(assessment["id"], "ffuf", "completed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What did ffuf add",
+        )["answer"]
+
+    for expected in ("Standard", "raft-medium-directories.txt", "Configured Standard SecLists wordlist", "30000", "120"):
+        assert expected in answer
+    assert "no structured ffuf response observations were stored" in answer.lower()
+    assert "does not establish that hidden content is absent" in answer
+    assert "/opt/seclists" not in answer
+    model.assert_not_called()
+
+
+def test_important_remaining_gaps_are_deterministic_and_state_aware() -> None:
+    user_id = 1099
+    assessment = create_assessment("State-aware gaps", user_id=user_id)
+    for tool in ("nmap", "httpx", "nuclei", "katana", "playwright", "ffuf"):
+        record_assessment_scan(assessment["id"], tool, "completed")
+    record_assessment_scan(assessment["id"], "testssl", "failed")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What important gaps remain now",
+        )["answer"]
+
+    assert "Completed core web coverage: Nmap, httpx, Nuclei, Katana, Playwright, ffuf" in answer
+    assert "testssl.sh is FAILED" in answer
+    assert "completed structured TLS configuration coverage remains missing" in answer
+    assert "BBOT is NOT_RUN" in answer and "if broader reconnaissance is relevant" in answer
+    assert "Gitleaks and Prowler are context-dependent, not required" in answer
+    assert "Metasploit and TShark are conditional, not mandatory" in answer
+    assert "does not establish that the target is secure or insecure" in answer
+    assert "run" not in answer.lower().split("metasploit and tshark")[1].split(".")[0]
+    model.assert_not_called()
+
+
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:
     finding = add_finding(
         user_id=user_id,

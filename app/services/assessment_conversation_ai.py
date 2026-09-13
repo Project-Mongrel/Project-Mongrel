@@ -1,6 +1,7 @@
 import json
 import re
 from copy import deepcopy
+from pathlib import Path
 from time import perf_counter
 
 from app.core.config import get_settings
@@ -1257,10 +1258,52 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
             "These are bounded crawl observations. Zero counts do not prove those features are absent, and the crawl "
             "does not by itself establish a vulnerability or complete coverage."
         )
-    if tool in {"bbot", "ffuf"}:
-        field = {"bbot": "bbot_observations", "ffuf": "ffuf_results"}[tool]
+    if tool == "bbot":
+        field = "bbot_observations"
         items = [item for finding in findings for item in (finding.get(field) or []) if isinstance(item, dict)]
         return f"{display} is recorded as completed with {len(items)} stored observation item(s). These discovery observations do not automatically establish ownership, vulnerability, sensitive exposure, or complete coverage."
+    if tool == "ffuf":
+        finding = findings[-1] if findings else {}
+        observations = [item for item in (finding.get("ffuf_results") or []) if isinstance(item, dict)]
+        summary = finding.get("ffuf_summary") if isinstance(finding.get("ffuf_summary"), dict) else {}
+        metadata = finding.get("metadata") if isinstance(finding.get("metadata"), dict) else {}
+        scope = []
+        profile = metadata.get("ffuf_profile_label") or metadata.get("ffuf_profile")
+        if profile:
+            scope.append(f"profile {profile}")
+        wordlist_path = str(metadata.get("wordlist_path") or "").strip()
+        if wordlist_path:
+            scope.append(f"wordlist {Path(wordlist_path).name}")
+        if metadata.get("wordlist_source"):
+            scope.append(f"source {metadata['wordlist_source']}")
+        if metadata.get("wordlist_count") is not None:
+            scope.append(f"{metadata['wordlist_count']} wordlist entries")
+        if metadata.get("timeout_seconds") is not None:
+            scope.append(f"timeout {metadata['timeout_seconds']} seconds")
+        status_codes = summary.get("status_codes") if isinstance(summary.get("status_codes"), dict) else {}
+        status_text = (
+            " Stored status-code summary: "
+            + ", ".join(f"{code}={count}" for code, count in status_codes.items())
+            + "."
+            if status_codes
+            else ""
+        )
+        limitations = [str(item) for item in (summary.get("limitations") or []) if str(item).strip()]
+        limitation_text = " Stored limitation: " + " ".join(limitations[:3]) if limitations else ""
+        observation_text = (
+            f"{len(observations)} structured ffuf response observation(s) were stored."
+            if observations
+            else "No structured ffuf response observations were stored."
+        )
+        return (
+            "ffuf is recorded as completed"
+            + (" with run scope: " + "; ".join(scope) if scope else "")
+            + ". "
+            + observation_text
+            + status_text
+            + limitation_text
+            + " This bounded result does not establish that hidden content is absent, that no vulnerability exists, or that coverage was complete."
+        )
     if tool == "playwright":
         playwright_findings = [
             finding
@@ -1486,15 +1529,32 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
         if follow_up:
             return follow_up
     if intent == "remaining_coverage_gaps":
-        gaps = [str(tool) for tool in recommendation.get("relevant_unperformed_tools") or []]
-        if gaps:
-            return (
-                "Relevant coverage remains incomplete. The stored assessment state shows "
-                + ", ".join(gaps)
-                + " have not been completed. For this web target, Katana, Playwright, and ffuf cover different web "
-                "discovery or browser-observation gaps; BBOT can add bounded reconnaissance. Gitleaks and Prowler are "
-                "not automatically appropriate without repository or cloud context."
+        core_web = [
+            display
+            for tool, display in (
+                ("nmap", "Nmap"), ("httpx", "httpx"), ("nuclei", "Nuclei"),
+                ("katana", "Katana"), ("playwright", "Playwright"), ("ffuf", "ffuf"),
             )
+            if states.get(tool) == "COMPLETED"
+        ]
+        parts = ["Completed core web coverage: " + (", ".join(core_web) if core_web else "none") + "."]
+        testssl_state = states.get("testssl", "NOT_RUN")
+        if testssl_state == "FAILED":
+            parts.append("testssl.sh is FAILED, so completed structured TLS configuration coverage remains missing.")
+        elif testssl_state != "COMPLETED":
+            parts.append(f"testssl.sh is {testssl_state}; completed structured TLS configuration coverage is not stored.")
+        if states.get("bbot") == "NOT_RUN":
+            parts.append("BBOT is NOT_RUN and could add bounded asset reconnaissance if broader reconnaissance is relevant.")
+        parts.append(
+            "Gitleaks and Prowler are context-dependent, not required for a public web target without suitable repository/filesystem or cloud context."
+        )
+        parts.append(
+            "Metasploit and TShark are conditional, not mandatory: active validation or packet capture should be considered only when existing evidence justifies it and the required authorization is present."
+        )
+        parts.append(
+            "Coverage state does not establish that the target is secure or insecure, and this answer does not execute any tool."
+        )
+        return " ".join(parts)
     if intent == "simplify_explanation":
         completed = [tool for tool, state in states.items() if state == "COMPLETED"]
         gaps = [str(tool) for tool in recommendation.get("relevant_unperformed_tools") or []]

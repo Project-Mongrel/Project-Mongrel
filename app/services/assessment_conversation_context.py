@@ -136,7 +136,7 @@ PRIORITIZATION_TERMS = ("which one first", "what first", "prioriti", "highest pr
 COVERAGE_GAP_TERMS = (
     "anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing",
     "what haven't we done", "what have we not done", "what remains", "biggest unknown", "what don't we know",
-    "what do we not know",
+    "what do we not know", "gaps remain",
 )
 SIGNIFICANCE_TERMS = ("anything worrying", "is that bad", "does that matter", "how serious", "why should i care")
 UNCERTAINTY_TERMS = (
