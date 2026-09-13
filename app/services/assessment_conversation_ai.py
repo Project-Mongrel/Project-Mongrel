@@ -83,6 +83,7 @@ EVIDENCE_LANGUAGE_OVERCLAIM_PATTERNS = (
     re.compile(r"\bhttpx\b.{0,80}\b(?:identified|determined|assessed|showed)\b.{0,50}\b(?:security posture|vulnerab)"),
     re.compile(r"\bbbot\b.{0,80}\b(?:proved|confirmed|established|identified)\b.{0,50}\b(?:ownership|breach|vulnerab|exploit)"),
     re.compile(r"\bnuclei\b.{0,80}\b(?:proved|confirmed|identified)\b.{0,50}\b(?:exploitab|vulnerab|xss|sqli|sql injection)"),
+    re.compile(r"\bnuclei\b.{0,300}\b(?:lead(?:s)? to|cause(?:s)?|enable(?:s)?)\b.{0,100}\b(?:mitm|man-in-the-middle|downgrade attack)"),
     re.compile(r"\bplaywright\b.{0,80}\b(?:proved|confirmed|identified|found)\b.{0,50}\b(?:xss|sqli|sql injection|csrf|vulnerab|safe|secure)"),
     re.compile(r"\bkatana\b.{0,80}\b(?:proved|confirmed|identified|found)\b.{0,50}\b(?:vulnerab|all hidden|complete coverage)"),
     re.compile(r"\bffuf\b.{0,80}\b(?:proved|confirmed|identified|found)\b.{0,50}\b(?:sensitive exposure|injection|vulnerab)"),
@@ -139,7 +140,8 @@ def answer_assessment_conversation_question(
     )
     context_ms = _elapsed_ms(context_started)
     direct_evidence_answer = (
-        _build_cross_tool_port_443_answer(context)
+        _build_evidence_confidence_answer(context)
+        or _build_cross_tool_port_443_answer(context)
         or _build_httpx_waf_semantic_answer(context)
         or _build_direct_nmap_evidence_fallback(context)
         or _build_direct_httpx_evidence_answer(context)
@@ -1232,10 +1234,7 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
     intent = str(context.get("question_intent") or "")
     if intent not in {"assessment_summary", "assessment_highlight"}:
         return None
-    findings = [
-        finding for finding in ((context.get("assessment_context") or {}).get("findings") or [])
-        if isinstance(finding, dict)
-    ]
+    findings = _latest_authoritative_findings(context)
     nmap_ports = []
     for finding in findings:
         if str(finding.get("source") or "").lower() != "nmap":
@@ -1245,19 +1244,6 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
                 nmap_ports.append(
                     f"{item.get('port')}/{item.get('protocol') or 'tcp'} ({item.get('service') or 'unknown'})"
                 )
-    if intent == "assessment_highlight":
-        if nmap_ports:
-            return (
-                "The clearest observation to pay attention to is the exposed service surface Nmap recorded: "
-                + ", ".join(nmap_ports[:10])
-                + ". It stands out because exposed services provide concrete surfaces for further investigation. This "
-                "is prioritization of an observed surface, not proof of a vulnerability, exploitability, or insecurity."
-            )
-        return (
-            "The stored evidence does not contain a sufficiently specific observation to name one item as most "
-            "significant. That uncertainty is not evidence that the target is safe."
-        )
-
     statements = []
     if nmap_ports:
         statements.append("Nmap recorded exposed TCP services: " + ", ".join(nmap_ports[:10]) + ".")
@@ -1282,9 +1268,11 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
     ]
     if nuclei_matches:
         severities = [str(item.get("severity") or "unknown").upper() for item in nuclei_matches]
+        match_names = [str(item.get("name") or item.get("template_id") or "unnamed template") for item in nuclei_matches[:5]]
         statements.append(
             f"Nuclei stored {len(nuclei_matches)} template match(es) with scanner severity "
             + ", ".join(dict.fromkeys(severities))
+            + " including " + ", ".join(match_names)
             + "; template matches do not automatically establish exploitability."
         )
     testssl_findings = [
@@ -1322,7 +1310,148 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
         statements.append("Relevant unperformed coverage remains: " + ", ".join(gaps) + ".")
     if not statements:
         return "No normalized observations are stored yet. That does not establish that the target is safe or free of vulnerabilities."
+    if intent == "assessment_highlight":
+        return _build_assessment_wide_synthesis(context, statements)
     return " ".join(statements) + " These are bounded stored observations, not an overall secure, insecure, or vulnerable conclusion."
+
+
+def _build_evidence_confidence_answer(context: dict) -> str | None:
+    """Calibrate confidence in a referenced observation without another model prompt."""
+    question = str(context.get("current_question") or "").lower()
+    confidence_question = any(
+        phrase in question
+        for phrase in ("how confident", "how sure", "how strong is", "why should i trust")
+    )
+    selection = context.get("selection") or {}
+    selected = [str(tool) for tool in selection.get("selected_tools") or []]
+    if not confidence_question or not selection.get("inherited_evidence_scope") or len(selected) != 1:
+        return None
+    tool = selected[0].lower().removesuffix(".sh")
+    names = {name.lower().removesuffix(".sh"): name for name in get_mongrel_tool_names()}
+    display = names.get(tool, tool)
+    state = str(((context.get("recommendation_context") or {}).get("tool_states") or {}).get(tool, "NOT_RUN"))
+    findings = _tool_findings(context, tool)
+    severity_values = sorted({
+        str(item.get("severity")).upper()
+        for finding in findings
+        for item in (finding.get("nuclei_findings") or [])
+        if isinstance(item, dict) and item.get("severity")
+    })
+    stored_confidence = sorted({
+        str(value)
+        for finding in findings
+        for value in (finding.get("confidence"), finding.get("confidence_score"))
+        if value not in (None, "")
+    })
+    evidence_kind = "template match" if tool == "nuclei" and severity_values else "normalized observation"
+    structured_evidence = any(
+        _has_structured_tool_evidence(finding, tool)
+        or any(bool(finding.get(key)) for key in ("open_ports", "playwright_observation", "tshark_evidence"))
+        for finding in findings
+    )
+    if state == "COMPLETED" and structured_evidence:
+        observation_confidence = (
+            f"There is moderate-to-high confidence that {display} recorded the stored {evidence_kind} because the "
+            "authoritative assessment state is COMPLETED and the normalized evidence is linked to this assessment"
+        )
+    else:
+        observation_confidence = (
+            f"Confidence that {display} established the referenced condition is limited because its authoritative "
+            f"assessment state is {state} or completed normalized evidence is unavailable"
+        )
+    if severity_values:
+        observation_confidence += "; the stored scanner severity is " + ", ".join(severity_values)
+    if stored_confidence:
+        observation_confidence += "; stored confidence metadata is " + ", ".join(stored_confidence)
+    return (
+        "Evidence confidence: " + observation_confidence + ". "
+        "Interpretation confidence: lower—the stored scanner or observation record should be independently validated "
+        "against the actual target condition and relevant configuration before drawing a security conclusion. "
+        "Exploitability confidence: not established; the stored observation and scanner severity do not by themselves "
+        "prove a practical attack path, successful exploitation, or real-world impact."
+    )
+
+
+def _build_assessment_wide_synthesis(context: dict, base_statements: list[str]) -> str:
+    """Render a bounded multi-tool highlight/risk/gap synthesis from authoritative state."""
+    states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
+    findings = _latest_authoritative_findings(context)
+    observations = list(base_statements)
+
+    katana = [item for finding in findings if str(finding.get("source") or "").lower() == "katana"
+              for item in (finding.get("katana_observations") or []) if isinstance(item, dict)]
+    if katana:
+        summary = summarize_katana_observations(katana)
+        observations.append(
+            f"Katana stored {summary['url_count']} URL/endpoint observation(s) with maximum observed depth "
+            f"{summary['max_depth']}; a shallow crawl is a coverage limitation, not proof that other routes are absent."
+        )
+    playwright = next((finding.get("playwright_observation") for finding in findings
+                       if str(finding.get("source") or "").lower() == "playwright"
+                       and isinstance(finding.get("playwright_observation"), dict)), None)
+    if playwright:
+        summary = summarize_playwright_observation(playwright)
+        observations.append(
+            f"Playwright stored passive browser state with {summary['inputs_count']} input(s), "
+            f"{summary['links_count']} link(s), and {summary['network_events_count']} network event(s); passive "
+            "observation does not establish vulnerability, safety, or complete behavior coverage."
+        )
+    ffuf_findings = [finding for finding in findings if str(finding.get("source") or "").lower() == "ffuf"]
+    latest_ffuf_scan = select_latest_tool_scan((context.get("assessment_context") or {}).get("scans") or [], "ffuf")
+    latest_ffuf_id = str((latest_ffuf_scan or {}).get("finding_id") or "")
+    latest = next((finding for finding in ffuf_findings if str(finding.get("id") or "") == latest_ffuf_id), None)
+    if latest and states.get("ffuf") == "COMPLETED":
+        metadata = latest.get("metadata") if isinstance(latest.get("metadata"), dict) else {}
+        results = latest.get("ffuf_results") if isinstance(latest.get("ffuf_results"), list) else []
+        scope = []
+        if metadata.get("ffuf_profile_label") or metadata.get("ffuf_profile"):
+            scope.append(str(metadata.get("ffuf_profile_label") or metadata.get("ffuf_profile")))
+        if metadata.get("wordlist_count") is not None:
+            scope.append(f"{metadata['wordlist_count']} entries")
+        observations.append(
+            "ffuf's latest completed run"
+            + (" used " + ", ".join(scope) if scope else "")
+            + f" and stored {len(results)} structured response observation(s); zero observations do not prove hidden content is absent."
+        )
+
+    risk = (
+        "Priority interpretation: this is prioritization of an observed surface and other stored hypotheses, not a "
+        "vulnerability ranking. Exposed services and scanner observations identify surfaces or hypotheses for "
+        "validation; INFO labels remain informational and none of these observations alone establishes a confirmed "
+        "vulnerability or exploitability."
+    )
+    incomplete = [f"{tool}={state}" for tool, state in states.items() if state in {"FAILED", "PARTIAL", "SKIPPED"}]
+    applicable_not_run = [tool for tool in ("bbot", "katana", "playwright", "ffuf", "testssl") if states.get(tool) == "NOT_RUN"]
+    gaps = "Important evidence/coverage gaps: "
+    gap_parts = []
+    if incomplete:
+        gap_parts.append("incomplete states " + ", ".join(incomplete))
+    if applicable_not_run:
+        gap_parts.append("applicable NOT_RUN coverage " + ", ".join(applicable_not_run))
+    if not gap_parts:
+        gap_parts.append("stored coverage remains bounded and does not establish completeness")
+    gaps += "; ".join(gap_parts) + "."
+    next_steps = (
+        "Sensible next validation steps: address failed or partial relevant coverage first, then validate the highest-value "
+        "stored observations with the least intrusive applicable Mongrel capability. Active validation or capture remains "
+        "conditional on evidence and authorization; this answer executes nothing."
+    )
+    return "What stands out: " + " ".join(observations) + " " + risk + " " + gaps + " " + next_steps
+
+
+def _latest_authoritative_findings(context: dict) -> list[dict]:
+    evidence = context.get("assessment_context") or {}
+    scans = [scan for scan in evidence.get("scans") or [] if isinstance(scan, dict)]
+    findings = [finding for finding in evidence.get("findings") or [] if isinstance(finding, dict)]
+    by_id = {str(finding.get("id")): finding for finding in findings if finding.get("id") is not None}
+    tools = sorted({str(scan.get("tool") or "").lower().removesuffix(".sh") for scan in scans})
+    selected = []
+    for tool in tools:
+        latest = select_latest_tool_scan(scans, tool)
+        finding = by_id.get(str((latest or {}).get("finding_id")))
+        if finding is not None:
+            selected.append(finding)
+    return selected
 
 
 def _has_structured_tool_evidence(finding: dict, tool: str) -> bool:

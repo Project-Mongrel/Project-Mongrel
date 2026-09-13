@@ -99,7 +99,7 @@ ASSESSMENT_SUMMARY_TERMS = (
 )
 ASSESSMENT_HIGHLIGHT_TERMS = (
     "most interesting thing", "what stands out", "most significant", "what's significant", "what is significant",
-    "what should i pay attention to", "which evidence matters most",
+    "what should i pay attention to", "which evidence matters most", "biggest risk", "highest risk",
 )
 ASSESSMENT_SUMMARY_PATTERNS = (
     re.compile(r"\bwhat\s+have\s+we\s+(?:actually\s+)?established\b"),
@@ -285,7 +285,7 @@ def build_assessment_conversation_context(
 def _is_referential_follow_up(question: str, intent: str) -> bool:
     normalized = _normalize_intent_text(question)
     referential = bool(re.search(
-        r"\b(?:that|it|this finding|this conclusion|that conclusion|why|how confident|what does (?:that|it) mean)\b",
+        r"\b(?:that|it|this finding|this conclusion|that conclusion|why|how confident|how sure|how strong is (?:that|the) evidence|why should i trust|what does (?:that|it) mean)\b",
         normalized,
     ))
     return referential and intent in {

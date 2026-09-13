@@ -1643,10 +1643,7 @@ def test_referential_confidence_followup_inherits_nuclei_scope_and_stays_bounded
     assert "UNRELATED-httpx-EVIDENCE" not in prompt
     assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
 
-    with patch(
-        "app.services.assessment_conversation_ai.ask_ai",
-        return_value="Confidence is limited to the stored INFO Weak HSTS template observation; validation is still required.",
-    ) as ask_ai:
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
         result = answer_assessment_conversation_question(
             user_id=user_id,
             assessment_id=assessment["id"],
@@ -1654,12 +1651,81 @@ def test_referential_confidence_followup_inherits_nuclei_scope_and_stays_bounded
             question=follow_up,
         )
 
-    model_prompt = ask_ai.call_args.args[0]
-    assert len(model_prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
-    assert "Weak HSTS" in model_prompt and "UNRELATED-nmap-EVIDENCE" not in model_prompt
+    ask_ai.assert_not_called()
+    assert "moderate-to-high confidence" in result["answer"]
+    assert "Interpretation confidence: lower" in result["answer"]
+    assert "Exploitability confidence: not established" in result["answer"]
+    assert "practical attack path" in result["answer"]
     assert result["instrumentation"]["inherited_evidence_scope"] is True
     assert result["instrumentation"]["prompt_budget_input_tokens"] == 2800
-    assert result["instrumentation"]["prompt_chars"] < 10_000
+    assert result["instrumentation"]["prompt_chars"] == 0
+    assert result["instrumentation"]["output_token_budget"] == 0
+
+
+def test_broad_assessment_highlight_synthesizes_multiple_tools_risks_and_gaps() -> None:
+    user_id = 1105
+    assessment = create_assessment("Broad synthesis", user_id=user_id)
+    fixtures = {
+        "nmap": {"open_ports": [{"port": 80, "service": "http"}, {"port": 443, "service": "https"}]},
+        "httpx": {"httpx_services": [{"url": "https://example.com", "status_code": 200, "technologies": ["Example CMS"]}]},
+        "nuclei": {"nuclei_findings": [{"name": "Weak HSTS", "template_id": "weak-hsts", "severity": "info"}]},
+        "katana": {"katana_observations": [{"url": "https://example.com/", "depth": 0}]},
+        "playwright": {"playwright_observation": {"final_url": "https://example.com/", "inputs_count": 12, "links_count": 56, "network_events_count": 25}},
+        "ffuf": {"ffuf_results": [], "metadata": {"ffuf_profile_label": "Standard", "wordlist_count": 2570}},
+    }
+    for tool, evidence in fixtures.items():
+        finding = add_finding(user_id=user_id, finding={"source": tool, "target": "example.com", **evidence})
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+    record_assessment_scan(assessment["id"], tool="testssl", status="failed")
+    record_assessment_scan(assessment["id"], tool="tshark", status="partial")
+
+    question = "Looking across the entire assessment, what stands out, what are the biggest risks, and what important gaps remain?"
+    context = build_assessment_conversation_context(user_id=user_id, assessment_id=assessment["id"], question=question)
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question=question,
+        )
+
+    answer = result["answer"]
+    ask_ai.assert_not_called()
+    assert context["selection"]["mode"] == "full_assessment"
+    assert all(marker in answer for marker in ("What stands out", "Nmap", "httpx", "Nuclei", "Katana", "Playwright", "ffuf"))
+    assert "Weak HSTS" in answer and "INFO" in answer
+    assert "zero observations do not prove hidden content is absent" in answer
+    assert "testssl=FAILED" in answer
+    assert "tshark=PARTIAL" in answer
+    assert "applicable NOT_RUN coverage bbot" in answer
+    assert "none of these observations alone establishes a confirmed vulnerability" in answer
+    assert "Important evidence/coverage gaps" in answer
+    assert "Sensible next validation steps" in answer
+    assert result["instrumentation"]["ai_ms"] == 0.0
+
+    risk_question = "What are the biggest risks?"
+    risk_context = build_assessment_conversation_context(
+        user_id=user_id, assessment_id=assessment["id"], question=risk_question,
+    )
+    with patch("app.services.assessment_conversation_ai.ask_ai") as risk_ai:
+        risk_result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question=risk_question,
+        )
+    risk_ai.assert_not_called()
+    assert risk_context["question_intent"] == "assessment_highlight"
+    assert all(tool in risk_result["answer"] for tool in ("Nmap", "Nuclei", "Katana", "Playwright", "ffuf"))
+
+
+def test_nuclei_template_match_cannot_be_rendered_as_causal_mitm_path() -> None:
+    assessment = create_assessment("Nuclei causal guard", user_id=1106)
+    finding = add_finding(user_id=1106, finding={
+        "source": "nuclei", "target": "example.com",
+        "nuclei_findings": [{"name": "Weak HSTS", "severity": "info"}],
+    })
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed", finding_id=finding["id"])
+    context = build_assessment_conversation_context(
+        user_id=1106, assessment_id=assessment["id"], question="What does the Nuclei match mean?",
+    )
+    answer = "Nuclei stored a Weak HSTS match. It can lead to MITM attacks and enable a downgrade attack."
+
+    assert violates_conversation_truthfulness(answer, context) is True
 
 
 def test_genuinely_broad_remaining_gaps_question_keeps_assessment_wide_state() -> None:
