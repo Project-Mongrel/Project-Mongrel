@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
@@ -208,6 +209,24 @@ def build_tshark_capture_validation_keyboard(user_id: int, eligible: list[object
         )
     rows.append([InlineKeyboardButton("Back", callback_data="tshark:choose" if assessment_id is None else f"tshark:choose:{int(assessment_id)}")])
     return InlineKeyboardMarkup(rows)
+
+
+async def _show_tshark_capture_validation_menu(query: object, user_id: int, eligible: list[object], assessment_id: int | None) -> None:
+    try:
+        await query.edit_message_text(
+            build_tshark_capture_validation_text(eligible),
+            reply_markup=build_tshark_capture_validation_keyboard(user_id, eligible, assessment_id) if eligible else build_tshark_mode_keyboard(assessment_id),
+        )
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+        if eligible:
+            await query.answer("Eligible capture validations are already shown.", show_alert=True)
+        else:
+            await query.answer(
+                "No fresh eligible validation. Create and approve a new HTTP service fingerprint validation first.",
+                show_alert=True,
+            )
 
 
 def build_tshark_capture_interface_keyboard(token_payload: dict, interfaces: list[str]) -> InlineKeyboardMarkup:
@@ -1555,10 +1574,7 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     if action == "capture":
         assessment_id = _parse_optional_int(parts[2] if len(parts) > 2 else None)
         eligible = _eligible_metasploit_capture_validations(user_id, assessment_id)
-        await query.edit_message_text(
-            build_tshark_capture_validation_text(eligible),
-            reply_markup=build_tshark_capture_validation_keyboard(user_id, eligible, assessment_id) if eligible else build_tshark_mode_keyboard(assessment_id),
-        )
+        await _show_tshark_capture_validation_menu(query, user_id, eligible, assessment_id)
         return
 
     if action == "cv":

@@ -6389,6 +6389,81 @@ def test_tshark_capture_during_validation_lists_only_eligible_approved_metasploi
     assert get_metasploit_proposal(http_proposal.id) is not None
 
 
+def test_tshark_capture_during_validation_explains_when_no_validation_is_eligible() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    assessment = create_assessment("TShark No Eligible Validation", user_id=5940)
+    query = SimpleNamespace(
+        data=f"tshark:capture:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5940)), SimpleNamespace()))
+
+    query.answer.assert_awaited_once_with()
+    text = query.edit_message_text.call_args.args[0]
+    assert "No eligible approved or completed Metasploit HTTP service fingerprint validation" in text
+    assert "Create the guided HTTP service fingerprint validation first" in text
+
+
+def test_repeated_tshark_capture_button_handles_identical_no_eligible_message() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    assessment = create_assessment("TShark Repeated Capture", user_id=5941)
+    query = SimpleNamespace(
+        data=f"tshark:capture:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(side_effect=BadRequest("Message is not modified")),
+    )
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5941)), SimpleNamespace()))
+
+    assert query.answer.await_count == 2
+    assert "No fresh eligible validation" in query.answer.call_args.args[0]
+    assert query.answer.call_args.kwargs["show_alert"] is True
+
+
+def test_tshark_capture_button_with_eligible_validation_continues_to_selection() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    assessment = create_assessment("TShark Eligible Validation", user_id=5942)
+    _approved_metasploit_http_proposal(5942, assessment_id=assessment["id"], target="example.com", port=443)
+    query = SimpleNamespace(
+        data=f"tshark:capture:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5942)), SimpleNamespace()))
+
+    query.answer.assert_awaited_once_with()
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].callback_data.startswith("tshark:cv:")
+    assert "HTTP Service Fingerprint" in keyboard.inline_keyboard[0][0].text
+
+
+def test_failed_tshark_capture_validation_remains_ineligible() -> None:
+    clear_metasploit_proposals()
+    clear_tshark_capture_proposals()
+    assessment = create_assessment("TShark Failed Validation", user_id=5943)
+    proposal = _approved_metasploit_http_proposal(5943, assessment_id=assessment["id"], target="example.com", port=443)
+    mark_metasploit_proposal_status(proposal.id, "failed")
+    query = SimpleNamespace(
+        data=f"tshark:capture:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=5943)), SimpleNamespace()))
+
+    text = query.edit_message_text.call_args.args[0]
+    keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert "No eligible approved or completed" in text
+    assert all(not button.callback_data.startswith("tshark:cv:") for row in keyboard.inline_keyboard for button in row)
+    assert get_metasploit_proposal(proposal.id).status == "failed"
+
+
 def test_tshark_capture_during_validation_lists_completed_guided_http_validation() -> None:
     clear_metasploit_proposals()
     clear_tshark_capture_proposals()
