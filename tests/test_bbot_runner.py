@@ -110,6 +110,7 @@ def test_bbot_subprocess_called_with_list_args_and_shell_false(tmp_path: Path) -
         cwd=str(Path.cwd().resolve()),
         shell=False,
     )
+    assert "env" not in popen_mock.call_args.kwargs
     assert result["success"] is True
     assert result["target"] == "example.com"
     assert result["output"] == "bbot output"

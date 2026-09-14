@@ -23,6 +23,13 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(password|pass|token|secret|apikey|api_key)\s*=>\s*\S+"),
     re.compile(r"(?i)(password|pass|token|secret|apikey|api_key)\s*[:=]\s*\S+"),
 )
+_METASPLOIT_BOOTSNAP_ENV = "DISABLE_BOOTSNAP_LOAD_PATH_CACHE"
+
+
+def _metasploit_subprocess_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment[_METASPLOIT_BOOTSNAP_ENV] = "1"
+    return environment
 
 
 def run_metasploit_validation(
@@ -58,6 +65,7 @@ def run_metasploit_validation(
             stderr=subprocess.PIPE,
             text=True,
             cwd=str(working_directory),
+            env=_metasploit_subprocess_environment(),
             shell=False,
         )
         try:
@@ -160,6 +168,7 @@ def check_metasploit_readiness(*, run_version_check: bool = False) -> dict[str, 
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=METASPLOIT_VERSION_TIMEOUT_SECONDS,
+                env=_metasploit_subprocess_environment(),
                 shell=False,
                 check=False,
             )

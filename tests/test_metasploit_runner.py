@@ -1,6 +1,7 @@
+import os
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 
@@ -71,6 +72,7 @@ def test_metasploit_runner_uses_shell_false_and_generated_resource(tmp_path) -> 
     fake_process = FakeProcess(stdout="appears vulnerable", returncode=0)
 
     with (
+        patch.dict(os.environ, {"MONGREL_INHERITED_ENV_TEST": "retained"}),
         patch("app.tools.metasploit_runner.get_settings", return_value=Settings(_env_file=None, metasploit_binary="msfconsole", metasploit_timeout_seconds=120)),
         patch("app.tools.metasploit_runner.shutil.which", return_value="msfconsole"),
         patch("app.tools.metasploit_runner.subprocess.Popen", return_value=fake_process) as popen_mock,
@@ -82,6 +84,8 @@ def test_metasploit_runner_uses_shell_false_and_generated_resource(tmp_path) -> 
     assert popen_mock.call_args.args[0][0] == "msfconsole"
     assert "-r" in popen_mock.call_args.args[0]
     assert popen_mock.call_args.kwargs["shell"] is False
+    assert popen_mock.call_args.kwargs["env"]["DISABLE_BOOTSNAP_LOAD_PATH_CACHE"] == "1"
+    assert popen_mock.call_args.kwargs["env"]["MONGREL_INHERITED_ENV_TEST"] == "retained"
     resource_path = popen_mock.call_args.args[0][-1]
     assert not (tmp_path / resource_path).exists()
 
@@ -187,7 +191,9 @@ def test_metasploit_readiness_version_check_is_safe_and_bounded(tmp_path) -> Non
         stderr=subprocess.PIPE,
         text=True,
         timeout=10,
+        env=ANY,
         shell=False,
         check=False,
     )
+    assert run_mock.call_args.kwargs["env"]["DISABLE_BOOTSNAP_LOAD_PATH_CACHE"] == "1"
     popen_mock.assert_not_called()
