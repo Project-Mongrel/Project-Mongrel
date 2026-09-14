@@ -144,9 +144,11 @@ def build_tshark_metasploit_correlation_record(
             "execution_status": _clean(tshark_evidence.get("execution_status")),
             "success": bool(tshark_evidence.get("success")),
             "packet_count": int(tshark_evidence.get("packet_count") or 0),
+            "byte_count": int(tshark_evidence.get("byte_count") or 0),
             "capture_start": _clean(tshark_evidence.get("capture_start")),
             "capture_end": _clean(tshark_evidence.get("capture_end")),
             "relevant_conversations": matching_conversations,
+            "observed_endpoints": [_bounded_item(item) for item in (tshark_evidence.get("observed_endpoints") or [])[:30]],
             "observed_endpoints_ports": observed_endpoint_ports,
             "observed_protocols": observed_protocols,
             "dns_evidence": dns_evidence,
@@ -408,9 +410,80 @@ def _bounded_record(record: dict) -> dict:
 
 
 def _guard_correlated_truthfulness_response(lines: list[str], record: dict) -> list[str]:
+    if _contains_packet_absence_contradiction(lines, record):
+        return _deterministic_correlated_assessment(record)
     if _contains_unsupported_correlated_claim(lines, record):
         return list(TRUTHFULNESS_FALLBACK_LINES)
     return lines
+
+
+def _contains_packet_absence_contradiction(lines: list[str], record: dict) -> bool:
+    tshark = record.get("tshark") or {}
+    endpoints = tshark.get("observed_endpoints") or tshark.get("observed_endpoints_ports") or []
+    protocols = {str(item).strip().lower() for item in tshark.get("observed_protocols") or [] if str(item).strip()}
+    substantive_protocols = protocols.intersection({"tcp", "udp", "dns", "http", "http2", "tls", "ssh"})
+    text = " ".join(lines).lower()
+    if endpoints and re.search(r"\bno\b[^.!?]{0,80}\b(?:endpoint|connection)s?\b[^.!?]{0,80}\b(?:observed|found|detected)\b", text):
+        return True
+    if substantive_protocols and re.search(r"\bno\b[^.!?]{0,80}\b(?:connection|protocol|traffic)s?\b[^.!?]{0,80}\b(?:observed|found|detected)\b", text):
+        return True
+    if substantive_protocols and re.search(r"\bonly\b[^.!?]{0,100}\b(?:eth|ethertype|ip|ipv6)\b[^.!?]{0,100}\b(?:protocol|observed)", text):
+        return True
+    return False
+
+
+def _deterministic_correlated_assessment(record: dict) -> list[str]:
+    metasploit = record.get("metasploit") or {}
+    tshark = record.get("tshark") or {}
+    endpoints = tshark.get("observed_endpoints") or []
+    endpoint_addresses = sorted({_clean(item.get("address") or item.get("src") or item.get("dst")) for item in endpoints if _clean(item.get("address") or item.get("src") or item.get("dst"))})
+    protocols = sorted({_clean(item).upper() for item in tshark.get("observed_protocols") or [] if _clean(item)})
+    endpoint_ports = tshark.get("observed_endpoints_ports") or []
+    ports = sorted({_clean(value) for item in endpoint_ports for value in (item.get("src_port"), item.get("dst_port")) if _clean(value)})
+    http = tshark.get("http_evidence") or {}
+    requests = http.get("requests") or []
+    responses = http.get("responses") or []
+    response_codes = sorted({_clean(item.get("response_code")) for item in responses if _clean(item.get("response_code"))})
+    tls = (tshark.get("tls_handshake_evidence") or {}).get("observations") or []
+    packet_summary = f"{int(tshark.get('packet_count') or 0)} packet(s)"
+    if int(tshark.get("byte_count") or 0) > 0:
+        packet_summary += f" / {int(tshark['byte_count'])} byte(s)"
+    tshark_lines = [f"The normalized current-run capture recorded {packet_summary}."]
+    if endpoint_addresses:
+        tshark_lines.append(f"Observed endpoints: {', '.join(endpoint_addresses[:20])}.")
+    if ports:
+        tshark_lines.append(f"Observed packet port metadata: {', '.join(ports[:20])}.")
+    if protocols:
+        tshark_lines.append(f"Observed protocols: {', '.join(protocols)}.")
+    if requests or responses:
+        response_detail = f"; response codes: {', '.join(response_codes)}" if response_codes else ""
+        tshark_lines.append(
+            f"HTTP metadata contains {len(requests)} request observation(s) and {len(responses)} separate response observation(s){response_detail}; request/response transaction pairing is not established."
+        )
+    if not tls:
+        tshark_lines.append("No TLS metadata was stored for this capture; that does not prove TLS traffic did not occur outside the captured or parsed evidence.")
+    return [
+        "Executive Summary",
+        "The approved validation workflow and bounded packet capture completed, but workflow completion and packet activity do not establish vulnerability, exploitation, or compromise.",
+        "",
+        "Metasploit Evidence",
+        f"Validation state: {_clean(metasploit.get('state')) or 'unknown'}; module executed: {bool(metasploit.get('module_executed'))}; session established: {bool(metasploit.get('session_established'))}.",
+        "",
+        "TShark Evidence",
+        *tshark_lines,
+        "",
+        "Correlation Outcome",
+        f"Outcome: {_clean(record.get('correlation_outcome')) or 'inconclusive'}; attribution confidence: {_clean(record.get('correlation_confidence')) or 'unknown'}.",
+        "",
+        "Confidence",
+        "Correlation confidence concerns current-run packet attribution only, not exploitability, vulnerability confirmation, or compromise.",
+        "",
+        "Limitations",
+        "Packet observations and validation metadata must remain separate evidence; packet timing alone does not prove that traffic was caused by the validation.",
+        "",
+        "Recommended Next Actions",
+        "Review the normalized validation, capture provenance, endpoints, protocols, and HTTP observations together before drawing any security conclusion.",
+    ]
 
 
 def _contains_unsupported_correlated_claim(lines: list[str], record: dict) -> bool:

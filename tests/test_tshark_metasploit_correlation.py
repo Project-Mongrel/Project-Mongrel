@@ -241,3 +241,59 @@ def test_legitimate_evidence_scoped_correlated_wording_is_allowed() -> None:
         lines = generate_tshark_metasploit_correlated_assessment(_record())
 
     assert lines == response.splitlines()
+
+
+def test_packet_absence_contradictions_are_replaced_with_deterministic_current_run_evidence() -> None:
+    tshark = _tshark()
+    tshark.update(
+        {
+            "packet_count": 59,
+            "byte_count": 6758,
+            "observed_protocols": [
+                {"protocol": "eth", "packet_count": 59},
+                {"protocol": "ip", "packet_count": 40},
+                {"protocol": "ipv6", "packet_count": 19},
+                {"protocol": "tcp", "packet_count": 30},
+                {"protocol": "udp", "packet_count": 20},
+                {"protocol": "dns", "packet_count": 10},
+                {"protocol": "http", "packet_count": 8},
+            ],
+            "observed_endpoints": [
+                {"address": "192.0.2.10", "packet_count": 20},
+                {"address": "2001:db8::10", "packet_count": 10},
+                {"address": "93.184.216.34", "packet_count": 29},
+            ],
+            "observed_conversations": [],
+            "dns_observations": [{"query_name": "example.com", "response_address": "93.184.216.34"}],
+            "http_observations": [
+                {"method": "GET", "host": "example.com", "uri": "/", "src": "192.0.2.10", "dst": "93.184.216.34"},
+                {"response_code": "301", "src": "93.184.216.34", "dst": "192.0.2.10"},
+            ],
+            "tls_observations": [],
+        }
+    )
+    record = _record(metasploit=_metasploit("VALIDATED"), tshark=tshark)
+    unsafe_response = "\n".join(
+        [
+            "Executive Summary",
+            "No observed endpoints or ports were found.",
+            "No external connections to known HTTP or HTTPS services were detected.",
+            "Only eth, ethertype, and ip protocols were observed.",
+        ]
+    )
+
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value=unsafe_response):
+        lines = generate_tshark_metasploit_correlated_assessment(record)
+
+    rendered = "\n".join(lines)
+    assert "59 packet(s) / 6758 byte(s)" in rendered
+    assert "192.0.2.10" in rendered
+    assert "2001:db8::10" in rendered
+    assert "TCP" in rendered and "UDP" in rendered and "DNS" in rendered and "HTTP" in rendered
+    assert "1 request observation(s) and 1 separate response observation(s); response codes: 301" in rendered
+    assert "transaction pairing is not established" in rendered
+    assert "No TLS metadata was stored" in rendered
+    assert "session established: False" in rendered
+    assert "do not establish vulnerability, exploitation, or compromise" in rendered
+    assert "No observed endpoints" not in rendered
+    assert record["tshark"]["observed_endpoints"][0]["address"] == "192.0.2.10"

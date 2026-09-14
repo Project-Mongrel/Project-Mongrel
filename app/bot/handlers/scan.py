@@ -3773,6 +3773,7 @@ async def _handle_metasploit_callback(query: object, user_id: int, context: Cont
             await _send_metasploit_ai_assessment(message, finding)
         else:
             await reply_text("No normalized Metasploit validation evidence was available from this run.")
+        await _send_assessment_dashboard(message, assessment_context if isinstance(assessment_context, dict) else None)
     else:
         await query.edit_message_text(build_metasploit_result_text(finding))
 

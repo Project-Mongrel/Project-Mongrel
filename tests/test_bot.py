@@ -3324,7 +3324,7 @@ def test_metasploit_approve_executes_and_stores_evidence() -> None:
 
     with (
         patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result) as runner_mock,
-        patch("app.bot.handlers.scan.generate_metasploit_ai_assessment", return_value=["Executive Summary", "- Metasploit evidence reviewed."]) as ai_mock,
+        patch("app.bot.handlers.scan._send_metasploit_ai_assessment", new_callable=AsyncMock) as ai_mock,
     ):
         asyncio.run(scan_callback_handler(callback_update, context))
 
@@ -3335,8 +3335,7 @@ def test_metasploit_approve_executes_and_stores_evidence() -> None:
     assert runner_kwargs["request"]["module"] == "auxiliary/scanner/http/http_version"
     sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
     assert any("Metasploit Validation" in text and "VALIDATED" in text for text in sent_messages)
-    assert "Generating Metasploit AI assessment..." in sent_messages
-    assert any("Metasploit AI Assessment" in text for text in sent_messages)
+    assert not any("Assessment Dashboard" in text for text in sent_messages)
     ai_mock.assert_called_once()
     finding = get_user_findings(7306)[0]
     assert finding["source"] == "metasploit"
@@ -3381,7 +3380,7 @@ def test_metasploit_assessment_context_records_artifact_and_scan(tmp_path) -> No
 
     with (
         patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result),
-        patch("app.bot.handlers.scan.generate_metasploit_ai_assessment", return_value=["Executive Summary", "- Metasploit evidence reviewed."]),
+        patch("app.bot.handlers.scan._send_metasploit_ai_assessment", new_callable=AsyncMock),
     ):
         asyncio.run(scan_callback_handler(callback_update, context))
 
@@ -3401,6 +3400,57 @@ def test_metasploit_assessment_context_records_artifact_and_scan(tmp_path) -> No
     assert assessment_context["findings"][0]["source"] == "metasploit"
     assert "metasploit" in guard["completed_tools"]
     assert "Metasploit validation not run" not in guard["locked_tool_limitations"]
+    final_call = message.reply_text.call_args_list[-1]
+    assert "Assessment Dashboard" in final_call.args[0]
+    final_buttons = [button.text for row in final_call.kwargs["reply_markup"].inline_keyboard for button in row]
+    assert "Ask Mongrel about this assessment" in final_buttons
+    assert "TShark PCAP" in final_buttons
+
+
+def test_failed_assessment_metasploit_validation_returns_to_dashboard() -> None:
+    clear_user_findings(7308)
+    clear_user_scan_requests(7308)
+    clear_metasploit_proposals()
+    _metasploit_pending_context.clear()
+    assessment = create_assessment("Failed Metasploit Assessment", user_id=7308)
+    target = add_assessment_target(assessment["id"], address="example.com")
+    scan_request = create_scan_request(user_id=7308, scan_type="metasploit")
+    mark_scan_request_awaiting_target(user_id=7308, scan_request_id=scan_request.id)
+    context = SimpleNamespace(
+        user_data={
+            PENDING_NMAP_REQUEST_KEY: scan_request.id,
+            ASSESSMENT_SCAN_CONTEXT_KEY: {"assessment_id": assessment["id"], "target_id": target["id"], "tool": "metasploit"},
+        }
+    )
+    message = SimpleNamespace(text=_metasploit_request_text(), reply_text=AsyncMock())
+    asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7308)), context))
+    proposal_id = next(iter(_metasploit_pending_context))
+    query = SimpleNamespace(data=f"msf:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=message)
+    result = {
+        "success": False,
+        "module": "auxiliary/scanner/http/http_version",
+        "action_type": "auxiliary_validation",
+        "target": "example.com",
+        "port": 80,
+        "output": "",
+        "error": "Metasploit execution failed.",
+        "error_type": "execution_failed",
+        "elapsed_seconds": 1,
+        "returncode": 1,
+    }
+
+    with (
+        patch("app.bot.handlers.scan.run_metasploit_validation", return_value=result),
+        patch("app.bot.handlers.scan._send_metasploit_ai_assessment", new_callable=AsyncMock),
+    ):
+        asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7308)), context))
+
+    assert list_assessment_scans(assessment["id"])[-1]["status"] == "failed"
+    final_call = message.reply_text.call_args_list[-1]
+    assert "Assessment Dashboard" in final_call.args[0]
+    final_buttons = [button.text for row in final_call.kwargs["reply_markup"].inline_keyboard for button in row]
+    assert "Ask Mongrel about this assessment" in final_buttons
+    assert "TShark PCAP" in final_buttons
 
 
 def test_metasploit_ai_no_evidence_path_does_not_invent_findings() -> None:
