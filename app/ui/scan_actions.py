@@ -17,9 +17,9 @@ def build_scan_recovery_actions(
     normalized_outcome = str(outcome or "").strip().lower()
     rows = []
     if normalized_outcome == "success":
-        rows.append([InlineKeyboardButton("Re-run Scan", callback_data=f"{SCAN_RECOVERY_CALLBACK_PREFIX}:rerun:{recovery_token}")])
+        rows.append([InlineKeyboardButton("Re-run Scan" if assessment_id is not None else "🔄 Run Again", callback_data=f"{SCAN_RECOVERY_CALLBACK_PREFIX}:rerun:{recovery_token}")])
     elif normalized_outcome == "failed":
-        rows.append([InlineKeyboardButton("Re-run Scan", callback_data=f"{SCAN_RECOVERY_CALLBACK_PREFIX}:rerun:{recovery_token}")])
+        rows.append([InlineKeyboardButton("Re-run Scan" if assessment_id is not None else "🔄 Run Again", callback_data=f"{SCAN_RECOVERY_CALLBACK_PREFIX}:rerun:{recovery_token}")])
         rows.append([InlineKeyboardButton("✏️ Edit Target", callback_data=f"{SCAN_RECOVERY_CALLBACK_PREFIX}:edit_target:{recovery_token}")])
     elif normalized_outcome == "invalid":
         rows.append([InlineKeyboardButton("✏️ Edit Input", callback_data=f"{SCAN_RECOVERY_CALLBACK_PREFIX}:edit_input:{recovery_token}")])
@@ -29,7 +29,9 @@ def build_scan_recovery_actions(
 
     if assessment_id is not None:
         rows.append([InlineKeyboardButton("Return to Assessment", callback_data=f"assessment:dashboard:{assessment_id}")])
-    rows.append([InlineKeyboardButton("Scan Menu", callback_data=f"{SCAN_RECOVERY_CALLBACK_PREFIX}:menu:{recovery_token}")])
+    else:
+        rows.append([InlineKeyboardButton("✦ Ask Mongrel", callback_data="toolmode:ask")])
+    rows.append([InlineKeyboardButton("Scan Menu" if assessment_id is not None else "⬅️ Back to Tools", callback_data=f"{SCAN_RECOVERY_CALLBACK_PREFIX}:menu:{recovery_token}")])
 
     return InlineKeyboardMarkup(rows)
 

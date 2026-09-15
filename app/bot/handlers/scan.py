@@ -25,6 +25,7 @@ from app.bot.handlers.assessment import (
 )
 from app.bot.handlers.findings import build_finding_followup_ai_prompt
 from app.bot.keyboards import MAIN_MENU_BUTTONS, build_main_menu_keyboard, build_scan_type_keyboard
+from app.bot.keyboards.tool_mode_actions import TOOL_MODE_ACTION_PREFIX, build_tool_mode_post_scan_keyboard
 from app.bot.progress import build_spinner_frames, run_progress_frames, safe_edit_text
 from app.models.scan_request import SUPPORTED_SCAN_TYPES
 from app.parsers.bbot_normalizer import normalize_bbot_output, summarize_observations
@@ -61,6 +62,7 @@ from app.services.chat_state import (
     get_ai_conversation_history,
     get_finding_analysis_context,
     is_ai_waiting,
+    set_ai_waiting,
 )
 from app.services.comparison_engine import compare_findings
 from app.services.findings_store import add_finding, get_latest_user_finding_for_target
@@ -2276,6 +2278,17 @@ async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     await query.answer()
 
+    if query.data == f"{TOOL_MODE_ACTION_PREFIX}:ask":
+        clear_assessment_flow_state(context)
+        if update.effective_user is not None:
+            set_ai_waiting(update.effective_user.id)
+        await query.edit_message_text("Ask Mongrel anything. Cybersecurity is my specialty.")
+        return
+    if query.data == f"{TOOL_MODE_ACTION_PREFIX}:back":
+        clear_assessment_flow_state(context)
+        await query.edit_message_text(build_scan_text(), reply_markup=build_scan_type_keyboard())
+        return
+
     if query.data == "nav:home":
         clear_assessment_flow_state(context)
         await query.edit_message_text(build_home_text())
@@ -2797,158 +2810,60 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         ),
     )
     if result.get("success") is True and finding:
-        await _send_nmap_ai_assessment(update.message, finding)
+        await _send_nmap_ai_assessment(update.message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(update.message, assessment_context)
 
 
-async def _send_nmap_ai_assessment(message: object, finding: dict) -> None:
-    progress_message = await message.reply_text("Generating Nmap AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_nmap_ai_assessment, finding)
-    if assessment_lines == NMAP_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "Nmap AI assessment unavailable.", context="Nmap AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
+async def _send_specialist_ai_assessment(message: object, finding: dict, *, tool: str, label: str, generator, fallback_lines: list[str], tool_mode: bool = True) -> None:
+    progress_message = await message.reply_text(f"Generating {label} AI assessment...")
+    try:
+        assessment_lines = await asyncio.to_thread(generator, finding)
+    except Exception:
+        assessment_lines = list(fallback_lines)
+    fallback = assessment_lines == fallback_lines
+    await safe_edit_text(progress_message, f"{label} AI assessment unavailable." if fallback else "AI assessment ready.", context=f"{label} AI assessment status")
+    assessment_text = "\n".join(assessment_lines) if fallback else render_ai_summary_card(assessment_lines, title=f"{label} AI Assessment")
+    chunks = split_report_text(assessment_text)
+    for index, chunk in enumerate(chunks):
+        markup = build_tool_mode_post_scan_keyboard(tool) if tool_mode and index == len(chunks) - 1 else None
+        await message.reply_text(chunk, **({"reply_markup": markup} if markup else {}))
+
+
+async def _send_nmap_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    await _send_specialist_ai_assessment(message, finding, tool="nmap", label="Nmap", generator=generate_nmap_ai_assessment, fallback_lines=NMAP_AI_FALLBACK_LINES, tool_mode=tool_mode)
+
+async def _send_nuclei_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    await _send_specialist_ai_assessment(message, finding, tool="nuclei", label="Nuclei", generator=generate_nuclei_ai_assessment, fallback_lines=NUCLEI_AI_FALLBACK_LINES, tool_mode=tool_mode)
+
+async def _send_httpx_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    await _send_specialist_ai_assessment(message, finding, tool="httpx", label="httpx", generator=generate_httpx_ai_assessment, fallback_lines=HTTPX_AI_FALLBACK_LINES, tool_mode=tool_mode)
+
+async def _send_katana_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    await _send_specialist_ai_assessment(message, finding, tool="katana", label="Katana", generator=generate_katana_ai_assessment, fallback_lines=KATANA_AI_FALLBACK_LINES, tool_mode=tool_mode)
+
+async def _send_playwright_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    await _send_specialist_ai_assessment(message, finding, tool="playwright", label="Playwright", generator=generate_playwright_ai_assessment, fallback_lines=PLAYWRIGHT_AI_FALLBACK_LINES, tool_mode=tool_mode)
+
+async def _send_ffuf_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    await _send_specialist_ai_assessment(message, finding, tool="ffuf", label="ffuf", generator=generate_ffuf_ai_assessment, fallback_lines=FFUF_AI_FALLBACK_LINES, tool_mode=tool_mode)
+
+async def _send_testssl_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    await _send_specialist_ai_assessment(message, finding, tool="testssl", label="testssl.sh", generator=generate_testssl_ai_assessment, fallback_lines=TESTSSL_AI_FALLBACK_LINES, tool_mode=tool_mode)
+
+async def _send_gitleaks_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    await _send_specialist_ai_assessment(message, finding, tool="gitleaks", label="Gitleaks", generator=generate_gitleaks_ai_assessment, fallback_lines=GITLEAKS_AI_FALLBACK_LINES, tool_mode=tool_mode)
+
+async def _send_prowler_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    if not (finding.get("prowler_evidence") or {}).get("findings"):
+        await message.reply_text("No parsed Prowler checks were available from this run.", **({"reply_markup": build_tool_mode_post_scan_keyboard("prowler")} if tool_mode else {}))
         return
+    await _send_specialist_ai_assessment(message, finding, tool="prowler", label="Prowler", generator=generate_prowler_ai_assessment, fallback_lines=PROWLER_AI_FALLBACK_LINES, tool_mode=tool_mode)
 
-    await safe_edit_text(progress_message, "AI assessment ready.", context="Nmap AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="Nmap AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_nuclei_ai_assessment(message: object, finding: dict) -> None:
-    progress_message = await message.reply_text("Generating Nuclei AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_nuclei_ai_assessment, finding)
-    if assessment_lines == NUCLEI_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "Nuclei AI assessment unavailable.", context="Nuclei AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
+async def _send_metasploit_ai_assessment(message: object, finding: dict, *, tool_mode: bool = True) -> None:
+    if not finding.get("metasploit_evidence"):
+        await message.reply_text("No normalized Metasploit validation evidence was available from this run.", **({"reply_markup": build_tool_mode_post_scan_keyboard("metasploit")} if tool_mode else {}))
         return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="Nuclei AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="Nuclei AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_httpx_ai_assessment(message: object, finding: dict) -> None:
-    progress_message = await message.reply_text("Generating httpx AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_httpx_ai_assessment, finding)
-    if assessment_lines == HTTPX_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "httpx AI assessment unavailable.", context="httpx AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
-        return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="httpx AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="httpx AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_katana_ai_assessment(message: object, finding: dict) -> None:
-    progress_message = await message.reply_text("Generating Katana AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_katana_ai_assessment, finding)
-    if assessment_lines == KATANA_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "Katana AI assessment unavailable.", context="Katana AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
-        return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="Katana AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="Katana AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_playwright_ai_assessment(message: object, finding: dict) -> None:
-    progress_message = await message.reply_text("Generating Playwright AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_playwright_ai_assessment, finding)
-    if assessment_lines == PLAYWRIGHT_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "Playwright AI assessment unavailable.", context="Playwright AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
-        return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="Playwright AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="Playwright AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_ffuf_ai_assessment(message: object, finding: dict) -> None:
-    progress_message = await message.reply_text("Generating ffuf AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_ffuf_ai_assessment, finding)
-    if assessment_lines == FFUF_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "ffuf AI assessment unavailable.", context="ffuf AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
-        return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="ffuf AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="ffuf AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_testssl_ai_assessment(message: object, finding: dict) -> None:
-    progress_message = await message.reply_text("Generating testssl.sh AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_testssl_ai_assessment, finding)
-    if assessment_lines == TESTSSL_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "testssl.sh AI assessment unavailable.", context="testssl.sh AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
-        return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="testssl.sh AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="testssl.sh AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_gitleaks_ai_assessment(message: object, finding: dict) -> None:
-    progress_message = await message.reply_text("Generating Gitleaks AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_gitleaks_ai_assessment, finding)
-    if assessment_lines == GITLEAKS_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "Gitleaks AI assessment unavailable.", context="Gitleaks AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
-        return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="Gitleaks AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="Gitleaks AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_prowler_ai_assessment(message: object, finding: dict) -> None:
-    evidence = finding.get("prowler_evidence") or {}
-    if not evidence.get("findings"):
-        await message.reply_text("No parsed Prowler checks were available from this run.")
-        return
-
-    progress_message = await message.reply_text("Generating Prowler AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_prowler_ai_assessment, finding)
-    if assessment_lines == PROWLER_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "Prowler AI assessment unavailable.", context="Prowler AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
-        return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="Prowler AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="Prowler AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
-
-
-async def _send_metasploit_ai_assessment(message: object, finding: dict) -> None:
-    evidence = finding.get("metasploit_evidence") or {}
-    if not evidence:
-        await message.reply_text("No normalized Metasploit validation evidence was available from this run.")
-        return
-
-    progress_message = await message.reply_text("Generating Metasploit AI assessment...")
-    assessment_lines = await asyncio.to_thread(generate_metasploit_ai_assessment, finding)
-    if assessment_lines == METASPLOIT_AI_FALLBACK_LINES:
-        await safe_edit_text(progress_message, "Metasploit AI assessment unavailable.", context="Metasploit AI assessment status")
-        await message.reply_text("\n".join(assessment_lines))
-        return
-
-    await safe_edit_text(progress_message, "AI assessment ready.", context="Metasploit AI assessment status")
-    assessment_text = render_ai_summary_card(assessment_lines, title="Metasploit AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
+    await _send_specialist_ai_assessment(message, finding, tool="metasploit", label="Metasploit", generator=generate_metasploit_ai_assessment, fallback_lines=METASPLOIT_AI_FALLBACK_LINES, tool_mode=tool_mode)
 
 
 async def _handle_ffuf_target(
@@ -3083,7 +2998,7 @@ async def _handle_ffuf_target(
         ),
     )
     if result.get("success") is True:
-        await _send_ffuf_ai_assessment(update.message, finding)
+        await _send_ffuf_ai_assessment(update.message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(update.message, assessment_context)
 
 
@@ -3196,7 +3111,7 @@ async def _handle_testssl_target(
         ),
     )
     if result.get("success") is True:
-        await _send_testssl_ai_assessment(update.message, finding)
+        await _send_testssl_ai_assessment(update.message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(update.message, assessment_context)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
 
@@ -3326,7 +3241,7 @@ async def _handle_gitleaks_target(
         ),
     )
     if result.get("success") is True:
-        await _send_gitleaks_ai_assessment(update.message, finding)
+        await _send_gitleaks_ai_assessment(update.message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(update.message, assessment_context)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
 
@@ -3433,7 +3348,7 @@ async def _handle_prowler_provider(
         ),
     )
     if result.get("success") is True:
-        await _send_prowler_ai_assessment(update.message, finding)
+        await _send_prowler_ai_assessment(update.message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(update.message, assessment_context)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
 
@@ -3770,7 +3685,7 @@ async def _handle_metasploit_callback(query: object, user_id: int, context: Cont
             ),
         )
         if normalized:
-            await _send_metasploit_ai_assessment(message, finding)
+            await _send_metasploit_ai_assessment(message, finding, tool_mode=assessment_context is None)
         else:
             await reply_text("No normalized Metasploit validation evidence was available from this run.")
         await _send_assessment_dashboard(message, assessment_context if isinstance(assessment_context, dict) else None)
@@ -3904,7 +3819,7 @@ async def _handle_playwright_target(
         ),
     )
     if result.get("success") is True:
-        await _send_playwright_ai_assessment(update.message, finding)
+        await _send_playwright_ai_assessment(update.message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(update.message, assessment_context)
 
 
@@ -4010,7 +3925,7 @@ async def _handle_katana_target(
         ),
     )
     if result.get("success") is True:
-        await _send_katana_ai_assessment(update.message, finding)
+        await _send_katana_ai_assessment(update.message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(update.message, assessment_context)
 
 
@@ -4122,7 +4037,7 @@ async def _handle_httpx_target(
         ),
     )
     if result.get("success") is True:
-        await _send_httpx_ai_assessment(update.message, finding)
+        await _send_httpx_ai_assessment(update.message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(update.message, assessment_context)
 
 
@@ -4318,6 +4233,7 @@ async def _handle_bbot_target(
             target=str(result.get("target") or display_target),
             observations=observations,
             recon_summary=recon_summary,
+            tool_mode=assessment_context is None,
         )
     await _send_assessment_dashboard(update.message, assessment_context)
 
@@ -4330,16 +4246,20 @@ async def _send_bbot_ai_assessment(
     target: str,
     observations: list[dict] | None = None,
     recon_summary: str | None = None,
+    tool_mode: bool = True,
 ) -> None:
     progress_message = await message.reply_text("Generating BBOT AI assessment...")
-    assessment_lines = await asyncio.to_thread(
-        generate_bbot_ai_assessment,
-        user_id,
-        investigation_id=investigation_id,
-        target=target,
-        observations=observations,
-        recon_summary=recon_summary,
-    )
+    try:
+        assessment_lines = await asyncio.to_thread(
+            generate_bbot_ai_assessment,
+            user_id,
+            investigation_id=investigation_id,
+            target=target,
+            observations=observations,
+            recon_summary=recon_summary,
+        )
+    except Exception:
+        assessment_lines = list(FALLBACK_LINES)
     fallback = assessment_lines == FALLBACK_LINES
     add_investigation_event(
         investigation_id=investigation_id,
@@ -4357,8 +4277,10 @@ async def _send_bbot_ai_assessment(
         context="BBOT AI assessment status",
     )
     assessment_text = "\n".join(assessment_lines) if fallback else render_ai_summary_card(assessment_lines, title="BBOT AI Assessment")
-    for chunk in split_report_text(assessment_text):
-        await message.reply_text(chunk)
+    chunks = split_report_text(assessment_text)
+    for index, chunk in enumerate(chunks):
+        markup = build_tool_mode_post_scan_keyboard("bbot") if tool_mode and index == len(chunks) - 1 else None
+        await message.reply_text(chunk, **({"reply_markup": markup} if markup else {}))
 
 
 async def _handle_bbot_ai_assessment_callback(query: object, user_id: int) -> None:
@@ -4955,7 +4877,7 @@ async def _run_nuclei_scan_background(
         finding.setdefault("metadata", {})
         finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
         _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
-        await _send_nuclei_ai_assessment(message, finding)
+        await _send_nuclei_ai_assessment(message, finding, tool_mode=assessment_context is None)
         await _send_assessment_dashboard(message, assessment_context)
         return
 
@@ -5024,7 +4946,7 @@ async def _run_nuclei_scan_background(
         finding.setdefault("metadata", {})
         finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
         _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
-        await _send_nuclei_ai_assessment(message, finding)
+        await _send_nuclei_ai_assessment(message, finding, tool_mode=assessment_context is None)
         await _send_assessment_dashboard(message, assessment_context)
         return
 
@@ -5062,7 +4984,7 @@ async def _run_nuclei_scan_background(
         ),
     )
     _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
-    await _send_nuclei_ai_assessment(message, finding)
+    await _send_nuclei_ai_assessment(message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(message, assessment_context)
 
 

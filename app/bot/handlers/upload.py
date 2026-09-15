@@ -13,6 +13,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
+from app.bot.keyboards.tool_mode_actions import build_tool_mode_post_scan_keyboard
 from app.core.config import get_settings
 from app.ui.scan_actions import build_scan_result_actions
 from app.ui.result_cards import render_scan_result_card
@@ -1406,8 +1407,10 @@ async def _send_tshark_metasploit_correlated_assessment(
         correlation_result.get("correlation_artifact_ref"),
         len(correlated_message),
     )
-    for chunk in split_report_text(correlated_message):
-        await message.reply_text(chunk)
+    chunks = split_report_text(correlated_message)
+    for index, chunk in enumerate(chunks):
+        markup = build_tool_mode_post_scan_keyboard("tshark") if assessment_id is None and index == len(chunks) - 1 else None
+        await message.reply_text(chunk, **({"reply_markup": markup} if markup else {}))
     logger.info(
         "Telegram send completed: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s",
         correlation_result.get("correlation_artifact_ref"),
