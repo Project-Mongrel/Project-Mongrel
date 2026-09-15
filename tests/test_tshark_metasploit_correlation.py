@@ -151,6 +151,45 @@ def test_no_false_tls_handshake_or_http_service_response_claim_in_record_and_pro
     assert "If session_established is false, correlated packets must not be described as shell/session access or exploit success." in prompt
 
 
+@pytest.mark.parametrize(
+    "observations, request_count, response_count",
+    [
+        ([{"method": "GET", "host": "example.com", "uri": "/"}], 1, 0),
+        ([{"response_status": "301", "src": "93.184.216.34", "dst": "192.0.2.10"}], 0, 1),
+        ([{"method": "GET"}, {"response_code": "301"}, {"method": "HEAD", "response_status": "204"}], 2, 2),
+        ([{"host": "example.com", "uri": "/attempted"}, {"src": "192.0.2.10", "dst": "93.184.216.34"}], 0, 0),
+    ],
+)
+def test_current_run_http_evidence_classifies_only_explicit_request_and_response_fields(
+    observations: list[dict], request_count: int, response_count: int,
+) -> None:
+    tshark = _tshark()
+    tshark["http_observations"] = observations
+
+    record = _record(tshark=tshark)
+
+    assert len(record["tshark"]["http_evidence"]["requests"]) == request_count
+    assert len(record["tshark"]["http_evidence"]["responses"]) == response_count
+
+
+def test_http_counts_ignore_stale_artifacts_and_validation_http_metadata() -> None:
+    tshark = _tshark()
+    tshark["http_observations"] = [{"method": "GET"}, {"response_status": "301"}]
+    tshark["related_artifacts"] = [{"http_observations": [{"method": "OLD"}] * 9}]
+    metasploit = _metasploit()
+    metasploit["http_observations"] = [{"response_status": "500"}] * 7
+
+    record = _record(tshark=tshark, metasploit=metasploit)
+
+    assert len(record["tshark"]["http_evidence"]["requests"]) == 1
+    assert len(record["tshark"]["http_evidence"]["responses"]) == 1
+    assert record["tshark"]["http_evidence"]["responses"][0]["response_status"] == "301"
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value="TShark Evidence\n- Address:"):
+        rendered = "\n".join(generate_tshark_metasploit_correlated_assessment(record))
+    assert "1 request observation(s) and 1 separate response observation(s); response codes: 301" in rendered
+    assert "transaction pairing is not established" in rendered
+
+
 def test_no_metasploit_session_remains_no_session_despite_correlated_packets() -> None:
     record = _record(metasploit=_metasploit("VALIDATED"))
 

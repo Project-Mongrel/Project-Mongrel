@@ -105,6 +105,7 @@ def build_tshark_metasploit_correlation_record(
     dns_evidence = _matching_dns(tshark_evidence, target)
     tls_evidence = _matching_tls(tshark_evidence, target, target_ips)
     http_evidence = _matching_http(tshark_evidence, target, target_ips)
+    capture_http_evidence = _current_run_http_evidence(tshark_evidence)
     observed_protocols = _observed_protocols(tshark_evidence)
     observed_endpoint_ports = _observed_endpoint_ports(tshark_evidence, matching_conversations)
     outcome, confidence, agreement_state, limitations = _correlation_outcome(
@@ -162,8 +163,8 @@ def build_tshark_metasploit_correlation_record(
                 "successful_handshake_observed": any(item.get("handshake_complete") is True for item in tls_evidence),
             },
             "http_evidence": {
-                "requests": [item for item in http_evidence if item.get("method") or item.get("host") or item.get("uri")],
-                "responses": [item for item in http_evidence if item.get("response_code")],
+                "requests": capture_http_evidence["requests"],
+                "responses": capture_http_evidence["responses"],
             },
         },
         "packet_count": int(tshark_evidence.get("packet_count") or 0),
@@ -324,6 +325,21 @@ def _matching_http(evidence: dict, target: str, target_ips: list[str]) -> list[d
     return matched[:20]
 
 
+def _current_run_http_evidence(evidence: dict) -> dict[str, list[dict]]:
+    """Classify capture HTTP facts without inferring transactions or target attribution."""
+    requests = []
+    responses = []
+    for item in evidence.get("http_observations") or []:
+        if not isinstance(item, dict):
+            continue
+        bounded = _bounded_item(item)
+        if _clean(item.get("method")):
+            requests.append(bounded)
+        if _clean(item.get("response_code") or item.get("response_status")):
+            responses.append(bounded)
+    return {"requests": requests[:20], "responses": responses[:20]}
+
+
 def _target_ips(target: str, evidence: dict) -> list[str]:
     observed = set()
     endpoint_addresses = {_clean(item.get("address")) for item in evidence.get("observed_endpoints") or []}
@@ -470,7 +486,11 @@ def _deterministic_correlated_assessment(record: dict) -> list[str]:
     http = tshark.get("http_evidence") or {}
     requests = http.get("requests") or []
     responses = http.get("responses") or []
-    response_codes = sorted({_clean(item.get("response_code")) for item in responses if _clean(item.get("response_code"))})
+    response_codes = sorted({
+        _clean(item.get("response_code") or item.get("response_status"))
+        for item in responses
+        if _clean(item.get("response_code") or item.get("response_status"))
+    })
     tls = (tshark.get("tls_handshake_evidence") or {}).get("observations") or []
     packet_summary = f"{int(tshark.get('packet_count') or 0)} packet(s)"
     if int(tshark.get("byte_count") or 0) > 0:
