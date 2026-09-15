@@ -20,6 +20,7 @@ from app.bot.handlers import (
     settings_handler,
     start_handler,
     tshark_callback_handler,
+    tool_mode_callback_handler,
     upload_document_handler,
     upload_callback_handler,
     upload_handler,
@@ -67,6 +68,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel_handler))
     application.add_handler(MessageHandler(filters.Regex("^Reports$"), reports_handler))
     application.add_handler(MessageHandler(filters.Regex("^Settings$"), settings_handler))
+    application.add_handler(CallbackQueryHandler(tool_mode_callback_handler, pattern="^toolmode:"))
     application.add_handler(CallbackQueryHandler(scan_callback_handler, pattern=SCAN_CALLBACK_PATTERN))
     application.add_handler(CallbackQueryHandler(tshark_callback_handler, pattern="^tshark:"))
     application.add_handler(CallbackQueryHandler(assessment_callback_handler, pattern="^assessment:"))

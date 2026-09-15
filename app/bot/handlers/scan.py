@@ -6,6 +6,7 @@ import secrets
 import time
 from datetime import UTC
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -2271,23 +2272,53 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def scan_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def tool_mode_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
         return
-
     await query.answer()
-
-    if query.data == f"{TOOL_MODE_ACTION_PREFIX}:ask":
+    data = str(query.data or "")
+    if data == f"{TOOL_MODE_ACTION_PREFIX}:ask":
         clear_assessment_flow_state(context)
         if update.effective_user is not None:
             set_ai_waiting(update.effective_user.id)
         await query.edit_message_text("Ask Mongrel anything. Cybersecurity is my specialty.")
         return
-    if query.data == f"{TOOL_MODE_ACTION_PREFIX}:back":
+    if data == f"{TOOL_MODE_ACTION_PREFIX}:back":
         clear_assessment_flow_state(context)
         await query.edit_message_text(build_scan_text(), reply_markup=build_scan_type_keyboard())
         return
+    parts = data.split(":", 2)
+    if len(parts) == 3 and parts[1] == "run":
+        tool = parts[2].strip().lower().removesuffix(".sh")
+        if tool not in SUPPORTED_SCAN_TYPES:
+            await query.edit_message_text("Unsupported Tool Mode action.", reply_markup=build_scan_type_keyboard())
+            return
+        routed_query = SimpleNamespace(
+            data=f"scan:{tool}", answer=query.answer, edit_message_text=query.edit_message_text,
+            message=getattr(query, "message", None),
+        )
+        routed_update = SimpleNamespace(
+            callback_query=routed_query,
+            effective_user=update.effective_user,
+        )
+        await scan_callback_handler(routed_update, context, acknowledge=False)
+        return
+    await query.edit_message_text("Unsupported Tool Mode action.", reply_markup=build_scan_type_keyboard())
+
+
+async def scan_callback_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    acknowledge: bool = True,
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    if acknowledge:
+        await query.answer()
 
     if query.data == "nav:home":
         clear_assessment_flow_state(context)

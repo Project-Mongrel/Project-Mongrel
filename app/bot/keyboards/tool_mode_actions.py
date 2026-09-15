@@ -12,7 +12,7 @@ def build_tool_mode_post_scan_keyboard(tool: str) -> InlineKeyboardMarkup:
     if normalized not in TOOL_MODE_TOOLS:
         raise ValueError("Unsupported Tool Mode tool.")
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Run Again", callback_data=f"scan:{normalized}")],
+        [InlineKeyboardButton("🔄 Run Again", callback_data=f"{TOOL_MODE_ACTION_PREFIX}:run:{normalized}")],
         [InlineKeyboardButton("✦ Ask Mongrel", callback_data=f"{TOOL_MODE_ACTION_PREFIX}:ask")],
         [InlineKeyboardButton("⬅️ Back to Tools", callback_data=f"{TOOL_MODE_ACTION_PREFIX}:back")],
     ])
