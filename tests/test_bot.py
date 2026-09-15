@@ -1883,7 +1883,7 @@ def test_nmap_inconclusive_scan_preserves_recovery_actions() -> None:
     assert "Status\nInconclusive" in result_call.args[0]
     assert "Risk\nUNKNOWN / INCONCLUSIVE" in result_call.args[0]
     buttons = [row[0].text for row in result_call.kwargs["reply_markup"].inline_keyboard]
-    assert buttons == ["AI Summary", "Re-run Scan", "✏️ Edit Target", "Scan Menu"]
+    assert buttons == ["AI Summary", "🔄 Run Again", "✏️ Edit Target", "✦ Ask Mongrel", "⬅️ Back to Tools"]
     ai_text = "\n".join(call.args[0] for call in message.reply_text.call_args_list[3:])
     assert "this-host-does-not-exist-123456.example" in ai_text
     assert "No significant vulnerabilities detected" not in ai_text
@@ -2230,7 +2230,9 @@ def test_ffuf_profile_selection_review_and_execution_context(tmp_path: Path) -> 
     assert "Timeout: 31s" in result_text
     assert "Wordlist source: Configured Standard external wordlist" in result_text
     assert not any("Running discovery..." in call.args[0] for call in message.reply_text.call_args_list)
-    assert any(button.text == "Re-run Scan" for row in keyboard.inline_keyboard for button in row)
+    assert [button.text for row in keyboard.inline_keyboard for button in row][-3:] == [
+        "🔄 Run Again", "✦ Ask Mongrel", "⬅️ Back to Tools",
+    ]
     recovery_tokens = [payload for payload in _scan_recovery_tokens.values() if payload.get("tool") == "ffuf"]
     assert recovery_tokens[-1]["options"] == {"ffuf_profile": "standard"}
     assert _ffuf_scan_profiles == {}
@@ -2310,9 +2312,10 @@ def test_ffuf_timeout_failure_keeps_progress_and_recovery_actions() -> None:
     assert "Status\nFailed" in result_text
     assert "Timeout: 9s" in result_text
     assert "ffuf hidden-content discovery timed out." in result_text
-    assert "Re-run Scan" in buttons
+    assert "🔄 Run Again" in buttons
     assert "✏️ Edit Target" in buttons
-    assert "Scan Menu" in buttons
+    assert "✦ Ask Mongrel" in buttons
+    assert "⬅️ Back to Tools" in buttons
 
 
 def test_testssl_scan_callback_prompts_for_target() -> None:
@@ -2469,7 +2472,7 @@ def test_scan_recovery_rerun_uses_saved_request_and_dispatcher() -> None:
     assert query.edit_message_text.call_args.args[0] == "Re-running NMAP scan..."
     run_nmap_scan.assert_called_once_with("127.0.0.1")
     assert "Nmap Scan Complete" in message.reply_text.call_args_list[1].args[0]
-    assert message.reply_text.call_args_list[1].kwargs["reply_markup"].inline_keyboard[1][0].text == "Re-run Scan"
+    assert message.reply_text.call_args_list[1].kwargs["reply_markup"].inline_keyboard[1][0].text == "🔄 Run Again"
 
 
 def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> None:
@@ -4342,9 +4345,10 @@ def test_bbot_scan_missing_binary_does_not_crash() -> None:
     message.reply_text.assert_called_once()
     assert message.reply_text.call_args.args[0] == "BBOT is not installed or not available on PATH."
     assert [row[0].text for row in message.reply_text.call_args.kwargs["reply_markup"].inline_keyboard] == [
-        "Re-run Scan",
+        "🔄 Run Again",
         "✏️ Edit Target",
-        "Scan Menu",
+        "✦ Ask Mongrel",
+        "⬅️ Back to Tools",
     ]
     assert context.user_data == {}
 
