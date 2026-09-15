@@ -107,6 +107,8 @@ from app.bot.handlers.upload import (
     UPLOAD_STATE_AWAITING_NMAP_XML,
     UPLOAD_EXPLAIN_CALLBACK,
     UPLOAD_STATE_AWAITING_TSHARK_PCAP,
+    _send_tshark_metasploit_correlated_assessment,
+    build_tshark_metasploit_correlated_assessment_text,
     build_tshark_mode_text,
     build_tshark_result_text,
     build_tshark_upload_prompt,
@@ -1592,6 +1594,42 @@ def test_long_report_splitting() -> None:
 
     assert len(chunks) > 1
     assert all(len(chunk) <= 3800 for chunk in chunks)
+
+
+def test_correlated_assessment_delivery_chunks_losslessly_then_sends_dashboard() -> None:
+    assessment = create_assessment("Correlation delivery")
+    lines = ["Executive Summary"] + [
+        f"Section {index}\n" + ("Bounded packet evidence. " * 30) for index in range(12)
+    ]
+    expected = build_tshark_metasploit_correlated_assessment_text(lines)
+    message = SimpleNamespace(reply_text=AsyncMock())
+
+    asyncio.run(_send_tshark_metasploit_correlated_assessment(
+        message,
+        {"ai_lines": lines, "correlation_artifact_ref": "assessment_artifact:test"},
+        assessment["id"],
+    ))
+
+    sent = [call.args[0] for call in message.reply_text.call_args_list]
+    report_chunks = sent[:-1]
+    assert len(report_chunks) > 1
+    assert all(len(chunk) <= 3800 for chunk in report_chunks)
+    assert "".join(report_chunks) == expected
+    assert "Assessment Dashboard" in sent[-1]
+
+
+def test_short_correlated_assessment_delivery_uses_one_message_without_dashboard_in_tool_mode() -> None:
+    lines = ["Executive Summary", "Complete bounded result."]
+    message = SimpleNamespace(reply_text=AsyncMock())
+
+    asyncio.run(_send_tshark_metasploit_correlated_assessment(
+        message,
+        {"ai_lines": lines, "correlation_artifact_ref": "current_run"},
+        None,
+    ))
+
+    message.reply_text.assert_awaited_once()
+    assert message.reply_text.call_args.args[0] == build_tshark_metasploit_correlated_assessment_text(lines)
 
 
 def test_ask_mongrel_sets_ai_waiting_state() -> None:

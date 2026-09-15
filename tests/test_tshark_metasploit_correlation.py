@@ -210,6 +210,32 @@ def test_ai_generation_uses_structured_record() -> None:
     assert lines == ["Executive Summary", "Correlated."]
 
 
+def test_truncated_model_field_is_replaced_by_deterministic_assessment() -> None:
+    response = "Executive Summary\nObserved packet details follow.\n\nTShark Evidence\n- Address:"
+
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value=response):
+        lines = generate_tshark_metasploit_correlated_assessment(_record())
+
+    rendered = "\n".join(lines)
+    assert rendered != response
+    assert "The normalized current-run capture recorded" in rendered
+    assert not rendered.rstrip().endswith("Address:")
+
+
+def test_deterministic_assessment_bounds_long_endpoint_list_cleanly() -> None:
+    tshark = _tshark()
+    tshark["observed_endpoints"] = [
+        {"address": f"192.0.2.{index}", "packet_count": 1} for index in range(1, 26)
+    ]
+    record = _record(tshark=tshark)
+
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value="TShark Evidence\n- Address:"):
+        rendered = "\n".join(generate_tshark_metasploit_correlated_assessment(record))
+
+    assert "and 13 more" in rendered
+    assert "192.0.2.25" not in rendered
+
+
 @pytest.mark.parametrize(
     "unsafe_response",
     [

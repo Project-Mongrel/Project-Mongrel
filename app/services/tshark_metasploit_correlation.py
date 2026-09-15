@@ -82,6 +82,10 @@ UNSUPPORTED_CORRELATED_CLAIM_PATTERNS = (
     re.compile(r"\bhttp\b[^.!?]{0,100}\b(?:transaction|exchange|request\s*/?\s*response)\b[^.!?]{0,100}\b(?:completed|succeeded|successful)\b"),
     re.compile(r"\bhigh\s+correlation\s+confidence\b[^.!?]{0,120}\b(?:confirms|proves|means)\b[^.!?]{0,80}\b(?:exploit|exploitation|compromise|vulnerab)\b"),
 )
+CORRELATED_SECTION_HEADINGS = {
+    "executive summary", "metasploit evidence", "tshark evidence", "correlation outcome",
+    "confidence", "limitations", "recommended next actions",
+}
 
 
 def build_tshark_metasploit_correlation_record(
@@ -410,11 +414,34 @@ def _bounded_record(record: dict) -> dict:
 
 
 def _guard_correlated_truthfulness_response(lines: list[str], record: dict) -> list[str]:
+    if _is_incomplete_correlated_response(lines):
+        return _deterministic_correlated_assessment(record)
     if _contains_packet_absence_contradiction(lines, record):
         return _deterministic_correlated_assessment(record)
     if _contains_unsupported_correlated_claim(lines, record):
         return list(TRUTHFULNESS_FALLBACK_LINES)
     return lines
+
+
+def _is_incomplete_correlated_response(lines: list[str]) -> bool:
+    """Detect structurally cut-off model output without relying on provider token metadata."""
+    nonempty = [str(line or "").strip() for line in lines if str(line or "").strip()]
+    if not nonempty:
+        return True
+    last = nonempty[-1]
+    normalized = last.strip("#* _").lower()
+    headings = {line.strip("#* _").lower() for line in nonempty}.intersection(CORRELATED_SECTION_HEADINGS)
+    if headings - {"executive summary"} and headings != CORRELATED_SECTION_HEADINGS:
+        return True
+    if normalized in CORRELATED_SECTION_HEADINGS:
+        return True
+    if re.fullmatch(r"(?:[-*]\s*)?[A-Za-z][A-Za-z0-9 /_-]{0,60}:\s*", last):
+        return True
+    if re.fullmatch(r"[-*]\s*", last) or last.endswith((",", ";", ":", " -")):
+        return True
+    if re.match(r"^[-*]\s+", last) and not last.endswith((".", "!", "?", ")", "]")):
+        return True
+    return False
 
 
 def _contains_packet_absence_contradiction(lines: list[str], record: dict) -> bool:
@@ -450,11 +477,11 @@ def _deterministic_correlated_assessment(record: dict) -> list[str]:
         packet_summary += f" / {int(tshark['byte_count'])} byte(s)"
     tshark_lines = [f"The normalized current-run capture recorded {packet_summary}."]
     if endpoint_addresses:
-        tshark_lines.append(f"Observed endpoints: {', '.join(endpoint_addresses[:20])}.")
+        tshark_lines.append(f"Observed endpoints: {_bounded_join(endpoint_addresses)}.")
     if ports:
-        tshark_lines.append(f"Observed packet port metadata: {', '.join(ports[:20])}.")
+        tshark_lines.append(f"Observed packet port metadata: {_bounded_join(ports)}.")
     if protocols:
-        tshark_lines.append(f"Observed protocols: {', '.join(protocols)}.")
+        tshark_lines.append(f"Observed protocols: {_bounded_join(protocols)}.")
     if requests or responses:
         response_detail = f"; response codes: {', '.join(response_codes)}" if response_codes else ""
         tshark_lines.append(
@@ -484,6 +511,12 @@ def _deterministic_correlated_assessment(record: dict) -> list[str]:
         "Recommended Next Actions",
         "Review the normalized validation, capture provenance, endpoints, protocols, and HTTP observations together before drawing any security conclusion.",
     ]
+
+
+def _bounded_join(values: list[str], *, limit: int = 12) -> str:
+    shown = values[:limit]
+    suffix = f", and {len(values) - limit} more" if len(values) > limit else ""
+    return ", ".join(shown) + suffix
 
 
 def _contains_unsupported_correlated_claim(lines: list[str], record: dict) -> bool:

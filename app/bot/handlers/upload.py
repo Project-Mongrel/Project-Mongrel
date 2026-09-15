@@ -17,6 +17,7 @@ from app.core.config import get_settings
 from app.ui.scan_actions import build_scan_result_actions
 from app.ui.result_cards import render_scan_result_card
 from app.bot.handlers.scan import store_parsed_nmap_finding
+from app.bot.handlers.reports import split_report_text
 from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.parsers.metasploit_parser import parse_metasploit_validation_result
@@ -1392,6 +1393,30 @@ def build_tshark_metasploit_correlated_assessment_text(ai_lines: list[str]) -> s
     )
 
 
+async def _send_tshark_metasploit_correlated_assessment(
+    message: object,
+    correlation_result: dict,
+    assessment_id: int | None,
+) -> None:
+    correlated_message = build_tshark_metasploit_correlated_assessment_text(
+        list(correlation_result.get("ai_lines") or [])
+    )
+    logger.info(
+        "About to send Telegram message: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s text_length=%s",
+        correlation_result.get("correlation_artifact_ref"),
+        len(correlated_message),
+    )
+    for chunk in split_report_text(correlated_message):
+        await message.reply_text(chunk)
+    logger.info(
+        "Telegram send completed: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s",
+        correlation_result.get("correlation_artifact_ref"),
+    )
+    if assessment_id is not None:
+        await _send_tshark_assessment_dashboard(message, assessment_id)
+        logger.info("Capture During Validation dashboard sent: assessment_id=%s", assessment_id)
+
+
 def _persist_metasploit_capture_validation_artifact(assessment_id: int, result: dict, normalized: dict, proposal_id: str) -> str:
     artifact = add_assessment_artifact(
         assessment_id=int(assessment_id),
@@ -1800,20 +1825,9 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             if query.message is not None:
                 await query.message.reply_text(build_tshark_result_text(normalized, result.get("offline_result") or result))
                 if isinstance(correlation_result, dict):
-                    correlated_message = build_tshark_metasploit_correlated_assessment_text(list(correlation_result.get("ai_lines") or []))
-                    logger.info(
-                        "About to send Telegram message: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s text_length=%s",
-                        correlation_result.get("correlation_artifact_ref"),
-                        len(correlated_message),
+                    await _send_tshark_metasploit_correlated_assessment(
+                        query.message, correlation_result, assessment_id
                     )
-                    await query.message.reply_text(correlated_message)
-                    logger.info(
-                        "Telegram send completed: type=tshark_metasploit_correlated_assessment correlation_artifact_ref=%s",
-                        correlation_result.get("correlation_artifact_ref"),
-                    )
-                if assessment_id is not None:
-                    await _send_tshark_assessment_dashboard(query.message, assessment_id)
-                    logger.info("Capture During Validation dashboard sent: assessment_id=%s", assessment_id)
             clear_tshark_live_context(proposal_id)
             clear_upload_state(user_id)
             logger.info("Capture During Validation handler exits normally: user_id=%s capture_proposal_id=%s", user_id, proposal_id)
