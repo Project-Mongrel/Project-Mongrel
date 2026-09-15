@@ -87,6 +87,7 @@ PRODUCT_QUESTION_PATTERNS = (
 )
 RECOMMENDATION_QUESTION_TERMS = (
     "what next", "what is next", "do next", "run next", "should i run", "which tool", "which mongrel tool",
+    "try next", "should i try", "will i try next", "what do i run next",
     "recommend", "what would you investigate", "would you investigate", "how do i investigate", "what should we do",
     "where do we go from here", "where should we go from here",
 )
@@ -100,6 +101,8 @@ ASSESSMENT_SUMMARY_TERMS = (
 ASSESSMENT_HIGHLIGHT_TERMS = (
     "most interesting thing", "what stands out", "most significant", "what's significant", "what is significant",
     "what should i pay attention to", "which evidence matters most", "biggest risk", "highest risk",
+    "anything i should be worried about", "should i be worried about anything", "what should concern me",
+    "what are the main concerns", "main concerns",
 )
 ASSESSMENT_SUMMARY_PATTERNS = (
     re.compile(r"\bwhat\s+have\s+we\s+(?:actually\s+)?established\b"),
@@ -149,6 +152,8 @@ CASUAL_SECURITY_TERM_ALIASES = (
     (re.compile(r"\bonw\b"), "one"),
     (re.compile(r"\bwouldnt\b"), "wouldn't"),
     (re.compile(r"\bdont\b"), "don't"),
+    (re.compile(r"\bwat\b"), "what"),
+    (re.compile(r"\bnxt\b"), "next"),
 )
 TOOL_RELEVANCE_PATTERNS = (
     re.compile(r"\b(?:why|what)\s+wouldn'?t\s+(?:you|we)\s+(?:use|run)\b"),

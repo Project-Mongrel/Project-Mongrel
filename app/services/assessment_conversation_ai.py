@@ -232,12 +232,12 @@ def answer_assessment_conversation_question(
             answer = FALLBACK_ANSWER
             fallback_reason = "empty"
         elif violates_conversation_truthfulness(answer, context):
-            conversational_fallback = _build_grounded_conversational_fallback(context)
-            answer = conversational_fallback or TRUTHFULNESS_FALLBACK_ANSWER
-            if conversational_fallback and context.get("question_intent") == "attacker_informed_defensive_reasoning":
+            deterministic_recovery = _recover_rejected_assessment_answer(context)
+            answer = deterministic_recovery or TRUTHFULNESS_FALLBACK_ANSWER
+            if deterministic_recovery and context.get("question_intent") == "attacker_informed_defensive_reasoning":
                 fallback_reason = "attacker_reasoning_fallback"
             else:
-                fallback_reason = "grounded_conversation_fallback" if conversational_fallback else "truthfulness_guard"
+                fallback_reason = "grounded_conversation_fallback" if deterministic_recovery else "truthfulness_guard"
         elif violates_mongrel_native_guidance(answer, context):
             answer = NATIVE_GUIDANCE_FALLBACK_ANSWER
             fallback_reason = "native_guidance_guard"
@@ -262,6 +262,24 @@ def answer_assessment_conversation_question(
             prompt_budget_metadata=budget_metadata,
         ),
     )
+
+
+def _recover_rejected_assessment_answer(context: dict) -> str | None:
+    """Recover common assessment intents from normalized evidence without retrying generation."""
+
+    confidence = _build_evidence_confidence_answer(context)
+    if confidence:
+        return confidence
+    intent = str(context.get("question_intent") or "")
+    if intent in {"assessment_highlight", "prioritization"}:
+        synthesis_context = dict(context)
+        synthesis_context["question_intent"] = "assessment_highlight"
+        return _build_grounded_assessment_summary(synthesis_context)
+    if intent == "next_step_recommendation":
+        return _build_grounded_conversational_fallback(context)
+    if intent == "uncertainty_safety" and str(context.get("uncertainty_subtype") or "overall_security") == "overall_security":
+        return _build_grounded_conversational_fallback(context)
+    return _build_grounded_conversational_fallback(context)
 
 
 def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict | None = None) -> str:
@@ -1205,7 +1223,9 @@ def _build_state_grounded_answer(context: dict) -> str | None:
     preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
     if intent == "product_self_knowledge":
         return PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER
-    if intent in {"next_step_recommendation", "prioritization"} and preferred:
+    if intent in {"next_step_recommendation", "prioritization"} and (
+        preferred or re.search(r"\b(?:try|run)\s+next\b", question)
+    ):
         return _build_grounded_conversational_fallback(context)
     if intent == "remaining_coverage_gaps":
         return _build_grounded_conversational_fallback(context)
@@ -1850,6 +1870,14 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
                 "web surface. Its path, status, and size observations could close that gap, but would not automatically "
                 "prove sensitive exposure or a vulnerability. This answer runs nothing."
             )
+        incomplete = [f"{tool}={state}" for tool, state in states.items() if state in {"FAILED", "PARTIAL", "SKIPPED"}]
+        return (
+            "The authoritative assessment state does not identify another automatically required tool. "
+            + ("Relevant incomplete coverage to review first is " + ", ".join(incomplete) + ". " if incomplete else "Review the latest stored evidence before selecting more coverage. ")
+            + "Gitleaks and Prowler are not automatic recommendations without suitable repository/filesystem or cloud context, "
+            "and Metasploit or TShark should be used only when existing evidence and authorization justify validation or capture. "
+            "This recommendation does not establish security, vulnerability, or exploitability, and it executes nothing."
+        )
     if intent == "significance_interpretation":
         if recommendation.get("web_services_observed_by_nmap"):
             completed = {str(tool) for tool in recommendation.get("completed_tools") or []}

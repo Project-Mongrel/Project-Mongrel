@@ -1713,6 +1713,73 @@ def test_broad_assessment_highlight_synthesizes_multiple_tools_risks_and_gaps() 
     assert all(tool in risk_result["answer"] for tool in ("Nmap", "Nuclei", "Katana", "Playwright", "ffuf"))
 
 
+def test_live_secure_concern_and_next_step_sequence_stays_deterministic() -> None:
+    user_id = 1110
+    assessment = create_assessment("Concern routing sequence", user_id=user_id)
+    conversation = create_conversation(assessment["id"], user_id)
+    finding = add_finding(
+        user_id=user_id,
+        finding={"source": "nmap", "target": "example.com", "open_ports": [{"port": 80, "protocol": "tcp", "service": "http"}]},
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", finding_id=finding["id"])
+    questions = ("so are we secure?", "anything I should be worried about?", "what will i try next")
+    answers = []
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        for question in questions:
+            result = answer_assessment_conversation_question(
+                user_id=user_id,
+                assessment_id=assessment["id"],
+                conversation_id=conversation["id"],
+                question=question,
+            )
+            answers.append(result["answer"])
+            append_message(conversation["id"], user_id, "user", question)
+            append_message(conversation["id"], user_id, "assistant", result["answer"])
+
+    model.assert_not_called()
+    assert "not enough to conclude" in answers[0].lower()
+    assert "what stands out" in answers[1].lower()
+    assert "nmap" in answers[1].lower() and "vulnerability" in answers[1].lower()
+    assert "httpx next" in answers[2].lower()
+    assert "no tool has been run" in answers[2].lower()
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_intent"),
+    [
+        ("anything I should be worried about?", "assessment_highlight"),
+        ("should I be worried about anything?", "assessment_highlight"),
+        ("what should concern me?", "assessment_highlight"),
+        ("what are the main concerns?", "assessment_highlight"),
+        ("what will I try next?", "next_step_recommendation"),
+        ("what should I try next?", "next_step_recommendation"),
+        ("what do I run next?", "next_step_recommendation"),
+        ("wat should i try nxt?", "next_step_recommendation"),
+    ],
+)
+def test_casual_concern_and_next_step_variants_use_deterministic_routes(question: str, expected_intent: str) -> None:
+    user_id = 1111
+    assessment = create_assessment("Standalone intent variants", user_id=user_id)
+    finding = add_finding(
+        user_id=user_id,
+        finding={"source": "nmap", "target": "example.com", "open_ports": [{"port": 443, "protocol": "tcp", "service": "https"}]},
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", finding_id=finding["id"])
+    context = build_assessment_conversation_context(user_id=user_id, assessment_id=assessment["id"], question=question)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question=question,
+        )
+
+    assert context["question_intent"] == expected_intent
+    assert result["answer"] != TRUTHFULNESS_FALLBACK_ANSWER
+    assert "gitleaks" not in result["answer"].lower() or "not automatic" in result["answer"].lower()
+    assert "prowler" not in result["answer"].lower() or "not automatic" in result["answer"].lower()
+    model.assert_not_called()
+
+
 def test_nuclei_template_match_cannot_be_rendered_as_causal_mitm_path() -> None:
     assessment = create_assessment("Nuclei causal guard", user_id=1106)
     finding = add_finding(user_id=1106, finding={
