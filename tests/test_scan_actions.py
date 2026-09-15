@@ -40,4 +40,8 @@ def test_build_scan_recovery_actions_uses_failed_and_invalid_variants() -> None:
         "⬅️ Back to Tools",
     ]
     assert invalid is not None
-    assert [row[0].text for row in invalid.inline_keyboard] == ["✏️ Edit Input", "Scan Menu"]
+    assert [row[0].text for row in invalid.inline_keyboard] == [
+        "✏️ Edit Input",
+        "✦ Ask Mongrel",
+        "⬅️ Back to Tools",
+    ]
