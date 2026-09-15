@@ -940,6 +940,21 @@ def _tool_findings(context: dict, tool: str) -> list[dict]:
     ]
 
 
+def _httpx_response_observations(findings: list[dict]) -> list[dict]:
+    """Return only records that prove an HTTP response was actually observed."""
+    response_fields = {
+        "status_code", "title", "redirect_location", "web_server", "content_type",
+        "technologies", "tls", "response_time", "content_length", "method",
+    }
+    return [
+        item
+        for finding in findings
+        for key in ("httpx_services", "httpx_results")
+        for item in (finding.get(key) or [])
+        if isinstance(item, dict) and any(item.get(field) not in (None, "", [], {}) for field in response_fields)
+    ]
+
+
 def _build_direct_httpx_evidence_answer(context: dict) -> str | None:
     if context.get("question_intent") != "current_assessment_evidence" or _selected_tools(context) != {"httpx"}:
         return None
@@ -949,7 +964,7 @@ def _build_direct_httpx_evidence_answer(context: dict) -> str | None:
     findings = _tool_findings(context, "httpx")
     if not findings:
         return None
-    services = [item for finding in findings for item in (finding.get("httpx_services") or []) if isinstance(item, dict)]
+    services = _httpx_response_observations(findings)
     if not services:
         return (
             "The stored httpx result contains no normalized HTTP response observations. That does not establish that the "
@@ -1069,34 +1084,32 @@ def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
 
 
 def _tshark_evidence(context: dict) -> list[dict]:
-    evidence = []
     assessment = context.get("assessment_context") or {}
+    normalized_artifacts = [
+        artifact for artifact in assessment.get("artifacts") or []
+        if isinstance(artifact, dict)
+        and str(artifact.get("artifact_type") or "") == "tshark_normalized_evidence"
+        and isinstance(artifact.get("content"), dict)
+    ]
+    if normalized_artifacts:
+        latest = max(
+            normalized_artifacts,
+            key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")),
+        )
+        return [latest["content"]]
     for finding in assessment.get("findings") or []:
         if not isinstance(finding, dict):
             continue
         item = finding.get("tshark_evidence")
         if isinstance(item, dict):
-            evidence.append(item)
+            return [item]
     for scan in assessment.get("scans") or []:
         if not isinstance(scan, dict):
             continue
         item = scan.get("tshark_evidence")
         if isinstance(item, dict):
-            evidence.append(item)
-    for artifact in assessment.get("artifacts") or []:
-        if not isinstance(artifact, dict) or str(artifact.get("artifact_type") or "") != "tshark_normalized_evidence":
-            continue
-        item = artifact.get("content")
-        if isinstance(item, dict):
-            evidence.append(item)
-    unique = []
-    seen = set()
-    for item in evidence:
-        marker = json.dumps(item, default=_json_default, sort_keys=True)
-        if marker not in seen:
-            seen.add(marker)
-            unique.append(item)
-    return unique
+            return [item]
+    return []
 
 
 def _build_direct_tshark_evidence_answer(context: dict) -> str | None:
@@ -1128,9 +1141,14 @@ def _build_direct_tshark_evidence_answer(context: dict) -> str | None:
         )
     rendered = []
     for evidence in evidence_items:
-        packet_count = int(evidence.get("packet_count") or 0)
-        byte_count = int(evidence.get("byte_count") or 0)
-        details = [f"captured {packet_count} packets ({byte_count} bytes)"]
+        packet_count = evidence.get("packet_count")
+        byte_count = evidence.get("byte_count")
+        if packet_count is None:
+            details = ["the packet count is unknown in the stored capture metadata"]
+        else:
+            details = [f"captured {int(packet_count)} packets"]
+            if byte_count is not None:
+                details[-1] += f" ({int(byte_count)} bytes)"
         endpoints = [str(item.get("address")) for item in evidence.get("observed_endpoints") or [] if isinstance(item, dict) and item.get("address")]
         if endpoints:
             details.append("observed endpoints " + ", ".join(endpoints[:10]))
@@ -1223,10 +1241,12 @@ def _build_state_grounded_answer(context: dict) -> str | None:
     preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
     if intent == "product_self_knowledge":
         return PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER
-    if intent in {"next_step_recommendation", "prioritization"} and (
-        preferred or re.search(r"\b(?:try|run)\s+next\b", question)
-    ):
+    if intent == "next_step_recommendation":
         return _build_grounded_conversational_fallback(context)
+    if intent == "prioritization":
+        synthesis_context = dict(context)
+        synthesis_context["question_intent"] = "assessment_highlight"
+        return _build_grounded_assessment_summary(synthesis_context)
     if intent == "remaining_coverage_gaps":
         return _build_grounded_conversational_fallback(context)
     if intent == "tool_state_overview":
@@ -1267,10 +1287,9 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
     statements = []
     if nmap_ports:
         statements.append("Nmap recorded exposed TCP services: " + ", ".join(nmap_ports[:10]) + ".")
-    httpx_items = [
-        item for finding in findings if str(finding.get("source") or "").lower() == "httpx"
-        for key in ("httpx_services", "httpx_results") for item in (finding.get(key) or []) if isinstance(item, dict)
-    ]
+    httpx_items = _httpx_response_observations([
+        finding for finding in findings if str(finding.get("source") or "").lower() == "httpx"
+    ])
     if httpx_items:
         observed = []
         seen = set()
@@ -1320,9 +1339,10 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
         )
     tshark_items = _tshark_evidence(context)
     if tshark_items:
-        packets = sum(int(item.get("packet_count") or 0) for item in tshark_items)
+        packet_counts = [int(item["packet_count"]) for item in tshark_items if item.get("packet_count") is not None]
+        packet_scope = f" covering {sum(packet_counts)} packet(s)" if packet_counts else " with an unknown packet count"
         statements.append(
-            f"TShark stored packet/network metadata covering {packets} packet(s); packet presence does not establish an attack, exploitation, or compromise."
+            f"TShark stored packet/network metadata{packet_scope}; packet presence does not establish an attack, exploitation, or compromise."
         )
     recommendation = context.get("recommendation_context") or {}
     gaps = [str(tool) for tool in recommendation.get("relevant_unperformed_tools") or []]
@@ -1344,7 +1364,17 @@ def _build_evidence_confidence_answer(context: dict) -> str | None:
     )
     selection = context.get("selection") or {}
     selected = [str(tool) for tool in selection.get("selected_tools") or []]
-    if not confidence_question or not selection.get("inherited_evidence_scope") or len(selected) != 1:
+    if not confidence_question:
+        return None
+    if not selection.get("inherited_evidence_scope") or len(selected) != 1:
+        synthesis_context = dict(context)
+        synthesis_context["question_intent"] = "assessment_highlight"
+        synthesis = _build_grounded_assessment_summary(synthesis_context)
+        if synthesis:
+            return (
+                "Evidence confidence is scoped to what each completed or partial tool actually stored; failed and unrun "
+                "tools remain coverage gaps, and no scan state establishes target safety. " + synthesis
+            )
         return None
     tool = selected[0].lower().removesuffix(".sh")
     names = {name.lower().removesuffix(".sh"): name for name in get_mongrel_tool_names()}
@@ -1571,7 +1601,7 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
         rendered = [f"{item.get('template_id') or item.get('name') or 'template'} ({str(item.get('severity') or 'unknown').upper()})" for item in matches[:10]]
         return "Nuclei stored template matches: " + ", ".join(rendered) + ". Their scanner severities are preserved; a match does not automatically establish exploitability."
     if tool == "httpx":
-        items = [item for finding in findings for key in ("httpx_services", "httpx_results") for item in (finding.get(key) or []) if isinstance(item, dict)]
+        items = _httpx_response_observations(findings)
         rendered = [str(item.get("url") or item.get("host") or "endpoint") + (f" (status {item.get('status_code')})" if item.get("status_code") is not None else "") for item in items[:10]]
         return "httpx stored response metadata for " + (", ".join(rendered) if rendered else "no normalized responding endpoints") + ". This does not establish vulnerability, security posture, or that an unresponsive host is down."
     if tool == "metasploit":
@@ -1581,8 +1611,9 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
         )
     if tool == "tshark":
         evidence = _tshark_evidence(context)
-        packets = sum(int(item.get("packet_count") or 0) for item in evidence)
-        return f"TShark is recorded as completed and stored metadata for {packets} packet(s). Packets do not by themselves establish an attack, exploitation, compromise, or a completed TLS handshake."
+        packet_counts = [int(item["packet_count"]) for item in evidence if item.get("packet_count") is not None]
+        scope = f"{sum(packet_counts)} packet(s)" if packet_counts else "an unknown packet count"
+        return f"TShark is recorded as completed and stored metadata for {scope}. Packets do not by themselves establish an attack, exploitation, compromise, or a completed TLS handshake."
     if tool == "gitleaks":
         count = sum(int((finding.get("gitleaks_evidence") or {}).get("finding_count") or 0) for finding in findings)
         return f"Gitleaks is recorded as completed with {count} redacted secret-pattern match(es). A match does not establish an active or usable credential, and raw secret values are not shown."

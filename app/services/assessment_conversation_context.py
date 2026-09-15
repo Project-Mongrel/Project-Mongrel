@@ -96,6 +96,7 @@ ASSESSMENT_SUMMARY_TERMS = (
     "what have we established", "what do we actually know", "what have we found so far", "summarize what we know",
     "summarise what we know", "what evidence do we have", "what do we know", "what have we found",
     "summarize this assessment", "summarise this assessment", "what does all this tell us",
+    "what did the tools find", "what have the tools found", "what did our tools find",
     "what can you actually say with confidence", "what can we say with confidence",
 )
 ASSESSMENT_HIGHLIGHT_TERMS = (
@@ -135,7 +136,7 @@ FOLLOW_UP_PATTERNS = (
     r"^(?:and\s+)?how do you know\??$",
     r"^(?:and\s+)?what evidence supports (?:this|that|it)\??$",
 )
-PRIORITIZATION_TERMS = ("which one first", "what first", "prioriti", "highest priority", "most important")
+PRIORITIZATION_TERMS = ("which one first", "what first", "attention first", "prioriti", "highest priority", "most important")
 COVERAGE_GAP_TERMS = (
     "anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing",
     "what haven't we done", "what have we not done", "what remains", "biggest unknown", "what don't we know",
@@ -478,58 +479,36 @@ def _resolve_conversation(user_id: int, assessment_id: int, conversation_id: str
 
 
 def _build_evidence_context(assessment_context: dict, selected_tools: list[str]) -> dict:
-    scan_ids = set()
-    finding_ids = set()
-    scans = []
-    findings_by_tool: dict[str, int] = {}
     full_assessment = not selected_tools
-    for scan in assessment_context.get("scans") or []:
-        tool = _normalize_tool(scan.get("tool"))
-        if not _include_tool(tool, selected_tools, full_assessment):
-            continue
-        scans.append(_sanitize(scan, drop_finding=True))
-        scan_ids.add(scan.get("id"))
-        finding = scan.get("finding")
-        if isinstance(finding, dict):
-            finding_id = finding.get("id")
-            if finding_id in finding_ids:
-                continue
-            count = findings_by_tool.get(tool, 0)
-            if count >= MAX_FINDINGS_PER_TOOL:
-                continue
-            findings_by_tool[tool] = count + 1
-            finding_ids.add(finding_id)
+    source_scans = [scan for scan in assessment_context.get("scans") or [] if isinstance(scan, dict)]
+    tools = selected_tools or sorted({_normalize_tool(scan.get("tool")) for scan in source_scans})
+    authoritative_scans = [
+        scan for tool in tools
+        if (scan := select_latest_tool_scan(source_scans, tool)) is not None
+    ]
+    scans = [_sanitize(scan, drop_finding=True) for scan in authoritative_scans]
+    selected_scan_ids = {scan.get("id") for scan in authoritative_scans}
 
-    source_findings = list(assessment_context.get("findings") or [])
-    latest_selected_finding_ids = {
-        str(scan.get("finding_id"))
-        for tool in selected_tools
-        for scan in [select_latest_tool_scan(assessment_context.get("scans") or [], tool)]
-        if scan is not None and scan.get("finding_id") is not None
+    findings_by_id = {
+        str(finding.get("id")): finding
+        for finding in assessment_context.get("findings") or []
+        if isinstance(finding, dict) and finding.get("id") is not None
     }
-    if latest_selected_finding_ids:
-        source_findings.sort(
-            key=lambda finding: str(finding.get("id")) in latest_selected_finding_ids,
-            reverse=True,
-        )
-
     findings = []
-    included_finding_ids = set()
-    for finding in source_findings:
-        tool = _normalize_tool(finding.get("source"))
-        if not _include_tool(tool, selected_tools, full_assessment):
-            continue
-        if finding.get("id") in included_finding_ids:
-            continue
-        if len([item for item in findings if item.get("source") == tool]) >= MAX_FINDINGS_PER_TOOL:
-            continue
-        included_finding_ids.add(finding.get("id"))
-        findings.append(_sanitize(finding))
+    for scan in authoritative_scans:
+        finding = findings_by_id.get(str(scan.get("finding_id")))
+        if finding is None and isinstance(scan.get("finding"), dict):
+            finding = scan["finding"]
+        if finding is not None:
+            findings.append(_sanitize(finding))
 
     artifacts = []
-    selected_scan_ids = {scan.get("id") for scan in scans}
     for artifact in reversed(assessment_context.get("artifacts") or []):
-        if not _include_artifact(artifact, selected_tools, full_assessment, selected_scan_ids):
+        scan_id = artifact.get("scan_id")
+        include_unlinked = not scan_id and _include_artifact(
+            artifact, selected_tools, full_assessment, selected_scan_ids
+        )
+        if scan_id not in selected_scan_ids and not include_unlinked:
             continue
         artifacts.append(_artifact_for_context(artifact))
         if len(artifacts) >= MAX_ARTIFACTS:

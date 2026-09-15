@@ -12,6 +12,7 @@ from app.services.assessment_conversation_ai import (
     answer_assessment_conversation_question,
     _apply_prompt_budget,
     _build_prompt_context,
+    _recover_rejected_assessment_answer,
     build_assessment_conversation_prompt,
     violates_conversation_truthfulness,
     violates_mongrel_native_guidance,
@@ -67,9 +68,8 @@ def test_novice_next_step_uses_current_evidence() -> None:
             question="Yo my man, I don't know what I'm doing. What should I do next?",
         )
 
-    assert "port': 22" not in ask_ai.call_args.args[0]
-    assert '"port": 22' in ask_ai.call_args.args[0]
-    assert "Review SSH exposure" in result["answer"]
+    ask_ai.assert_not_called()
+    assert "executes nothing" in result["answer"]
 
 
 def test_advanced_multi_tool_comparison_prompt_includes_selected_evidence() -> None:
@@ -1315,7 +1315,7 @@ def test_confidence_summary_deduplicates_httpx_and_omits_unknown_status() -> Non
     )
 
     assert result["answer"].count("https://example.test (status 200)") == 1
-    assert result["answer"].count("https://other.example") == 1
+    assert "https://other.example" not in result["answer"]
     assert "status None" not in result["answer"]
 
 
@@ -1780,6 +1780,74 @@ def test_casual_concern_and_next_step_variants_use_deterministic_routes(question
     model.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "question",
+    ["Which concern should I prioritize?", "What risk needs attention first?"],
+)
+def test_rejected_prioritization_generation_recovers_with_bounded_assessment_synthesis(question: str) -> None:
+    user_id = 1112
+    assessment = create_assessment("Rejected prioritization recovery", user_id=user_id)
+    finding = add_finding(
+        user_id=user_id,
+        finding={"source": "nmap", "target": "example.com", "open_ports": [{"port": 22, "protocol": "tcp", "service": "ssh"}]},
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="The target is secure and has no vulnerabilities.") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question=question,
+        )
+
+    model.assert_not_called()
+    assert "What stands out" in result["answer"]
+    assert "22/tcp" in result["answer"]
+    assert "establishes a confirmed vulnerability" in result["answer"]
+    assert result["answer"] != TRUTHFULNESS_FALLBACK_ANSWER
+
+
+def test_rejected_next_action_generation_recovers_without_second_model_call() -> None:
+    user_id = 1113
+    assessment = create_assessment("Rejected next action recovery", user_id=user_id)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Run every scanner; this proves the target is secure.") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Where should we go from here?",
+        )
+
+    model.assert_not_called()
+    assert "does not identify another automatically required tool" in result["answer"]
+    assert "executes nothing" in result["answer"]
+    assert result["answer"] != TRUTHFULNESS_FALLBACK_ANSWER
+
+
+def test_rejected_security_and_confidence_intents_use_existing_deterministic_calibration() -> None:
+    security = _recover_rejected_assessment_answer(
+        {
+            "question_intent": "uncertainty_safety",
+            "uncertainty_subtype": "overall_security",
+            "recommendation_context": {"tool_states": {}},
+        }
+    )
+    confidence = _recover_rejected_assessment_answer(
+        {
+            "question_intent": "follow_up_reference",
+            "current_question": "How strong is that evidence?",
+            "selection": {"inherited_evidence_scope": True, "selected_tools": ["nuclei"]},
+            "recommendation_context": {"tool_states": {"nuclei": "COMPLETED"}},
+            "assessment_context": {
+                "findings": [{"source": "nuclei", "nuclei_findings": [{"name": "Stored template", "severity": "info"}]}]
+            },
+        }
+    )
+
+    assert security is not None and "not enough to conclude" in security
+    assert confidence is not None and "Evidence confidence" in confidence
+    assert "Exploitability confidence: not established" in confidence
+
+
 def test_nuclei_template_match_cannot_be_rendered_as_causal_mitm_path() -> None:
     assessment = create_assessment("Nuclei causal guard", user_id=1106)
     finding = add_finding(user_id=1106, finding={
@@ -1847,8 +1915,7 @@ def test_broad_prompt_budget_prioritizes_severity_and_preserves_tool_coverage() 
     assert reduced is True
     rendered_findings = json.dumps(findings, default=str)
     assert "Stored high-severity template" in rendered_findings
-    assert "Technology fingerprint" in rendered_findings
-    assert rendered_findings.index("Stored high-severity template") < rendered_findings.index("Technology fingerprint")
+    assert "Technology fingerprint" not in rendered_findings
     assert budgeted["tool_state"]["testssl"] == "FAILED"
     assert set((budgeted.get("tool_state") or {})) == {
         "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl",
@@ -1858,7 +1925,7 @@ def test_broad_prompt_budget_prioritizes_severity_and_preserves_tool_coverage() 
     assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
 
 
-def test_narrow_prompt_budget_keeps_referenced_info_ahead_of_unrelated_high() -> None:
+def test_narrow_prompt_budget_uses_latest_authoritative_same_tool_run() -> None:
     user_id = 1104
     assessment = create_assessment("Reference-first budget", user_id=user_id)
     referenced = add_finding(user_id=user_id, finding={
@@ -1892,7 +1959,115 @@ def test_narrow_prompt_budget_keeps_referenced_info_ahead_of_unrelated_high() ->
     prompt = build_assessment_conversation_prompt(context, prompt_context=budgeted)
 
     assert reduced is True
-    assert "Weak HSTS" in rendered
+    assert "Weak HSTS" not in rendered
     assert "Unrelated high item" in rendered
-    assert rendered.index("Weak HSTS") < rendered.index("Unrelated high item")
     assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
+
+
+def _competition_final_conversation_fixture(user_id: int = 1200) -> dict:
+    assessment = create_assessment("Collective answer projection", user_id=user_id)
+    fixtures = {
+        "nmap": {"open_ports": [{"port": 80, "protocol": "tcp", "service": "http"}, {"port": 443, "protocol": "tcp", "service": "https"}]},
+        "httpx": {"httpx_services": [{"url": "https://example.test", "status_code": 301}, {"url": "https://attempted.example"}]},
+        "nuclei": {"nuclei_findings": [
+            {"name": "Technology observation", "severity": "info"},
+            {"name": "WAF detection", "severity": "info"},
+            {"name": "Weak HSTS", "severity": "info"},
+        ]},
+        "katana": {"katana_observations": [{"url": "https://example.test/", "depth": 0}]},
+        "playwright": {"playwright_observation": {"final_url": "https://example.test/", "status_code": 200, "forms_count": 0, "inputs_count": 12, "links_count": 4, "network_events_count": 8}},
+        "ffuf": {"ffuf_results": [], "metadata": {"ffuf_profile_label": "Standard", "wordlist_count": 2570}},
+        "testssl": {"testssl_evidence": {"target": "example.test", "protocols": [{"id": "TLS1_2", "finding": "offered"}]}},
+        "metasploit": {"metasploit_evidence": {"module_executed": True, "validation_outcome": "DETECTED", "session_established": False}},
+        "tshark": {"tshark_evidence": {"packet_count": 59, "byte_count": 6758, "observed_endpoints": [{"address": "203.0.113.10"}], "observed_protocols": [{"protocol": "TCP"}, {"protocol": "DNS"}, {"protocol": "HTTP"}], "http_observations": [{"method": "GET"}, {"status_code": 301}]}},
+    }
+    scans = {}
+    for tool, evidence in fixtures.items():
+        finding = add_finding(user_id=user_id, finding={"source": tool, "target": "example.test", **evidence})
+        scans[tool] = record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+    record_assessment_scan(assessment["id"], tool="bbot", status="failed")
+    return {"assessment": assessment, "scans": scans}
+
+
+@pytest.mark.parametrize(
+    "question, expected",
+    [
+        ("so are we secure?", "not enough to conclude"),
+        ("anything I should be worried about?", "What stands out"),
+        ("what should I try next?", "executes nothing"),
+        ("what important gaps remain?", "coverage"),
+        ("How strong is the evidence across this assessment?", "Evidence confidence"),
+        ("What did Nuclei find?", "template matches"),
+        ("Which concern should I prioritize?", "Priority interpretation"),
+        ("What did the tools find?", "Nmap recorded"),
+        ("What remains unknown?", "coverage"),
+    ],
+)
+def test_core_assessment_intent_matrix_is_deterministic_and_useful(question: str, expected: str) -> None:
+    fixture = _competition_final_conversation_fixture()
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1200, assessment_id=fixture["assessment"]["id"], conversation_id=None, question=question,
+        )
+
+    model.assert_not_called()
+    assert result["answer"] != TRUTHFULNESS_FALLBACK_ANSWER
+    assert expected.lower() in result["answer"].lower()
+    assert "secure target" not in result["answer"].lower()
+
+
+def test_canonical_projection_uses_latest_capture_not_later_related_artifact() -> None:
+    fixture = _competition_final_conversation_fixture(user_id=1201)
+    assessment_id = fixture["assessment"]["id"]
+    old = add_finding(user_id=1201, finding={"source": "tshark", "target": "example.test", "tshark_evidence": {"packet_count": 7}})
+    record_assessment_scan(assessment_id, tool="tshark", status="completed", finding_id=old["id"])
+    latest = add_finding(user_id=1201, finding={"source": "tshark", "target": "example.test", "tshark_evidence": {"observed_protocols": [{"protocol": "TCP"}]}})
+    latest_scan = record_assessment_scan(assessment_id, tool="tshark", status="partial", finding_id=latest["id"])
+    add_assessment_artifact(
+        assessment_id, scan_id=latest_scan["id"], artifact_type="tshark_normalized_evidence",
+        title="Authoritative capture", content=json.dumps({"packet_count": 59, "observed_protocols": [{"protocol": "TCP"}]}),
+    )
+    add_assessment_artifact(
+        assessment_id, scan_id=latest_scan["id"], artifact_type="tshark_metasploit_correlation_record",
+        title="Later related record", content=json.dumps({"correlation_confidence": "high"}),
+    )
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1201, assessment_id=assessment_id, conversation_id=None, question="What did TShark actually observe?",
+        )
+
+    model.assert_not_called()
+    assert "captured 59 packets" in result["answer"]
+    assert "7 packet" not in result["answer"]
+    assert "captured 0" not in result["answer"]
+
+
+def test_missing_tshark_packet_count_remains_unknown_not_zero() -> None:
+    assessment = create_assessment("Unknown capture count", user_id=1203)
+    finding = add_finding(user_id=1203, finding={
+        "source": "tshark", "target": "example.test",
+        "tshark_evidence": {"observed_protocols": [{"protocol": "TCP"}]},
+    })
+    record_assessment_scan(assessment["id"], tool="tshark", status="partial", finding_id=finding["id"])
+
+    result = answer_assessment_conversation_question(
+        user_id=1203, assessment_id=assessment["id"], conversation_id=None,
+        question="What did TShark actually observe?",
+    )
+
+    assert "packet count is unknown" in result["answer"]
+    assert "captured 0" not in result["answer"]
+
+
+def test_canonical_httpx_projection_does_not_promote_attempts_to_responses() -> None:
+    fixture = _competition_final_conversation_fixture(user_id=1202)
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1202, assessment_id=fixture["assessment"]["id"], conversation_id=None,
+            question="What did httpx actually observe?",
+        )
+
+    model.assert_not_called()
+    assert "https://example.test; status 301" in result["answer"]
+    assert "attempted.example" not in result["answer"]
