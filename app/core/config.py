@@ -99,7 +99,7 @@ class Settings(BaseSettings):
     ffuf_path: str = "ffuf"
     ffuf_scan_timeout_seconds: int = 120
     ffuf_quick_scan_timeout_seconds: int = 30
-    ffuf_deep_scan_timeout_seconds: int = 1500
+    ffuf_deep_scan_timeout_seconds: int = 2400
     ffuf_wordlist_path: Path = Path("app/resources/wordlists/ffuf_default.txt")
     ffuf_wordlist_standard_path: Path | None = None
     ffuf_wordlist_deep_path: Path | None = None

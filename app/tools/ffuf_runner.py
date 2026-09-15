@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 from pathlib import Path
 # Required to run authorized local ffuf subprocesses.
@@ -19,6 +20,9 @@ DEFAULT_FFUF_WORDLIST = Path("app/resources/wordlists/ffuf_default.txt")
 FFUF_MATCH_STATUS_CODES = "200-299,300-399,401,403,405,407,409,429,500-599"
 MAX_FFUF_THREADS = 50
 MAX_FFUF_RATE_LIMIT = 500
+# Deep runs reserve a bounded 20-minute margin beyond the rate-limit floor for
+# DNS, target latency, retries, filtering, and process overhead.
+FFUF_DEEP_TIMEOUT_MARGIN_SECONDS = 1200
 SAFE_FFUF_EXTENSION_PATTERN = re.compile(r"^\.[A-Za-z0-9]{1,16}$")
 FFUF_PROFILE_QUICK = "quick"
 FFUF_PROFILE_STANDARD = "standard"
@@ -51,7 +55,11 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
     wordlist_info = resolve_ffuf_profile_wordlist(profile, settings=settings, working_directory=working_directory)
     wordlist_path = wordlist_info["wordlist_path"]
     wordlist_count = int(wordlist_info["wordlist_count"] or 0)
-    timeout_seconds = resolve_ffuf_profile_timeout(profile, settings=settings)
+    timeout_seconds = resolve_ffuf_profile_timeout(
+        profile,
+        settings=settings,
+        wordlist_count=wordlist_count,
+    )
 
     if executable is None:
         logger.warning("ffuf executable missing. Checked PATH and candidate paths: %s", [str(candidate) for candidate in _ffuf_executable_candidates()])
@@ -279,13 +287,27 @@ def resolve_ffuf_profile_wordlist(profile: str | None = None, *, settings: objec
     }
 
 
-def resolve_ffuf_profile_timeout(profile: str | None = None, *, settings: object | None = None) -> int:
+def resolve_ffuf_profile_timeout(
+    profile: str | None = None,
+    *,
+    settings: object | None = None,
+    wordlist_count: int = 0,
+) -> int:
     resolved_settings = settings or get_settings()
     normalized_profile = normalize_ffuf_profile(profile)
     if normalized_profile == FFUF_PROFILE_QUICK:
         return max(1, int(getattr(resolved_settings, "ffuf_quick_scan_timeout_seconds", 30) or 30))
     if normalized_profile == FFUF_PROFILE_DEEP:
-        return max(1, int(getattr(resolved_settings, "ffuf_deep_scan_timeout_seconds", 1500) or 1500))
+        configured_timeout = max(
+            1,
+            int(getattr(resolved_settings, "ffuf_deep_scan_timeout_seconds", 2400) or 2400),
+        )
+        bounded_rate = max(
+            1,
+            min(int(getattr(resolved_settings, "ffuf_rate_limit", 25) or 25), MAX_FFUF_RATE_LIMIT),
+        )
+        request_floor = math.ceil(max(0, int(wordlist_count or 0)) / bounded_rate)
+        return max(configured_timeout, request_floor + FFUF_DEEP_TIMEOUT_MARGIN_SECONDS)
     return max(1, int(getattr(resolved_settings, "ffuf_scan_timeout_seconds", 120) or 120))
 
 

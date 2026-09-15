@@ -238,6 +238,7 @@ def test_navigation_text_builders_are_importable() -> None:
     assert "JavaScript endpoint discovery" in build_katana_target_prompt()
     assert "No clicks, form submissions, credential entry" in build_playwright_target_prompt()
     assert "Choose an ffuf discovery profile" in build_ffuf_profile_text()
+    assert "20–40+ minutes" in build_ffuf_profile_text()
     assert "ffuf Custom discovery request created" in build_ffuf_target_prompt()
     assert "https://example.com/search?q=FUZZ" in build_ffuf_target_prompt()
     assert "Nmap XML" in build_upload_text()

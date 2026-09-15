@@ -279,7 +279,7 @@ def build_ffuf_profile_text() -> str:
             "",
             "Quick: Fast smoke test with minimal coverage.",
             "Standard: Recommended default for normal discovery.",
-            "Deep: Broader discovery with more requests and longer runtime.",
+            "Deep: Broader discovery; allow approximately 20–40+ minutes depending on target latency.",
             "Settings: Use the configured custom FFUF_WORDLIST_PATH.",
         ]
     )
@@ -2940,7 +2940,11 @@ async def _handle_ffuf_target(
             target=display_target,
             profile_info=wordlist_info,
             fuzz_url=_build_fuzz_url(display_target),
-            timeout=resolve_ffuf_profile_timeout(profile, settings=settings),
+            timeout=resolve_ffuf_profile_timeout(
+                profile,
+                settings=settings,
+                wordlist_count=int(wordlist_info.get("wordlist_count") or 0),
+            ),
             threads=settings.ffuf_threads,
             rate_limit=settings.ffuf_rate_limit,
         )

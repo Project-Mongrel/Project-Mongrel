@@ -8,6 +8,7 @@ from app.core.config import Settings
 from app.parsers.ffuf_parser import parse_ffuf_output, summarize_ffuf_results
 from app.tools.ffuf_runner import (
     DEFAULT_FFUF_WORDLIST,
+    FFUF_DEEP_TIMEOUT_MARGIN_SECONDS,
     FFUF_MATCH_STATUS_CODES,
     FFUF_PROFILE_DEEP,
     FFUF_PROFILE_QUICK,
@@ -146,12 +147,32 @@ def test_ffuf_deep_profile_uses_configured_deep_wordlist(tmp_path: Path) -> None
 
 
 def test_ffuf_profile_timeout_resolution_is_profile_aware() -> None:
-    settings = Settings(_env_file=None, ffuf_scan_timeout_seconds=120, ffuf_quick_scan_timeout_seconds=30, ffuf_deep_scan_timeout_seconds=1500)
+    settings = Settings(_env_file=None, ffuf_scan_timeout_seconds=120, ffuf_quick_scan_timeout_seconds=30, ffuf_deep_scan_timeout_seconds=2400)
 
-    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_QUICK, settings=settings) == 30
-    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_STANDARD, settings=settings) == 120
-    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_DEEP, settings=settings) == 1500
+    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_QUICK, settings=settings, wordlist_count=29_999) == 30
+    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_STANDARD, settings=settings, wordlist_count=29_999) == 120
+    assert resolve_ffuf_profile_timeout(FFUF_PROFILE_DEEP, settings=settings) == 2400
     assert resolve_ffuf_profile_timeout(None, settings=settings) == 120
+
+
+def test_ffuf_deep_timeout_cannot_undercut_rate_floor_plus_margin() -> None:
+    wordlist_count = 29_999
+    rate_limit = 25
+    request_floor = 1_200
+    settings = Settings(
+        _env_file=None,
+        ffuf_deep_scan_timeout_seconds=1,
+        ffuf_rate_limit=rate_limit,
+    )
+
+    timeout = resolve_ffuf_profile_timeout(
+        FFUF_PROFILE_DEEP,
+        settings=settings,
+        wordlist_count=wordlist_count,
+    )
+
+    assert timeout == request_floor + FFUF_DEEP_TIMEOUT_MARGIN_SECONDS
+    assert timeout == 2_400
 
 
 def test_ffuf_standard_profile_missing_wordlist_fails_cleanly(tmp_path: Path) -> None:
