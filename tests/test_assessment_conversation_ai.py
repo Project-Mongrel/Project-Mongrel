@@ -1783,6 +1783,84 @@ def test_casual_concern_and_next_step_variants_use_deterministic_routes(question
 
 @pytest.mark.parametrize(
     "question",
+    [
+        "Which tools completed, failed, timed out or were not run?",
+        "Which tools completed?",
+        "What failed?",
+        "What timed out?",
+        "Which tools were not run?",
+        "What was or was not run?",
+        "Show scan statuses",
+        "What is the assessment coverage/status?",
+    ],
+)
+def test_tool_status_inventory_questions_are_deterministic_and_precede_recommendations(question: str) -> None:
+    user_id = 1114
+    assessment = create_assessment("Mixed tool status inventory", user_id=user_id)
+    for tool, status in (
+        ("nmap", "completed"),
+        ("httpx", "partial"),
+        ("testssl", "timed_out"),
+        ("bbot", "failed"),
+        ("ffuf", "cancelled"),
+        ("katana", "interrupted"),
+    ):
+        record_assessment_scan(assessment["id"], tool=tool, status=status)
+
+    context = build_assessment_conversation_context(
+        user_id=user_id, assessment_id=assessment["id"], question=question,
+    )
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question=question,
+        )
+
+    assert context["question_intent"] == "tool_state_overview"
+    answer = result["answer"]
+    assert "Completed: Nmap." in answer
+    assert "Partial: httpx." in answer
+    assert "Timed out: testssl.sh." in answer
+    assert "Failed: BBOT." in answer
+    assert "Cancelled: ffuf." in answer
+    assert "Interrupted: Katana." in answer
+    assert "Not run: Nuclei, Playwright, Gitleaks, Prowler, Metasploit, TShark." in answer
+    assert "completion does not establish security" in answer.lower()
+    assert "does not recommend or execute another tool" in answer.lower()
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What should I run next?",
+        "Which missing tool should I use?",
+    ],
+)
+def test_explicit_next_tool_questions_remain_recommendations(question: str) -> None:
+    user_id = 1115
+    assessment = create_assessment("Explicit next tool routing", user_id=user_id)
+    finding = add_finding(
+        user_id=user_id,
+        finding={"source": "nmap", "target": "example.com", "open_ports": [{"port": 80, "protocol": "tcp", "service": "http"}]},
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", finding_id=finding["id"])
+
+    context = build_assessment_conversation_context(
+        user_id=user_id, assessment_id=assessment["id"], question=question,
+    )
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question=question,
+        )
+
+    assert context["question_intent"] == "next_step_recommendation"
+    assert "httpx next" in result["answer"].lower()
+    assert "no tool has been run" in result["answer"].lower()
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "question",
     ["Which concern should I prioritize?", "What risk needs attention first?"],
 )
 def test_rejected_prioritization_generation_recovers_with_bounded_assessment_synthesis(question: str) -> None:

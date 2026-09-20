@@ -88,6 +88,7 @@ PRODUCT_QUESTION_PATTERNS = (
 )
 RECOMMENDATION_QUESTION_TERMS = (
     "what next", "what is next", "do next", "run next", "should i run", "which tool", "which mongrel tool",
+    "which missing tool",
     "try next", "should i try", "will i try next", "what do i run next",
     "recommend", "what would you investigate", "would you investigate", "how do i investigate", "what should we do",
     "where do we go from here", "where should we go from here",
@@ -169,6 +170,12 @@ TOOL_RELEVANCE_PATTERNS = (
 TOOL_STATE_OVERVIEW_PATTERNS = (
     re.compile(r"\bwhich\s+tools?\s+(?:have|has)\s+(?:run|been\s+run)\b"),
     re.compile(r"\bwhich\s+tools?\s+(?:haven'?t|have\s+not)\s+(?:run|been\s+run)\b"),
+    re.compile(r"\bwhich\s+tools?\s+(?:completed|failed|timed\s+out)\b"),
+    re.compile(r"\bwhich\s+tools?\s+(?:(?:were|are)\s+)?not\s+run\b"),
+    re.compile(r"\bwhat\s+(?:tools?\s+)?(?:failed|timed\s+out)\b"),
+    re.compile(r"\bwhat\s+(?:was|were)\s+(?:or|and)\s+(?:was|were)\s+not\s+run\b"),
+    re.compile(r"\bshow\s+(?:me\s+)?(?:the\s+)?scan\s+statuses\b"),
+    re.compile(r"\bassessment\s+(?:coverage|status)(?:\s*(?:and|/)\s*(?:coverage|status))?\b"),
     re.compile(r"\bwhich\s+(?:ones|tools?)\s+haven'?t\b"),
     re.compile(r"^which\s+haven'?t\??$"),
 )

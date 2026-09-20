@@ -1824,25 +1824,31 @@ def _build_false_premise_correction(context: dict) -> str:
 def _build_tool_state_overview(context: dict) -> str:
     states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
     names = {name.lower().removesuffix(".sh"): name for name in get_mongrel_tool_names()}
-    grouped = {}
+    grouped: dict[str, list[str]] = {}
     for tool, state in states.items():
         grouped.setdefault(str(state), []).append(names.get(str(tool), str(tool)))
-    question = str(context.get("current_question") or "").lower()
-    if "haven't" in question or "havent" in question or "have not" in question:
-        missing = grouped.get("NOT_RUN", [])
-        return (
-            "Not run in this assessment: " + (", ".join(missing) if missing else "none") + ". NOT_RUN is tool state, "
-            "not evidence of a clean result or absence of findings."
-        )
-    completed = grouped.get("COMPLETED", [])
-    qualifiers = [
-        f"{state.lower().replace('_', ' ')}: {', '.join(grouped[state])}"
-        for state in ("RUNNING", "PARTIAL", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED", "SKIPPED") if grouped.get(state)
+    labels = (
+        ("COMPLETED", "Completed"),
+        ("PARTIAL", "Partial"),
+        ("TIMED_OUT", "Timed out"),
+        ("FAILED", "Failed"),
+        ("CANCELLED", "Cancelled"),
+        ("INTERRUPTED", "Interrupted"),
+        ("NOT_RUN", "Not run"),
+        ("RUNNING", "Running"),
+        ("SKIPPED", "Skipped"),
+    )
+    inventory = [
+        f"{label}: {', '.join(grouped.get(state) or ['none'])}."
+        for state, label in labels
+        if state not in {"RUNNING", "SKIPPED"} or grouped.get(state)
     ]
-    answer = "Completed in this assessment: " + (", ".join(completed) if completed else "none") + "."
-    if qualifiers:
-        answer += " Other recorded states — " + "; ".join(qualifiers) + "."
-    return answer + " Completion records execution state; it does not establish findings, exploitation, or security."
+    return (
+        "Assessment tool status — "
+        + " ".join(inventory)
+        + " These are execution and coverage states only: completion does not establish security, vulnerability absence, "
+        "or exploitability. This answer does not recommend or execute another tool."
+    )
 
 
 def _build_cross_tool_confirmation(context: dict) -> str:
