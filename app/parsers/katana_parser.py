@@ -124,13 +124,13 @@ def _query_parameters(item: dict, parsed_url: object) -> list[str]:
     if isinstance(raw_parameters, dict):
         values.extend(str(key) for key in raw_parameters)
     elif isinstance(raw_parameters, list):
-        values.extend(str(value) for value in raw_parameters)
+        values.extend(_explicit_parameter_name(value) for value in raw_parameters)
     elif isinstance(raw_parameters, str):
         values.extend(part.strip() for part in raw_parameters.split(","))
     values.extend(parse_qs(parsed_url.query).keys())
     unique_values = []
     for value in values:
-        cleaned = str(value or "").strip()
+        cleaned = _explicit_parameter_name(value)
         if cleaned and cleaned.lower() not in {item.lower() for item in unique_values}:
             unique_values.append(cleaned)
     return unique_values
@@ -143,8 +143,23 @@ def _normalize_form(form: dict) -> dict:
     }
     inputs = form.get("inputs") if isinstance(form.get("inputs"), list) else []
     if inputs:
-        normalized["inputs"] = [str(value).strip() for value in inputs if str(value).strip()]
+        normalized["inputs"] = [name for value in inputs if (name := _explicit_parameter_name(value))]
     return {key: value for key, value in normalized.items() if value not in (None, "", [], {})}
+
+
+def _explicit_parameter_name(value: object) -> str:
+    if isinstance(value, dict):
+        value = value.get("name") if value.get("name") not in (None, "") else value.get("key")
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return ""
+    cleaned = str(value).strip()
+    if not cleaned or cleaned.startswith(("{", "[")):
+        return ""
+    for separator in ("=", ":"):
+        cleaned = cleaned.split(separator, 1)[0].strip()
+    if not cleaned or len(cleaned) > 128:
+        return ""
+    return cleaned if all(character.isalnum() or character in "_.-[]" for character in cleaned) else ""
 
 
 def _first_string(item: dict, *keys: str) -> str | None:

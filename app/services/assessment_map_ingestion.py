@@ -24,15 +24,22 @@ from app.services.assessment_map_store import (
     AssessmentMapScopeError,
     initialize_assessment_map_schema,
 )
+from app.services.assessment_map_web_ingestion import (
+    STRUCTURED_ARTIFACT_TYPES as WEB_STRUCTURED_ARTIFACT_TYPES,
+    map_web_source,
+    project_web_source,
+    web_coverage_metadata,
+)
 from app.services.findings_store import _get_connection
 from app.services.sqlite_runtime import run_locked_transaction
 
 INGESTION_VERSION = 1
 DIGEST_VERSION = "assessment-map.ingestion-source.v1"
-SUPPORTED_TOOLS = frozenset({"nmap", "httpx"})
+SUPPORTED_TOOLS = frozenset({"nmap", "httpx", "katana", "playwright", "ffuf"})
 STRUCTURED_ARTIFACT_TYPES = {
     "nmap": frozenset({"nmap_normalized_evidence", "nmap_structured_evidence", "nmap_json"}),
     "httpx": frozenset({"httpx_normalized_evidence", "httpx_structured_evidence", "httpx_json"}),
+    **WEB_STRUCTURED_ARTIFACT_TYPES,
 }
 _SAFE_RESPONSE_HEADER_NAMES = frozenset(
     {
@@ -70,6 +77,50 @@ class _Counts:
         return cls(set(), set(), set())
 
 
+class _WebMappingWriter:
+    """Bind tool-specific mapping rules to the central transactional/provenance writer."""
+
+    def __init__(self, connection, user_id, assessment_id, scan, source, counts, metadata):
+        self.connection = connection
+        self.user_id = user_id
+        self.assessment_id = assessment_id
+        self.scan = scan
+        self.source = source
+        self.counts = counts
+        self.metadata = metadata
+        self.root_path = source.root_path
+
+    def entity(self, identity, evidence_kind, path):
+        row = _entity(self.connection, self.user_id, self.assessment_id, identity)
+        self.counts.entities.add(int(row["id"]))
+        _evidence(
+            self.connection, self.user_id, self.assessment_id, self.scan, self.source,
+            row, "entity", evidence_kind, path, self.counts,
+        )
+        return row
+
+    def skipped_optional(self, reason):
+        skipped = self.metadata.setdefault("skipped_optional_records", {})
+        skipped[reason] = int(skipped.get(reason, 0)) + 1
+
+    def assertion(
+        self, subject, predicate, *, evidence_kind, path, object_entity=None, value=...,
+    ):
+        kwargs = {"object_entity_id": int(object_entity["id"])} if object_entity is not None else {}
+        if value is not ...:
+            kwargs["value"] = value
+        row = _assertion(
+            self.connection, self.user_id, self.assessment_id, int(subject["id"]), predicate,
+            **kwargs,
+        )
+        self.counts.assertions.add(int(row["id"]))
+        _evidence(
+            self.connection, self.user_id, self.assessment_id, self.scan, self.source,
+            row, "assertion", evidence_kind, path, self.counts,
+        )
+        return row
+
+
 def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) -> dict:
     """Ingest one scan; ledger counts are unique canonical rows referenced by its projection."""
 
@@ -105,17 +156,38 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
         active.execute("SAVEPOINT assessment_map_scan_ingestion")
         try:
             counts = _Counts.empty()
+            projection_metadata: dict[str, Any] = {}
+            if tool in {"katana", "playwright", "ffuf"}:
+                projection_metadata = {
+                    "metadata_version": "assessment-map.web-coverage.v1",
+                    "tool": tool,
+                    "sources": [
+                        {
+                            "finding_id": source.finding_id,
+                            "artifact_id": source.artifact_id,
+                            "coverage": web_coverage_metadata(tool, source.data),
+                        }
+                        for source in sources
+                    ],
+                }
             for source in sources:
                 if tool == "nmap":
                     _ingest_nmap_source(active, user_id, assessment_id, scan, source, counts)
-                else:
+                elif tool == "httpx":
                     _ingest_httpx_source(active, user_id, assessment_id, scan, source, counts)
-            if not counts.entities and not counts.assertions:
+                else:
+                    map_web_source(tool, source.data, _WebMappingWriter(
+                        active, user_id, assessment_id, scan, source, counts, projection_metadata
+                    ))
+            if not counts.entities and not counts.assertions and tool != "ffuf":
                 raise AssessmentMapIngestionError("No supported structured observations were available.")
         except (AssessmentMapIngestionError, ValueError, TypeError, AssessmentMapIdentityCollisionError):
             active.execute("ROLLBACK TO SAVEPOINT assessment_map_scan_ingestion")
             active.execute("RELEASE SAVEPOINT assessment_map_scan_ingestion")
-            return _write_ledger(active, user_id, assessment_id, scan_id, digest, "failed", error_code="malformed_structured_evidence")
+            return _write_ledger(
+                active, user_id, assessment_id, scan_id, digest, "failed",
+                error_code="malformed_structured_evidence", metadata=projection_metadata,
+            )
         except sqlite3.OperationalError:
             raise
         except Exception:
@@ -132,6 +204,7 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
             entity_count=len(counts.entities),
             assertion_count=len(counts.assertions),
             evidence_count=len(counts.evidence),
+            metadata=projection_metadata,
         )
         _replace_projection(
             active,
@@ -223,7 +296,14 @@ def _canonical_digest_projection(
 ) -> dict[str, Any]:
     projected_sources = []
     for source in sources:
-        projection = _project_nmap_source(source.data) if tool == "nmap" else _project_httpx_source(source.data)
+        if tool == "nmap":
+            projection = _project_nmap_source(source.data)
+        elif tool == "httpx":
+            projection = _project_httpx_source(source.data)
+        elif tool in {"katana", "playwright", "ffuf"}:
+            projection = project_web_source(tool, source.data)
+        else:
+            projection = {"unsupported": True}
         projected_sources.append(
             {
                 "finding_id": source.finding_id,
@@ -917,20 +997,24 @@ def _write_ledger(
     assertion_count: int = 0,
     evidence_count: int = 0,
     error_code: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict:
     now = _now()
     connection.execute(
         """INSERT INTO assessment_map_ingestions (
                assessment_id, user_id, scan_id, ingestion_version, source_digest, status,
-               entity_count, assertion_count, evidence_count, error_code, ingested_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               entity_count, assertion_count, evidence_count, error_code, metadata_json,
+               ingested_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(assessment_id, user_id, scan_id, ingestion_version, source_digest)
            DO UPDATE SET status = excluded.status, entity_count = excluded.entity_count,
                assertion_count = excluded.assertion_count, evidence_count = excluded.evidence_count,
-               error_code = excluded.error_code, updated_at = excluded.updated_at""",
+               error_code = excluded.error_code, metadata_json = excluded.metadata_json,
+               updated_at = excluded.updated_at""",
         (
             assessment_id, user_id, scan_id, INGESTION_VERSION, digest, status,
-            entity_count, assertion_count, evidence_count, error_code, now, now,
+            entity_count, assertion_count, evidence_count, error_code,
+            _json(metadata or {}), now, now,
         ),
     )
     return _row(_ledger(connection, user_id, assessment_id, scan_id, digest))

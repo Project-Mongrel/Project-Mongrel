@@ -653,6 +653,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             assertion_count INTEGER NOT NULL DEFAULT 0,
             evidence_count INTEGER NOT NULL DEFAULT 0,
             error_code TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             ingested_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY(assessment_id, user_id, scan_id, ingestion_version, source_digest),
@@ -661,6 +662,15 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
         """
     )
+    ingestion_columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(assessment_map_ingestions)").fetchall()
+    }
+    if "metadata_json" not in ingestion_columns:
+        connection.execute(
+            "ALTER TABLE assessment_map_ingestions "
+            "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+        )
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_map_evidence_id_scope_unique "
         "ON assessment_map_evidence_links(id, assessment_id, user_id)"
