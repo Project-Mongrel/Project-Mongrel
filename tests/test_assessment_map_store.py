@@ -111,6 +111,8 @@ def test_concurrent_initialization_is_idempotent_and_thread_safe() -> None:
         "assessment_map_entities",
         "assessment_map_assertions",
         "assessment_map_evidence_links",
+        "assessment_map_ingestion_evidence",
+        "assessment_map_ingestion_heads",
         "assessment_map_ingestions",
     }
 

@@ -661,6 +661,50 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
         """
     )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_map_evidence_id_scope_unique "
+        "ON assessment_map_evidence_links(id, assessment_id, user_id)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS assessment_map_ingestion_heads (
+            assessment_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            scan_id INTEGER NOT NULL,
+            ingestion_version INTEGER NOT NULL,
+            source_digest TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(assessment_id, user_id, scan_id, ingestion_version),
+            FOREIGN KEY(assessment_id, user_id) REFERENCES assessments(id, user_id) ON DELETE RESTRICT,
+            FOREIGN KEY(scan_id, assessment_id) REFERENCES assessment_scans(id, assessment_id) ON DELETE RESTRICT,
+            FOREIGN KEY(assessment_id, user_id, scan_id, ingestion_version, source_digest)
+                REFERENCES assessment_map_ingestions(
+                    assessment_id, user_id, scan_id, ingestion_version, source_digest
+                ) ON DELETE RESTRICT
+        ) WITHOUT ROWID
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS assessment_map_ingestion_evidence (
+            assessment_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            scan_id INTEGER NOT NULL,
+            ingestion_version INTEGER NOT NULL,
+            source_digest TEXT NOT NULL,
+            evidence_link_id INTEGER NOT NULL,
+            PRIMARY KEY(
+                assessment_id, user_id, scan_id, ingestion_version, source_digest, evidence_link_id
+            ),
+            FOREIGN KEY(assessment_id, user_id, scan_id, ingestion_version, source_digest)
+                REFERENCES assessment_map_ingestions(
+                    assessment_id, user_id, scan_id, ingestion_version, source_digest
+                ) ON DELETE RESTRICT,
+            FOREIGN KEY(evidence_link_id, assessment_id, user_id)
+                REFERENCES assessment_map_evidence_links(id, assessment_id, user_id) ON DELETE RESTRICT
+        ) WITHOUT ROWID
+        """
+    )
     for statement in (
         "CREATE INDEX IF NOT EXISTS idx_map_entities_scope_type ON assessment_map_entities(user_id, assessment_id, entity_type, id)",
         "CREATE INDEX IF NOT EXISTS idx_map_assertions_subject ON assessment_map_assertions(user_id, assessment_id, subject_entity_id, predicate)",
@@ -671,6 +715,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_map_validation_finding ON assessment_validation_attempts(user_id, assessment_id, finding_entity_id, completed_at)",
         "CREATE INDEX IF NOT EXISTS idx_map_validation_state ON assessment_validation_attempts(user_id, assessment_id, validation_state)",
         "CREATE INDEX IF NOT EXISTS idx_map_ingestions_scan ON assessment_map_ingestions(user_id, assessment_id, scan_id)",
+        "CREATE INDEX IF NOT EXISTS idx_map_ingestion_evidence_link ON assessment_map_ingestion_evidence(evidence_link_id)",
     ):
         connection.execute(statement)
     _create_scope_triggers(connection)
