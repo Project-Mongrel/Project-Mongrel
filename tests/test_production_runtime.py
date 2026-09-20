@@ -10,6 +10,10 @@ from app.core.logging import RedactingFormatter, redact_sensitive_text
 
 
 UNIT_PATH = Path("deploy/systemd/mongrel.service")
+TESTSSL_ENV_EXAMPLE_PATH = Path("deploy/systemd/testssl.env.example")
+TESTSSL_DROP_IN_PATH = Path("deploy/systemd/mongrel.service.d/testssl-env.conf")
+FFUF_ENV_EXAMPLE_PATH = Path("deploy/systemd/ffuf.env.example")
+FFUF_DROP_IN_PATH = Path("deploy/systemd/mongrel.service.d/ffuf-env.conf")
 
 
 def test_systemd_unit_uses_explicit_non_root_runtime_and_venv():
@@ -20,6 +24,64 @@ def test_systemd_unit_uses_explicit_non_root_runtime_and_venv():
     assert "ExecStart=/home/mongrel/Project-Mongrel/.venv/bin/python -m app.bot.bot" in unit
     assert "EnvironmentFile=/etc/mongrel/mongrel.env" in unit
     assert "TELEGRAM_BOT_TOKEN=" not in unit
+
+
+def test_testssl_configuration_default_and_explicit_override(monkeypatch):
+    monkeypatch.delenv("TESTSSL_SCAN_TIMEOUT_SECONDS", raising=False)
+    assert Settings(_env_file=None).testssl_scan_timeout_seconds == 600
+    assert Settings(_env_file=None, testssl_scan_timeout_seconds=37).testssl_scan_timeout_seconds == 37
+
+
+def test_production_testssl_override_uses_absolute_path_and_safe_timeout():
+    lines = [
+        line
+        for line in TESTSSL_ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert lines == [
+        "TESTSSL_PATH=/opt/testssl.sh/testssl.sh",
+        "TESTSSL_SCAN_TIMEOUT_SECONDS=600",
+    ]
+    assignments = [line.partition("=") for line in lines]
+    assert all(not name.endswith(("TOKEN", "PASSWORD", "KEY")) for name, _, _value in assignments)
+
+
+def test_testssl_drop_in_loads_override_after_primary_environment_file():
+    unit = UNIT_PATH.read_text(encoding="utf-8")
+    drop_in = TESTSSL_DROP_IN_PATH.read_text(encoding="utf-8")
+    assert "EnvironmentFile=/etc/mongrel/mongrel.env" in unit
+    assert drop_in.splitlines() == ["[Service]", "EnvironmentFile=/etc/mongrel/testssl.env"]
+
+
+def test_production_ffuf_override_uses_managed_seclists_symlinks():
+    lines = [
+        line
+        for line in FFUF_ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert lines == [
+        "FFUF_WORDLIST_STANDARD_PATH=/home/mongrel/wordlists/ffuf-standard.txt",
+        "FFUF_WORDLIST_DEEP_PATH=/home/mongrel/wordlists/ffuf-deep.txt",
+    ]
+    documentation = FFUF_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+    assert "symlinks to SecLists" in documentation
+    assert "readable by the mongrel service user" in documentation
+    portable_lines = [
+        line
+        for line in Path(".env.example").read_text(encoding="utf-8").splitlines()
+        if line.startswith(("FFUF_WORDLIST_STANDARD_PATH=", "FFUF_WORDLIST_DEEP_PATH="))
+    ]
+    assert portable_lines == [
+        "FFUF_WORDLIST_STANDARD_PATH=",
+        "FFUF_WORDLIST_DEEP_PATH=",
+    ]
+
+
+def test_ffuf_drop_in_loads_override_after_primary_environment_file():
+    unit = UNIT_PATH.read_text(encoding="utf-8")
+    drop_in = FFUF_DROP_IN_PATH.read_text(encoding="utf-8")
+    assert "EnvironmentFile=/etc/mongrel/mongrel.env" in unit
+    assert drop_in.splitlines() == ["[Service]", "EnvironmentFile=/etc/mongrel/ffuf.env"]
 
 
 def test_systemd_unit_has_restart_shutdown_and_boot_controls():

@@ -188,7 +188,7 @@ cp .env.example .env
 .venv/bin/python -m app.bot.bot
 ```
 
-The application loads `.env` locally. The supplied systemd unit instead reads `/etc/mongrel/mongrel.env`.
+The application loads `.env` locally. The supplied systemd unit instead reads `/etc/mongrel/mongrel.env`. The portable local example uses `TESTSSL_PATH=testssl.sh`; production deployments can install the reviewed testssl override below to use `/opt/testssl.sh/testssl.sh` with the 600-second scan timeout.
 
 ### systemd deployment
 
@@ -203,10 +203,20 @@ Review those paths, required groups/capabilities, and every `ReadWritePaths` ent
 
 ```bash
 sudo install -o root -g root -m 0644 deploy/systemd/mongrel.service /etc/systemd/system/mongrel.service
+sudo install -d -o root -g root -m 0755 /etc/systemd/system/mongrel.service.d
+sudo install -o root -g root -m 0644 deploy/systemd/mongrel.service.d/testssl-env.conf /etc/systemd/system/mongrel.service.d/testssl-env.conf
+sudo install -o root -g root -m 0644 deploy/systemd/mongrel.service.d/ffuf-env.conf /etc/systemd/system/mongrel.service.d/ffuf-env.conf
+sudo install -d -o root -g root -m 0755 /etc/mongrel
+sudo install -o root -g root -m 0600 deploy/systemd/testssl.env.example /etc/mongrel/testssl.env
+sudo install -o root -g root -m 0600 deploy/systemd/ffuf.env.example /etc/mongrel/ffuf.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now mongrel.service
 sudo systemctl status mongrel.service --no-pager
 ```
+
+The testssl drop-in loads `/etc/mongrel/testssl.env` after the primary environment file, so its two reviewed production values take precedence without duplicating or exposing the main environment file. Review the absolute executable path on each host before installation.
+
+The ffuf drop-in similarly loads `/etc/mongrel/ffuf.env` after the primary environment file. The configured files under `/home/mongrel/wordlists/` are deployment-managed symlinks to the selected SecLists wordlists; both symlinks and their targets must be readable by the `mongrel` service user. The blank ffuf paths in `.env.example` remain portable development defaults.
 
 Do not weaken the unit sandbox broadly to make a scanner work. Grant only the narrowly required runtime paths and privileges after validating the scanner outside and inside the service boundary.
 

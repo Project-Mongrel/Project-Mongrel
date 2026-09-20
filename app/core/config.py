@@ -107,7 +107,7 @@ class Settings(BaseSettings):
     ffuf_rate_limit: int = 25
     ffuf_extensions: str = ""
     testssl_path: str = "testssl.sh"
-    testssl_scan_timeout_seconds: int = 180
+    testssl_scan_timeout_seconds: int = 600
     testssl_connect_timeout_seconds: int = 10
     testssl_openssl_timeout_seconds: int = 5
     testssl_ip_mode: str = ""
