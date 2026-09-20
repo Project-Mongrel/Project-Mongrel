@@ -24,7 +24,15 @@ from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.parsers.metasploit_parser import parse_metasploit_validation_result
 from app.parsers.tshark_parser import normalize_tshark_result
 from app.services.ai_client import ask_ai
-from app.services.assessment_store import add_assessment_artifact, get_assessment, list_assessment_scans, list_assessment_targets, record_assessment_scan
+from app.services.assessment_store import (
+    add_assessment_artifact,
+    finalize_assessment_scan,
+    get_assessment,
+    list_assessment_scans,
+    list_assessment_targets,
+    record_assessment_scan,
+    start_assessment_scan,
+)
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
 from app.services.icon_helper import icon_label, section_label
@@ -37,6 +45,7 @@ from app.services.metasploit_approval import (
     record_metasploit_result_reference,
 )
 from app.services.target_normalizer import normalize_target_key
+from app.services.scan_status import scan_status_from_result
 from app.services.tshark_approval import TSharkApprovalError, approve_tshark_capture, get_tshark_capture_proposal, propose_tshark_capture, reject_tshark_capture
 from app.services.tshark_metasploit_correlation import (
     build_tshark_metasploit_correlation_record,
@@ -64,6 +73,7 @@ _tshark_live_contexts: dict[str, dict] = {}
 _tshark_capture_validation_tokens: dict[str, dict] = {}
 _latest_upload_scan_summaries: dict[int, dict] = {}
 logger = logging.getLogger(__name__)
+TSHARK_RUNNING_SCAN_GUARD_KEY = "tshark_running_scan_guard"
 
 
 def build_upload_text() -> str:
@@ -1212,6 +1222,7 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
         return
 
     temp_path: Path | None = None
+    fallback_status = "failed"
     try:
         telegram_file = await document.get_file()
         file_bytes = bytes(await telegram_file.download_as_bytearray())
@@ -1231,6 +1242,8 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
         finally:
             handle.close()
 
+        if assessment_context:
+            _start_tshark_assessment_scan(assessment_context)
         result = await asyncio.to_thread(run_tshark_offline_analysis, temp_path)
         normalized = await asyncio.to_thread(normalize_tshark_result, result)
         if assessment_context:
@@ -1239,7 +1252,11 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
         await update.message.reply_text(build_tshark_result_text(normalized, display_result))
         if assessment_context:
             await _send_tshark_assessment_dashboard(update.message, int(assessment_context["assessment_id"]))
+    except asyncio.CancelledError:
+        fallback_status = "cancelled"
+        raise
     finally:
+        _finalize_tshark_assessment_scan_if_running(assessment_context, status=fallback_status)
         clear_upload_state(user_id)
         if temp_path is not None:
             try:
@@ -1250,14 +1267,24 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
 
 def _persist_tshark_assessment_evidence(assessment_context: dict, result: dict, normalized: dict) -> None:
     assessment_id = int(assessment_context["assessment_id"])
-    status = "completed" if result.get("success") is True else "failed"
-    scan = record_assessment_scan(
-        assessment_id=assessment_id,
-        tool="tshark",
-        status=status,
-        elapsed_seconds=_parse_elapsed_seconds(result.get("elapsed_seconds")),
-        raw_reference="assessment_artifact:tshark_normalized_evidence",
-    )
+    status = scan_status_from_result(result)
+    scan_id = assessment_context.get("assessment_scan_id")
+    if scan_id is not None:
+        scan = finalize_assessment_scan(
+            assessment_id=assessment_id,
+            scan_id=int(scan_id),
+            status=status,
+            elapsed_seconds=_parse_elapsed_seconds(result.get("elapsed_seconds")),
+            raw_reference="assessment_artifact:tshark_normalized_evidence",
+        )
+    else:
+        scan = record_assessment_scan(
+            assessment_id=assessment_id,
+            tool="tshark",
+            status=status,
+            elapsed_seconds=_parse_elapsed_seconds(result.get("elapsed_seconds")),
+            raw_reference="assessment_artifact:tshark_normalized_evidence",
+        )
     add_assessment_artifact(
         assessment_id=assessment_id,
         scan_id=scan["id"],
@@ -1266,6 +1293,31 @@ def _persist_tshark_assessment_evidence(assessment_context: dict, result: dict, 
         content=json.dumps(_bounded_tshark_artifact_payload(normalized), sort_keys=True),
         file_path=None,
     )
+
+
+def _start_tshark_assessment_scan(assessment_context: dict) -> None:
+    if assessment_context.get("assessment_scan_id") is not None:
+        return
+    scan = start_assessment_scan(
+        assessment_id=int(assessment_context["assessment_id"]),
+        target_id=_parse_optional_int(assessment_context.get("target_id")),
+        tool="tshark",
+    )
+    assessment_context["assessment_scan_id"] = int(scan["id"])
+
+
+def _finalize_tshark_assessment_scan_if_running(
+    assessment_context: dict | None,
+    *,
+    status: str = "failed",
+) -> dict | None:
+    if not isinstance(assessment_context, dict):
+        return None
+    assessment_id = _parse_optional_int(assessment_context.get("assessment_id"))
+    scan_id = _parse_optional_int(assessment_context.get("assessment_scan_id"))
+    if assessment_id is None or scan_id is None:
+        return None
+    return finalize_assessment_scan(assessment_id=assessment_id, scan_id=scan_id, status=status)
 
 
 def _persist_tshark_capture_validation_provenance(assessment_id: int, result: dict) -> str | None:
@@ -1563,6 +1615,19 @@ def _decode_callback_value(value: str) -> str:
 
 
 async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    fallback_status = "failed"
+    try:
+        await _tshark_callback_handler_impl(update, context)
+    except asyncio.CancelledError:
+        fallback_status = "cancelled"
+        raise
+    finally:
+        user_data = getattr(context, "user_data", None)
+        assessment_context = user_data.pop(TSHARK_RUNNING_SCAN_GUARD_KEY, None) if isinstance(user_data, dict) else None
+        _finalize_tshark_assessment_scan_if_running(assessment_context, status=fallback_status)
+
+
+async def _tshark_callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
         return
@@ -1784,6 +1849,9 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 return
             validation_proposal_id = str(executable_validation.id)
             metasploit_request = dict(executable_validation.request)
+            if _parse_optional_int(live_context.get("assessment_id")) is not None:
+                _start_tshark_assessment_scan(live_context)
+                context.user_data[TSHARK_RUNNING_SCAN_GUARD_KEY] = live_context
             await query.edit_message_text("TShark capture approved. Running bounded capture during validation...")
             result = await asyncio.to_thread(
                 run_tshark_capture_during_validation,
@@ -1807,7 +1875,7 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
             provenance_ref = None
             if assessment_id is not None:
-                _persist_tshark_assessment_evidence({"assessment_id": assessment_id}, result, normalized)
+                _persist_tshark_assessment_evidence(live_context, result, normalized)
                 provenance_ref = _persist_tshark_capture_validation_provenance(assessment_id, result)
             correlation_result = await asyncio.to_thread(
                 _persist_tshark_metasploit_correlation,
@@ -1836,12 +1904,15 @@ async def tshark_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             logger.info("Capture During Validation handler exits normally: user_id=%s capture_proposal_id=%s", user_id, proposal_id)
             return
 
+        if _parse_optional_int(live_context.get("assessment_id")) is not None:
+            _start_tshark_assessment_scan(live_context)
+            context.user_data[TSHARK_RUNNING_SCAN_GUARD_KEY] = live_context
         await query.edit_message_text("TShark live capture approved. Running bounded capture...")
         result = await asyncio.to_thread(run_tshark_live_capture, user_id=user_id, proposal_id=proposal_id, request=request)
         normalized = _normalized_tshark_live_evidence(result)
         assessment_id = _parse_optional_int(live_context.get("assessment_id"))
         if assessment_id is not None:
-            _persist_tshark_assessment_evidence({"assessment_id": assessment_id}, result, normalized)
+            _persist_tshark_assessment_evidence(live_context, result, normalized)
         if query.message is not None:
             await query.message.reply_text(build_tshark_result_text(normalized, result.get("offline_result") or result))
             if assessment_id is not None:

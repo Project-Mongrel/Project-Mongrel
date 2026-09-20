@@ -1470,7 +1470,10 @@ def _build_assessment_wide_synthesis(context: dict, base_statements: list[str]) 
         "validation; INFO labels remain informational and none of these observations alone establishes a confirmed "
         "vulnerability or exploitability."
     )
-    incomplete = [f"{tool}={state}" for tool, state in states.items() if state in {"FAILED", "PARTIAL", "SKIPPED"}]
+    incomplete = [
+        f"{tool}={state}" for tool, state in states.items()
+        if state in {"RUNNING", "FAILED", "PARTIAL", "TIMED_OUT", "CANCELLED", "INTERRUPTED", "SKIPPED"}
+    ]
     applicable_not_run = [tool for tool in ("bbot", "katana", "playwright", "ffuf", "testssl") if states.get(tool) == "NOT_RUN"]
     gaps = "Important evidence/coverage gaps: "
     gap_parts = []
@@ -1519,9 +1522,16 @@ def _has_structured_tool_evidence(finding: dict, tool: str) -> bool:
 
 
 def _build_missing_structured_evidence_statement(display: str, evidence_kind: str, state: str) -> str | None:
-    if state == "FAILED":
+    if state in {"RUNNING", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"}:
+        state_phrase = {
+            "RUNNING": "is still running",
+            "FAILED": "did not complete successfully",
+            "TIMED_OUT": "timed out",
+            "CANCELLED": "was cancelled by the user",
+            "INTERRUPTED": "was interrupted by service shutdown",
+        }[state]
         return (
-            f"{display} did not complete successfully, so this assessment does not contain completed structured "
+            f"{display} {state_phrase}, so this assessment does not contain completed structured "
             f"{evidence_kind} evidence from {display}."
         )
     if state == "PARTIAL":
@@ -1544,9 +1554,13 @@ def _build_individual_tool_state_answer(context: dict) -> str | None:
     display = names.get(tool, tool)
     state_sentence = {
         "NOT_RUN": f"{display} has not been run in this assessment.",
+        "RUNNING": f"{display} is recorded as running in this assessment.",
         "COMPLETED": f"{display} is recorded as completed in this assessment.",
-        "PARTIAL": f"{display} has partial or interrupted assessment state.",
+        "PARTIAL": f"{display} has partial assessment state.",
         "FAILED": f"{display} is recorded as failed in this assessment.",
+        "TIMED_OUT": f"{display} is recorded as timed out in this assessment.",
+        "CANCELLED": f"{display} is recorded as cancelled in this assessment.",
+        "INTERRUPTED": f"{display} is recorded as interrupted by service shutdown in this assessment.",
         "SKIPPED": f"{display} is recorded as skipped in this assessment.",
     }.get(state, f"{display} has assessment state {state}.")
     if tool == "gitleaks":
@@ -1746,8 +1760,12 @@ def _build_named_ffuf_evidence_answer(context: dict, state: str, findings: list[
     )
     state_text = {
         "COMPLETED": "recorded as completed",
+        "RUNNING": "running",
         "FAILED": "failed",
-        "PARTIAL": "partial or interrupted",
+        "PARTIAL": "partial",
+        "TIMED_OUT": "timed out",
+        "CANCELLED": "cancelled",
+        "INTERRUPTED": "interrupted by service shutdown",
         "NOT_RUN": "not run",
         "SKIPPED": "skipped",
     }.get(state, f"in state {state}")
@@ -1819,7 +1837,7 @@ def _build_tool_state_overview(context: dict) -> str:
     completed = grouped.get("COMPLETED", [])
     qualifiers = [
         f"{state.lower().replace('_', ' ')}: {', '.join(grouped[state])}"
-        for state in ("PARTIAL", "FAILED", "SKIPPED") if grouped.get(state)
+        for state in ("RUNNING", "PARTIAL", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED", "SKIPPED") if grouped.get(state)
     ]
     answer = "Completed in this assessment: " + (", ".join(completed) if completed else "none") + "."
     if qualifiers:
@@ -1901,7 +1919,10 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
                 "web surface. Its path, status, and size observations could close that gap, but would not automatically "
                 "prove sensitive exposure or a vulnerability. This answer runs nothing."
             )
-        incomplete = [f"{tool}={state}" for tool, state in states.items() if state in {"FAILED", "PARTIAL", "SKIPPED"}]
+        incomplete = [
+            f"{tool}={state}" for tool, state in states.items()
+            if state in {"RUNNING", "FAILED", "PARTIAL", "TIMED_OUT", "CANCELLED", "INTERRUPTED", "SKIPPED"}
+        ]
         return (
             "The authoritative assessment state does not identify another automatically required tool. "
             + ("Relevant incomplete coverage to review first is " + ", ".join(incomplete) + ". " if incomplete else "Review the latest stored evidence before selecting more coverage. ")

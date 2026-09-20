@@ -1,11 +1,12 @@
-import subprocess
 from pathlib import Path
+import threading
 from unittest.mock import patch
 
 import pytest
 
 from app.core.config import Settings
 from app.parsers.testssl_parser import normalize_testssl_output, summarize_testssl_evidence
+from app.tools.process_lifecycle import ScannerExecution
 from app.tools.testssl_runner import _build_testssl_command, _resolve_testssl_executable, run_testssl_scan
 
 
@@ -25,8 +26,8 @@ TESTSSL_JSON = """
 """
 
 
-def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=["testssl.sh"], returncode=returncode, stdout=stdout, stderr=stderr)
+def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> ScannerExecution:
+    return ScannerExecution(stdout=stdout, stderr=stderr, returncode=returncode)
 
 
 def test_testssl_runner_success_uses_safe_subprocess_args() -> None:
@@ -39,7 +40,7 @@ def test_testssl_runner_success_uses_safe_subprocess_args() -> None:
     with (
         patch("app.tools.testssl_runner.get_settings", return_value=settings),
         patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
-        patch("app.tools.testssl_runner.subprocess.run", side_effect=run_side_effect) as run_mock,
+        patch("app.tools.testssl_runner.run_scanner_process", side_effect=run_side_effect) as run_mock,
     ):
         result = run_testssl_scan("https://example.com")
 
@@ -48,9 +49,8 @@ def test_testssl_runner_success_uses_safe_subprocess_args() -> None:
     assert command[1] == "--jsonfile-pretty"
     assert command[-1] == "example.com:443"
     assert "--connect-timeout" not in command
-    assert run_mock.call_args.kwargs["shell"] is False
-    assert run_mock.call_args.kwargs["check"] is False
-    assert run_mock.call_args.kwargs["timeout"] == 19
+    assert run_mock.call_args.kwargs["timeout_seconds"] == 19
+    assert run_mock.call_args.kwargs["cancellation_event"] is None
     assert result["success"] is True
     assert result["target"] == "example.com:443"
     assert result["json_output"].strip().startswith("[")
@@ -61,7 +61,7 @@ def test_testssl_missing_binary_is_clean_failure() -> None:
         patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.testssl_runner.shutil.which", return_value=None),
         patch("app.tools.testssl_runner.Path.is_file", return_value=False),
-        patch("app.tools.testssl_runner.subprocess.run") as run_mock,
+        patch("app.tools.testssl_runner.run_scanner_process") as run_mock,
     ):
         result = run_testssl_scan("https://example.com")
 
@@ -71,11 +71,28 @@ def test_testssl_missing_binary_is_clean_failure() -> None:
     run_mock.assert_not_called()
 
 
+def test_testssl_pre_spawn_cancellation_does_not_start_process() -> None:
+    cancellation_event = threading.Event()
+    cancellation_event.set()
+    with (
+        patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
+        patch("app.tools.testssl_runner.run_scanner_process") as run_mock,
+    ):
+        result = run_testssl_scan("https://example.com", cancellation_event=cancellation_event)
+
+    assert result["error_type"] == "cancelled"
+    run_mock.assert_not_called()
+
+
 def test_testssl_timeout_is_clean_failure() -> None:
     with (
         patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None, testssl_scan_timeout_seconds=1)),
         patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
-        patch("app.tools.testssl_runner.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="testssl.sh", timeout=1, output="", stderr="slow")),
+        patch(
+            "app.tools.testssl_runner.run_scanner_process",
+            return_value=ScannerExecution(stdout="", stderr="slow", returncode=-15, timed_out=True),
+        ),
     ):
         result = run_testssl_scan("https://example.com")
 
@@ -156,7 +173,7 @@ def test_testssl_stdout_diagnostic_used_when_stderr_empty() -> None:
     with (
         patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
-        patch("app.tools.testssl_runner.subprocess.run", return_value=_completed(stdout=f"\x1b[31m{diagnostic}\x1b[0m", stderr="", returncode=1)),
+        patch("app.tools.testssl_runner.run_scanner_process", return_value=_completed(stdout=f"\x1b[31m{diagnostic}\x1b[0m", stderr="", returncode=1)),
     ):
         result = run_testssl_scan("https://example.com")
 
@@ -173,7 +190,7 @@ def test_testssl_rejects_invalid_config_without_subprocess() -> None:
     with (
         patch("app.tools.testssl_runner.get_settings", return_value=settings),
         patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
-        patch("app.tools.testssl_runner.subprocess.run") as run_mock,
+        patch("app.tools.testssl_runner.run_scanner_process") as run_mock,
     ):
         result = run_testssl_scan("https://example.com")
 
@@ -187,7 +204,7 @@ def test_testssl_ipv6_target_is_bracketed_for_testssl() -> None:
     with (
         patch("app.tools.testssl_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
-        patch("app.tools.testssl_runner.subprocess.run", return_value=_completed()) as run_mock,
+        patch("app.tools.testssl_runner.run_scanner_process", return_value=_completed()) as run_mock,
     ):
         result = run_testssl_scan("https://[2001:db8::1]")
 
@@ -205,7 +222,7 @@ def test_testssl_oversized_json_is_clean_failure() -> None:
     with (
         patch("app.tools.testssl_runner.get_settings", return_value=settings),
         patch("app.tools.testssl_runner.shutil.which", return_value="testssl.sh"),
-        patch("app.tools.testssl_runner.subprocess.run", side_effect=run_side_effect),
+        patch("app.tools.testssl_runner.run_scanner_process", side_effect=run_side_effect),
     ):
         result = run_testssl_scan("https://example.com")
 

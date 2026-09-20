@@ -11,6 +11,12 @@ from uuid import uuid4
 from app.core.config import get_settings
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
 from app.services.target_normalizer import normalize_for_bbot
+from app.tools.process_lifecycle import (
+    finish_scanner_process,
+    run_scanner_process,
+    start_scanner_process,
+    terminate_scanner_process_tree,
+)
 
 BBOT_TIMEOUT_SECONDS = 600
 BBOT_OUTPUT_DIR = Path("data") / "bbot"
@@ -115,17 +121,14 @@ def check_bbot_readiness() -> dict[str, object]:
     if executable is None:
         return {"ready": False, "error": BBOT_NOT_AVAILABLE_ERROR, "executable": None, "version": ""}
     try:
-        completed = subprocess.run(  # nosec B603
+        completed = run_scanner_process(
             [executable, "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-            shell=False,
-            check=False,
+            timeout_seconds=10,
         )
     except (FileNotFoundError, OSError):
         return {"ready": False, "error": BBOT_NOT_AVAILABLE_ERROR, "executable": executable, "version": ""}
+    if completed.timed_out or completed.cancelled:
+        return {"ready": False, "error": "BBOT version check failed.", "executable": executable, "version": ""}
     version_text = _bounded_text((completed.stdout or completed.stderr or "").strip(), 500, label="version")[0]
     return {
         "ready": completed.returncode == 0,
@@ -135,7 +138,7 @@ def check_bbot_readiness() -> dict[str, object]:
     }
 
 
-def run_bbot_scan(target: str) -> dict[str, object]:
+def run_bbot_scan(target: str, *, cancellation_event: threading.Event | None = None) -> dict[str, object]:
     validated_target = _validate_target(target)
     settings = get_settings()
     output_dir = _run_output_dir(validated_target)
@@ -188,17 +191,34 @@ def run_bbot_scan(target: str) -> dict[str, object]:
     logger.info("BBOT subprocess prepared: arg_count=%s", len(command))
     logger.info("BBOT working directory: %s", working_directory)
 
+    if cancellation_event is not None and cancellation_event.is_set():
+        return {
+            "target": validated_target,
+            "success": False,
+            "output": "",
+            "error": "BBOT recon cancelled.",
+            "error_type": "cancelled",
+            "returncode": None,
+            "elapsed_seconds": time.monotonic() - started_at,
+            "output_dir": str(output_dir),
+            "command": command,
+            "working_directory": str(working_directory),
+            "json_output_paths": [],
+            "json_output_found": False,
+            "output_truncated": False,
+        }
+
     try:
         # Command uses explicit args list, shell=False, and a validated target.
-        process = subprocess.Popen(  # nosec B603
+        managed_process = start_scanner_process(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
             cwd=str(working_directory),
-            shell=False,
         )
+        process = managed_process.process
     except FileNotFoundError:
         elapsed_seconds = time.monotonic() - started_at
         return {
@@ -220,13 +240,15 @@ def run_bbot_scan(target: str) -> dict[str, object]:
     stderr_thread = _start_stream_thread(process.stderr, stderr_lines, "stderr", max_output_bytes)
 
     try:
-        returncode = process.wait(timeout=timeout_seconds)
+        returncode = _wait_for_bbot(process, timeout_seconds, cancellation_event)
     except subprocess.TimeoutExpired:
-        logger.error("BBOT recon timed out after %ss", timeout_seconds)
-        process.kill()
-        returncode = process.wait()
+        cancelled = cancellation_event is not None and cancellation_event.is_set()
+        logger.error("BBOT recon %s after %ss", "cancelled" if cancelled else "timed out", timeout_seconds)
+        terminate_scanner_process_tree(managed_process)
+        returncode = process.returncode
         _join_stream_thread(stdout_thread, "stdout")
         _join_stream_thread(stderr_thread, "stderr")
+        finish_scanner_process(managed_process)
         elapsed_seconds = time.monotonic() - started_at
         stdout = "\n".join(stdout_lines)
         stderr = "\n".join(stderr_lines)
@@ -235,8 +257,8 @@ def run_bbot_scan(target: str) -> dict[str, object]:
             "target": validated_target,
             "success": False,
             "output": _combine_output(stdout, json_output),
-            "error": stderr or "BBOT recon timed out.",
-            "error_type": "timeout",
+            "error": stderr or ("BBOT recon cancelled." if cancelled else "BBOT recon timed out."),
+            "error_type": "cancelled" if cancelled else "timeout",
             "returncode": returncode,
             "elapsed_seconds": elapsed_seconds,
             "output_dir": str(output_dir),
@@ -246,13 +268,20 @@ def run_bbot_scan(target: str) -> dict[str, object]:
             "json_output_found": bool(json_output_paths),
             "output_truncated": _is_truncated(stdout) or _is_truncated(stderr) or json_truncated,
         }
+    except BaseException:
+        terminate_scanner_process_tree(managed_process)
+        finish_scanner_process(managed_process)
+        raise
 
     logger.info("BBOT process exited normally: returncode=%s", returncode)
+    success = returncode == 0
+    if not success:
+        terminate_scanner_process_tree(managed_process)
     _join_stream_thread(stdout_thread, "stdout")
     _join_stream_thread(stderr_thread, "stderr")
+    finish_scanner_process(managed_process)
     logger.info("BBOT output stream readers completed after process exit.")
     elapsed_seconds = time.monotonic() - started_at
-    success = returncode == 0
     stdout = "\n".join(stdout_lines)
     stderr = "\n".join(stderr_lines)
     if not success and _is_runtime_incompatible_error(stdout, stderr):
@@ -293,6 +322,26 @@ def run_bbot_scan(target: str) -> dict[str, object]:
         "json_output_found": bool(json_output_paths),
         "output_truncated": _is_truncated(stdout) or _is_truncated(stderr) or json_truncated,
     }
+
+
+def _wait_for_bbot(
+    process: subprocess.Popen,
+    timeout_seconds: float,
+    cancellation_event: threading.Event | None,
+) -> int:
+    if cancellation_event is None:
+        return process.wait(timeout=timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise subprocess.TimeoutExpired(cmd="bbot", timeout=timeout_seconds)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd="bbot", timeout=timeout_seconds)
+        try:
+            return process.wait(timeout=min(0.1, remaining))
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _validate_target(target: str) -> str:

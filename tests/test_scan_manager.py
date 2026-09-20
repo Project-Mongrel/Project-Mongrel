@@ -1,3 +1,5 @@
+import pytest
+
 from app.services.scan_manager import (
     clear_user_scan_requests,
     complete_scan_request,
@@ -68,3 +70,21 @@ def test_scan_request_state_transitions_work() -> None:
     assert completed_request.result == {"success": True, "target": "example.com", "output": "open ports"}
     assert completed_request.completed_at is not None
     assert get_scan_request(1005, scan_request.id) == completed_request
+
+
+@pytest.mark.parametrize(
+    ("result", "status"),
+    [
+        ({"success": False, "error_type": "timeout"}, "timed_out"),
+        ({"success": False, "error_type": "cancelled"}, "cancelled"),
+        ({"success": False, "partial": True, "error_type": "timeout"}, "partial"),
+        ({"success": False}, "failed"),
+    ],
+)
+def test_scan_request_terminal_states_remain_distinct(result: dict, status: str) -> None:
+    clear_user_scan_requests(1006)
+    scan_request = create_scan_request(user_id=1006, scan_type="ffuf")
+
+    terminal = complete_scan_request(1006, scan_request.id, "example.com", result)
+
+    assert terminal.status == status

@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from app.core.config import get_settings
 from app.services.target_normalizer import normalize_target_key
+from app.services.sqlite_runtime import SQLITE_BUSY_TIMEOUT_MS, configure_operational_connection, run_locked_transaction
 
 _connection_state = threading.local()
 _database_path_override: Path | None = None
@@ -44,7 +45,7 @@ def add_finding(user_id: int, finding: dict) -> dict:
     if target_key is not None:
         stored_finding["target_key"] = target_key
 
-    with _get_connection() as connection:
+    def insert_finding(connection: sqlite3.Connection) -> None:
         connection.execute(
             """
             INSERT INTO scan_runs (
@@ -91,6 +92,8 @@ def add_finding(user_id: int, finding: dict) -> dict:
                 _format_datetime(created_at),
             ),
         )
+
+    run_locked_transaction(_get_connection(), insert_finding)
 
     return dict(stored_finding)
 
@@ -241,8 +244,9 @@ def _get_connection() -> sqlite3.Connection:
         database_path = _resolve_database_path()
         if str(database_path) != ":memory:":
             database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database_path)
+        connection = sqlite3.connect(database_path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
         connection.row_factory = sqlite3.Row
+        configure_operational_connection(connection, enable_wal=str(database_path) != ":memory:")
         _initialize_schema(connection)
         _connection_state.connection = connection
         _connection_state.generation = _database_generation

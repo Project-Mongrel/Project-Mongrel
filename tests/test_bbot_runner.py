@@ -1,5 +1,6 @@
 from io import StringIO
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +9,7 @@ import pytest
 
 from app.core.config import Settings
 from app.tools import bbot_runner
+from app.tools.process_lifecycle import ScannerExecution
 from app.tools.bbot_runner import (
     BBOT_RUNTIME_INCOMPATIBLE_ERROR,
     BBOT_UNAPPROVED_PROFILE_ERROR,
@@ -82,6 +84,21 @@ def test_empty_target_rejected() -> None:
         run_bbot_scan("   ")
 
 
+def test_bbot_pre_spawn_cancellation_does_not_start_process(tmp_path: Path) -> None:
+    cancellation_event = threading.Event()
+    cancellation_event.set()
+    with (
+        patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
+        patch.object(bbot_runner, "BBOT_OUTPUT_DIR", tmp_path),
+        patch("app.tools.bbot_runner.shutil.which", return_value="bbot"),
+        patch("app.tools.bbot_runner.start_scanner_process") as start_mock,
+    ):
+        result = run_bbot_scan("example.com", cancellation_event=cancellation_event)
+
+    assert result["error_type"] == "cancelled"
+    start_mock.assert_not_called()
+
+
 @pytest.mark.parametrize("target", ["example.com;whoami", "example.com && whoami", "example.com|whoami"])
 def test_dangerous_shell_characters_rejected(target: str) -> None:
     with pytest.raises(ValueError, match="shell characters"):
@@ -109,6 +126,7 @@ def test_bbot_subprocess_called_with_list_args_and_shell_false(tmp_path: Path) -
         bufsize=1,
         cwd=str(Path.cwd().resolve()),
         shell=False,
+        start_new_session=True,
     )
     assert "env" not in popen_mock.call_args.kwargs
     assert result["success"] is True
@@ -138,8 +156,8 @@ def test_bbot_timeout_handled(tmp_path: Path) -> None:
     assert result["success"] is False
     assert result["output"] == "partial output"
     assert result["error"] == "partial error"
-    assert result["returncode"] == -9
-    assert process.killed is True
+    assert result["returncode"] == -15
+    assert process.terminated is True
 
 
 def test_bbot_timeout_harvests_json_output(tmp_path: Path) -> None:
@@ -163,7 +181,7 @@ def test_bbot_timeout_harvests_json_output(tmp_path: Path) -> None:
     assert '{"type":"DNS_NAME","data":"partial.example.com"}' in result["output"]
     assert result["json_output_found"] is True
     assert result["json_output_paths"] == [str(json_file)]
-    assert process.killed is True
+    assert process.terminated is True
 
 
 def test_bbot_missing_binary_handled(tmp_path: Path) -> None:
@@ -204,6 +222,7 @@ def test_bbot_subprocess_uses_configured_external_binary(tmp_path: Path) -> None
         bufsize=1,
         cwd=str(Path.cwd().resolve()),
         shell=False,
+        start_new_session=True,
     )
     assert result["success"] is True
     assert result["command"][0] == external_bbot
@@ -325,16 +344,16 @@ def test_bbot_rejects_flag_injection_without_subprocess(tmp_path: Path) -> None:
 
 
 def test_bbot_readiness_version_check() -> None:
-    completed = subprocess.CompletedProcess(args=["bbot", "--version"], returncode=0, stdout="bbot 2.8.6\n", stderr="")
+    completed = ScannerExecution(returncode=0, stdout="bbot 2.8.6\n", stderr="")
     with (
         patch("app.tools.bbot_runner.get_settings", return_value=Settings(_env_file=None)),
         patch("app.tools.bbot_runner.shutil.which", return_value="/usr/local/bin/bbot"),
-        patch("app.tools.bbot_runner.subprocess.run", return_value=completed) as run_mock,
+        patch("app.tools.bbot_runner.run_scanner_process", return_value=completed) as run_mock,
     ):
         result = check_bbot_readiness()
 
     assert run_mock.call_args.args[0] == ["/usr/local/bin/bbot", "--version"]
-    assert run_mock.call_args.kwargs["shell"] is False
+    assert run_mock.call_args.kwargs["timeout_seconds"] == 10
     assert result["ready"] is True
     assert result["version"] == "bbot 2.8.6"
 
@@ -488,10 +507,13 @@ def test_bbot_json_output_is_bounded(tmp_path: Path) -> None:
 
 class FakeBbotProcess:
     def __init__(self, returncode: int, stdout: str, stderr: str, timeout: bool = False) -> None:
-        self.returncode = returncode
+        self.final_returncode = returncode
+        self.returncode = None
         self.stdout = StringIO(stdout)
         self.stderr = StringIO(stderr)
+        self.stdin = None
         self.timeout = timeout
+        self.terminated = False
         self.killed = False
         self.wait_calls = 0
         self.wait_timeouts: list[int] = []
@@ -502,7 +524,17 @@ class FakeBbotProcess:
             self.wait_timeouts.append(timeout)
         if self.timeout and self.wait_calls == 1:
             raise subprocess.TimeoutExpired(cmd=["bbot"], timeout=timeout)
+        if self.returncode is None:
+            self.returncode = self.final_returncode
         return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
 
     def kill(self) -> None:
         self.killed = True
+        self.returncode = -9

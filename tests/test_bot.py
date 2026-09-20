@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -8,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from telegram.error import BadRequest
 from telegram.error import TimedOut
 
@@ -2213,7 +2215,9 @@ def test_ffuf_profile_selection_review_and_execution_context(tmp_path: Path) -> 
     ):
         asyncio.run(scan_target_handler(update, context))
 
-    run_ffuf_scan.assert_called_once_with("https://example.com/api/FUZZ", "standard")
+    run_ffuf_scan.assert_called_once()
+    assert run_ffuf_scan.call_args.args == ("https://example.com/api/FUZZ", "standard")
+    assert isinstance(run_ffuf_scan.call_args.kwargs["cancellation_event"], threading.Event)
     start_auto_refresh.assert_awaited_once_with("Running discovery...", interval_seconds=5)
     assert stop_auto_refresh.await_count >= 1
     review_text = message.reply_text.call_args_list[0].args[0]
@@ -2515,7 +2519,7 @@ def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> 
                 "returncode": 0,
                 "elapsed_seconds": 6,
             },
-        ),
+        ) as run_testssl_scan,
         patch("app.bot.handlers.scan.generate_testssl_ai_assessment", return_value=assessment_lines),
         patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock) as start_auto_refresh,
         patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock) as stop_auto_refresh,
@@ -2523,6 +2527,7 @@ def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> 
         asyncio.run(scan_target_handler(update, context))
 
     start_auto_refresh.assert_awaited_once_with("Running scan...", interval_seconds=5)
+    assert isinstance(run_testssl_scan.call_args.kwargs["cancellation_event"], threading.Event)
     assert stop_auto_refresh.await_count >= 1
     sent_messages = [call.args[0] for call in message.reply_text.call_args_list]
     assert any("testssl.sh Scan Complete" in text for text in sent_messages)
@@ -3035,6 +3040,7 @@ def test_metasploit_guided_review_card_and_approve_executes_exact_request() -> N
         asyncio.run(scan_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=7334)), context))
 
     request = runner_mock.call_args.kwargs["request"]
+    assert isinstance(runner_mock.call_args.kwargs["cancellation_event"], threading.Event)
     assert request["module"] == "auxiliary/scanner/http/http_version"
     assert request["action_type"] == "auxiliary_validation"
     assert request["target"] == "example.com"
@@ -3979,7 +3985,9 @@ def test_successful_bbot_scan_creates_events_and_stores_result() -> None:
     ):
         asyncio.run(scan_target_handler(update, context))
 
-    run_bbot_scan.assert_called_once_with("https://example.com")
+    run_bbot_scan.assert_called_once()
+    assert run_bbot_scan.call_args.args == ("https://example.com",)
+    assert isinstance(run_bbot_scan.call_args.kwargs["cancellation_event"], threading.Event)
     assert message.reply_text.call_args_list[0].args[0] == (
         f" BBOT Scan\n\n{icon('target')} Target\nexample.com\n\n"
         f"{icon('running')} Status\nLaunching scan...\n\n{icon('elapsed')} Elapsed\n0s"
@@ -6666,7 +6674,7 @@ def test_tshark_capture_validation_approve_invokes_orchestrator_and_persists_pro
         patch("app.bot.handlers.upload.run_tshark_capture_during_validation", return_value=result) as orchestrator,
         patch("app.bot.handlers.upload.generate_tshark_metasploit_correlated_assessment", return_value=["Executive Summary", "Correlated evidence reviewed."]) as correlated_ai,
     ):
-        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5922)), SimpleNamespace()))
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5922)), SimpleNamespace(user_data={})))
 
     orchestrator.assert_called_once()
     assert orchestrator.call_args.kwargs["capture_proposal_id"] == proposal_id
@@ -7033,7 +7041,7 @@ def test_tshark_assessment_live_success_and_permission_failure_persist_and_clean
     live_result = {"success": True, "elapsed_seconds": 1.2, "offline_result": {"success": True}, "normalized_evidence": _tshark_normalized()}
 
     with patch("app.bot.handlers.upload.run_tshark_live_capture", return_value=live_result):
-        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5908)), SimpleNamespace()))
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5908)), SimpleNamespace(user_data={})))
 
     scans = list_assessment_scans(assessment["id"])
     artifacts = list_assessment_artifacts(assessment["id"])
@@ -7053,7 +7061,7 @@ def test_tshark_assessment_live_success_and_permission_failure_persist_and_clean
     permission = {"success": False, "error_type": "permission_denied", "error": "TShark live capture could not start with the current interface permissions.", "elapsed_seconds": 0}
 
     with patch("app.bot.handlers.upload.run_tshark_live_capture", return_value=permission):
-        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5909)), SimpleNamespace()))
+        asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5909)), SimpleNamespace(user_data={})))
 
     assert list_assessment_scans(assessment["id"])[-1]["status"] == "failed"
     assert "current interface permissions" in approve_query.message.reply_text.call_args_list[0].args[0]
@@ -7145,7 +7153,7 @@ def test_valid_tshark_assessment_upload_records_scan_artifact_and_dashboard() ->
     assert get_tshark_assessment_upload_context(user_id) is None
 
 
-def test_tshark_assessment_upload_failure_records_failed_scan_and_artifact() -> None:
+def test_tshark_assessment_upload_timeout_records_timed_out_scan_and_artifact() -> None:
     user_id = 5311
     assessment = create_assessment("Assessment PCAP Failure")
     set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
@@ -7166,10 +7174,32 @@ def test_tshark_assessment_upload_failure_records_failed_scan_and_artifact() -> 
     scans = list_assessment_scans(assessment["id"])
     artifacts = list_assessment_artifacts(assessment["id"])
     assert scans[0]["tool"] == "tshark"
-    assert scans[0]["status"] == "failed"
+    assert scans[0]["status"] == "timed_out"
     assert artifacts[0]["artifact_type"] == "tshark_normalized_evidence"
     assert '"error_type": "timeout"' in artifacts[0]["content"]
-    assert "TShark: Failed" in update.message.reply_text.call_args_list[-1].args[0]
+    assert "TShark: Timed out" in update.message.reply_text.call_args_list[-1].args[0]
+
+
+def test_tshark_assessment_upload_cancellation_finalizes_cancelled_once() -> None:
+    user_id = 5315
+    assessment = create_assessment("Assessment PCAP Cancellation")
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    from app.bot.handlers.upload import set_tshark_assessment_upload_context
+
+    set_tshark_assessment_upload_context(user_id, {"assessment_id": assessment["id"], "user_id": user_id})
+    update = _tshark_upload_update(user_id, file_name="capture.pcap", content=b"pcap")
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis", side_effect=asyncio.CancelledError),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "tshark"
+    assert scans[0]["status"] == "cancelled"
 
 
 def test_tshark_assessment_upload_wrong_user_and_missing_assessment_are_blocked() -> None:

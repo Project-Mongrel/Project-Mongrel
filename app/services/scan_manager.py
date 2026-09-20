@@ -3,6 +3,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from app.models.scan_request import ScanRequest, create_pending_scan_request
+from app.services.scan_status import scan_status_from_result
 
 _scan_requests: dict[int, list[ScanRequest]] = defaultdict(list)
 
@@ -30,7 +31,7 @@ def mark_scan_request_awaiting_target(user_id: int, scan_request_id: str) -> Sca
 
 
 def complete_scan_request(user_id: int, scan_request_id: str, target: str, result: dict[str, object]) -> ScanRequest:
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     return _replace_scan_request(
         user_id,
         scan_request_id,

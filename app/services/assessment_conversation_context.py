@@ -13,6 +13,7 @@ from app.services.assessment_conversation_store import (
 from app.services.assessment_guard import build_assessment_guard, build_guard_prompt_section
 from app.services.assessment_store import get_user_assessment
 from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile, get_mongrel_tool_names
+from app.services.scan_status import normalize_scan_status
 
 CONTEXT_SCHEMA_VERSION = "assessment_conversation_context.v1"
 DEFAULT_RECENT_MESSAGE_LIMIT = 8
@@ -687,19 +688,17 @@ def _build_recommendation_context(
         scan = select_latest_tool_scan(assessment_context.get("scans") or [], tool)
         if scan is None:
             continue
-        status = str(scan.get("status") or "").strip().lower()
+        status = normalize_scan_status(scan.get("status"), default="")
         tool_states[tool] = {
             "completed": "COMPLETED",
             "partial": "PARTIAL",
-            "active": "PARTIAL",
-            "running": "PARTIAL",
-            "in_progress": "PARTIAL",
-            "interrupted": "PARTIAL",
+            "running": "RUNNING",
+            "interrupted": "INTERRUPTED",
             "failed": "FAILED",
             "error": "FAILED",
+            "timed_out": "TIMED_OUT",
             "skipped": "SKIPPED",
-            "cancelled": "SKIPPED",
-            "canceled": "SKIPPED",
+            "cancelled": "CANCELLED",
         }.get(status, "PARTIAL" if status else "NOT_RUN")
     completed_tools = [tool for tool, state in tool_states.items() if state == "COMPLETED"]
 

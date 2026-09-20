@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 
 from app.services.assessment_scan_selection import select_latest_scans, select_latest_tool_scan
+from app.services.scan_status import normalize_scan_status, scan_status_label
 
 
 def generate_assessment_markdown_report(context: dict) -> str:
@@ -69,7 +70,7 @@ def generate_assessment_markdown_report(context: dict) -> str:
         "",
         "## Evidence Limitations",
         "",
-        "- The scan summary represents each tool's latest recorded state, including completed, partial, and failed runs where present.",
+        "- The scan summary represents each tool's latest recorded state, including completed, partial, and failed runs, plus running, timed-out, cancelled, and interrupted runs where present.",
         "- Absence of findings is not evidence of security.",
         "- Additional assessment activities may be required.",
     ]
@@ -86,12 +87,17 @@ def _format_executive_summary(context: dict) -> list[str]:
     targets = context.get("targets") or []
     scans = context.get("scans") or []
     represented_scans = _represented_scans(select_latest_scans(scans))
+    latest_scans = select_latest_scans(scans)
     highest_risk = _highest_risk(represented_scans)
     target_text = ", ".join(_clean(target.get("address") or "unknown") for target in targets) or "the configured scope"
 
     if not represented_scans:
         return [
             f"No completed or partial assessment scans are recorded for {target_text}.",
+            "Latest execution states: " + (
+                ", ".join(f"{_tool_label(scan.get('tool'))}={scan_status_label(scan.get('status'))}" for scan in latest_scans)
+                or "none recorded"
+            ) + ".",
             "The assessment report is limited until scan evidence is collected.",
         ]
 
@@ -100,6 +106,9 @@ def _format_executive_summary(context: dict) -> list[str]:
             f"{target_text} has {len(represented_scans)} completed or partial assessment scan(s) "
             f"with highest recorded risk of {highest_risk.upper()}."
         ),
+        "Latest execution states: " + ", ".join(
+            f"{_tool_label(scan.get('tool'))}={scan_status_label(scan.get('status'))}" for scan in latest_scans
+        ) + ".",
         "This report is based only on stored assessment evidence.",
     ]
 
@@ -109,10 +118,15 @@ def _format_assessment_overview(context: dict) -> list[str]:
     scans = context.get("scans") or []
     represented_scans = _represented_scans(select_latest_scans(scans))
     tools = ", ".join(sorted({str(scan.get("tool") or "unknown").upper() for scan in represented_scans})) or "None completed or partial"
+    latest_states = ", ".join(
+        f"{_tool_label(scan.get('tool'))}={scan_status_label(scan.get('status'))}"
+        for scan in select_latest_scans(scans)
+    ) or "None recorded"
     status = _clean((context.get("assessment") or {}).get("status") or "unknown").title()
     return [
         f"- Scope: {', '.join(_clean(target.get('address') or 'unknown') for target in targets) or 'No primary target configured.'}",
         f"- Completed activities: {tools}",
+        f"- Latest tool execution states: {latest_states}",
         f"- Current assessment status: {status}",
     ]
 
@@ -133,7 +147,7 @@ def _format_scan_summary(scans: list[dict]) -> list[str]:
                 f"### {_tool_label(tool)}",
                 "",
                 "Scan status",
-                str(latest.get("status") or "unknown").title(),
+                scan_status_label(latest.get("status")),
                 "",
                 "Summary",
                 _scan_summary(latest),
@@ -228,16 +242,16 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
 
 
 def _format_assessment_history(scans: list[dict]) -> list[str]:
-    completed = _represented_scans(scans)
-    if not completed:
-        return ["No completed or partial scans are recorded yet."]
+    recorded = scans
+    if not recorded:
+        return ["No assessment scans are recorded yet."]
     return [
         (
             f"- {_format_timestamp(scan.get('completed_at') or scan.get('created_at'))}: "
-            f"{_tool_label(scan.get('tool'))} {str(scan.get('status') or 'unknown').title()}"
+            f"{_tool_label(scan.get('tool'))} {scan_status_label(scan.get('status'))}"
             f"{_risk_suffix(scan)}"
         )
-        for scan in completed
+        for scan in recorded
     ]
 
 
@@ -306,10 +320,18 @@ def _represented_scans(scans: list[dict]) -> list[dict]:
 def _scan_summary(scan: dict) -> str:
     finding = scan.get("finding") or {}
     tool = str(scan.get("tool") or "").lower()
-    status = str(scan.get("status") or "").lower()
-    if status == "failed" and not _has_structured_evidence(tool, finding):
+    status = normalize_scan_status(scan.get("status"))
+    if status in {"failed", "timed_out", "cancelled", "interrupted", "running"} and not _has_structured_evidence(tool, finding):
         label = "testssl.sh" if tool == "testssl" else _tool_label(tool)
-        return f"{label} did not complete successfully; no completed structured evidence was stored."
+        if status == "failed":
+            return f"{label} did not complete successfully; no completed structured evidence was stored."
+        state_text = {
+            "timed_out": "timed out",
+            "cancelled": "was cancelled",
+            "interrupted": "was interrupted by service shutdown",
+            "running": "is still recorded as running",
+        }[status]
+        return f"{label} {state_text}; no completed structured evidence was stored."
     if tool == "nuclei" and finding.get("nuclei_findings"):
         matches = finding["nuclei_findings"]
         severities = sorted({_clean(item.get("severity") or "info").upper() for item in matches})

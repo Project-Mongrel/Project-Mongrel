@@ -1,16 +1,16 @@
 import logging
 from pathlib import Path
-# Required to run authorized local testssl.sh subprocesses.
-import subprocess  # nosec B404
 import re
 import shutil
 import tempfile
+import threading
 import time
 from urllib.parse import urlparse
 
 from app.core.config import get_settings
 from app.services.target_normalizer import normalize_for_httpx
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
+from app.tools.process_lifecycle import run_scanner_process
 
 logger = logging.getLogger(__name__)
 TESTSSL_NOT_AVAILABLE_ERROR = "testssl.sh executable was not found."
@@ -42,7 +42,7 @@ ANSI_CONTROL_PATTERN = re.compile(r"(?:\x1B\[[0-?]*[ -/]*[@-~]|\x1B[@-_][0-?]*[ 
 MAX_TESTSSL_ERROR_BYTES = 2_000
 
 
-def run_testssl_scan(target: str) -> dict[str, object]:
+def run_testssl_scan(target: str, *, cancellation_event: threading.Event | None = None) -> dict[str, object]:
     validated_target = _validate_target(target)
     settings = get_settings()
     executable = _resolve_testssl_executable(settings.testssl_path)
@@ -54,6 +54,17 @@ def run_testssl_scan(target: str) -> dict[str, object]:
             success=False,
             error=TESTSSL_NOT_AVAILABLE_ERROR,
             error_type="missing_binary",
+            elapsed_seconds=0,
+            command=None,
+            working_directory=working_directory,
+        )
+
+    if cancellation_event is not None and cancellation_event.is_set():
+        return _result(
+            target=validated_target,
+            success=False,
+            error="testssl.sh scan cancelled.",
+            error_type="cancelled",
             elapsed_seconds=0,
             command=None,
             working_directory=working_directory,
@@ -83,16 +94,28 @@ def run_testssl_scan(target: str) -> dict[str, object]:
     logger.info("testssl.sh scan started: target=%s timeout=%s", validated_target, settings.testssl_scan_timeout_seconds)
     logger.info("testssl.sh subprocess prepared: arg_count=%s", len(command))
     try:
-        completed = subprocess.run(  # nosec B603
+        completed = run_scanner_process(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=settings.testssl_scan_timeout_seconds,
+            timeout_seconds=settings.testssl_scan_timeout_seconds,
             cwd=str(working_directory),
-            shell=False,
-            check=False,
+            cancellation_event=cancellation_event,
         )
+        if completed.timed_out or completed.cancelled:
+            elapsed_seconds = time.monotonic() - start_time
+            error_type = "cancelled" if completed.cancelled else "timeout"
+            logger.warning("testssl.sh scan %s: target=%s elapsed_seconds=%.2f", error_type, validated_target, elapsed_seconds)
+            return _result(
+                target=validated_target,
+                success=False,
+                output=completed.stdout,
+                error=completed.stderr or ("testssl.sh scan cancelled." if completed.cancelled else TESTSSL_TIMEOUT_ERROR),
+                error_type=error_type,
+                returncode=completed.returncode,
+                elapsed_seconds=elapsed_seconds,
+                command=command,
+                working_directory=working_directory,
+                json_output="",
+            )
         json_output, json_truncated = _read_bounded_text(
             json_path,
             _bounded_int(
@@ -101,20 +124,6 @@ def run_testssl_scan(target: str) -> dict[str, object]:
                 maximum=MAX_TESTSSL_JSON_BYTES,
                 default=2_000_000,
             ),
-        )
-    except subprocess.TimeoutExpired as exc:
-        elapsed_seconds = time.monotonic() - start_time
-        logger.warning("testssl.sh scan timed out: target=%s elapsed_seconds=%.2f", validated_target, elapsed_seconds)
-        return _result(
-            target=validated_target,
-            success=False,
-            output=exc.stdout or "",
-            error=exc.stderr or TESTSSL_TIMEOUT_ERROR,
-            error_type="timeout",
-            elapsed_seconds=elapsed_seconds,
-            command=command,
-            working_directory=working_directory,
-            json_output="",
         )
     except FileNotFoundError:
         elapsed_seconds = time.monotonic() - start_time

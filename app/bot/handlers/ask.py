@@ -86,6 +86,11 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if exited_finding_analysis:
             logger.info("Finding analysis ended for user_id=%s", update.effective_user.id)
         cancelled_scan = cancel_active_scan(update.effective_user.id)
+        native_cancellation = bool(
+            cancelled_scan is not None
+            and cancelled_scan.cancellation_event is not None
+            and cancelled_scan.cancellation_requested
+        )
         if cancelled_scan is not None and cancelled_scan.status_message is not None:
             from app.ui.scan_progress import ScanProgressCard
 
@@ -95,20 +100,27 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 cancelled_scan.target,
                 cancelled_scan.progress_started_at,
             )
-            await progress_card.update("Cancelled")
-        clear_active_scan(update.effective_user.id)
+            await progress_card.update("Cancellation requested" if native_cancellation else "Cancelled")
+        if cancelled_scan is not None and cancelled_scan.cancellation_event is None:
+            clear_active_scan(update.effective_user.id, cancelled_scan)
 
     await update.message.reply_text(
-        _build_cancel_response(cancelled_scan is not None, exited_finding_analysis),
+        _build_cancel_response(cancelled_scan, exited_finding_analysis),
         reply_markup=build_main_menu_keyboard(),
     )
 
 
-def _build_cancel_response(scan_cancelled: bool, finding_analysis_exited: bool) -> str:
+def _build_cancel_response(cancelled_scan: object | None, finding_analysis_exited: bool) -> str:
     if finding_analysis_exited:
         return "Exited Finding Analysis Mode."
 
-    if scan_cancelled:
+    if cancelled_scan is not None and getattr(cancelled_scan, "cancellation_event", None) is not None:
+        if getattr(cancelled_scan, "cancellation_requested", False):
+            label = str(getattr(cancelled_scan, "scan_type", "scanner") or "scanner")
+            return f"Cancellation requested for {label}. Waiting for scanner process cleanup."
+        return "The scanner process already finished; its result is being finalized."
+
+    if cancelled_scan is not None:
         return "Nuclei scan cancelled."
 
     return build_cancel_text()

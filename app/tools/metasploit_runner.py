@@ -2,8 +2,8 @@ import logging
 import os
 import re
 import shutil
-import subprocess  # nosec B404
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -13,6 +13,8 @@ from app.services.metasploit_approval import (
     mark_metasploit_proposal_status,
     require_approved_metasploit_action,
 )
+from app.services.scan_status import scan_status_from_result
+from app.tools.process_lifecycle import run_scanner_process
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +40,23 @@ def run_metasploit_validation(
     proposal_id: str,
     request: dict,
     work_dir: str | Path | None = None,
+    cancellation_event: threading.Event | None = None,
 ) -> dict[str, object]:
     try:
         proposal = require_approved_metasploit_action(proposal_id, user_id=user_id, request=request)
     except MetasploitApprovalError as exc:
         return _result(request=request, success=False, error=str(exc), error_type="approval_required", elapsed_seconds=0, command=None)
+
+    if cancellation_event is not None and cancellation_event.is_set():
+        mark_metasploit_proposal_status(proposal.id, "cancelled")
+        return _result(
+            request=request,
+            success=False,
+            error="Metasploit validation cancelled.",
+            error_type="cancelled",
+            elapsed_seconds=0,
+            command=None,
+        )
 
     settings = get_settings()
     readiness = check_metasploit_readiness(run_version_check=False)
@@ -59,47 +73,40 @@ def run_metasploit_validation(
     start_time = time.monotonic()
     mark_metasploit_proposal_status(proposal.id, "executing")
     try:
-        process = subprocess.Popen(  # nosec B603
+        completed = run_scanner_process(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            timeout_seconds=timeout_seconds,
             cwd=str(working_directory),
             env=_metasploit_subprocess_environment(),
-            shell=False,
+            cancellation_event=cancellation_event,
         )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-            elapsed = time.monotonic() - start_time
-            success = process.returncode == 0
-            mark_metasploit_proposal_status(proposal.id, "executed" if success else "failed")
-            return _result(
-                request=request,
-                success=success,
-                output=redact_metasploit_text(stdout or ""),
-                error=redact_metasploit_text(stderr or ""),
-                error_type=None if success else "execution_failed",
-                returncode=process.returncode,
-                elapsed_seconds=elapsed,
-                command=command,
-                working_directory=working_directory,
-            )
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-            elapsed = time.monotonic() - start_time
-            mark_metasploit_proposal_status(proposal.id, "failed")
-            return _result(
-                request=request,
-                success=False,
-                output=redact_metasploit_text(stdout or ""),
-                error=redact_metasploit_text(stderr or METASPLOIT_TIMEOUT_ERROR),
-                error_type="timeout",
-                returncode=process.returncode,
-                elapsed_seconds=elapsed,
-                command=command,
-                working_directory=working_directory,
-            )
+        elapsed = time.monotonic() - start_time
+        success = completed.returncode == 0 and not completed.timed_out and not completed.cancelled
+        error_type = "cancelled" if completed.cancelled else "timeout" if completed.timed_out else None if success else "execution_failed"
+        result_status = scan_status_from_result(
+            {
+                "success": success,
+                "error_type": error_type,
+            }
+        )
+        proposal_status = "executed" if result_status == "completed" else result_status
+        mark_metasploit_proposal_status(proposal.id, proposal_status)
+        error = completed.stderr
+        if completed.timed_out and not error:
+            error = METASPLOIT_TIMEOUT_ERROR
+        elif completed.cancelled and not error:
+            error = "Metasploit validation cancelled."
+        return _result(
+            request=request,
+            success=success,
+            output=redact_metasploit_text(completed.stdout),
+            error=redact_metasploit_text(error),
+            error_type=error_type,
+            returncode=completed.returncode,
+            elapsed_seconds=elapsed,
+            command=command,
+            working_directory=working_directory,
+        )
     except FileNotFoundError:
         elapsed = time.monotonic() - start_time
         mark_metasploit_proposal_status(proposal.id, "failed")
@@ -162,17 +169,20 @@ def check_metasploit_readiness(*, run_version_check: bool = False) -> dict[str, 
         }
     if run_version_check:
         try:
-            completed = subprocess.run(  # nosec B603
+            completed = run_scanner_process(
                 [executable, "--version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=METASPLOIT_VERSION_TIMEOUT_SECONDS,
+                timeout_seconds=METASPLOIT_VERSION_TIMEOUT_SECONDS,
                 env=_metasploit_subprocess_environment(),
-                shell=False,
-                check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError:
+            return {
+                "ready": False,
+                "error": "Metasploit/msfconsole readiness check failed.",
+                "error_type": "version_check_failed",
+                "configured_binary": configured_binary,
+                "resolved_binary": executable,
+            }
+        if completed.timed_out or completed.cancelled:
             return {
                 "ready": False,
                 "error": "Metasploit/msfconsole readiness check failed.",

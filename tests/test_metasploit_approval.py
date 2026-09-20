@@ -127,6 +127,19 @@ def test_metasploit_execution_and_result_reference_persist() -> None:
     assert loaded.result_artifact_ref == "assessment_artifact:42"
 
 
+@pytest.mark.parametrize("status", ["cancelled", "timed_out"])
+def test_metasploit_terminal_interruption_states_persist_without_migration(status: str) -> None:
+    request = _request()
+    proposal = approve_metasploit_proposal(propose_metasploit_action(100, request).id, user_id=100)
+    updated = mark_metasploit_proposal_status(proposal.id, status)
+    from app.services import metasploit_approval
+
+    metasploit_approval._proposals.clear()
+    loaded = get_metasploit_proposal(updated.id)
+    assert loaded.status == status
+    assert loaded.execution_state == status
+
+
 def test_metasploit_stale_cleanup_marks_expired() -> None:
     proposal = propose_metasploit_action(100, _request())
 

@@ -20,6 +20,7 @@ from app.services.assessment_store import (
     list_assessment_scans,
     list_assessment_targets,
 )
+from app.services.scan_status import scan_status_label
 from app.services.assessment_ai import FALLBACK_REPORT, generate_assessment_ai_report
 from app.services.assessment_conversation_ai import FALLBACK_ANSWER, answer_assessment_conversation_question
 from app.services.assessment_conversation_store import (
@@ -318,7 +319,7 @@ def build_assessment_history_text(assessment: dict, scans: list[dict] | None = N
     for scan in scans[-10:]:
         lines.extend(
             [
-                f"{str(scan.get('tool') or 'unknown').upper()} - {str(scan.get('status') or 'unknown').title()}",
+                f"{str(scan.get('tool') or 'unknown').upper()} - {scan_status_label(scan.get('status'))}",
                 f"Time: {_format_dashboard_time(_scan_time(scan))}",
             ]
         )
@@ -1044,7 +1045,7 @@ def _scan_statuses(scans: list[dict]) -> dict[str, str]:
     for scan in scans:
         tool = str(scan.get("tool") or "").lower().removesuffix(".sh")
         if tool in statuses:
-            statuses[tool] = str(scan.get("status") or "unknown").title()
+            statuses[tool] = scan_status_label(scan.get("status"))
     return statuses
 
 

@@ -3,6 +3,7 @@ import ipaddress
 import logging
 import re
 import secrets
+import threading
 import time
 from datetime import UTC
 from pathlib import Path
@@ -43,14 +44,18 @@ from app.parsers.metasploit_parser import parse_metasploit_validation_result
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import (
     add_assessment_artifact,
+    finalize_assessment_scan,
     get_assessment,
     list_assessment_scans,
     list_assessment_targets,
     record_assessment_scan,
+    start_assessment_scan,
 )
 from app.services.active_scan_state import (
     clear_active_scan,
     get_active_scan,
+    mark_active_scan_process_complete,
+    mark_active_scan_terminal,
     set_active_scan,
     set_active_scan_status_task,
     set_active_scan_task,
@@ -98,6 +103,7 @@ from app.services.scan_manager import (
     get_scan_request,
     mark_scan_request_awaiting_target,
 )
+from app.services.scan_status import scan_status_from_result
 from app.services.scan_ai_summary import FALLBACK_SUMMARY_LINES, generate_scan_ai_summary
 from app.services.nmap_ai_assessment import FALLBACK_LINES as NMAP_AI_FALLBACK_LINES
 from app.services.nmap_ai_assessment import generate_nmap_ai_assessment
@@ -160,6 +166,7 @@ METASPLOIT_CALLBACK_PREFIX = "msf"
 GITLEAKS_EVIDENCE_TOKEN_TTL_SECONDS = 900
 METASPLOIT_FLOW_MODE_KEY = "metasploit_flow_mode"
 METASPLOIT_GUIDED_CONTEXT_KEY = "metasploit_guided_context"
+ASSESSMENT_RUNNING_SCAN_GUARD_KEY = "assessment_running_scan_guard"
 FFUF_PROFILE_CALLBACK_PREFIX = "ffufp"
 SCAN_RECOVERY_TOKEN_TTL_SECONDS = 3600
 _gitleaks_evidence_action_tokens: dict[str, dict[str, object]] = {}
@@ -984,7 +991,7 @@ def build_httpx_result_text(result: dict[str, object], services: list[dict] | No
 
 def store_httpx_scan_result(user_id: int, result: dict[str, object], services: list[dict] | None = None) -> dict:
     services = services or []
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     summary = summarize_httpx_services(services)
     if result.get("success") is True:
         finding_summary = f"httpx observed {len(services)} HTTP response/URL record(s)."
@@ -1065,7 +1072,7 @@ def build_katana_result_text(result: dict[str, object], observations: list[dict]
 
 def store_katana_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
     observations = observations or []
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     summary = summarize_katana_observations(observations)
     if result.get("success") is True:
         finding_summary = f"Katana observed {len(observations)} URL/endpoint record(s)."
@@ -1150,7 +1157,7 @@ def build_playwright_result_text(result: dict[str, object], observation: dict | 
 def store_playwright_scan_result(user_id: int, result: dict[str, object], observation: dict | None = None) -> dict:
     observation = normalize_playwright_observation(observation or {})
     summary = summarize_playwright_observation(observation)
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     if result.get("success") is True:
         finding_summary = "Playwright passive browser observation completed."
     else:
@@ -1231,7 +1238,7 @@ def build_ffuf_result_text(result: dict[str, object], observations: list[dict] |
 
 def store_ffuf_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
     observations = observations or []
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     summary = summarize_ffuf_results(observations)
     if result.get("success") is True:
         finding_summary = f"ffuf observed {len(observations)} hidden-content path record(s)."
@@ -1323,7 +1330,7 @@ def build_testssl_result_text(result: dict[str, object], evidence: dict | None =
 
 def store_testssl_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
     evidence = evidence or {}
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     summary = summarize_testssl_evidence(evidence) if evidence else {}
     notable_count = int(summary.get("notable_count") or 0) + int(summary.get("weak_protocol_count") or 0)
     target = str(result.get("target") or evidence.get("target") or "")
@@ -1639,7 +1646,7 @@ def store_metasploit_scan_result(
     artifact_ref: str,
 ) -> dict:
     validation_state = str(normalized.get("validation_state") or "INCONCLUSIVE")
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     return add_finding(
         user_id=user_id,
         finding={
@@ -1691,7 +1698,7 @@ def _metasploit_validation_name(module: str) -> str:
 def store_prowler_scan_result(user_id: int, result: dict[str, object], evidence: dict | None = None) -> dict:
     evidence = evidence or {}
     summary = summarize_prowler_evidence(evidence) if evidence else {}
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     provider = str(result.get("provider") or evidence.get("provider") or "")
     cloud_context = str(result.get("cloud_context") or evidence.get("cloud_context") or f"standalone-{provider}") if provider else "unknown-cloud-context"
     return add_finding(
@@ -1734,7 +1741,7 @@ def store_gitleaks_scan_result(user_id: int, result: dict[str, object], evidence
     evidence = evidence or {}
     summary = summarize_gitleaks_evidence(evidence) if evidence else {}
     finding_count = int(summary.get("finding_count") or 0)
-    status = "completed" if result.get("success") is True else "failed"
+    status = scan_status_from_result(result)
     target = str(result.get("target") or evidence.get("scan_root") or "")
     return add_finding(
         user_id=user_id,
@@ -1874,12 +1881,7 @@ def _prowler_assessment_provider_limitation(error: object) -> str:
 def store_bbot_scan_result(user_id: int, result: dict[str, object], observations: list[dict] | None = None) -> dict:
     observations = observations or []
     observation_counts = summarize_observations(observations)
-    if result.get("partial") is True:
-        status = "partial"
-    elif result.get("success") is True:
-        status = "completed"
-    else:
-        status = "failed"
+    status = scan_status_from_result(result)
     if result.get("success") is True or result.get("partial") is True:
         summary = _build_bbot_summary(observation_counts)
     else:
@@ -2032,6 +2034,106 @@ def _current_assessment_scan_context(context: ContextTypes.DEFAULT_TYPE, tool: s
     return dict(assessment_context)
 
 
+def _start_current_assessment_scan(context: ContextTypes.DEFAULT_TYPE, tool: str) -> None:
+    """Persist the active assessment scan immediately before its runner starts."""
+
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        return
+    assessment_context = user_data.get(ASSESSMENT_SCAN_CONTEXT_KEY)
+    if not isinstance(assessment_context, dict) or str(assessment_context.get("tool") or "").lower() != tool:
+        return
+    _start_assessment_scan_context(assessment_context, tool)
+    user_data[ASSESSMENT_RUNNING_SCAN_GUARD_KEY] = assessment_context
+
+
+def _start_assessment_scan_context(assessment_context: dict | None, tool: str) -> None:
+    if not assessment_context or assessment_context.get("assessment_scan_id") is not None:
+        return
+    scan = start_assessment_scan(
+        assessment_id=int(assessment_context["assessment_id"]),
+        target_id=int(assessment_context["target_id"]) if assessment_context.get("target_id") is not None else None,
+        tool=tool,
+    )
+    assessment_context["assessment_scan_id"] = int(scan["id"])
+
+
+def _finalize_assessment_scan_context_if_running(
+    assessment_context: dict | None,
+    *,
+    status: str = "failed",
+) -> dict | None:
+    """Apply one fallback terminal transition without replacing an existing terminal state."""
+
+    if not isinstance(assessment_context, dict):
+        return None
+    scan_id = assessment_context.get("assessment_scan_id")
+    assessment_id = assessment_context.get("assessment_id")
+    if scan_id is None or assessment_id is None:
+        return None
+    return finalize_assessment_scan(
+        assessment_id=int(assessment_id),
+        scan_id=int(scan_id),
+        status=status,
+    )
+
+
+def _finalize_guarded_assessment_scan(context: ContextTypes.DEFAULT_TYPE, *, status: str) -> None:
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        return
+    assessment_context = user_data.pop(ASSESSMENT_RUNNING_SCAN_GUARD_KEY, None)
+    _finalize_assessment_scan_context_if_running(assessment_context, status=status)
+
+
+async def _run_cancellable_scanner(
+    *,
+    user_id: int,
+    scan_type: str,
+    target: str,
+    status_message: object | None,
+    runner,
+    args: tuple = (),
+    kwargs: dict | None = None,
+) -> dict:
+    """Run one synchronous scanner with its native cancellation token registered."""
+    cancellation_event = threading.Event()
+    active_scan = set_active_scan(
+        user_id=user_id,
+        scan_type=scan_type,
+        target=target,
+        task=asyncio.current_task(),
+        status_message=status_message,
+        cancellation_event=cancellation_event,
+    )
+    runner_kwargs = dict(kwargs or {})
+    runner_kwargs["cancellation_event"] = cancellation_event
+    worker_task = asyncio.create_task(asyncio.to_thread(runner, *args, **runner_kwargs))
+    try:
+        result = await asyncio.shield(worker_task)
+        mark_active_scan_process_complete(user_id, active_scan)
+        terminal_status = scan_status_from_result(result)
+        mark_active_scan_terminal(user_id, active_scan, terminal_status)
+        return result
+    except asyncio.CancelledError:
+        cancellation_event.set()
+        try:
+            await asyncio.shield(worker_task)
+        except BaseException:
+            logger.warning("Scanner worker failed while task cancellation cleanup was in progress.", exc_info=True)
+        finally:
+            mark_active_scan_process_complete(user_id, active_scan)
+            mark_active_scan_terminal(user_id, active_scan, "cancelled")
+        raise
+    except BaseException:
+        if worker_task.done():
+            mark_active_scan_process_complete(user_id, active_scan)
+        mark_active_scan_terminal(user_id, active_scan, "failed")
+        raise
+    finally:
+        clear_active_scan(user_id, active_scan)
+
+
 def _record_assessment_scan(
     assessment_context: dict | None,
     *,
@@ -2041,22 +2143,37 @@ def _record_assessment_scan(
 ) -> dict | None:
     if not assessment_context:
         return None
-    if result.get("partial") is True:
-        status = "partial"
-    elif result.get("success") is True:
-        status = "completed"
-    else:
-        status = "failed"
-    return record_assessment_scan(
+    status = scan_status_from_result(result)
+    scan_values = dict(
         assessment_id=int(assessment_context["assessment_id"]),
-        target_id=int(assessment_context["target_id"]) if assessment_context.get("target_id") is not None else None,
-        tool=tool,
         status=status,
         finding_id=finding.get("id") if finding else None,
         elapsed_seconds=_scan_elapsed_seconds(result, finding),
         risk=_scan_risk(result, finding),
         raw_reference=_scan_raw_reference(result, finding),
     )
+    scan_id = assessment_context.get("assessment_scan_id")
+    if scan_id is not None:
+        return finalize_assessment_scan(scan_id=int(scan_id), **scan_values)
+    return record_assessment_scan(
+        target_id=int(assessment_context["target_id"]) if assessment_context.get("target_id") is not None else None,
+        tool=tool,
+        **scan_values,
+    )
+
+
+def _scan_event_outcome(result: dict) -> tuple[str, str, str]:
+    """Return canonical persisted status, event suffix, and truthful wording."""
+
+    status = scan_status_from_result(result)
+    wording = {
+        "completed": "completed",
+        "partial": "completed partially",
+        "timed_out": "timed out",
+        "cancelled": "cancelled",
+        "failed": "failed",
+    }.get(status, status.replace("_", " "))
+    return status, status, wording
 
 
 async def _send_assessment_dashboard(message: object, assessment_context: dict | None) -> None:
@@ -2308,6 +2425,22 @@ async def tool_mode_callback_handler(update: Update, context: ContextTypes.DEFAU
 
 
 async def scan_callback_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    acknowledge: bool = True,
+) -> None:
+    fallback_status = "failed"
+    try:
+        await _scan_callback_handler_impl(update, context, acknowledge=acknowledge)
+    except asyncio.CancelledError:
+        fallback_status = "cancelled"
+        raise
+    finally:
+        _finalize_guarded_assessment_scan(context, status=fallback_status)
+
+
+async def _scan_callback_handler_impl(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -2611,6 +2744,19 @@ async def _handle_scan_recovery_callback(query: object, user_id: int, context: C
 
 
 async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dispatch text input and close any durable scan row left by an exceptional path."""
+
+    fallback_status = "failed"
+    try:
+        await _scan_target_handler_impl(update, context)
+    except asyncio.CancelledError:
+        fallback_status = "cancelled"
+        raise
+    finally:
+        _finalize_guarded_assessment_scan(context, status=fallback_status)
+
+
+async def _scan_target_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
@@ -2780,6 +2926,7 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     progress_card = ScanProgressCard(update.message, "Nmap Scan", normalized_target)
     await progress_card.start("Launching scan...")
+    _start_current_assessment_scan(context, "nmap")
 
     try:
         result = await asyncio.to_thread(run_nmap_scan, target)
@@ -2804,14 +2951,15 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         result=result,
     )
     finding = store_successful_nmap_finding(user_id=user_id, result=result)
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=str(result["target"]),
-        event_type="nmap_scan_completed",
+        event_type=f"nmap_scan_{event_suffix}",
         tool="nmap",
-        status="completed" if result.get("success") is True else "failed",
-        summary="Nmap scan completed" if result.get("success") is True else "Nmap scan failed",
+        status=event_status,
+        summary=f"Nmap scan {event_wording}",
         metadata={"finding_id": finding.get("id") if finding else None},
     )
     assessment_context = _pop_assessment_scan_context(context, "nmap")
@@ -2963,9 +3111,17 @@ async def _handle_ffuf_target(
     progress_card = ScanProgressCard(update.message, "ffuf Discovery", display_target)
     await progress_card.start("Launching discovery...")
     await progress_card.start_auto_refresh("Running discovery...", interval_seconds=5)
+    _start_current_assessment_scan(context, "ffuf")
 
     try:
-        result = await asyncio.to_thread(run_ffuf_scan, target, profile)
+        result = await _run_cancellable_scanner(
+            user_id=user_id,
+            scan_type="ffuf",
+            target=display_target,
+            status_message=progress_card.status_message,
+            runner=run_ffuf_scan,
+            args=(target, profile),
+        )
     except ValueError as exc:
         await progress_card.fail(str(exc))
         add_investigation_event(
@@ -3002,21 +3158,25 @@ async def _handle_ffuf_target(
     )
     observations = parse_ffuf_output(str(result.get("output") or "")) if result.get("output") else []
     finding = store_ffuf_scan_result(user_id=user_id, result=result, observations=observations)
+    is_cancelled = result.get("error_type") == "cancelled"
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=str(result["target"]),
-        event_type="ffuf_scan_completed" if result.get("success") is True else "ffuf_scan_failed",
+        event_type=f"ffuf_scan_{event_suffix}",
         tool="ffuf",
-        status="completed" if result.get("success") is True else "failed",
-        summary="ffuf hidden-content discovery completed" if result.get("success") is True else "ffuf hidden-content discovery failed",
+        status=event_status,
+        summary=f"ffuf hidden-content discovery {event_wording}",
         metadata={"finding_id": finding.get("id"), "result_count": len(observations)},
     )
     assessment_context = _pop_assessment_scan_context(context, "ffuf")
     _record_assessment_scan(assessment_context, tool="ffuf", result=result, finding=finding)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     _ffuf_scan_profiles.pop(scan_request_id, None)
-    if result.get("success") is True:
+    if result.get("error_type") == "cancelled":
+        await progress_card.update("Cancelled")
+    elif result.get("success") is True:
         await progress_card.complete()
     else:
         await progress_card.fail(str(result.get("error") or "Unknown error."))
@@ -3076,10 +3236,18 @@ async def _handle_testssl_target(
     progress_card = ScanProgressCard(update.message, "testssl.sh TLS", display_target)
     await progress_card.start("Launching scan...")
     await progress_card.start_auto_refresh("Running scan...", interval_seconds=5)
+    _start_current_assessment_scan(context, "testssl")
     assessment_context = _pop_assessment_scan_context(context, "testssl")
 
     try:
-        result = await asyncio.to_thread(run_testssl_scan, target)
+        result = await _run_cancellable_scanner(
+            user_id=user_id,
+            scan_type="testssl",
+            target=display_target,
+            status_message=progress_card.status_message,
+            runner=run_testssl_scan,
+            args=(target,),
+        )
     except ValueError as exc:
         await progress_card.fail(str(exc))
         await update.message.reply_text(
@@ -3119,18 +3287,22 @@ async def _handle_testssl_target(
             result = {**result, "success": False, "error": parser_error, "error_type": "parser_error"}
 
     finding = store_testssl_scan_result(user_id=user_id, result=result, evidence=evidence)
+    is_cancelled = result.get("error_type") == "cancelled"
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=str(result.get("target") or display_target),
-        event_type="testssl_scan_completed" if result.get("success") is True else "testssl_scan_failed",
+        event_type=f"testssl_scan_{event_suffix}",
         tool="testssl",
-        status="completed" if result.get("success") is True else "failed",
-        summary="testssl.sh TLS assessment completed" if result.get("success") is True else "testssl.sh TLS assessment failed",
+        status=event_status,
+        summary=f"testssl.sh TLS assessment {event_wording}",
         metadata={"finding_id": finding.get("id"), "parser_error": parser_error},
     )
     _record_assessment_scan(assessment_context, tool="testssl", result=result, finding=finding)
-    if result.get("success") is True:
+    if result.get("error_type") == "cancelled":
+        await progress_card.update("Cancelled")
+    elif result.get("success") is True:
         await progress_card.complete()
     else:
         await progress_card.fail(str(result.get("error") or "Unknown error."))
@@ -3174,6 +3346,7 @@ async def _handle_gitleaks_target(
     progress_card = ScanProgressCard(update.message, "Gitleaks Secrets", scope)
     await progress_card.start("Launching scan...")
     await progress_card.start_auto_refresh("Running scan...", interval_seconds=5)
+    _start_current_assessment_scan(context, "gitleaks")
     assessment_context = _pop_assessment_scan_context(context, "gitleaks")
 
     try:
@@ -3237,14 +3410,15 @@ async def _handle_gitleaks_target(
     )
 
     finding = store_gitleaks_scan_result(user_id=user_id, result=result, evidence=evidence)
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=str(result.get("target") or scope),
-        event_type="gitleaks_scan_completed" if result.get("success") is True else "gitleaks_scan_failed",
+        event_type=f"gitleaks_scan_{event_suffix}",
         tool="gitleaks",
-        status="completed" if result.get("success") is True else "failed",
-        summary="Gitleaks secret scan completed" if result.get("success") is True else "Gitleaks secret scan failed",
+        status=event_status,
+        summary=f"Gitleaks secret scan {event_wording}",
         metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count"), "parser_error": parser_error},
     )
     _record_assessment_scan(assessment_context, tool="gitleaks", result=result, finding=finding)
@@ -3314,6 +3488,7 @@ async def _handle_prowler_provider(
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
 
+    _start_current_assessment_scan(context, "prowler")
     assessment_context = _pop_assessment_scan_context(context, "prowler")
     cloud_context = _prowler_cloud_context(provider, assessment_context)
     investigation = get_or_create_latest_open_investigation(user_id=user_id, target=cloud_context)
@@ -3356,14 +3531,15 @@ async def _handle_prowler_provider(
         result=result,
     )
     finding = store_prowler_scan_result(user_id=user_id, result=result, evidence=evidence)
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=cloud_context,
-        event_type="prowler_scan_completed" if result.get("success") is True else "prowler_scan_failed",
+        event_type=f"prowler_scan_{event_suffix}",
         tool="prowler",
-        status="completed" if result.get("success") is True else "failed",
-        summary=f"Prowler cloud posture scan completed for {provider.upper()} context {cloud_context}" if result.get("success") is True else "Prowler cloud posture scan failed",
+        status=event_status,
+        summary=f"Prowler cloud posture scan {event_wording} for {provider.upper()} context {cloud_context}",
         metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count"), "parser_error": parser_error, "provider": provider, "cloud_context": cloud_context},
     )
     _record_assessment_scan(assessment_context, tool="prowler", result=result, finding=finding)
@@ -3691,8 +3867,23 @@ async def _handle_metasploit_callback(query: object, user_id: int, context: Cont
         await query.edit_message_text(f"Metasploit approval denied: {exc}")
         return
 
+    pending = _metasploit_pending_context.get(approved.id, {})
+    pending_assessment_context = pending.get("assessment_context") if isinstance(pending, dict) else None
+    _start_assessment_scan_context(
+        pending_assessment_context if isinstance(pending_assessment_context, dict) else None,
+        "metasploit",
+    )
+    if isinstance(pending_assessment_context, dict):
+        context.user_data[ASSESSMENT_RUNNING_SCAN_GUARD_KEY] = pending_assessment_context
     await query.edit_message_text("Metasploit proposal approved. Executing bounded validation...")
-    result = await asyncio.to_thread(run_metasploit_validation, user_id=user_id, proposal_id=approved.id, request=approved.request)
+    result = await _run_cancellable_scanner(
+        user_id=user_id,
+        scan_type="metasploit",
+        target=str(approved.request.get("target") or ""),
+        status_message=getattr(query, "message", None),
+        runner=run_metasploit_validation,
+        kwargs={"user_id": user_id, "proposal_id": approved.id, "request": approved.request},
+    )
     normalized = parse_metasploit_validation_result(result)
     pending = _metasploit_pending_context.pop(approved.id, {})
     assessment_context = pending.get("assessment_context") if isinstance(pending, dict) else None
@@ -3790,6 +3981,7 @@ async def _handle_playwright_target(
     )
     progress_card = ScanProgressCard(update.message, "Playwright Observation", display_target)
     await progress_card.start("Launching browser observation...")
+    _start_current_assessment_scan(context, "playwright")
 
     try:
         result = await asyncio.to_thread(run_playwright_observation, target)
@@ -3825,14 +4017,15 @@ async def _handle_playwright_target(
     )
     observation = normalize_playwright_observation(result.get("output") or {}) if result.get("output") else {}
     finding = store_playwright_scan_result(user_id=user_id, result=result, observation=observation)
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=str(result["target"]),
-        event_type="playwright_observation_completed" if result.get("success") is True else "playwright_observation_failed",
+        event_type=f"playwright_observation_{event_suffix}",
         tool="playwright",
-        status="completed" if result.get("success") is True else "failed",
-        summary="Playwright passive browser observation completed" if result.get("success") is True else "Playwright passive browser observation failed",
+        status=event_status,
+        summary=f"Playwright passive browser observation {event_wording}",
         metadata={"finding_id": finding.get("id"), "final_url": observation.get("final_url")},
     )
     assessment_context = _pop_assessment_scan_context(context, "playwright")
@@ -3896,6 +4089,7 @@ async def _handle_katana_target(
     )
     progress_card = ScanProgressCard(update.message, "Katana Crawl", display_target)
     await progress_card.start("Launching crawl...")
+    _start_current_assessment_scan(context, "katana")
 
     try:
         result = await asyncio.to_thread(run_katana_scan, target)
@@ -3931,14 +4125,15 @@ async def _handle_katana_target(
     )
     observations = parse_katana_output(str(result.get("output") or "")) if result.get("output") else []
     finding = store_katana_scan_result(user_id=user_id, result=result, observations=observations)
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=str(result["target"]),
-        event_type="katana_scan_completed" if result.get("success") is True else "katana_scan_failed",
+        event_type=f"katana_scan_{event_suffix}",
         tool="katana",
-        status="completed" if result.get("success") is True else "failed",
-        summary="Katana crawl completed" if result.get("success") is True else "Katana crawl failed",
+        status=event_status,
+        summary=f"Katana crawl {event_wording}",
         metadata={"finding_id": finding.get("id"), "url_count": len(observations)},
     )
     assessment_context = _pop_assessment_scan_context(context, "katana")
@@ -4003,6 +4198,7 @@ async def _handle_httpx_target(
     progress_card = ScanProgressCard(update.message, "httpx Scan", display_target)
     await progress_card.start("Launching scan...")
     await progress_card.start_auto_refresh("Running scan...", interval_seconds=5)
+    _start_current_assessment_scan(context, "httpx")
 
     try:
         result = await asyncio.to_thread(run_httpx_scan, target)
@@ -4040,14 +4236,15 @@ async def _handle_httpx_target(
     )
     services = parse_httpx_output(str(result.get("output") or "")) if result.get("output") else []
     finding = store_httpx_scan_result(user_id=user_id, result=result, services=services)
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=str(result["target"]),
-        event_type="httpx_scan_completed" if result.get("success") is True else "httpx_scan_failed",
+        event_type=f"httpx_scan_{event_suffix}",
         tool="httpx",
-        status="completed" if result.get("success") is True else "failed",
-        summary="httpx fingerprinting completed" if result.get("success") is True else "httpx fingerprinting failed",
+        status=event_status,
+        summary=f"httpx fingerprinting {event_wording}",
         metadata={"finding_id": finding.get("id"), "service_count": len(services)},
     )
     assessment_context = _pop_assessment_scan_context(context, "httpx")
@@ -4129,9 +4326,17 @@ async def _handle_bbot_target(
     progress_card = ScanProgressCard(update.message, "BBOT Scan", display_target)
     await progress_card.start("Launching scan...")
     await progress_card.start_auto_refresh("Launching scan...", interval_seconds=5)
+    _start_current_assessment_scan(context, "bbot")
 
     try:
-        result = await asyncio.to_thread(run_bbot_scan, target)
+        result = await _run_cancellable_scanner(
+            user_id=user_id,
+            scan_type="bbot",
+            target=display_target,
+            status_message=progress_card.status_message,
+            runner=run_bbot_scan,
+            args=(target,),
+        )
     except ValueError as exc:
         await progress_card.fail(str(exc))
         add_investigation_event(
@@ -4189,14 +4394,15 @@ async def _handle_bbot_target(
             "error": sanitized_error or "BBOT completed but produced no fresh normalized evidence for this run.",
             "error_type": "no_fresh_evidence",
         }
-    elif result.get("success") is not True and observations:
+    elif result.get("success") is not True and observations and result.get("error_type") != "cancelled":
         result = {**result, "partial": True, "parser_error": parser_error}
     elif parser_error:
         result = {**result, "parser_error": parser_error}
     finding = store_bbot_scan_result(user_id=user_id, result=result, observations=observations)
     is_partial = result.get("partial") is True
     is_successful_or_partial = result.get("success") is True or is_partial
-    event_type = "bbot_scan_partial" if is_partial else ("bbot_scan_completed" if result.get("success") is True else "bbot_scan_failed")
+    is_cancelled = result.get("error_type") == "cancelled"
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     observation_count = len(observations)
     recon_summary = None
     if is_successful_or_partial:
@@ -4208,16 +4414,16 @@ async def _handle_bbot_target(
         investigation_id=investigation["id"],
         user_id=user_id,
         target=str(result["target"]),
-        event_type=event_type,
+        event_type=f"bbot_scan_{event_suffix}",
         tool="bbot",
-        status="partial" if is_partial else ("completed" if result.get("success") is True else "failed"),
+        status=event_status,
         summary=(
             f"BBOT scan partial - Recon Summary Generated ({observation_count} observations)."
             if is_partial
             else (
                 f"BBOT scan completed - Recon Summary Generated ({observation_count} observations)."
                 if result.get("success") is True
-                else "BBOT recon failed"
+                else f"BBOT recon {event_wording}"
             )
         ),
         metadata={"finding_id": finding.get("id"), "observation_count": observation_count, "partial": is_partial},
@@ -4228,7 +4434,9 @@ async def _handle_bbot_target(
     elapsed_seconds = _parse_elapsed_seconds(result.get("elapsed_seconds"))
     if elapsed_seconds is not None:
         progress_card.started_at = time.monotonic() - elapsed_seconds
-    if is_partial:
+    if result.get("error_type") == "cancelled":
+        await progress_card.update("Cancelled")
+    elif is_partial:
         await progress_card.partial()
     elif result.get("success") is True:
         await progress_card.complete()
@@ -4750,6 +4958,7 @@ async def _handle_nuclei_target(
     )
     progress_card = ScanProgressCard(update.message, "Nuclei Scan", display_target)
     status_message = await progress_card.start("Launching scan...")
+    _start_current_assessment_scan(context, "nuclei")
     active_scan = set_active_scan(
         user_id=user_id,
         scan_type="nuclei",
@@ -4758,6 +4967,7 @@ async def _handle_nuclei_target(
     )
     started_at = progress_card.started_at
     assessment_context = _pop_assessment_scan_context(context, "nuclei")
+    context.user_data.pop(ASSESSMENT_RUNNING_SCAN_GUARD_KEY, None)
     status_task = asyncio.create_task(_update_nuclei_status_card(user_id, status_message, display_target, started_at))
     task = asyncio.create_task(
         _run_nuclei_scan_background(
@@ -4784,6 +4994,37 @@ async def _handle_nuclei_target(
 
 
 async def _run_nuclei_scan_background(
+    user_id: int,
+    scan_request_id: str,
+    target: str,
+    message: object,
+    progress_card: ScanProgressCard,
+    display_target: str,
+    started_at: float,
+    investigation_id: str,
+    assessment_context: dict | None = None,
+) -> None:
+    fallback_status = "failed"
+    try:
+        await _run_nuclei_scan_background_impl(
+            user_id=user_id,
+            scan_request_id=scan_request_id,
+            target=target,
+            message=message,
+            progress_card=progress_card,
+            display_target=display_target,
+            started_at=started_at,
+            investigation_id=investigation_id,
+            assessment_context=assessment_context,
+        )
+    except asyncio.CancelledError:
+        fallback_status = "cancelled"
+        raise
+    finally:
+        _finalize_assessment_scan_context_if_running(assessment_context, status=fallback_status)
+
+
+async def _run_nuclei_scan_background_impl(
     user_id: int,
     scan_request_id: str,
     target: str,
@@ -4839,6 +5080,11 @@ async def _run_nuclei_scan_background(
         logger.info("Nuclei scan result discarded for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
         return
 
+    output = str(result.get("output") or "")
+    is_partial_timeout = result.get("error_type") == "timeout" and bool(output.strip())
+    if is_partial_timeout:
+        result = {**result, "partial": True}
+
     complete_scan_request(
         user_id=user_id,
         scan_request_id=scan_request_id,
@@ -4851,19 +5097,17 @@ async def _run_nuclei_scan_background(
     elapsed_label = f"{int(elapsed_seconds)}s"
     logger.info("Nuclei scan completed for user_id=%s elapsed_seconds=%.2f", user_id, elapsed_seconds)
 
-    output = str(result.get("output") or "")
-    is_partial_timeout = result.get("error_type") == "timeout" and bool(output.strip())
-
     if result.get("success") is not True and not is_partial_timeout:
         await progress_card.fail(str(result.get("error") or "Unknown error."))
+        event_status, event_suffix, event_wording = _scan_event_outcome(result)
         add_investigation_event(
             investigation_id=investigation_id,
             user_id=user_id,
             target=display_target,
-            event_type="nuclei_scan_completed",
+            event_type=f"nuclei_scan_{event_suffix}",
             tool="nuclei",
-            status="failed",
-            summary="Nuclei scan failed",
+            status=event_status,
+            summary=f"Nuclei scan {event_wording}",
         )
         await _send_scan_message(
             message,
@@ -4996,14 +5240,15 @@ async def _run_nuclei_scan_background(
         "timeout_reason": result.get("timeout_reason") if is_partial_timeout else None,
     }
     finding = store_nuclei_finding(user_id=user_id, nuclei_findings=nuclei_findings, metadata=nuclei_metadata)
+    event_status, event_suffix, event_wording = _scan_event_outcome(result)
     add_investigation_event(
         investigation_id=investigation_id,
         user_id=user_id,
         target=str(finding.get("target") or display_target),
-        event_type="nuclei_scan_completed",
+        event_type=f"nuclei_scan_{event_suffix}",
         tool="nuclei",
-        status="partial" if is_partial_timeout else "completed",
-        summary="Nuclei scan partial - findings retained before timeout" if is_partial_timeout else "Nuclei scan completed",
+        status=event_status,
+        summary=("Nuclei scan completed partially - findings retained before timeout" if is_partial_timeout else f"Nuclei scan {event_wording}"),
         metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count")},
     )
     await _send_scan_message(

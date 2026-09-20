@@ -1561,7 +1561,8 @@ def test_named_ffuf_preserves_newest_partial_run_evidence() -> None:
         user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What did ffuf add?",
     )["answer"]
 
-    assert "ffuf is partial or interrupted" in answer
+    assert "ffuf is partial" in answer
+    assert "interrupted" not in answer
     assert "Deep" in answer and "60000" in answer and "403=1" in answer
     assert "Custom" not in answer and "19 wordlist entries" not in answer
 

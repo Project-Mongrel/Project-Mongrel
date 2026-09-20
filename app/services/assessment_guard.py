@@ -1,3 +1,6 @@
+from app.services.scan_status import normalize_scan_status
+
+
 CORE_TOOLS = ("nmap", "bbot", "nuclei", "httpx", "katana", "playwright", "ffuf")
 LOCKED_TOOL_LIMITATIONS = (
     "testssl.sh not run",
@@ -13,24 +16,34 @@ def build_assessment_guard(context: dict, question: object | None = None) -> dic
     scans = context.get("scans") or []
     status_by_tool = _status_by_tool(scans)
     completed_tools = _tools_with_status(status_by_tool, "completed")
+    running_tools = _tools_with_status(status_by_tool, "running")
     partial_tools = _tools_with_status(status_by_tool, "partial")
     failed_tools = _tools_with_status(status_by_tool, "failed")
+    timed_out_tools = _tools_with_status(status_by_tool, "timed_out")
+    cancelled_tools = _tools_with_status(status_by_tool, "cancelled")
+    interrupted_tools = _tools_with_status(status_by_tool, "interrupted")
     represented_tools = sorted(set(completed_tools + partial_tools))
     missing_core_tools = [tool for tool in CORE_TOOLS if tool not in status_by_tool]
     observed_assets = collect_observed_assets(context)
 
     return {
         "completed_tools": completed_tools,
+        "running_tools": running_tools,
         "partial_tools": partial_tools,
         "failed_tools": failed_tools,
+        "timed_out_tools": timed_out_tools,
+        "cancelled_tools": cancelled_tools,
+        "interrupted_tools": interrupted_tools,
         "represented_tools": represented_tools,
         "missing_core_tools": missing_core_tools,
         "locked_tool_limitations": _locked_tool_limitations(status_by_tool),
         "observed_assets": observed_assets,
         "is_secure_question": is_secure_question(question),
         "secure_preamble": SECURE_PREAMBLE,
-        "is_complete": not missing_core_tools and not failed_tools and not partial_tools,
-        "limitations": build_guard_limitations(missing_core_tools, partial_tools, failed_tools),
+        "is_complete": not any((missing_core_tools, running_tools, failed_tools, partial_tools, timed_out_tools, cancelled_tools, interrupted_tools)),
+        "limitations": build_guard_limitations(
+            missing_core_tools, partial_tools, failed_tools, timed_out_tools, cancelled_tools, interrupted_tools, running_tools
+        ),
     }
 
 
@@ -39,8 +52,12 @@ def build_guard_prompt_section(context: dict, question: object | None = None) ->
     lines = [
         "Assessment Guardrails:",
         f"- Completed tools: {_join_or_none(guard['completed_tools'])}",
+        f"- Running tools: {_join_or_none(guard['running_tools'])}",
         f"- Partial tools: {_join_or_none(guard['partial_tools'])}",
         f"- Failed tools: {_join_or_none(guard['failed_tools'])}",
+        f"- Timed-out tools: {_join_or_none(guard['timed_out_tools'])}",
+        f"- Cancelled tools: {_join_or_none(guard['cancelled_tools'])}",
+        f"- Interrupted tools: {_join_or_none(guard['interrupted_tools'])}",
         f"- Represented evidence tools: {_join_or_none(guard['represented_tools'])}",
         f"- Missing core tools: {_join_or_none(guard['missing_core_tools'])}",
         f"- Assessment complete relative to current core tools: {guard['is_complete']}",
@@ -65,14 +82,30 @@ def build_guard_prompt_section(context: dict, question: object | None = None) ->
     return "\n".join(lines)
 
 
-def build_guard_limitations(missing_core_tools: list[str], partial_tools: list[str], failed_tools: list[str]) -> list[str]:
+def build_guard_limitations(
+    missing_core_tools: list[str],
+    partial_tools: list[str],
+    failed_tools: list[str],
+    timed_out_tools: list[str] | None = None,
+    cancelled_tools: list[str] | None = None,
+    interrupted_tools: list[str] | None = None,
+    running_tools: list[str] | None = None,
+) -> list[str]:
     limitations = []
     if missing_core_tools:
         limitations.append("Core tools not run: " + ", ".join(missing_core_tools))
+    if running_tools:
+        limitations.append("Scans still running: " + ", ".join(running_tools))
     if partial_tools:
         limitations.append("Partial evidence from: " + ", ".join(partial_tools))
     if failed_tools:
         limitations.append("Failed scans: " + ", ".join(failed_tools))
+    if timed_out_tools:
+        limitations.append("Timed-out scans: " + ", ".join(timed_out_tools))
+    if cancelled_tools:
+        limitations.append("User-cancelled scans: " + ", ".join(cancelled_tools))
+    if interrupted_tools:
+        limitations.append("Scans interrupted by service shutdown: " + ", ".join(interrupted_tools))
     limitations.append("Absence of findings is not evidence of security.")
     return limitations
 
@@ -223,7 +256,7 @@ def _status_by_tool(scans: list[dict]) -> dict[str, set[str]]:
     statuses: dict[str, set[str]] = {}
     for scan in scans:
         tool = str(scan.get("tool") or "").strip().lower()
-        status = str(scan.get("status") or "").strip().lower()
+        status = normalize_scan_status(scan.get("status"), default="")
         if not tool or not status:
             continue
         statuses.setdefault(tool, set()).add(status)

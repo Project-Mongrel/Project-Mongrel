@@ -7,8 +7,10 @@ from uuid import uuid4
 from app.services.findings_store import _get_connection
 from app.services.metasploit_policy import metasploit_request_fingerprint
 
-APPROVAL_STATUSES = frozenset({"proposed", "approved", "rejected", "expired", "executing", "executed", "failed"})
-EXECUTION_STATES = frozenset({"not_started", "executing", "executed", "failed"})
+APPROVAL_STATUSES = frozenset(
+    {"proposed", "approved", "rejected", "expired", "executing", "executed", "failed", "timed_out", "cancelled"}
+)
+EXECUTION_STATES = frozenset({"not_started", "executing", "executed", "failed", "timed_out", "cancelled"})
 
 
 class MetasploitApprovalError(ValueError):
@@ -110,7 +112,7 @@ def mark_metasploit_proposal_status(proposal_id: str, status: str) -> Metasploit
         raise ValueError("Unsupported Metasploit proposal status.")
     proposal = _get_existing_proposal(proposal_id)
     execution_state = proposal.execution_state
-    if normalized_status in {"executing", "executed", "failed"}:
+    if normalized_status in EXECUTION_STATES:
         execution_state = normalized_status
     updated = replace(proposal, status=normalized_status, execution_state=execution_state)
     _save_proposal(updated)

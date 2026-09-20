@@ -2,15 +2,15 @@ import logging
 import math
 import re
 from pathlib import Path
-# Required to run authorized local ffuf subprocesses.
-import subprocess  # nosec B404
 import shutil
+import threading
 import time
 from urllib.parse import urlparse, urlunparse
 
 from app.core.config import get_settings
 from app.services.target_normalizer import normalize_for_ffuf
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS
+from app.tools.process_lifecycle import run_scanner_process
 
 logger = logging.getLogger(__name__)
 FFUF_NOT_AVAILABLE_ERROR = "ffuf executable was not found."
@@ -47,7 +47,12 @@ FFUF_PROFILE_ENV_VARS = {
 }
 
 
-def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
+def run_ffuf_scan(
+    target: str,
+    profile: str | None = None,
+    *,
+    cancellation_event: threading.Event | None = None,
+) -> dict[str, object]:
     validated_target = _validate_target(target)
     settings = get_settings()
     executable = _resolve_ffuf_executable(settings.ffuf_path)
@@ -60,6 +65,22 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
         settings=settings,
         wordlist_count=wordlist_count,
     )
+
+    if cancellation_event is not None and cancellation_event.is_set():
+        return _result(
+            target=validated_target,
+            success=False,
+            error="ffuf scan cancelled.",
+            error_type="cancelled",
+            elapsed_seconds=0,
+            command=None,
+            working_directory=working_directory,
+            wordlist_path=wordlist_path,
+            wordlist_count=wordlist_count,
+            fuzz_url=None,
+            profile_info=wordlist_info,
+            timeout_seconds=timeout_seconds,
+        )
 
     if executable is None:
         logger.warning("ffuf executable missing. Checked PATH and candidate paths: %s", [str(candidate) for candidate in _ffuf_executable_candidates()])
@@ -123,34 +144,32 @@ def run_ffuf_scan(target: str, profile: str | None = None) -> dict[str, object]:
     logger.info("ffuf scan started: target=%s timeout=%s profile=%s wordlist_count=%s", validated_target, timeout_seconds, wordlist_info["profile"], wordlist_count)
     logger.info("ffuf subprocess prepared: arg_count=%s", len(command))
     try:
-        completed = subprocess.run(  # nosec B603
+        completed = run_scanner_process(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=str(working_directory),
-            shell=False,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        elapsed_seconds = time.monotonic() - start_time
-        logger.warning("ffuf scan timed out: target=%s elapsed_seconds=%.2f", validated_target, elapsed_seconds)
-        return _result(
-            target=validated_target,
-            success=False,
-            output=exc.stdout or "",
-            error=exc.stderr or FFUF_TIMEOUT_ERROR,
-            error_type="timeout",
-            elapsed_seconds=elapsed_seconds,
-            command=command,
-            working_directory=working_directory,
-            wordlist_path=wordlist_path,
-            wordlist_count=wordlist_count,
-            fuzz_url=fuzz_url,
-            profile_info=wordlist_info,
             timeout_seconds=timeout_seconds,
+            cwd=str(working_directory),
+            cancellation_event=cancellation_event,
         )
+        if completed.timed_out or completed.cancelled:
+            elapsed_seconds = time.monotonic() - start_time
+            error_type = "cancelled" if completed.cancelled else "timeout"
+            logger.warning("ffuf scan %s: target=%s elapsed_seconds=%.2f", error_type, validated_target, elapsed_seconds)
+            return _result(
+                target=validated_target,
+                success=False,
+                output=completed.stdout,
+                error=completed.stderr or ("ffuf scan cancelled." if completed.cancelled else FFUF_TIMEOUT_ERROR),
+                error_type=error_type,
+                returncode=completed.returncode,
+                elapsed_seconds=elapsed_seconds,
+                command=command,
+                working_directory=working_directory,
+                wordlist_path=wordlist_path,
+                wordlist_count=wordlist_count,
+                fuzz_url=fuzz_url,
+                profile_info=wordlist_info,
+                timeout_seconds=timeout_seconds,
+            )
     except FileNotFoundError:
         elapsed_seconds = time.monotonic() - start_time
         return _result(

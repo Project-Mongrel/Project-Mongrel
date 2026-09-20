@@ -39,6 +39,11 @@ async def home_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if finding_analysis_exited:
             logger.info("Finding analysis ended for user_id=%s", update.effective_user.id)
         cancelled_scan = cancel_active_scan(update.effective_user.id)
+        native_cancellation = bool(
+            cancelled_scan is not None
+            and cancelled_scan.cancellation_event is not None
+            and cancelled_scan.cancellation_requested
+        )
         if cancelled_scan is not None and cancelled_scan.status_message is not None:
             from app.ui.scan_progress import ScanProgressCard
 
@@ -48,8 +53,9 @@ async def home_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 cancelled_scan.target,
                 cancelled_scan.progress_started_at,
             )
-            await progress_card.update("Cancelled")
-        clear_active_scan(update.effective_user.id)
+            await progress_card.update("Cancellation requested" if native_cancellation else "Cancelled")
+        if cancelled_scan is not None and cancelled_scan.cancellation_event is None:
+            clear_active_scan(update.effective_user.id, cancelled_scan)
         if finding_analysis_exited:
             await update.message.reply_text("Exited Finding Analysis Mode.")
 

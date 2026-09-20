@@ -340,8 +340,17 @@ def _sanitize_assessment_ai_report(report: str, context: dict) -> str:
             scan = latest_by_tool.get("testssl") or {}
             status = str(scan.get("status") or "").lower()
             evidence = (scan.get("finding") or {}).get("testssl_evidence") or {}
-            if status == "failed" and not evidence and any(term in lowered for term in ("clean", "no finding", "completed", "stored tls", "tls observations")):
-                line = "testssl.sh: FAILED; no completed structured TLS configuration evidence was stored."
+            if status in {"failed", "timed_out", "cancelled", "interrupted", "running"} and not evidence and any(
+                term in lowered for term in ("clean", "no finding", "completed", "stored tls", "tls observations")
+            ):
+                label = {
+                    "failed": "FAILED",
+                    "timed_out": "TIMED OUT",
+                    "cancelled": "CANCELLED",
+                    "interrupted": "INTERRUPTED",
+                    "running": "RUNNING",
+                }[status]
+                line = f"testssl.sh: {label}; no completed structured TLS configuration evidence was stored."
         lines.append(line)
     return "\n".join(lines).strip()
 

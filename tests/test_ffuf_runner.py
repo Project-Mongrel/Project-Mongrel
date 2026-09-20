@@ -1,11 +1,12 @@
-import subprocess
 from pathlib import Path
+import threading
 from unittest.mock import patch
 
 import pytest
 
 from app.core.config import Settings
 from app.parsers.ffuf_parser import parse_ffuf_output, summarize_ffuf_results
+from app.tools.process_lifecycle import ScannerExecution
 from app.tools.ffuf_runner import (
     DEFAULT_FFUF_WORDLIST,
     FFUF_DEEP_TIMEOUT_MARGIN_SECONDS,
@@ -24,8 +25,8 @@ from app.tools.ffuf_runner import (
 )
 
 
-def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=["ffuf"], returncode=returncode, stdout=stdout, stderr=stderr)
+def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> ScannerExecution:
+    return ScannerExecution(stdout=stdout, stderr=stderr, returncode=returncode)
 
 
 def test_ffuf_runner_success_uses_safe_subprocess_args(tmp_path: Path) -> None:
@@ -37,20 +38,16 @@ def test_ffuf_runner_success_uses_safe_subprocess_args(tmp_path: Path) -> None:
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=settings),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run", return_value=_completed(stdout=output)) as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process", return_value=_completed(stdout=output)) as run_mock,
     ):
         result = run_ffuf_scan("example.com")
 
     expected_command = _build_ffuf_command("ffuf", "https://example.com/FUZZ", wordlist, threads=3, rate_limit=11)
     run_mock.assert_called_once_with(
         expected_command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=17,
+        timeout_seconds=17,
         cwd=str(Path.cwd().resolve()),
-        shell=False,
-        check=False,
+        cancellation_event=None,
     )
     assert result["success"] is True
     assert result["target"] == "https://example.com"
@@ -70,7 +67,7 @@ def test_ffuf_missing_binary_is_clean_failure(tmp_path: Path) -> None:
         patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_path=wordlist)),
         patch("app.tools.ffuf_runner.shutil.which", return_value=None),
         patch("app.tools.ffuf_runner._ffuf_executable_candidates", return_value=()),
-        patch("app.tools.ffuf_runner.subprocess.run") as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process") as run_mock,
     ):
         result = run_ffuf_scan("https://example.com")
 
@@ -80,12 +77,28 @@ def test_ffuf_missing_binary_is_clean_failure(tmp_path: Path) -> None:
     run_mock.assert_not_called()
 
 
+def test_ffuf_pre_spawn_cancellation_does_not_start_process(tmp_path: Path) -> None:
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("admin\n", encoding="utf-8")
+    cancellation_event = threading.Event()
+    cancellation_event.set()
+    with (
+        patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_path=wordlist)),
+        patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
+        patch("app.tools.ffuf_runner.run_scanner_process") as run_mock,
+    ):
+        result = run_ffuf_scan("https://example.com", cancellation_event=cancellation_event)
+
+    assert result["error_type"] == "cancelled"
+    run_mock.assert_not_called()
+
+
 def test_ffuf_missing_wordlist_is_clean_failure(tmp_path: Path) -> None:
     missing = tmp_path / "missing.txt"
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_path=missing)),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run") as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process") as run_mock,
     ):
         result = run_ffuf_scan("https://example.com")
 
@@ -112,7 +125,7 @@ def test_ffuf_standard_profile_uses_configured_standard_wordlist(tmp_path: Path)
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=settings),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run", return_value=_completed(stdout=output)) as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process", return_value=_completed(stdout=output)) as run_mock,
     ):
         result = run_ffuf_scan("example.com", FFUF_PROFILE_STANDARD)
 
@@ -122,7 +135,7 @@ def test_ffuf_standard_profile_uses_configured_standard_wordlist(tmp_path: Path)
     assert result["ffuf_profile"] == FFUF_PROFILE_STANDARD
     assert result["wordlist_count"] == 3
     assert result["timeout_seconds"] == 111
-    assert run_mock.call_args.kwargs["timeout"] == 111
+    assert run_mock.call_args.kwargs["timeout_seconds"] == 111
 
 
 def test_ffuf_deep_profile_uses_configured_deep_wordlist(tmp_path: Path) -> None:
@@ -133,7 +146,7 @@ def test_ffuf_deep_profile_uses_configured_deep_wordlist(tmp_path: Path) -> None
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=settings),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run", return_value=_completed(stdout='{"results":[]}')) as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process", return_value=_completed(stdout='{"results":[]}')) as run_mock,
     ):
         result = run_ffuf_scan("example.com", FFUF_PROFILE_DEEP)
 
@@ -143,7 +156,7 @@ def test_ffuf_deep_profile_uses_configured_deep_wordlist(tmp_path: Path) -> None
     assert result["ffuf_profile"] == FFUF_PROFILE_DEEP
     assert result["wordlist_count"] == 4
     assert result["timeout_seconds"] == 1501
-    assert run_mock.call_args.kwargs["timeout"] == 1501
+    assert run_mock.call_args.kwargs["timeout_seconds"] == 1501
 
 
 def test_ffuf_profile_timeout_resolution_is_profile_aware() -> None:
@@ -180,7 +193,7 @@ def test_ffuf_standard_profile_missing_wordlist_fails_cleanly(tmp_path: Path) ->
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_standard_path=missing)),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run") as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process") as run_mock,
     ):
         result = run_ffuf_scan("https://example.com", FFUF_PROFILE_STANDARD)
 
@@ -195,7 +208,7 @@ def test_ffuf_deep_profile_missing_wordlist_fails_cleanly(tmp_path: Path) -> Non
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_deep_path=missing)),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run") as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process") as run_mock,
     ):
         result = run_ffuf_scan("https://example.com", FFUF_PROFILE_DEEP)
 
@@ -211,7 +224,10 @@ def test_ffuf_timeout_is_clean_failure(tmp_path: Path) -> None:
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_scan_timeout_seconds=1, ffuf_wordlist_path=wordlist)),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="ffuf", timeout=1, output="", stderr="slow")),
+        patch(
+            "app.tools.ffuf_runner.run_scanner_process",
+            return_value=ScannerExecution(stdout="", stderr="slow", returncode=-15, timed_out=True),
+        ),
     ):
         result = run_ffuf_scan("https://example.com")
 
@@ -282,7 +298,7 @@ def test_ffuf_profile_selection_does_not_change_fuzz_placement(tmp_path: Path) -
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=settings),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run", return_value=_completed(stdout='{"results":[]}')) as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process", return_value=_completed(stdout='{"results":[]}')) as run_mock,
     ):
         result = run_ffuf_scan("https://example.com/search?q=FUZZ", FFUF_PROFILE_STANDARD)
 
@@ -307,7 +323,7 @@ def test_ffuf_rejects_malformed_extension_configuration(tmp_path: Path) -> None:
     with (
         patch("app.tools.ffuf_runner.get_settings", return_value=Settings(_env_file=None, ffuf_wordlist_path=wordlist, ffuf_extensions=".php;id")),
         patch("app.tools.ffuf_runner.shutil.which", return_value="ffuf"),
-        patch("app.tools.ffuf_runner.subprocess.run") as run_mock,
+        patch("app.tools.ffuf_runner.run_scanner_process") as run_mock,
     ):
         result = run_ffuf_scan("https://example.com")
 
