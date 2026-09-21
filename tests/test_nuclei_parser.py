@@ -25,6 +25,7 @@ def test_parse_nuclei_jsonl_with_multiple_findings() -> None:
             "name": "Missing Security Headers",
             "host": "https://example.com",
             "matched_at": "https://example.com/login",
+            "matched_surface_source": "matched-at",
             "tags": ["http", "headers"],
             "references": ["https://example.com/ref"],
             "description": "Missing headers.",
@@ -36,6 +37,7 @@ def test_parse_nuclei_jsonl_with_multiple_findings() -> None:
             "name": "SSH Detect",
             "host": "example.com",
             "matched_at": "example.com:22",
+            "matched_surface_source": "matched",
             "tags": [],
             "references": [],
             "description": None,
@@ -75,6 +77,7 @@ def test_parse_single_nuclei_json_object() -> None:
             "name": "Single Finding",
             "host": "https://example.com",
             "matched_at": "https://example.com",
+            "matched_surface_source": "url",
             "tags": [],
             "references": [],
             "description": None,
@@ -99,6 +102,7 @@ def test_missing_optional_fields_do_not_crash_parser() -> None:
             "name": None,
             "host": None,
             "matched_at": None,
+            "matched_surface_source": None,
             "tags": [],
             "references": [],
             "description": None,
@@ -125,6 +129,15 @@ def test_tags_as_string_and_list() -> None:
     assert from_list[0]["tags"] == ["http", "headers"]
 
 
+def test_tags_and_references_reject_arbitrary_objects() -> None:
+    results = parse_nuclei_json(
+        '{"info":{"tags":["http",{"name":"secret"}],"reference":["https://example.com/ref",{"url":"https://bad.example"}]}}'
+    )
+
+    assert results[0]["tags"] == ["http"]
+    assert results[0]["references"] == ["https://example.com/ref"]
+
+
 def test_references_as_string_and_list() -> None:
     from_string = parse_nuclei_json('{"info":{"reference":"https://example.com/ref"}}')
     from_list = parse_nuclei_json('{"info":{"reference":["https://example.com/ref1","https://example.com/ref2"]}}')
@@ -139,8 +152,11 @@ def test_matched_at_fallback_behavior() -> None:
     host = parse_nuclei_json('{"host":"https://example.com"}')
 
     assert matched[0]["matched_at"] == "https://example.com/matched"
+    assert matched[0]["matched_surface_source"] == "matched"
     assert url[0]["matched_at"] == "https://example.com/url"
+    assert url[0]["matched_surface_source"] == "url"
     assert host[0]["matched_at"] == "https://example.com"
+    assert host[0]["matched_surface_source"] == "host"
 
 
 def test_parser_preserves_professional_metadata_without_raw_request_response() -> None:

@@ -24,6 +24,12 @@ from app.services.assessment_map_store import (
     AssessmentMapScopeError,
     initialize_assessment_map_schema,
 )
+from app.services.assessment_map_security_ingestion import (
+    STRUCTURED_ARTIFACT_TYPES as SECURITY_STRUCTURED_ARTIFACT_TYPES,
+    map_security_source,
+    project_security_source,
+    security_coverage_metadata,
+)
 from app.services.assessment_map_web_ingestion import (
     STRUCTURED_ARTIFACT_TYPES as WEB_STRUCTURED_ARTIFACT_TYPES,
     map_web_source,
@@ -35,11 +41,12 @@ from app.services.sqlite_runtime import run_locked_transaction
 
 INGESTION_VERSION = 1
 DIGEST_VERSION = "assessment-map.ingestion-source.v1"
-SUPPORTED_TOOLS = frozenset({"nmap", "httpx", "katana", "playwright", "ffuf"})
+SUPPORTED_TOOLS = frozenset({"nmap", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl"})
 STRUCTURED_ARTIFACT_TYPES = {
     "nmap": frozenset({"nmap_normalized_evidence", "nmap_structured_evidence", "nmap_json"}),
     "httpx": frozenset({"httpx_normalized_evidence", "httpx_structured_evidence", "httpx_json"}),
     **WEB_STRUCTURED_ARTIFACT_TYPES,
+    **SECURITY_STRUCTURED_ARTIFACT_TYPES,
 }
 _SAFE_RESPONSE_HEADER_NAMES = frozenset(
     {
@@ -77,7 +84,7 @@ class _Counts:
         return cls(set(), set(), set())
 
 
-class _WebMappingWriter:
+class _MappingWriter:
     """Bind tool-specific mapping rules to the central transactional/provenance writer."""
 
     def __init__(self, connection, user_id, assessment_id, scan, source, counts, metadata):
@@ -157,15 +164,24 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
         try:
             counts = _Counts.empty()
             projection_metadata: dict[str, Any] = {}
-            if tool in {"katana", "playwright", "ffuf"}:
+            if tool in {"katana", "playwright", "ffuf", "nuclei", "testssl"}:
+                metadata_function = (
+                    web_coverage_metadata
+                    if tool in {"katana", "playwright", "ffuf"}
+                    else security_coverage_metadata
+                )
                 projection_metadata = {
-                    "metadata_version": "assessment-map.web-coverage.v1",
+                    "metadata_version": (
+                        "assessment-map.web-coverage.v1"
+                        if tool in {"katana", "playwright", "ffuf"}
+                        else "assessment-map.security-coverage.v1"
+                    ),
                     "tool": tool,
                     "sources": [
                         {
                             "finding_id": source.finding_id,
                             "artifact_id": source.artifact_id,
-                            "coverage": web_coverage_metadata(tool, source.data),
+                            "coverage": metadata_function(tool, source.data),
                         }
                         for source in sources
                     ],
@@ -175,8 +191,12 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
                     _ingest_nmap_source(active, user_id, assessment_id, scan, source, counts)
                 elif tool == "httpx":
                     _ingest_httpx_source(active, user_id, assessment_id, scan, source, counts)
+                elif tool in {"katana", "playwright", "ffuf"}:
+                    map_web_source(tool, source.data, _MappingWriter(
+                        active, user_id, assessment_id, scan, source, counts, projection_metadata
+                    ))
                 else:
-                    map_web_source(tool, source.data, _WebMappingWriter(
+                    map_security_source(tool, source.data, _MappingWriter(
                         active, user_id, assessment_id, scan, source, counts, projection_metadata
                     ))
             if not counts.entities and not counts.assertions and tool != "ffuf":
@@ -302,6 +322,8 @@ def _canonical_digest_projection(
             projection = _project_httpx_source(source.data)
         elif tool in {"katana", "playwright", "ffuf"}:
             projection = project_web_source(tool, source.data)
+        elif tool in {"nuclei", "testssl"}:
+            projection = project_security_source(tool, source.data)
         else:
             projection = {"unsupported": True}
         projected_sources.append(

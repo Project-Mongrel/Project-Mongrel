@@ -73,13 +73,15 @@ def _normalize_finding(raw_finding: dict[str, Any]) -> dict:
     info = raw_finding.get("info")
     if not isinstance(info, dict):
         info = {}
+    matched_at, matched_surface_source = _matched_surface(raw_finding)
 
     normalized = {
         "template_id": _first_string(raw_finding.get("template-id"), raw_finding.get("templateID")),
         "severity": _normalize_severity(_first_string(info.get("severity"), raw_finding.get("severity"))),
         "name": _first_string(info.get("name"), raw_finding.get("name")),
         "host": _first_string(raw_finding.get("host"), raw_finding.get("url")),
-        "matched_at": _first_string(raw_finding.get("matched-at"), raw_finding.get("matched"), raw_finding.get("url"), raw_finding.get("host")),
+        "matched_at": matched_at,
+        "matched_surface_source": matched_surface_source,
         "tags": _normalize_list(info.get("tags")),
         "references": _normalize_list(info.get("reference")),
         "description": _first_string(info.get("description"), raw_finding.get("description")),
@@ -109,7 +111,7 @@ def _normalize_list(value: Any) -> list[str]:
         return []
 
     if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
     if isinstance(value, str):
         if "," in value:
@@ -118,7 +120,20 @@ def _normalize_list(value: Any) -> list[str]:
         stripped_value = value.strip()
         return [stripped_value] if stripped_value else []
 
-    return [str(value).strip()] if str(value).strip() else []
+    return []
+
+
+def _matched_surface(raw_finding: dict[str, Any]) -> tuple[str | None, str | None]:
+    for key, source in (
+        ("matched-at", "matched-at"),
+        ("matched", "matched"),
+        ("url", "url"),
+        ("host", "host"),
+    ):
+        value = _first_string(raw_finding.get(key))
+        if value:
+            return value, source
+    return None, None
 
 
 def _normalize_mapping(value: Any) -> dict[str, str]:
