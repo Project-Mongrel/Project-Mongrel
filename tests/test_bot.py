@@ -147,6 +147,7 @@ from app.services.active_scan_state import clear_active_scan, get_active_scan, s
 from app.services.assessment_context import build_assessment_context
 from app.services.assessment_conversation_store import get_or_create_assessment_conversation
 from app.services.assessment_guard import build_assessment_guard
+from app.services.assessment_map_ingestion import AssessmentMapIngestionError
 from app.services.assessment_store import (
     add_assessment_target,
     create_assessment,
@@ -467,6 +468,7 @@ def test_assessment_nuclei_button_records_assessment_scan() -> None:
                 return_value={"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0},
             ),
             patch("app.bot.handlers.scan.generate_nuclei_ai_assessment", return_value=NUCLEI_AI_FALLBACK_LINES),
+            patch("app.bot.handlers.scan.ingest_assessment_scan") as ingest_map,
         ):
             await assessment_callback_handler(
                 SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8122)),
@@ -476,6 +478,55 @@ def test_assessment_nuclei_button_records_assessment_scan() -> None:
             assert active_scan is not None
             assert active_scan.task is not None
             await active_scan.task
+            return ingest_map
+
+    ingest_map = asyncio.run(run_flow())
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "nuclei"
+    assert scans[0]["status"] == "completed"
+    assert scans[0]["target_id"] == target["id"]
+    assert scans[0]["finding_id"]
+    ingest_map.assert_called_once_with(user_id=8122, assessment_id=assessment["id"], scan_id=scans[0]["id"])
+    assert "Nuclei: Completed" in query_message.reply_text.call_args_list[-1].args[0]
+
+
+def test_assessment_nuclei_map_ingestion_failure_does_not_hide_scan_result() -> None:
+    clear_user_findings(8138)
+    clear_user_investigations(8138)
+    clear_active_scan(8138)
+    assessment = create_assessment("Assessment Nuclei Map Failure", user_id=8138)
+    target = add_assessment_target(assessment["id"], address="https://example.com")
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    query_message = SimpleNamespace(reply_text=AsyncMock(return_value=status_message))
+    query = SimpleNamespace(
+        data=f"assessment:run:nuclei:{assessment['id']}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=query_message,
+    )
+
+    async def run_flow() -> None:
+        with (
+            patch(
+                "app.bot.handlers.scan.run_nuclei_scan",
+                return_value={"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0},
+            ),
+            patch("app.bot.handlers.scan.generate_nuclei_ai_assessment", return_value=NUCLEI_AI_FALLBACK_LINES),
+            patch(
+                "app.bot.handlers.scan.ingest_assessment_scan",
+                side_effect=AssessmentMapIngestionError("malformed structured evidence"),
+            ) as ingest_map,
+        ):
+            await assessment_callback_handler(
+                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=8138)),
+                SimpleNamespace(user_data={}),
+            )
+            active_scan = get_active_scan(8138)
+            assert active_scan is not None
+            assert active_scan.task is not None
+            await active_scan.task
+            ingest_map.assert_called_once()
 
     asyncio.run(run_flow())
     scans = list_assessment_scans(assessment["id"])
@@ -483,7 +534,6 @@ def test_assessment_nuclei_button_records_assessment_scan() -> None:
     assert scans[0]["tool"] == "nuclei"
     assert scans[0]["status"] == "completed"
     assert scans[0]["target_id"] == target["id"]
-    assert scans[0]["finding_id"]
     assert "Nuclei: Completed" in query_message.reply_text.call_args_list[-1].args[0]
 
 
@@ -2537,6 +2587,60 @@ def test_testssl_scan_starts_timer_stores_evidence_and_sends_ai_assessment() -> 
     assert finding["source"] == "testssl"
     assert finding["testssl_evidence"]["certificate"]["issuer"] == "Example CA"
     assert finding["testssl_summary"]["supported_protocols"] == ["TLS 1.2", "TLS 1.3"]
+
+
+def test_assessment_testssl_scan_ingests_assessment_map_after_recording() -> None:
+    clear_user_findings(7218)
+    clear_user_investigations(7218)
+    clear_user_scan_requests(7218)
+    clear_active_scan(7218)
+    assessment = create_assessment("Assessment testssl", user_id=7218)
+    target = add_assessment_target(assessment["id"], address="example.com")
+    scan_request = create_scan_request(user_id=7218, scan_type="testssl")
+    mark_scan_request_awaiting_target(user_id=7218, scan_request_id=scan_request.id)
+    context = SimpleNamespace(
+        user_data={
+            PENDING_NMAP_REQUEST_KEY: scan_request.id,
+            ASSESSMENT_SCAN_CONTEXT_KEY: {
+                "assessment_id": assessment["id"],
+                "target_id": target["id"],
+                "tool": "testssl",
+            },
+        }
+    )
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text="example.com", reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7218))
+    json_output = """
+    [{"id":"TLS1_2","severity":"OK","finding":"offered"}]
+    """
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_testssl_scan",
+            return_value={
+                "success": True,
+                "target": "example.com:443",
+                "output": "",
+                "json_output": json_output,
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 6,
+            },
+        ),
+        patch("app.bot.handlers.scan.generate_testssl_ai_assessment", return_value=["testssl.sh AI Assessment"]),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ingest_assessment_scan") as ingest_map,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "testssl"
+    assert scans[0]["status"] == "completed"
+    assert scans[0]["target_id"] == target["id"]
+    ingest_map.assert_called_once_with(user_id=7218, assessment_id=assessment["id"], scan_id=scans[0]["id"])
 
 
 def test_testssl_scan_failure_uses_sanitized_runner_error() -> None:
@@ -4896,6 +5000,7 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
                     "Medium",
                 ],
             ),
+            patch("app.bot.handlers.scan.ingest_assessment_scan") as ingest_map,
         ):
             await scan_target_handler(update, context)
             active_scan = get_active_scan(7102)
@@ -4904,6 +5009,7 @@ def test_successful_nuclei_scan_returns_verdict_and_stores_finding() -> None:
             await active_scan.task
 
         run_nuclei_scan.assert_called_once_with("https://example.com")
+        ingest_map.assert_not_called()
 
     asyncio.run(run_flow())
     assert " Nuclei Scan" in message.reply_text.call_args_list[0].args[0]

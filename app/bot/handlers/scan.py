@@ -51,6 +51,8 @@ from app.services.assessment_store import (
     record_assessment_scan,
     start_assessment_scan,
 )
+from app.services.assessment_map_ingestion import AssessmentMapIngestionError, ingest_assessment_scan
+from app.services.assessment_map_store import AssessmentMapScopeError
 from app.services.active_scan_state import (
     clear_active_scan,
     get_active_scan,
@@ -2162,6 +2164,39 @@ def _record_assessment_scan(
     )
 
 
+def _ingest_assessment_map_after_scan(
+    assessment_context: dict | None,
+    *,
+    user_id: int,
+    tool: str,
+    scan: dict | None,
+) -> None:
+    if not assessment_context or tool not in {"nuclei", "testssl"} or not scan:
+        return
+    assessment_id = assessment_context.get("assessment_id")
+    scan_id = scan.get("id")
+    if assessment_id is None or scan_id is None:
+        return
+    try:
+        ingest_assessment_scan(user_id=user_id, assessment_id=int(assessment_id), scan_id=int(scan_id))
+    except (AssessmentMapIngestionError, AssessmentMapScopeError, ValueError) as exc:
+        logger.warning(
+            "Assessment map ingestion skipped for %s scan_id=%s assessment_id=%s: %s",
+            tool,
+            scan_id,
+            assessment_id,
+            exc,
+        )
+    except Exception as exc:  # Defensive: map population must not alter scan delivery.
+        logger.warning(
+            "Assessment map ingestion failed for %s scan_id=%s assessment_id=%s: %s",
+            tool,
+            scan_id,
+            assessment_id,
+            exc,
+        )
+
+
 def _scan_event_outcome(result: dict) -> tuple[str, str, str]:
     """Return canonical persisted status, event suffix, and truthful wording."""
 
@@ -3260,11 +3295,12 @@ async def _handle_testssl_target(
                 assessment_context=assessment_context,
             ),
         )
-        _record_assessment_scan(
+        scan = _record_assessment_scan(
             assessment_context,
             tool="testssl",
             result={"success": False, "target": display_target, "error": str(exc)},
         )
+        _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="testssl", scan=scan)
         await _send_assessment_dashboard(update.message, assessment_context)
         context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
         return
@@ -3299,7 +3335,8 @@ async def _handle_testssl_target(
         summary=f"testssl.sh TLS assessment {event_wording}",
         metadata={"finding_id": finding.get("id"), "parser_error": parser_error},
     )
-    _record_assessment_scan(assessment_context, tool="testssl", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context, tool="testssl", result=result, finding=finding)
+    _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="testssl", scan=scan)
     if result.get("error_type") == "cancelled":
         await progress_card.update("Cancelled")
     elif result.get("success") is True:
@@ -5061,11 +5098,12 @@ async def _run_nuclei_scan_background_impl(
                 assessment_context=assessment_context,
             ),
         )
-        _record_assessment_scan(
+        scan = _record_assessment_scan(
             assessment_context,
             tool="nuclei",
             result={"success": False, "target": display_target, "error": str(exc)},
         )
+        _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="nuclei", scan=scan)
         await _send_assessment_dashboard(message, assessment_context)
         return
     except asyncio.CancelledError:
@@ -5120,7 +5158,8 @@ async def _run_nuclei_scan_background_impl(
                 assessment_context=assessment_context,
             ),
         )
-        _record_assessment_scan(assessment_context, tool="nuclei", result=result)
+        scan = _record_assessment_scan(assessment_context, tool="nuclei", result=result)
+        _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="nuclei", scan=scan)
         await _send_assessment_dashboard(message, assessment_context)
         return
 
@@ -5155,7 +5194,8 @@ async def _run_nuclei_scan_background_impl(
         )
         finding.setdefault("metadata", {})
         finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
-        _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
+        scan = _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
+        _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="nuclei", scan=scan)
         await _send_nuclei_ai_assessment(message, finding, tool_mode=assessment_context is None)
         await _send_assessment_dashboard(message, assessment_context)
         return
@@ -5174,11 +5214,12 @@ async def _run_nuclei_scan_background_impl(
                 assessment_context=assessment_context,
             ),
         )
-        _record_assessment_scan(
+        scan = _record_assessment_scan(
             assessment_context,
             tool="nuclei",
             result={**result, "success": False, "error": "Unable to parse Nuclei scan output."},
         )
+        _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="nuclei", scan=scan)
         await _send_assessment_dashboard(message, assessment_context)
         return
 
@@ -5195,7 +5236,8 @@ async def _run_nuclei_scan_background_impl(
                     assessment_context=assessment_context,
                 ),
             )
-            _record_assessment_scan(assessment_context, tool="nuclei", result=result)
+            scan = _record_assessment_scan(assessment_context, tool="nuclei", result=result)
+            _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="nuclei", scan=scan)
             await _send_assessment_dashboard(message, assessment_context)
             return
         clean_target = str(result.get("target") or target)
@@ -5224,7 +5266,8 @@ async def _run_nuclei_scan_background_impl(
         )
         finding.setdefault("metadata", {})
         finding["metadata"].update({"elapsed": elapsed_label, "elapsed_seconds": int(elapsed_seconds), "scan_profile": "fast"})
-        _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
+        scan = _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
+        _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="nuclei", scan=scan)
         await _send_nuclei_ai_assessment(message, finding, tool_mode=assessment_context is None)
         await _send_assessment_dashboard(message, assessment_context)
         return
@@ -5263,7 +5306,8 @@ async def _run_nuclei_scan_background_impl(
             assessment_context=assessment_context,
         ),
     )
-    _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context, tool="nuclei", result=result, finding=finding)
+    _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="nuclei", scan=scan)
     await _send_nuclei_ai_assessment(message, finding, tool_mode=assessment_context is None)
     await _send_assessment_dashboard(message, assessment_context)
 
