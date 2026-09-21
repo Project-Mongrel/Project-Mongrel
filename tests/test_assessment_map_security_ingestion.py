@@ -123,7 +123,11 @@ def test_nuclei_references_and_tags_are_strictly_sanitized() -> None:
     scan = _scan(517, assessment["id"], "nuclei", _nuclei_finding([
         {
             "template_id": "refs", "severity": "info", "matched_at": "https://example.com",
-            "matched_surface_source": "matched-at", "tags": ["http", {"name": "secret"}],
+            "matched_surface_source": "matched-at",
+            "tags": [
+                "http", "tls_1.2", "cve-2024", {"name": "secret"}, "token=secret",
+                "https://bad.example/tag", "frag#secret", "api-key", "bad tag!",
+            ],
             "references": [
                 "CVE-2024-12345", "cwe-79", "GHSA-abcd-efgh-ijkl",
                 "https://docs.example/path?token=secret#frag", "mailto:admin@example.com",
@@ -135,9 +139,13 @@ def test_nuclei_references_and_tags_are_strictly_sanitized() -> None:
     combined = _keys("assessment_map_assertions")
     skipped = json.loads(ledger["metadata_json"])["skipped_optional_records"]
     assert "CVE-2024-12345" in combined and "CWE-79" in combined and "GHSA-ABCD-EFGH-IJKL" in combined
+    assert "http" in combined and "tls_1.2" in combined and "cve-2024" in combined
     assert "docs.example" in combined
-    assert all(secret not in combined for secret in ("token=secret", "frag", "mailto", "internal note", "bad.example"))
-    assert skipped == {"unsupported_nuclei_tag": 1, "unsupported_nuclei_reference": 3}
+    assert all(
+        secret not in combined
+        for secret in ("token=secret", "api-key", "frag#secret", "bad tag!", "mailto", "internal note", "bad.example")
+    )
+    assert skipped == {"unsupported_nuclei_tag": 6, "unsupported_nuclei_reference": 3}
 
 
 def test_nuclei_input_only_record_is_not_a_matched_finding_and_valid_sibling_survives() -> None:
@@ -218,7 +226,9 @@ def test_testssl_issue_polarity_uses_record_identity_not_free_text_guessing() ->
         json.dumps([
             {"id": "secure_renego", "severity": "HIGH", "finding": "not supported"},
             {"id": "heartbleed", "severity": "HIGH", "finding": "false"},
+            {"id": "robot", "severity": "HIGH", "finding": "false but potentially vulnerable"},
             {"id": "ticketbleed", "severity": "HIGH", "finding": "disabled"},
+            {"id": "drown", "severity": "HIGH", "finding": "passed; vulnerable check not triggered"},
             {"id": "fake_warn", "severity": "HIGH", "finding": "enabled"},
             {"id": "HSTS", "severity": "HIGH", "finding": "enabled"},
         ]),
@@ -230,7 +240,10 @@ def test_testssl_issue_polarity_uses_record_identity_not_free_text_guessing() ->
         row["canonical_key"] for row in _rows("assessment_map_entities") if row["entity_type"] == "finding"
     )
     assert "secure_renego" in finding_keys
-    assert all(item not in finding_keys for item in ("heartbleed", "ticketbleed", "fake_warn", "HSTS"))
+    assert all(
+        item not in finding_keys
+        for item in ("heartbleed", "robot", "ticketbleed", "drown", "fake_warn", "HSTS")
+    )
 
 
 @pytest.mark.parametrize(("target", "expected_port"), [("example.com", 443), ("example.com:8443", 8443)])

@@ -37,6 +37,13 @@ _TESTSSL_OBSERVATION_ONLY_PREFIXES = frozenset({"tls", "ssl", "cert", "header", 
 _CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _CWE_RE = re.compile(r"^CWE-\d+$", re.IGNORECASE)
 _GHSA_RE = re.compile(r"^GHSA-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}$", re.IGNORECASE)
+_SAFE_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")
+_SECRET_TAG_TERMS = (
+    "token", "secret", "password", "passwd", "api_key", "api-key", "apikey",
+    "access_key", "access-key", "private_key", "private-key", "credential",
+    "session", "auth", "bearer",
+)
+_AMBIGUOUS_RESULT = "ambiguous"
 
 
 class MappingWriter(Protocol):
@@ -126,7 +133,7 @@ def _map_nuclei(data: dict[str, Any], writer: MappingWriter) -> None:
                 writer.skipped_optional(f"malformed_nuclei_{field}")
                 continue
             for value_index, value in enumerate(values):
-                sanitized = _safe_reference(value) if field == "references" else _safe_label(value)
+                sanitized = _safe_reference(value) if field == "references" else _safe_tag(value)
                 if sanitized is not None:
                     writer.assertion(finding, predicate, value=sanitized, evidence_kind=predicate,
                                      path=f"{base}.{field}[{value_index}]")
@@ -282,7 +289,7 @@ def _project_nuclei(value: object) -> object:
             "surface": surface.identity.canonical_key if surface is not None else "invalid",
             "surface_port": surface.port if surface is not None else None,
             "surface_transport": surface.transport if surface is not None else None,
-            "tags": [_safe_label(item) for item in record.get("tags") or []]
+            "tags": [_safe_tag(item) for item in record.get("tags") or []]
             if isinstance(record.get("tags") or [], list) else {"malformed": True},
             "references": [_safe_reference(item) for item in record.get("references") or []]
             if isinstance(record.get("references") or [], list) else {"malformed": True},
@@ -319,8 +326,10 @@ def _project_testssl(value: object) -> object:
 def _is_issue_record(category: str, record_id: str, severity: str | None, finding: str) -> bool:
     result = _normalized_result(finding)
     lowered_id = record_id.casefold()
-    if lowered_id.startswith("secure_renego") and result == "not supported":
+    if lowered_id.startswith("secure_renego") and _contains_result_term(finding, "not supported"):
         return True
+    if result == _AMBIGUOUS_RESULT:
+        return False
     if result in _NON_ISSUE_RESULT_TERMS:
         return False
     if category == "protocol":
@@ -409,6 +418,26 @@ def _safe_label(value: object) -> str | None:
     return cleaned
 
 
+def _safe_tag(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    lowered = cleaned.casefold()
+    if (
+        not cleaned
+        or "?" in cleaned
+        or "#" in cleaned
+        or ":" in cleaned
+        or "/" in cleaned
+        or "=" in cleaned
+        or "@" in cleaned
+        or any(term in lowered for term in _SECRET_TAG_TERMS)
+        or _SAFE_TAG_RE.fullmatch(cleaned) is None
+    ):
+        return None
+    return cleaned
+
+
 def _safe_reference(value: object) -> object | None:
     if not isinstance(value, str):
         return None
@@ -446,14 +475,22 @@ def _normalized_result(value: object) -> str:
     text = " ".join(str(value or "").casefold().split())
     if text in _ISSUE_RESULT_TERMS or text in _NON_ISSUE_RESULT_TERMS:
         return text
-    for term in sorted(_NON_ISSUE_RESULT_TERMS, key=len, reverse=True):
-        if term in text:
-            return term
-    for term in sorted(_ISSUE_RESULT_TERMS, key=len, reverse=True):
-        if term in text:
-            return term
+    non_issue_terms = {term for term in _NON_ISSUE_RESULT_TERMS if _contains_result_term(text, term)}
+    issue_terms = {term for term in _ISSUE_RESULT_TERMS if _contains_result_term(text, term)}
+    if non_issue_terms and issue_terms:
+        return _AMBIGUOUS_RESULT
+    if non_issue_terms:
+        return max(non_issue_terms, key=len)
+    if issue_terms:
+        return max(issue_terms, key=len)
     return text
 
 
 def _normalize_tls_protocol_id(value: object) -> str:
     return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
+def _contains_result_term(value: object, term: str) -> bool:
+    text = " ".join(str(value or "").casefold().split())
+    escaped = re.escape(term.casefold()).replace(r"\ ", r"\s+")
+    return re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text) is not None
