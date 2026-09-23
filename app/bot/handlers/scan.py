@@ -2171,7 +2171,7 @@ def _ingest_assessment_map_after_scan(
     tool: str,
     scan: dict | None,
 ) -> None:
-    if not assessment_context or tool not in {"nuclei", "testssl"} or not scan:
+    if not assessment_context or tool not in {"nmap", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl"} or not scan:
         return
     assessment_id = assessment_context.get("assessment_id")
     scan_id = scan.get("id")
@@ -2998,7 +2998,8 @@ async def _scan_target_handler_impl(update: Update, context: ContextTypes.DEFAUL
         metadata={"finding_id": finding.get("id") if finding else None},
     )
     assessment_context = _pop_assessment_scan_context(context, "nmap")
-    _record_assessment_scan(assessment_context, tool="nmap", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context, tool="nmap", result=result, finding=finding)
+    _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="nmap", scan=scan)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     if result.get("success") is True:
         await progress_card.complete()
@@ -3206,7 +3207,8 @@ async def _handle_ffuf_target(
         metadata={"finding_id": finding.get("id"), "result_count": len(observations)},
     )
     assessment_context = _pop_assessment_scan_context(context, "ffuf")
-    _record_assessment_scan(assessment_context, tool="ffuf", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context, tool="ffuf", result=result, finding=finding)
+    _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="ffuf", scan=scan)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     _ffuf_scan_profiles.pop(scan_request_id, None)
     if result.get("error_type") == "cancelled":
@@ -4066,7 +4068,8 @@ async def _handle_playwright_target(
         metadata={"finding_id": finding.get("id"), "final_url": observation.get("final_url")},
     )
     assessment_context = _pop_assessment_scan_context(context, "playwright")
-    _record_assessment_scan(assessment_context, tool="playwright", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context, tool="playwright", result=result, finding=finding)
+    _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="playwright", scan=scan)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     if result.get("success") is True:
         await progress_card.complete()
@@ -4174,7 +4177,8 @@ async def _handle_katana_target(
         metadata={"finding_id": finding.get("id"), "url_count": len(observations)},
     )
     assessment_context = _pop_assessment_scan_context(context, "katana")
-    _record_assessment_scan(assessment_context, tool="katana", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context, tool="katana", result=result, finding=finding)
+    _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="katana", scan=scan)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     if result.get("success") is True:
         await progress_card.complete()
@@ -4285,7 +4289,8 @@ async def _handle_httpx_target(
         metadata={"finding_id": finding.get("id"), "service_count": len(services)},
     )
     assessment_context = _pop_assessment_scan_context(context, "httpx")
-    _record_assessment_scan(assessment_context, tool="httpx", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context, tool="httpx", result=result, finding=finding)
+    _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="httpx", scan=scan)
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     elapsed_seconds = _parse_elapsed_seconds(result.get("elapsed_seconds"))
     if elapsed_seconds is not None:

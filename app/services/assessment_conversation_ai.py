@@ -148,6 +148,7 @@ def answer_assessment_conversation_question(
         or _build_direct_testssl_evidence_answer(context)
         or _build_direct_tshark_evidence_answer(context)
         or _build_state_grounded_answer(context)
+        or _build_assessment_map_answer(context)
         or _build_grounded_assessment_summary(context)
     )
     if direct_evidence_answer:
@@ -270,6 +271,9 @@ def _recover_rejected_assessment_answer(context: dict) -> str | None:
     confidence = _build_evidence_confidence_answer(context)
     if confidence:
         return confidence
+    map_answer = _build_assessment_map_answer(context)
+    if map_answer:
+        return map_answer
     intent = str(context.get("question_intent") or "")
     if intent in {"assessment_highlight", "prioritization"}:
         synthesis_context = dict(context)
@@ -493,6 +497,10 @@ def _build_prompt_context(context: dict) -> dict:
         "explanation", "simplify_explanation",
     }:
         prompt_context["tool_state"] = recommendation.get("tool_states") or {}
+    if _question_can_use_relationship_map(context):
+        relationship_map = context.get("assessment_map") or {}
+        if relationship_map.get("available"):
+            prompt_context["relationship_map"] = relationship_map
     semantics = get_represented_evidence_semantics(assessment_context.get("findings") or [])
     if semantics:
         prompt_context["evidence_semantics"] = semantics
@@ -541,6 +549,11 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
 
     if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) > ASSESSMENT_PROMPT_MAX_CHARS:
         candidate.pop("evidence_semantics", None)
+        relationship_map = candidate.get("relationship_map")
+        if isinstance(relationship_map, dict):
+            relationship_map["entities"] = list(relationship_map.get("entities") or [])[:6]
+            relationship_map["relationships"] = list(relationship_map.get("relationships") or [])[:8]
+            relationship_map["truncated"] = True
         prior = candidate.get("prior_exchange")
         if isinstance(prior, dict):
             prior.pop("summary", None)
@@ -556,6 +569,8 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
         prior = candidate.get("prior_exchange")
         if isinstance(prior, dict):
             prior["messages"] = list(prior.get("messages") or [])[-2:]
+    if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) > ASSESSMENT_PROMPT_MAX_CHARS:
+        candidate.pop("relationship_map", None)
     return candidate, True
 
 
@@ -1819,6 +1834,127 @@ def _build_false_premise_correction(context: dict) -> str:
         "No. The stored assessment evidence does not establish the claimed vulnerability, exploitability, compromise, "
         "or overall security conclusion. Completed tools provide bounded observations; missing coverage remains uncertainty."
     )
+
+
+def _question_can_use_relationship_map(context: dict) -> bool:
+    question = str(context.get("current_question") or "").lower()
+    intent = str(context.get("question_intent") or "")
+    if intent not in {
+        "assessment_summary",
+        "assessment_highlight",
+        "current_assessment_evidence",
+        "explanation",
+        "remaining_coverage_gaps",
+        "prioritization",
+        "next_step_recommendation",
+    }:
+        return False
+    return any(
+        term in question
+        for term in (
+            "asset",
+            "server",
+            "service",
+            "endpoint",
+            "url",
+            "application",
+            "technology",
+            "relationship",
+            "relate",
+            "connected",
+            "connect these",
+            "map evidence",
+            "mapped evidence",
+            "associated",
+            "same endpoint",
+            "same service",
+            "same host",
+            "same server",
+            "evidence supports",
+            "supports this finding",
+            "supports that finding",
+            "discovered about",
+            "found about",
+            "unknown about",
+        )
+    )
+
+
+def _build_assessment_map_answer(context: dict) -> str | None:
+    if not _question_can_use_relationship_map(context):
+        return None
+    relationship_map = context.get("assessment_map") or {}
+    if not relationship_map.get("available"):
+        return None
+
+    entities = [item for item in relationship_map.get("entities") or [] if isinstance(item, dict)]
+    relationships = [item for item in relationship_map.get("relationships") or [] if isinstance(item, dict)]
+    parts = ["Assessment map evidence is bounded to stored normalized observations, not hypotheses or security conclusions."]
+    if entities:
+        grouped: dict[str, list[str]] = {}
+        for entity in entities:
+            grouped.setdefault(str(entity.get("type") or "entity"), []).append(str(entity.get("label") or "entity"))
+        rendered_groups = []
+        for entity_type in ("hostname", "ip", "service", "application", "endpoint", "technology", "finding"):
+            values = grouped.get(entity_type)
+            if values:
+                rendered_groups.append(f"{entity_type}: {', '.join(values[:6])}")
+        if rendered_groups:
+            parts.append("Mapped entities — " + "; ".join(rendered_groups) + ".")
+    if relationships:
+        rendered = [_render_map_relationship(relationship) for relationship in relationships[:8]]
+        parts.append("Mapped relationships — " + " ".join(rendered))
+    provenance = _map_provenance_summary(entities, relationships)
+    if provenance:
+        parts.append("Provenance — " + provenance + ".")
+    coverage = relationship_map.get("coverage") or {}
+    represented_tools = coverage.get("represented_tools") if isinstance(coverage, dict) else []
+    if represented_tools:
+        parts.append(
+            "This retrieved map slice includes provenance from "
+            + ", ".join(str(tool) for tool in represented_tools)
+            + "; other stored evidence remains available through the normal assessment context."
+        )
+    parts.append(
+        "Missing map entries are not proof of absence, completion is not proof of security, and findings remain scoped to "
+        "the tool evidence that produced them. This answer does not run or approve any tool."
+    )
+    return " ".join(parts)
+
+
+def _render_map_relationship(relationship: dict) -> str:
+    subject = str(relationship.get("subject") or "entity")
+    predicate = str(relationship.get("predicate") or "relates_to").replace("_", " ")
+    object_label = str(relationship.get("object") or "").strip()
+    value = relationship.get("value")
+    if object_label:
+        detail = f"{subject} {predicate} {object_label}"
+    elif value not in (None, "", [], {}):
+        detail = f"{subject} {predicate} {_plain_value(value)}"
+    else:
+        detail = f"{subject} {predicate}"
+    polarity = str(relationship.get("polarity") or "observed")
+    return f"{detail} ({polarity})."
+
+
+def _map_provenance_summary(entities: list[dict], relationships: list[dict]) -> str:
+    refs = []
+    seen = set()
+    for item in entities + relationships:
+        for ref in item.get("provenance") or []:
+            if not isinstance(ref, dict):
+                continue
+            label = str(ref.get("tool") or "tool")
+            if ref.get("scan_id") is not None:
+                label += f" scan {ref.get('scan_id')}"
+            if ref.get("finding_id") is not None:
+                label += f" finding {ref.get('finding_id')}"
+            if ref.get("artifact_id") is not None:
+                label += f" artifact {ref.get('artifact_id')}"
+            if label not in seen:
+                seen.add(label)
+                refs.append(label)
+    return ", ".join(refs[:10])
 
 
 def _build_tool_state_overview(context: dict) -> str:

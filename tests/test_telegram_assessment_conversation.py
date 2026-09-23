@@ -371,9 +371,15 @@ def test_final_judge_conversation_chains_remain_grounded_and_state_consistent() 
     assert "Playwright" in rendered["and after that?"]
     assert "not enough to conclude" in rendered["are we secure?"]
     assert "Nmap recorded exposed TCP services" in rendered["so what can you actually say with confidence?"]
-    assert "Completed in this assessment" in rendered["which tools have run?"]
-    assert all(tool in rendered["which tools have run?"] for tool in ("Nmap", "Nuclei", "httpx", "testssl.sh", "Metasploit", "TShark"))
-    assert "Not run in this assessment" in rendered["which haven't?"]
+    tool_status_answer = rendered["which tools have run?"]
+    assert "Assessment tool status" in tool_status_answer
+    assert "Completed: Nmap, Nuclei, httpx, testssl.sh, Metasploit, TShark." in tool_status_answer
+    assert "Not run: BBOT, Playwright, Katana, ffuf, Gitleaks, Prowler." in tool_status_answer
+    assert "completion does not establish security" in tool_status_answer
+    assert "does not recommend or execute another tool" in tool_status_answer
+    not_run_answer = rendered["which haven't?"]
+    assert "Assessment tool status" in not_run_answer
+    assert "Not run: BBOT, Playwright, Katana, ffuf, Gitleaks, Prowler." in not_run_answer
     assert "Gitleaks has not been run" in rendered["why haven't we used gitleaks?"]
     assert "Prowler has not been run" in rendered["what about prowler?"]
     assert "Metasploit is recorded as completed" in rendered["what about metasploit?"]

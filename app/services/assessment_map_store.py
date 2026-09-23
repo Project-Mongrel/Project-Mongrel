@@ -483,19 +483,29 @@ def list_assertions(
     limit: int = 50,
 ) -> list[dict]:
     _prepare_scope(user_id, assessment_id)
-    clauses = ["assessment_id = ?", "user_id = ?"]
-    params: list[object] = [assessment_id, user_id]
+    normalized_predicate = str(predicate).strip().lower() if predicate is not None else None
     if entity_id is not None:
         _require_entity(_get_connection(), user_id, assessment_id, entity_id)
-        clauses.append("(subject_entity_id = ? OR object_entity_id = ?)")
-        params.extend([entity_id, entity_id])
-    if predicate is not None:
-        clauses.append("predicate = ?")
-        params.append(str(predicate).strip().lower())
-    params.append(_bounded_limit(limit))
     rows = _get_connection().execute(
-        f"SELECT * FROM assessment_map_assertions WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?",
-        tuple(params),
+        """
+        SELECT * FROM assessment_map_assertions
+        WHERE assessment_id = ?
+          AND user_id = ?
+          AND (? IS NULL OR subject_entity_id = ? OR object_entity_id = ?)
+          AND (? IS NULL OR predicate = ?)
+        ORDER BY id
+        LIMIT ?
+        """,
+        (
+            assessment_id,
+            user_id,
+            entity_id,
+            entity_id,
+            entity_id,
+            normalized_predicate,
+            normalized_predicate,
+            _bounded_limit(limit),
+        ),
     ).fetchall()
     return [_row_dict(row) for row in rows]
 
@@ -732,44 +742,77 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
 
 def _create_scope_triggers(connection: sqlite3.Connection) -> None:
-    for action in ("INSERT", "UPDATE"):
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_map_evidence_finding_scope_insert
+        BEFORE INSERT ON assessment_map_evidence_links
+        WHEN NEW.finding_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1
+            FROM findings AS finding
+            JOIN assessment_scans AS scan ON scan.finding_id = finding.id
+            JOIN assessments AS assessment ON assessment.id = scan.assessment_id
+            WHERE finding.id = NEW.finding_id
+              AND finding.user_id = NEW.user_id
+              AND scan.assessment_id = NEW.assessment_id
+              AND assessment.user_id = NEW.user_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'assessment-map finding scope violation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_map_evidence_finding_scope_update
+        BEFORE UPDATE ON assessment_map_evidence_links
+        WHEN NEW.finding_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1
+            FROM findings AS finding
+            JOIN assessment_scans AS scan ON scan.finding_id = finding.id
+            JOIN assessments AS assessment ON assessment.id = scan.assessment_id
+            WHERE finding.id = NEW.finding_id
+              AND finding.user_id = NEW.user_id
+              AND scan.assessment_id = NEW.assessment_id
+              AND assessment.user_id = NEW.user_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'assessment-map finding scope violation');
+        END
+        """
+    )
+    if _table_exists(connection, "metasploit_proposals"):
         connection.execute(
-            f"""
-            CREATE TRIGGER IF NOT EXISTS trg_map_evidence_finding_scope_{action.lower()}
-            BEFORE {action} ON assessment_map_evidence_links
-            WHEN NEW.finding_id IS NOT NULL AND NOT EXISTS (
-                SELECT 1
-                FROM findings AS finding
-                JOIN assessment_scans AS scan ON scan.finding_id = finding.id
-                JOIN assessments AS assessment ON assessment.id = scan.assessment_id
-                WHERE finding.id = NEW.finding_id
-                  AND finding.user_id = NEW.user_id
-                  AND scan.assessment_id = NEW.assessment_id
-                  AND assessment.user_id = NEW.user_id
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_map_validation_proposal_scope_insert
+            BEFORE INSERT ON assessment_validation_attempts
+            WHEN NEW.proposal_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM metasploit_proposals AS proposal
+                WHERE proposal.id = NEW.proposal_id
+                  AND proposal.user_id = NEW.user_id
+                  AND CAST(json_extract(proposal.assessment_context_json, '$.assessment_id') AS INTEGER)
+                      = NEW.assessment_id
             )
             BEGIN
-                SELECT RAISE(ABORT, 'assessment-map finding scope violation');
+                SELECT RAISE(ABORT, 'assessment-map proposal scope violation');
             END
             """
         )
-    if _table_exists(connection, "metasploit_proposals"):
-        for action in ("INSERT", "UPDATE"):
-            connection.execute(
-                f"""
-                CREATE TRIGGER IF NOT EXISTS trg_map_validation_proposal_scope_{action.lower()}
-                BEFORE {action} ON assessment_validation_attempts
-                WHEN NEW.proposal_id IS NOT NULL AND NOT EXISTS (
-                    SELECT 1 FROM metasploit_proposals AS proposal
-                    WHERE proposal.id = NEW.proposal_id
-                      AND proposal.user_id = NEW.user_id
-                      AND CAST(json_extract(proposal.assessment_context_json, '$.assessment_id') AS INTEGER)
-                          = NEW.assessment_id
-                )
-                BEGIN
-                    SELECT RAISE(ABORT, 'assessment-map proposal scope violation');
-                END
-                """
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_map_validation_proposal_scope_update
+            BEFORE UPDATE ON assessment_validation_attempts
+            WHEN NEW.proposal_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM metasploit_proposals AS proposal
+                WHERE proposal.id = NEW.proposal_id
+                  AND proposal.user_id = NEW.user_id
+                  AND CAST(json_extract(proposal.assessment_context_json, '$.assessment_id') AS INTEGER)
+                      = NEW.assessment_id
             )
+            BEGIN
+                SELECT RAISE(ABORT, 'assessment-map proposal scope violation');
+            END
+            """
+        )
 
 
 def _entity_by_hash(

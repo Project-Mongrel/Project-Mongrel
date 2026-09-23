@@ -11,6 +11,7 @@ from app.services.assessment_conversation_store import (
     list_recent_messages,
 )
 from app.services.assessment_guard import build_assessment_guard, build_guard_prompt_section
+from app.services.assessment_map_retrieval import build_assessment_map_context
 from app.services.assessment_store import get_user_assessment
 from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile, get_mongrel_tool_names
 from app.services.scan_status import normalize_scan_status
@@ -270,6 +271,15 @@ def build_assessment_conversation_context(
             "recent_message_limit": max(0, int(recent_message_limit or 0)),
         },
         "assessment_context": evidence,
+        "assessment_map": _build_assessment_map_context_safe(
+            user_id=user_id,
+            assessment_id=assessment_id,
+            question=_assessment_map_retrieval_query(
+                question=question,
+                recent_messages=recent_messages,
+                referential=_is_referential_follow_up(question, question_intent),
+            ),
+        ),
         "mongrel_capabilities": MONGREL_CAPABILITIES,
         "mongrel_self_knowledge": build_mongrel_self_knowledge_profile(),
         "telegram_capability_guidance": TELEGRAM_CAPABILITY_GUIDANCE,
@@ -294,6 +304,50 @@ def build_assessment_conversation_context(
     }
     context["evidence_context_digest"] = build_context_digest(context)
     return context
+
+
+def _build_assessment_map_context_safe(*, user_id: int, assessment_id: int, question: str) -> dict:
+    try:
+        return build_assessment_map_context(
+            user_id=user_id,
+            assessment_id=assessment_id,
+            question=question,
+        )
+    except Exception:
+        return {
+            "version": "assessment-map.retrieval.v1",
+            "available": False,
+            "reason": "retrieval_error",
+            "coverage": {
+                "supported_tools": [],
+                "represented_tools": [],
+                "limitation": "Assessment-map retrieval was unavailable for this turn.",
+            },
+            "entities": [],
+            "relationships": [],
+            "truncated": False,
+        }
+
+
+def _assessment_map_retrieval_query(
+    *, question: str, recent_messages: list[dict], referential: bool
+) -> str:
+    """Use bounded prior user wording only as a retrieval hint, never as evidence."""
+
+    current = str(question or "").strip()
+    if not referential:
+        return current
+    skipped_current = False
+    for message in reversed(recent_messages):
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        content = str(message.get("content") or "").strip()
+        if not skipped_current and _normalize_intent_text(content) == _normalize_intent_text(current):
+            skipped_current = True
+            continue
+        if content:
+            return f"{current}\nPrior user topic (retrieval hint only): {content[:500]}"
+    return current
 
 
 def _is_referential_follow_up(question: str, intent: str) -> bool:

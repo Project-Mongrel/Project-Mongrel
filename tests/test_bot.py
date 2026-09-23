@@ -3,6 +3,7 @@ import json
 import re
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -201,6 +202,32 @@ from app.ui.ai_summary import render_ai_summary_card
 from app.ui.icons import icon
 
 
+def _assessment_scan_text_context(*, user_id: int, tool: str, target_text: str):
+    clear_user_findings(user_id)
+    clear_user_investigations(user_id)
+    clear_user_scan_requests(user_id)
+    assessment = create_assessment(f"Assessment {tool}", user_id=user_id)
+    target = add_assessment_target(assessment["id"], address=target_text)
+    scan_request = create_scan_request(user_id=user_id, scan_type=tool)
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+    context = SimpleNamespace(
+        user_data={
+            PENDING_NMAP_REQUEST_KEY: scan_request.id,
+            ASSESSMENT_SCAN_CONTEXT_KEY: {
+                "assessment_id": assessment["id"],
+                "target_id": target["id"],
+                "tool": tool,
+                "primary_target": target_text,
+                "scan_request_id": scan_request.id,
+            },
+        }
+    )
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text=target_text, reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id))
+    return assessment, target, scan_request, context, update, message
+
+
 def test_main_menu_keyboard_contains_expected_buttons() -> None:
     keyboard = build_main_menu_keyboard()
     rendered_buttons = [
@@ -384,6 +411,7 @@ def test_assessment_nmap_button_records_assessment_scan() -> None:
             },
         ),
         patch("app.bot.handlers.scan.generate_nmap_ai_assessment", return_value=NMAP_AI_FALLBACK_LINES),
+        patch("app.bot.handlers.scan.ingest_assessment_scan") as ingest_map,
     ):
         asyncio.run(
             assessment_callback_handler(
@@ -399,7 +427,187 @@ def test_assessment_nmap_button_records_assessment_scan() -> None:
     assert scans[0]["status"] == "completed"
     assert scans[0]["target_id"] == target["id"]
     assert scans[0]["finding_id"]
+    ingest_map.assert_called_once_with(user_id=8120, assessment_id=assessment["id"], scan_id=scans[0]["id"])
     assert "Nmap: Completed" in query_message.reply_text.call_args_list[-1].args[0]
+
+
+@pytest.mark.parametrize(
+    ("tool", "user_id", "runner_name", "result", "ai_sender_name"),
+    [
+        (
+            "httpx",
+            8140,
+            "run_httpx_scan",
+            {
+                "success": True,
+                "target": "https://example.com",
+                "output": '{"url":"https://example.com","status_code":200,"title":"Example"}',
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 2,
+            },
+            "_send_httpx_ai_assessment",
+        ),
+        (
+            "katana",
+            8141,
+            "run_katana_scan",
+            {
+                "success": True,
+                "target": "https://example.com",
+                "output": "",
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 2,
+            },
+            "_send_katana_ai_assessment",
+        ),
+        (
+            "playwright",
+            8142,
+            "run_playwright_observation",
+            {
+                "success": True,
+                "target": "https://example.com",
+                "output": {
+                    "requested_url": "https://example.com",
+                    "final_url": "https://example.com",
+                    "title": "Example",
+                    "load_status": "loaded",
+                    "status_code": 200,
+                },
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 2,
+            },
+            "_send_playwright_ai_assessment",
+        ),
+        (
+            "ffuf",
+            8143,
+            "run_ffuf_scan",
+            {
+                "success": True,
+                "target": "https://example.com/FUZZ",
+                "output": "",
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 2,
+                "wordlist_count": 19,
+                "wordlist_path": "app/resources/wordlists/ffuf_default.txt",
+                "wordlist_source": "Bundled smoke-test wordlist",
+                "ffuf_profile": "quick",
+                "ffuf_profile_label": "Quick",
+                "fuzz_url": "https://example.com/FUZZ",
+                "timeout_seconds": 30,
+            },
+            "_send_ffuf_ai_assessment",
+        ),
+    ],
+)
+def test_assessment_existing_map_tool_handlers_ingest_after_scan_recording(tool, user_id, runner_name, result, ai_sender_name) -> None:
+    assessment, target, scan_request, context, update, message = _assessment_scan_text_context(
+        user_id=user_id,
+        tool=tool,
+        target_text="https://example.com",
+    )
+    if tool == "ffuf":
+        _ffuf_scan_profiles[scan_request.id] = "quick"
+
+    with ExitStack() as stack:
+        stack.enter_context(patch(f"app.bot.handlers.scan.{runner_name}", return_value=result))
+        stack.enter_context(patch(f"app.bot.handlers.scan.{ai_sender_name}", new_callable=AsyncMock))
+        ingest_map = stack.enter_context(patch("app.bot.handlers.scan.ingest_assessment_scan"))
+        if tool in {"httpx", "ffuf"}:
+            stack.enter_context(patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock))
+            stack.enter_context(patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock))
+
+        asyncio.run(scan_target_handler(update, context))
+
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == tool
+    assert scans[0]["target_id"] == target["id"]
+    assert scans[0]["status"] == "completed"
+    assert scans[0]["finding_id"]
+    ingest_map.assert_called_once_with(user_id=user_id, assessment_id=assessment["id"], scan_id=scans[0]["id"])
+    label = {"httpx": "httpx", "katana": "Katana", "playwright": "Playwright", "ffuf": "ffuf"}[tool]
+    assert any(label in call.args[0] for call in message.reply_text.call_args_list)
+
+
+def test_assessment_map_ingestion_failure_does_not_hide_existing_tool_result() -> None:
+    assessment, target, _scan_request, context, update, message = _assessment_scan_text_context(
+        user_id=8144,
+        tool="httpx",
+        target_text="https://example.com",
+    )
+
+    with (
+        patch(
+            "app.bot.handlers.scan.run_httpx_scan",
+            return_value={
+                "success": True,
+                "target": "https://example.com",
+                "output": '{"url":"https://example.com","status_code":200,"title":"Example"}',
+                "error": "",
+                "returncode": 0,
+                "elapsed_seconds": 2,
+            },
+        ),
+        patch("app.bot.handlers.scan._send_httpx_ai_assessment", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock),
+        patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock),
+        patch(
+            "app.bot.handlers.scan.ingest_assessment_scan",
+            side_effect=AssessmentMapIngestionError("malformed structured evidence"),
+        ) as ingest_map,
+    ):
+        asyncio.run(scan_target_handler(update, context))
+
+    scans = list_assessment_scans(assessment["id"])
+    assert len(scans) == 1
+    assert scans[0]["tool"] == "httpx"
+    assert scans[0]["status"] == "completed"
+    assert scans[0]["target_id"] == target["id"]
+    ingest_map.assert_called_once_with(user_id=8144, assessment_id=assessment["id"], scan_id=scans[0]["id"])
+    assert any("httpx Scan Complete" in call.args[0] for call in message.reply_text.call_args_list)
+
+
+@pytest.mark.parametrize(
+    ("tool", "user_id", "runner_name", "result", "ai_sender_name"),
+    [
+        ("nmap", 8145, "run_nmap_scan", {"success": True, "target": "127.0.0.1", "output": "Nmap scan report for 127.0.0.1\nHost is up.\n22/tcp open ssh\n", "error": ""}, "_send_nmap_ai_assessment"),
+        ("httpx", 8146, "run_httpx_scan", {"success": True, "target": "https://example.com", "output": '{"url":"https://example.com","status_code":200}', "error": "", "returncode": 0, "elapsed_seconds": 2}, "_send_httpx_ai_assessment"),
+        ("katana", 8147, "run_katana_scan", {"success": True, "target": "https://example.com", "output": "", "error": "", "returncode": 0, "elapsed_seconds": 2}, "_send_katana_ai_assessment"),
+        ("playwright", 8148, "run_playwright_observation", {"success": True, "target": "https://example.com", "output": {"final_url": "https://example.com", "status_code": 200}, "error": "", "elapsed_seconds": 2}, "_send_playwright_ai_assessment"),
+        ("ffuf", 8149, "run_ffuf_scan", {"success": True, "target": "https://example.com/FUZZ", "output": "", "error": "", "returncode": 0, "elapsed_seconds": 2, "ffuf_profile": "quick", "ffuf_profile_label": "Quick", "wordlist_count": 19, "wordlist_path": "app/resources/wordlists/ffuf_default.txt", "fuzz_url": "https://example.com/FUZZ"}, "_send_ffuf_ai_assessment"),
+    ],
+)
+def test_standalone_existing_map_tool_handlers_do_not_ingest_assessment_map(tool, user_id, runner_name, result, ai_sender_name) -> None:
+    clear_user_findings(user_id)
+    clear_user_investigations(user_id)
+    clear_user_scan_requests(user_id)
+    scan_request = create_scan_request(user_id=user_id, scan_type=tool)
+    mark_scan_request_awaiting_target(user_id=user_id, scan_request_id=scan_request.id)
+    if tool == "ffuf":
+        _ffuf_scan_profiles[scan_request.id] = "quick"
+    context = SimpleNamespace(user_data={PENDING_NMAP_REQUEST_KEY: scan_request.id})
+    status_message = SimpleNamespace(edit_text=AsyncMock())
+    target_text = "127.0.0.1" if tool == "nmap" else "https://example.com"
+    message = SimpleNamespace(text=target_text, reply_text=AsyncMock(return_value=status_message))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id))
+
+    with ExitStack() as stack:
+        stack.enter_context(patch(f"app.bot.handlers.scan.{runner_name}", return_value=result))
+        stack.enter_context(patch(f"app.bot.handlers.scan.{ai_sender_name}", new_callable=AsyncMock))
+        ingest_map = stack.enter_context(patch("app.bot.handlers.scan.ingest_assessment_scan"))
+        if tool in {"httpx", "ffuf"}:
+            stack.enter_context(patch("app.bot.handlers.scan.ScanProgressCard.start_auto_refresh", new_callable=AsyncMock))
+            stack.enter_context(patch("app.bot.handlers.scan.ScanProgressCard.stop_auto_refresh", new_callable=AsyncMock))
+
+        asyncio.run(scan_target_handler(update, context))
+
+    ingest_map.assert_not_called()
 
 
 def test_assessment_bbot_button_records_assessment_scan() -> None:
