@@ -30,6 +30,12 @@ from app.services.assessment_map_security_ingestion import (
     project_security_source,
     security_coverage_metadata,
 )
+from app.services.assessment_map_cloud_validation_ingestion import (
+    STRUCTURED_ARTIFACT_TYPES as CLOUD_VALIDATION_STRUCTURED_ARTIFACT_TYPES,
+    cloud_validation_coverage_metadata,
+    map_cloud_validation_source,
+    project_cloud_validation_source,
+)
 from app.services.assessment_map_recon_secret_ingestion import (
     STRUCTURED_ARTIFACT_TYPES as RECON_SECRET_STRUCTURED_ARTIFACT_TYPES,
     map_recon_secret_source,
@@ -49,6 +55,7 @@ INGESTION_VERSION = 1
 DIGEST_VERSION = "assessment-map.ingestion-source.v1"
 SUPPORTED_TOOLS = frozenset({
     "nmap", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl", "bbot", "gitleaks",
+    "prowler", "metasploit",
 })
 STRUCTURED_ARTIFACT_TYPES = {
     "nmap": frozenset({"nmap_normalized_evidence", "nmap_structured_evidence", "nmap_json"}),
@@ -56,6 +63,7 @@ STRUCTURED_ARTIFACT_TYPES = {
     **WEB_STRUCTURED_ARTIFACT_TYPES,
     **SECURITY_STRUCTURED_ARTIFACT_TYPES,
     **RECON_SECRET_STRUCTURED_ARTIFACT_TYPES,
+    **CLOUD_VALIDATION_STRUCTURED_ARTIFACT_TYPES,
 }
 _SAFE_RESPONSE_HEADER_NAMES = frozenset(
     {
@@ -136,6 +144,11 @@ class _MappingWriter:
         )
         return row
 
+    def validation_attempt(self, **kwargs):
+        return _validation_attempt(
+            self.connection, self.user_id, self.assessment_id, self.scan, kwargs
+        )
+
 
 def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) -> dict:
     """Ingest one scan; ledger counts are unique canonical rows referenced by its projection."""
@@ -173,16 +186,19 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
         try:
             counts = _Counts.empty()
             projection_metadata: dict[str, Any] = {}
-            if tool in {"katana", "playwright", "ffuf", "nuclei", "testssl", "bbot", "gitleaks"}:
+            if tool in {"katana", "playwright", "ffuf", "nuclei", "testssl", "bbot", "gitleaks", "prowler", "metasploit"}:
                 if tool in {"katana", "playwright", "ffuf"}:
                     metadata_function = web_coverage_metadata
                     metadata_version = "assessment-map.web-coverage.v1"
                 elif tool in {"nuclei", "testssl"}:
                     metadata_function = security_coverage_metadata
                     metadata_version = "assessment-map.security-coverage.v1"
-                else:
+                elif tool in {"bbot", "gitleaks"}:
                     metadata_function = recon_secret_coverage_metadata
                     metadata_version = "assessment-map.recon-secret-coverage.v1"
+                else:
+                    metadata_function = cloud_validation_coverage_metadata
+                    metadata_version = "assessment-map.cloud-validation-coverage.v1"
                 projection_metadata = {
                     "metadata_version": metadata_version,
                     "tool": tool,
@@ -206,6 +222,10 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
                     ))
                 elif tool in {"nuclei", "testssl"}:
                     map_security_source(tool, source.data, _MappingWriter(
+                        active, user_id, assessment_id, scan, source, counts, projection_metadata
+                    ))
+                elif tool in {"prowler", "metasploit"}:
+                    map_cloud_validation_source(tool, source.data, _MappingWriter(
                         active, user_id, assessment_id, scan, source, counts, projection_metadata
                     ))
                 else:
@@ -339,6 +359,8 @@ def _canonical_digest_projection(
             projection = project_security_source(tool, source.data)
         elif tool in {"bbot", "gitleaks"}:
             projection = project_recon_secret_source(tool, source.data)
+        elif tool in {"prowler", "metasploit"}:
+            projection = project_cloud_validation_source(tool, source.data)
         else:
             projection = {"unsupported": True}
         projected_sources.append(
@@ -867,6 +889,69 @@ def _evidence(
         (assessment_id, user_id, destination_type, destination_id, fingerprint),
     ).fetchone()
     counts.evidence.add(int(evidence["id"]))
+
+
+def _validation_attempt(
+    connection: sqlite3.Connection,
+    user_id: int,
+    assessment_id: int,
+    scan: sqlite3.Row,
+    values: dict[str, Any],
+) -> sqlite3.Row | None:
+    attempt_key = str(values.get("attempt_key") or "").strip()
+    if not attempt_key:
+        return None
+    proposal_id = str(values.get("proposal_id") or "").strip() or None
+    proposal = None
+    if proposal_id and _table_exists(connection, "metasploit_proposals"):
+        proposal = connection.execute(
+            "SELECT fingerprint, status, execution_state FROM metasploit_proposals WHERE id = ? AND user_id = ?",
+            (proposal_id, user_id),
+        ).fetchone()
+    fingerprint = str(proposal["fingerprint"] if proposal is not None else _digest(attempt_key))
+    approval_status = str(proposal["status"] if proposal is not None else "unknown")
+    execution_status = str(proposal["execution_state"] if proposal is not None else scan["status"] or "unknown")
+    now = _now()
+    connection.execute(
+        """
+        INSERT INTO assessment_validation_attempts (
+            assessment_id, user_id, attempt_key, tool, proposal_id, request_fingerprint,
+            target_entity_id, service_entity_id, finding_entity_id, scan_id, artifact_id,
+            approval_status, execution_status, validation_state, module, action_type,
+            session_established, started_at, completed_at, limitations_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(assessment_id, user_id, attempt_key) DO UPDATE SET
+            approval_status = excluded.approval_status,
+            execution_status = excluded.execution_status,
+            validation_state = excluded.validation_state,
+            scan_id = COALESCE(excluded.scan_id, assessment_validation_attempts.scan_id),
+            artifact_id = COALESCE(excluded.artifact_id, assessment_validation_attempts.artifact_id),
+            session_established = excluded.session_established,
+            completed_at = excluded.completed_at,
+            limitations_json = excluded.limitations_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            assessment_id, user_id, attempt_key, "metasploit", proposal_id, fingerprint,
+            values.get("target_entity_id"), values.get("service_entity_id"), values.get("finding_entity_id"),
+            scan["id"], None, approval_status, execution_status, values.get("validation_state"),
+            values.get("module"), values.get("action_type"),
+            None if values.get("session_established") is None else int(bool(values.get("session_established"))),
+            scan["started_at"], scan["completed_at"], _json(values.get("limitations") or []), now, now,
+        ),
+    )
+    return connection.execute(
+        """SELECT * FROM assessment_validation_attempts
+           WHERE assessment_id = ? AND user_id = ? AND attempt_key = ?""",
+        (assessment_id, user_id, attempt_key),
+    ).fetchone()
+
+
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (str(table_name),),
+    ).fetchone() is not None
 
 
 def _ledger(

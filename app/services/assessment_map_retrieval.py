@@ -15,6 +15,7 @@ from app.services.findings_store import _get_connection
 MAP_RETRIEVAL_VERSION = "assessment-map.retrieval.v1"
 MAP_EVIDENCE_TOOLS = (
     "nmap", "bbot", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl", "gitleaks",
+    "prowler", "metasploit",
 )
 MAX_ENTITY_CANDIDATES = 40
 MAX_ASSERTION_CANDIDATES = 80
@@ -229,6 +230,12 @@ def _entity_label(entity: dict, payload: dict) -> str:
         return f"{origin.get('scheme', 'web')} application"
     if entity_type == "finding":
         return f"{payload.get('tool', 'tool')} finding {payload.get('stable_id', '')}".strip()
+    if entity_type == "cloud_account":
+        return f"{payload.get('provider', 'cloud')} account {payload.get('account_id', '')}".strip()
+    if entity_type == "cloud_region":
+        return f"{payload.get('provider', 'cloud')} region {payload.get('region', '')}".strip()
+    if entity_type == "cloud_resource":
+        return str(payload.get("resource_name") or payload.get("resource_id") or "cloud resource")
     return entity_type
 
 
@@ -447,6 +454,9 @@ def _entity_type_rank(entity_type: str) -> int:
         "endpoint": 4,
         "technology": 5,
         "finding": 6,
+        "cloud_account": 7,
+        "cloud_region": 8,
+        "cloud_resource": 9,
     }.get(entity_type, 99)
 
 

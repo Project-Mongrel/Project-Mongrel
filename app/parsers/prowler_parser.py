@@ -58,6 +58,17 @@ def _normalize_record(record: dict, provider: str | None = None) -> dict:
     status = _safe_text(_first(record, "status_code", "status", "status_detail"))
     normalized = {
         "provider": _safe_text(provider or cloud.get("provider") or _first(record, "provider")),
+        "account_id": _safe_text(
+            _as_dict(cloud.get("account")).get("uid")
+            or _as_dict(cloud.get("account")).get("id")
+            or _first(record, "account_id", "account_uid")
+            or cloud.get("account_uid")
+            or cloud.get("account_id")
+        ),
+        "account_name": _safe_text(
+            _as_dict(cloud.get("account")).get("name")
+            or _first(record, "account_name")
+        ),
         "check_id": _safe_text(metadata.get("event_code") or finding_info.get("uid") or _first(record, "check_id", "checkId")),
         "check_title": _safe_text(finding_info.get("title") or _first(record, "check_title", "checkTitle", "title")),
         "status": status,

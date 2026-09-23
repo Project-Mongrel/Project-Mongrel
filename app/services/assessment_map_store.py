@@ -28,6 +28,26 @@ _MISSING = object()
 _TERMINAL_VALIDATION_EXECUTION_STATES = frozenset(
     {"completed", "executed", "failed", "partial", "timed_out", "cancelled", "interrupted"}
 )
+_ENTITY_TABLE_SQL = """
+CREATE TABLE assessment_map_entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assessment_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    entity_type TEXT NOT NULL CHECK(entity_type IN ('hostname','ip','service','application','endpoint','technology','finding','cloud_account','cloud_region','cloud_resource')),
+    identity_version TEXT NOT NULL,
+    identity_hash TEXT NOT NULL,
+    canonical_key TEXT NOT NULL,
+    display_value TEXT,
+    attributes_json TEXT NOT NULL DEFAULT '{}',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(assessment_id, user_id, entity_type, identity_hash),
+    UNIQUE(id, assessment_id, user_id),
+    FOREIGN KEY(assessment_id, user_id) REFERENCES assessments(id, user_id) ON DELETE RESTRICT
+)
+"""
 
 
 class AssessmentMapScopeError(ValueError):
@@ -43,12 +63,52 @@ def initialize_assessment_map_schema() -> None:
     with _schema_lock:
         if not _table_exists(connection, "assessments"):
             _initialize_assessment_schema(connection)
+        _migrate_entity_type_check_constraint(connection)
         run_locked_transaction(connection, _create_schema_transaction)
 
 
 def _create_schema_transaction(connection: sqlite3.Connection) -> None:
     connection.execute("BEGIN IMMEDIATE")
     _create_schema(connection)
+
+
+def _migrate_entity_type_check_constraint(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "assessment_map_entities"):
+        return
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'assessment_map_entities'"
+    ).fetchone()
+    table_sql = str(row["sql"] if row is not None else "")
+    if "cloud_account" in table_sql and "cloud_resource" in table_sql:
+        return
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(_ENTITY_TABLE_SQL.replace("assessment_map_entities", "assessment_map_entities_new", 1))
+        connection.execute(
+            """
+            INSERT INTO assessment_map_entities_new (
+                id, assessment_id, user_id, entity_type, identity_version, identity_hash,
+                canonical_key, display_value, attributes_json, first_seen_at, last_seen_at,
+                created_at, updated_at
+            )
+            SELECT
+                id, assessment_id, user_id, entity_type, identity_version, identity_hash,
+                canonical_key, display_value, attributes_json, first_seen_at, last_seen_at,
+                created_at, updated_at
+            FROM assessment_map_entities
+            """
+        )
+        connection.execute("DROP TABLE assessment_map_entities")
+        connection.execute("ALTER TABLE assessment_map_entities_new RENAME TO assessment_map_entities")
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON" if foreign_keys else "PRAGMA foreign_keys = OFF")
 
 
 def get_or_create_entity(
@@ -524,28 +584,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_assessment_scans_id_assessment_unique ON assessment_scans(id, assessment_id)")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_assessment_artifacts_id_assessment_unique ON assessment_artifacts(id, assessment_id)")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_id_user_unique ON findings(id, user_id)")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS assessment_map_entities (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assessment_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            entity_type TEXT NOT NULL CHECK(entity_type IN ('hostname','ip','service','application','endpoint','technology','finding')),
-            identity_version TEXT NOT NULL,
-            identity_hash TEXT NOT NULL,
-            canonical_key TEXT NOT NULL,
-            display_value TEXT,
-            attributes_json TEXT NOT NULL DEFAULT '{}',
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(assessment_id, user_id, entity_type, identity_hash),
-            UNIQUE(id, assessment_id, user_id),
-            FOREIGN KEY(assessment_id, user_id) REFERENCES assessments(id, user_id) ON DELETE RESTRICT
-        )
-        """
-    )
+    connection.execute(_ENTITY_TABLE_SQL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS assessment_map_assertions (

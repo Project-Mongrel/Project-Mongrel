@@ -2173,6 +2173,7 @@ def _ingest_assessment_map_after_scan(
 ) -> None:
     if not assessment_context or tool not in {
         "nmap", "bbot", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl", "gitleaks",
+        "prowler", "metasploit",
     } or not scan:
         return
     assessment_id = assessment_context.get("assessment_id")
@@ -3590,7 +3591,9 @@ async def _handle_prowler_provider(
         summary=f"Prowler cloud posture scan {event_wording} for {provider.upper()} context {cloud_context}",
         metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count"), "parser_error": parser_error, "provider": provider, "cloud_context": cloud_context},
     )
-    _record_assessment_scan(assessment_context, tool="prowler", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context, tool="prowler", result=result, finding=finding)
+    if (evidence.get("findings") if isinstance(evidence, dict) else None):
+        _ingest_assessment_map_after_scan(assessment_context, user_id=user_id, tool="prowler", scan=scan)
     if result.get("success") is True:
         await progress_card.complete()
     else:
@@ -3942,7 +3945,14 @@ async def _handle_metasploit_callback(query: object, user_id: int, context: Cont
     scan_request_id = pending.get("scan_request_id") if isinstance(pending, dict) else None
     if isinstance(scan_request_id, str):
         complete_scan_request(user_id=user_id, scan_request_id=scan_request_id, target=str(result.get("target") or ""), result=result)
-    _record_assessment_scan(assessment_context if isinstance(assessment_context, dict) else None, tool="metasploit", result=result, finding=finding)
+    scan = _record_assessment_scan(assessment_context if isinstance(assessment_context, dict) else None, tool="metasploit", result=result, finding=finding)
+    if normalized:
+        _ingest_assessment_map_after_scan(
+            assessment_context if isinstance(assessment_context, dict) else None,
+            user_id=user_id,
+            tool="metasploit",
+            scan=scan,
+        )
 
     message = getattr(query, "message", None)
     reply_text = getattr(message, "reply_text", None)

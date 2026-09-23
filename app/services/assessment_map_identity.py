@@ -11,7 +11,10 @@ from typing import Any
 from urllib.parse import unquote_plus, urlsplit
 
 IDENTITY_SCHEMA_VERSION = "assessment-map.identity.v1"
-ENTITY_TYPES = frozenset({"hostname", "ip", "service", "application", "endpoint", "technology", "finding"})
+ENTITY_TYPES = frozenset({
+    "hostname", "ip", "service", "application", "endpoint", "technology", "finding",
+    "cloud_account", "cloud_region", "cloud_resource",
+})
 _TRANSPORT_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,15}")
 
 
@@ -102,6 +105,59 @@ def canonical_technology(name: str, *, version: str | None = None) -> CanonicalI
     return identity_from_payload("technology", {"product": normalized})
 
 
+def canonical_cloud_account(provider: str, account_id: str) -> CanonicalIdentity:
+    normalized_provider = _normalize_cloud_component(provider, field="provider")
+    normalized_account = _normalize_cloud_component(account_id, field="account")
+    return identity_from_payload(
+        "cloud_account",
+        {"provider": normalized_provider, "account_id": normalized_account},
+    )
+
+
+def canonical_cloud_region(provider: str, account_id: str, region: str) -> CanonicalIdentity:
+    account = canonical_cloud_account(provider, account_id)
+    normalized_region = _normalize_cloud_component(region, field="region")
+    return identity_from_payload(
+        "cloud_region",
+        {
+            "provider": account.payload["provider"],
+            "account_hash": account.identity_hash,
+            "account_key": account.canonical_key,
+            "region": normalized_region,
+        },
+    )
+
+
+def canonical_cloud_resource(
+    provider: str,
+    account_id: str,
+    *,
+    region: str | None = None,
+    service: str | None = None,
+    resource_id: str | None = None,
+    resource_name: str | None = None,
+) -> CanonicalIdentity:
+    account = canonical_cloud_account(provider, account_id)
+    normalized_resource_id = _normalize_cloud_component(resource_id, field="resource_id", required=False)
+    normalized_resource_name = _normalize_cloud_component(resource_name, field="resource_name", required=False)
+    if normalized_resource_id is None and normalized_resource_name is None:
+        raise ValueError("Cloud resource requires a resource identifier or name.")
+    payload: dict[str, Any] = {
+        "provider": account.payload["provider"],
+        "account_hash": account.identity_hash,
+        "account_key": account.canonical_key,
+        "resource_id": normalized_resource_id,
+        "resource_name": normalized_resource_name,
+    }
+    normalized_region = _normalize_cloud_component(region, field="region", required=False)
+    normalized_service = _normalize_cloud_component(service, field="service", required=False)
+    if normalized_region is not None:
+        payload["region"] = normalized_region
+    if normalized_service is not None:
+        payload["service"] = normalized_service
+    return identity_from_payload("cloud_resource", payload)
+
+
 def canonical_finding(
     tool: str,
     stable_id: str,
@@ -125,6 +181,23 @@ def canonical_finding(
     if normalized_matcher:
         payload["matcher"] = normalized_matcher
     return identity_from_payload("finding", payload)
+
+
+def _normalize_cloud_component(value: object, *, field: str, required: bool = True) -> str | None:
+    normalized = " ".join(str(value or "").replace("\x00", "").split())
+    if not normalized:
+        if required:
+            raise ValueError(f"Cloud {field} is required.")
+        return None
+    if len(normalized) > 300:
+        raise ValueError(f"Cloud {field} is too long.")
+    lowered = normalized.lower()
+    if any(marker in lowered for marker in (
+        "authorization", "bearer ", "cookie", "password", "secret", "token", "api_key", "apikey",
+        "private_key", "credential",
+    )):
+        raise ValueError(f"Cloud {field} appears sensitive.")
+    return normalized.casefold() if field in {"provider", "region", "service"} else normalized
 
 
 def _normalize_hostname(value: str) -> str:
