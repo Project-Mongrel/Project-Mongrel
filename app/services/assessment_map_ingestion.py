@@ -30,6 +30,12 @@ from app.services.assessment_map_security_ingestion import (
     project_security_source,
     security_coverage_metadata,
 )
+from app.services.assessment_map_recon_secret_ingestion import (
+    STRUCTURED_ARTIFACT_TYPES as RECON_SECRET_STRUCTURED_ARTIFACT_TYPES,
+    map_recon_secret_source,
+    project_recon_secret_source,
+    recon_secret_coverage_metadata,
+)
 from app.services.assessment_map_web_ingestion import (
     STRUCTURED_ARTIFACT_TYPES as WEB_STRUCTURED_ARTIFACT_TYPES,
     map_web_source,
@@ -41,12 +47,15 @@ from app.services.sqlite_runtime import run_locked_transaction
 
 INGESTION_VERSION = 1
 DIGEST_VERSION = "assessment-map.ingestion-source.v1"
-SUPPORTED_TOOLS = frozenset({"nmap", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl"})
+SUPPORTED_TOOLS = frozenset({
+    "nmap", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl", "bbot", "gitleaks",
+})
 STRUCTURED_ARTIFACT_TYPES = {
     "nmap": frozenset({"nmap_normalized_evidence", "nmap_structured_evidence", "nmap_json"}),
     "httpx": frozenset({"httpx_normalized_evidence", "httpx_structured_evidence", "httpx_json"}),
     **WEB_STRUCTURED_ARTIFACT_TYPES,
     **SECURITY_STRUCTURED_ARTIFACT_TYPES,
+    **RECON_SECRET_STRUCTURED_ARTIFACT_TYPES,
 }
 _SAFE_RESPONSE_HEADER_NAMES = frozenset(
     {
@@ -164,18 +173,18 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
         try:
             counts = _Counts.empty()
             projection_metadata: dict[str, Any] = {}
-            if tool in {"katana", "playwright", "ffuf", "nuclei", "testssl"}:
-                metadata_function = (
-                    web_coverage_metadata
-                    if tool in {"katana", "playwright", "ffuf"}
-                    else security_coverage_metadata
-                )
+            if tool in {"katana", "playwright", "ffuf", "nuclei", "testssl", "bbot", "gitleaks"}:
+                if tool in {"katana", "playwright", "ffuf"}:
+                    metadata_function = web_coverage_metadata
+                    metadata_version = "assessment-map.web-coverage.v1"
+                elif tool in {"nuclei", "testssl"}:
+                    metadata_function = security_coverage_metadata
+                    metadata_version = "assessment-map.security-coverage.v1"
+                else:
+                    metadata_function = recon_secret_coverage_metadata
+                    metadata_version = "assessment-map.recon-secret-coverage.v1"
                 projection_metadata = {
-                    "metadata_version": (
-                        "assessment-map.web-coverage.v1"
-                        if tool in {"katana", "playwright", "ffuf"}
-                        else "assessment-map.security-coverage.v1"
-                    ),
+                    "metadata_version": metadata_version,
                     "tool": tool,
                     "sources": [
                         {
@@ -195,8 +204,12 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
                     map_web_source(tool, source.data, _MappingWriter(
                         active, user_id, assessment_id, scan, source, counts, projection_metadata
                     ))
-                else:
+                elif tool in {"nuclei", "testssl"}:
                     map_security_source(tool, source.data, _MappingWriter(
+                        active, user_id, assessment_id, scan, source, counts, projection_metadata
+                    ))
+                else:
+                    map_recon_secret_source(tool, source.data, _MappingWriter(
                         active, user_id, assessment_id, scan, source, counts, projection_metadata
                     ))
             if not counts.entities and not counts.assertions and tool != "ffuf":
@@ -324,6 +337,8 @@ def _canonical_digest_projection(
             projection = project_web_source(tool, source.data)
         elif tool in {"nuclei", "testssl"}:
             projection = project_security_source(tool, source.data)
+        elif tool in {"bbot", "gitleaks"}:
+            projection = project_recon_secret_source(tool, source.data)
         else:
             projection = {"unsupported": True}
         projected_sources.append(

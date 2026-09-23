@@ -637,6 +637,7 @@ def test_assessment_bbot_button_records_assessment_scan() -> None:
                 "elapsed_seconds": 4.2,
             },
         ),
+        patch("app.bot.handlers.scan.ingest_assessment_scan") as ingest_map,
     ):
         asyncio.run(
             assessment_callback_handler(
@@ -651,6 +652,9 @@ def test_assessment_bbot_button_records_assessment_scan() -> None:
     assert scans[0]["status"] == "completed"
     assert scans[0]["target_id"] == target["id"]
     assert scans[0]["elapsed_seconds"] == 4
+    ingest_map.assert_called_once_with(
+        user_id=8121, assessment_id=assessment["id"], scan_id=scans[0]["id"]
+    )
     assert "BBOT: Completed" in query_message.reply_text.call_args_list[-1].args[0]
 
 

@@ -1,6 +1,9 @@
 import pytest
 
+from app.services.assessment_map_ingestion import ingest_assessment_scan
+from app.services.assessment_store import create_assessment, record_assessment_scan
 from app.services.findings_store import (
+    _get_connection,
     add_finding,
     add_report_metadata,
     clear_user_findings,
@@ -68,6 +71,51 @@ def test_clear_findings() -> None:
     clear_user_findings(2004)
 
     assert get_user_findings(2004) == []
+
+
+def test_clear_findings_removes_user_map_references_without_cross_user_deletion() -> None:
+    first = create_assessment("Mapped finding cleanup", user_id=2013)
+    second = create_assessment("Other mapped finding cleanup", user_id=2014)
+    first_finding = add_finding(
+        user_id=2013,
+        finding={
+            "source": "nmap",
+            "target": "owned.example",
+            "host_status": "up",
+            "open_ports": [{"port": "443", "protocol": "tcp", "state": "open", "service": "https"}],
+        },
+    )
+    second_finding = add_finding(
+        user_id=2014,
+        finding={
+            "source": "nmap",
+            "target": "other.example",
+            "host_status": "up",
+            "open_ports": [{"port": "80", "protocol": "tcp", "state": "open", "service": "http"}],
+        },
+    )
+    first_scan = record_assessment_scan(
+        first["id"], tool="nmap", status="completed", finding_id=first_finding["id"]
+    )
+    second_scan = record_assessment_scan(
+        second["id"], tool="nmap", status="completed", finding_id=second_finding["id"]
+    )
+    ingest_assessment_scan(user_id=2013, assessment_id=first["id"], scan_id=first_scan["id"])
+    ingest_assessment_scan(user_id=2014, assessment_id=second["id"], scan_id=second_scan["id"])
+
+    clear_user_findings(2013)
+
+    connection = _get_connection()
+    assert get_user_findings(2013) == []
+    assert get_user_findings(2014) == [second_finding]
+    assert connection.execute(
+        "SELECT COUNT(*) FROM assessment_map_evidence_links WHERE user_id = ?",
+        (2013,),
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT COUNT(*) FROM assessment_map_evidence_links WHERE user_id = ?",
+        (2014,),
+    ).fetchone()[0] > 0
 
 
 def test_previous_lookup_works_with_target_key() -> None:

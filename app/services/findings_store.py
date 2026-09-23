@@ -143,8 +143,231 @@ def get_latest_user_finding_for_target(
 
 def clear_user_findings(user_id: int) -> None:
     with _get_connection() as connection:
+        _clear_user_assessment_map_finding_references(connection, user_id)
         connection.execute("DELETE FROM findings WHERE user_id = ?", (user_id,))
         connection.execute("DELETE FROM scan_runs WHERE user_id = ?", (user_id,))
+
+
+def _clear_user_assessment_map_finding_references(connection: sqlite3.Connection, user_id: int) -> None:
+    if not _table_exists(connection, "assessment_map_evidence_links"):
+        return
+
+    connection.execute("DROP TABLE IF EXISTS temp._mongrel_clear_map_evidence")
+    connection.execute("DROP TABLE IF EXISTS temp._mongrel_clear_map_assertions")
+    connection.execute("DROP TABLE IF EXISTS temp._mongrel_clear_map_entities")
+    connection.execute(
+        """
+        CREATE TEMP TABLE _mongrel_clear_map_evidence(
+            id INTEGER PRIMARY KEY,
+            assessment_id INTEGER NOT NULL,
+            scan_id INTEGER,
+            entity_id INTEGER,
+            assertion_id INTEGER
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO temp._mongrel_clear_map_evidence(id, assessment_id, scan_id, entity_id, assertion_id)
+        SELECT evidence.id, evidence.assessment_id, evidence.scan_id, evidence.entity_id, evidence.assertion_id
+        FROM assessment_map_evidence_links AS evidence
+        WHERE evidence.user_id = ?
+          AND (
+              evidence.finding_id IN (SELECT id FROM findings WHERE user_id = ?)
+              OR evidence.scan_id IN (
+                  SELECT scan.id
+                  FROM assessment_scans AS scan
+                  WHERE scan.finding_id IN (SELECT id FROM findings WHERE user_id = ?)
+              )
+          )
+        """,
+        (user_id, user_id, user_id),
+    )
+    has_map_evidence = connection.execute(
+        "SELECT 1 FROM temp._mongrel_clear_map_evidence LIMIT 1"
+    ).fetchone()
+    if has_map_evidence is None:
+        connection.execute("DROP TABLE temp._mongrel_clear_map_evidence")
+        return
+
+    connection.execute(
+        """
+        CREATE TEMP TABLE _mongrel_clear_map_assertions(
+            id INTEGER PRIMARY KEY,
+            assessment_id INTEGER NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TEMP TABLE _mongrel_clear_map_entities(
+            id INTEGER NOT NULL,
+            assessment_id INTEGER NOT NULL,
+            PRIMARY KEY(id, assessment_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO temp._mongrel_clear_map_assertions(id, assessment_id)
+        SELECT assertion_id, assessment_id
+        FROM temp._mongrel_clear_map_evidence
+        WHERE assertion_id IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO temp._mongrel_clear_map_entities(id, assessment_id)
+        SELECT entity_id, assessment_id
+        FROM temp._mongrel_clear_map_evidence
+        WHERE entity_id IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO temp._mongrel_clear_map_entities(id, assessment_id)
+        SELECT assertion.subject_entity_id, assertion.assessment_id
+        FROM assessment_map_assertions AS assertion
+        JOIN temp._mongrel_clear_map_assertions AS candidate
+          ON candidate.id = assertion.id
+         AND candidate.assessment_id = assertion.assessment_id
+        WHERE assertion.user_id = ?
+        """,
+        (user_id,),
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO temp._mongrel_clear_map_entities(id, assessment_id)
+        SELECT assertion.object_entity_id, assertion.assessment_id
+        FROM assessment_map_assertions AS assertion
+        JOIN temp._mongrel_clear_map_assertions AS candidate
+          ON candidate.id = assertion.id
+         AND candidate.assessment_id = assertion.assessment_id
+        WHERE assertion.user_id = ?
+          AND assertion.object_entity_id IS NOT NULL
+        """,
+        (user_id,),
+    )
+    connection.execute(
+        """
+        DELETE FROM assessment_map_ingestion_heads
+        WHERE user_id = ?
+          AND EXISTS (
+              SELECT 1
+              FROM temp._mongrel_clear_map_evidence AS stale
+              WHERE stale.assessment_id = assessment_map_ingestion_heads.assessment_id
+                AND stale.scan_id = assessment_map_ingestion_heads.scan_id
+          )
+        """,
+        (user_id,),
+    )
+    connection.execute(
+        """
+        DELETE FROM assessment_map_ingestion_evidence
+        WHERE user_id = ?
+          AND EXISTS (
+              SELECT 1
+              FROM temp._mongrel_clear_map_evidence AS stale
+              WHERE stale.assessment_id = assessment_map_ingestion_evidence.assessment_id
+                AND stale.id = assessment_map_ingestion_evidence.evidence_link_id
+          )
+        """,
+        (user_id,),
+    )
+    connection.execute(
+        """
+        DELETE FROM assessment_map_ingestions
+        WHERE user_id = ?
+          AND EXISTS (
+              SELECT 1
+              FROM temp._mongrel_clear_map_evidence AS stale
+              WHERE stale.assessment_id = assessment_map_ingestions.assessment_id
+                AND stale.scan_id = assessment_map_ingestions.scan_id
+          )
+        """,
+        (user_id,),
+    )
+    connection.execute(
+        """
+        DELETE FROM assessment_map_evidence_links
+        WHERE user_id = ?
+          AND EXISTS (
+              SELECT 1
+              FROM temp._mongrel_clear_map_evidence AS stale
+              WHERE stale.id = assessment_map_evidence_links.id
+                AND stale.assessment_id = assessment_map_evidence_links.assessment_id
+          )
+        """,
+        (user_id,),
+    )
+    connection.execute(
+        """
+        DELETE FROM assessment_map_assertions
+        WHERE user_id = ?
+          AND EXISTS (
+              SELECT 1
+              FROM temp._mongrel_clear_map_assertions AS candidate
+              WHERE candidate.id = assessment_map_assertions.id
+                AND candidate.assessment_id = assessment_map_assertions.assessment_id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM assessment_map_evidence_links AS evidence
+              WHERE evidence.assertion_id = assessment_map_assertions.id
+                AND evidence.assessment_id = assessment_map_assertions.assessment_id
+                AND evidence.user_id = assessment_map_assertions.user_id
+          )
+        """,
+        (user_id,),
+    )
+    connection.execute(
+        """
+        DELETE FROM assessment_map_entities
+        WHERE user_id = ?
+          AND EXISTS (
+              SELECT 1
+              FROM temp._mongrel_clear_map_entities AS candidate
+              WHERE candidate.id = assessment_map_entities.id
+                AND candidate.assessment_id = assessment_map_entities.assessment_id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM assessment_map_evidence_links AS evidence
+              WHERE evidence.entity_id = assessment_map_entities.id
+                AND evidence.assessment_id = assessment_map_entities.assessment_id
+                AND evidence.user_id = assessment_map_entities.user_id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM assessment_map_assertions AS assertion
+              WHERE assertion.assessment_id = assessment_map_entities.assessment_id
+                AND assertion.user_id = assessment_map_entities.user_id
+                AND (assertion.subject_entity_id = assessment_map_entities.id
+                     OR assertion.object_entity_id = assessment_map_entities.id)
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM assessment_validation_attempts AS validation
+              WHERE validation.assessment_id = assessment_map_entities.assessment_id
+                AND validation.user_id = assessment_map_entities.user_id
+                AND (validation.target_entity_id = assessment_map_entities.id
+                     OR validation.service_entity_id = assessment_map_entities.id
+                     OR validation.finding_entity_id = assessment_map_entities.id)
+          )
+        """,
+        (user_id,),
+    )
+    connection.execute("DROP TABLE temp._mongrel_clear_map_entities")
+    connection.execute("DROP TABLE temp._mongrel_clear_map_assertions")
+    connection.execute("DROP TABLE temp._mongrel_clear_map_evidence")
+
+
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
 
 
 def get_user_scan_runs(user_id: int) -> list[dict]:

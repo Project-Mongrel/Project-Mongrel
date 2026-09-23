@@ -358,7 +358,7 @@ def test_live_style_standalone_gitleaks_reveal_uses_vaulted_value() -> None:
 
 def test_live_style_gitleaks_completion_preserves_assessment_linkage_in_view_evidence() -> None:
     user_id = 9311
-    assessment = create_assessment("Live Gitleaks Assessment")
+    assessment = create_assessment("Live Gitleaks Assessment", user_id=user_id)
     target = add_assessment_target(assessment["id"], address="/home/mongrel/Project-Mongrel/data/gitleaks_smoke_fixture", target_type="artifact_dir")
     output = _gitleaks_json(
         [
@@ -374,11 +374,12 @@ def test_live_style_gitleaks_completion_preserves_assessment_linkage_in_view_evi
         ]
     )
 
-    message, _ = _live_style_gitleaks_scan(
-        user_id=user_id,
-        json_output=output,
-        assessment_context={"assessment_id": assessment["id"], "target_id": target["id"], "tool": "gitleaks"},
-    )
+    with patch("app.bot.handlers.scan.ingest_assessment_scan") as ingest_map:
+        message, _ = _live_style_gitleaks_scan(
+            user_id=user_id,
+            json_output=output,
+            assessment_context={"assessment_id": assessment["id"], "target_id": target["id"], "tool": "gitleaks"},
+        )
     result_call = _result_card_call(message)
     keyboard = result_call.kwargs["reply_markup"]
     buttons = [button for row in keyboard.inline_keyboard for button in row]
@@ -392,20 +393,26 @@ def test_live_style_gitleaks_completion_preserves_assessment_linkage_in_view_evi
     assert _gitleaks_evidence_action_tokens[token]["assessment_id"] == str(assessment["id"])
     assert _gitleaks_evidence_action_tokens[token]["finding_id"] == finding["id"]
     assert _gitleaks_evidence_action_tokens[token]["evidence_id"] == evidence_id
-    assert list_assessment_scans(assessment["id"])[0]["finding_id"] == finding["id"]
+    scan = list_assessment_scans(assessment["id"])[0]
+    assert scan["finding_id"] == finding["id"]
+    ingest_map.assert_called_once_with(
+        user_id=user_id, assessment_id=assessment["id"], scan_id=scan["id"]
+    )
     assert RAW_SECRET not in view_button.callback_data
 
 
 def test_live_style_gitleaks_completion_without_vaulted_evidence_has_no_view_evidence() -> None:
     user_id = 9312
 
-    message, _ = _live_style_gitleaks_scan(user_id=user_id, json_output="[]")
+    with patch("app.bot.handlers.scan.ingest_assessment_scan") as ingest_map:
+        message, _ = _live_style_gitleaks_scan(user_id=user_id, json_output="[]")
     result_call = _result_card_call(message)
     keyboard = result_call.kwargs["reply_markup"]
     button_texts = [button.text for row in keyboard.inline_keyboard for button in row]
 
     assert "AI Summary" in button_texts
     assert "View Evidence" not in button_texts
+    ingest_map.assert_not_called()
 
 
 def test_live_style_gitleaks_multiple_findings_map_to_distinct_evidence_callbacks() -> None:

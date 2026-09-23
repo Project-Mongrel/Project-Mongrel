@@ -13,7 +13,9 @@ from app.services.assessment_map_store import list_entities as _list_entities
 from app.services.findings_store import _get_connection
 
 MAP_RETRIEVAL_VERSION = "assessment-map.retrieval.v1"
-MAP_EVIDENCE_TOOLS = ("nmap", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl")
+MAP_EVIDENCE_TOOLS = (
+    "nmap", "bbot", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl", "gitleaks",
+)
 MAX_ENTITY_CANDIDATES = 40
 MAX_ASSERTION_CANDIDATES = 80
 MAX_CONTEXT_ENTITIES = 12

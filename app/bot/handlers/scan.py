@@ -2171,7 +2171,9 @@ def _ingest_assessment_map_after_scan(
     tool: str,
     scan: dict | None,
 ) -> None:
-    if not assessment_context or tool not in {"nmap", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl"} or not scan:
+    if not assessment_context or tool not in {
+        "nmap", "bbot", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl", "gitleaks",
+    } or not scan:
         return
     assessment_id = assessment_context.get("assessment_id")
     scan_id = scan.get("id")
@@ -3460,7 +3462,14 @@ async def _handle_gitleaks_target(
         summary=f"Gitleaks secret scan {event_wording}",
         metadata={"finding_id": finding.get("id"), "finding_count": finding.get("finding_count"), "parser_error": parser_error},
     )
-    _record_assessment_scan(assessment_context, tool="gitleaks", result=result, finding=finding)
+    assessment_scan = _record_assessment_scan(
+        assessment_context, tool="gitleaks", result=result, finding=finding
+    )
+    mapped_findings = evidence.get("findings")
+    if isinstance(mapped_findings, list) and mapped_findings:
+        _ingest_assessment_map_after_scan(
+            assessment_context, user_id=user_id, tool="gitleaks", scan=assessment_scan
+        )
     if result.get("success") is True:
         await progress_card.complete()
     else:
@@ -4471,7 +4480,13 @@ async def _handle_bbot_target(
         metadata={"finding_id": finding.get("id"), "observation_count": observation_count, "partial": is_partial},
     )
     assessment_context = _pop_assessment_scan_context(context, "bbot")
-    _record_assessment_scan(assessment_context, tool="bbot", result=result, finding=finding)
+    assessment_scan = _record_assessment_scan(
+        assessment_context, tool="bbot", result=result, finding=finding
+    )
+    if observations:
+        _ingest_assessment_map_after_scan(
+            assessment_context, user_id=user_id, tool="bbot", scan=assessment_scan
+        )
     context.user_data.pop(PENDING_NMAP_REQUEST_KEY, None)
     elapsed_seconds = _parse_elapsed_seconds(result.get("elapsed_seconds"))
     if elapsed_seconds is not None:
