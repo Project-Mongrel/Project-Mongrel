@@ -153,7 +153,8 @@ RECOMMENDATION_QUESTION_TERMS = (
     "what next", "what is next", "do next", "run next", "should i run", "which tool", "which mongrel tool",
     "which missing tool",
     "try next", "should i try", "will i try next", "what do i run next",
-    "recommend", "what would you investigate", "would you investigate", "how do i investigate", "what should we do",
+    "recommend", "what would you investigate", "what should we investigate", "should we investigate",
+    "would you investigate", "how do i investigate", "what should we do",
     "where do we go from here", "where should we go from here",
 )
 ASSESSMENT_QUESTION_TERMS = ("what did", "what was found", "what have we found", "current assessment", "assessment evidence", "scan result")

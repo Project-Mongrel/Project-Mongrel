@@ -1584,6 +1584,7 @@ def _summary_requested_next_step_answer(context: dict) -> str | None:
     question = str(context.get("current_question") or "").lower()
     if not re.search(
         r"\b(?:what\s+should\s+(?:i|we)\s+do\s+next|what\s+do\s+(?:i|we)\s+do\s+next|"
+        r"what\s+should\s+(?:i|we)\s+investigate\s+next|what\s+would\s+you\s+investigate\s+next|"
         r"what\s+next|next\s+step|do\s+next|run\s+next|investigate\s+next)\b",
         question,
     ):

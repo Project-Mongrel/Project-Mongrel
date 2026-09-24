@@ -490,6 +490,54 @@ def test_nmap_web_summary_with_next_step_adds_plain_httpx_guidance() -> None:
     assert "does not run a tool" in answer
 
 
+def test_two_port_nmap_web_summary_and_investigate_next_recommends_httpx() -> None:
+    assessment = create_assessment("Two-port web next", user_id=1001)
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=1001)
+
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What have we learned now, and what should we investigate next?",
+    )
+    assert context["recommendation_context"]["web_services_observed_by_nmap"] is True
+    assert context["recommendation_context"]["preferred_next_tools"] == ["httpx"]
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we learned now, and what should we investigate next?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "80/tcp (http)" in answer
+    assert "443/tcp (https)" in answer
+    assert "httpx because" in answer
+    assert "which HTTP(S) endpoints respond" in answer
+    assert "vulnerab" not in answer.lower().split("bounded stored observations")[0]
+    assert "Prowler" not in answer
+    assert "does not run a tool" in answer
+
+
+def test_two_port_nmap_web_summary_only_does_not_force_httpx_recommendation() -> None:
+    assessment = create_assessment("Two-port web summary only", user_id=1001)
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=1001)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we learned now?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "80/tcp (http)" in answer
+    assert "443/tcp (https)" in answer
+    assert "httpx because" not in answer
+
+
 def test_summary_only_does_not_force_next_step_when_evidence_exists() -> None:
     assessment = create_assessment("Summary only", user_id=1001)
     _add_live_web_nmap_scan(assessment["id"], user_id=1001)
@@ -1914,6 +1962,24 @@ def _add_live_web_nmap_scan(assessment_id: int, *, user_id: int) -> dict:
                 {"port": 443, "protocol": "tcp", "service": "https"},
                 {"port": 8080, "protocol": "tcp", "service": "http-proxy"},
                 {"port": 8443, "protocol": "tcp", "service": "https-alt"},
+            ],
+        },
+    )
+    return record_assessment_scan(assessment_id, tool="nmap", status="completed", finding_id=finding["id"])
+
+
+def _add_two_port_web_nmap_scan(assessment_id: int, *, user_id: int) -> dict:
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nmap",
+            "target": "example.com",
+            "status": "completed",
+            "summary": "Host reachable; open ports observed.",
+            "host_status": "up",
+            "open_ports": [
+                {"port": 80, "protocol": "tcp", "service": "http"},
+                {"port": 443, "protocol": "tcp", "service": "https"},
             ],
         },
     )
