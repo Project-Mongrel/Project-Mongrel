@@ -188,6 +188,325 @@ def test_natural_what_is_next_recovers_grounded_advice_from_unsafe_model_output(
     assert "withheld" not in result["answer"].lower()
 
 
+def test_empty_website_summary_recommends_initial_recon_without_prowler() -> None:
+    assessment = create_assessment("Mongrel final assessment test", user_id=1001)
+    add_assessment_target(assessment["id"], "Btjoinery.ie")
+
+    with patch(
+        "app.services.assessment_conversation_ai.ask_ai",
+        return_value="Use Prowler next to discover operating systems, services, and vulnerabilities for the hostname.",
+    ) as model:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we learned about this target so far?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"].lower()
+    assert "not stored any scans or findings" in answer
+    assert "not enough evidence" in answer
+    assert "nmap" in answer and "httpx" in answer
+    assert "prowler" not in answer
+    assert "does not run any tool" in answer
+
+
+def test_empty_website_next_step_starts_with_nmap_or_httpx_not_evidence_review() -> None:
+    assessment = create_assessment("Empty Website Next", user_id=1001)
+    add_assessment_target(assessment["id"], "https://btjoinery.ie")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Yo what should we do first?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"].lower()
+    assert "no stored scans or findings yet" in answer
+    assert "nmap" in answer and "reachable ports" in answer
+    assert "httpx" in answer and "http" in answer
+    assert "review the latest stored evidence" not in answer
+    assert "prowler" not in answer
+    assert "does not run any tool" in answer
+
+
+def test_generated_empty_website_prowler_recommendation_is_replaced_by_supported_guidance() -> None:
+    assessment = create_assessment("Generated Bad Prowler", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What should we do next?",
+    )
+
+    assert context["recommendation_context"]["empty_assessment"] is True
+    assert context["recommendation_context"]["preferred_next_tools"] == ["nmap", "httpx"]
+    assert violates_conversation_truthfulness(
+        "I recommend Prowler to discover operating systems and services for this website.",
+        context,
+    ) is True
+
+    with patch(
+        "app.services.assessment_conversation_ai.ask_ai",
+        return_value="I recommend Prowler to discover operating systems and services for this website.",
+    ):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should we do next?",
+        )
+
+    answer = result["answer"].lower()
+    assert "nmap" in answer and "httpx" in answer
+    assert "prowler" not in answer
+    assert result["fallback_reason"] is None
+
+
+def test_prowler_capability_is_cloud_scoped_not_website_recon() -> None:
+    assessment = create_assessment("Prowler scope", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What about Prowler?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"].lower()
+    assert "prowler has not been run in this assessment" in answer
+    assert "cloud security" in answer or "cloud" in answer
+    assert "requires authorized cloud context" in answer or "authorized cloud" in answer
+    assert "operating system" not in answer
+    assert "website reconnaissance" not in answer
+    assert "no cloud issues" not in answer
+
+
+def test_cloud_context_can_prefer_prowler_initial_recommendation() -> None:
+    assessment = create_assessment("Authorized AWS review", user_id=1001, description="Authorized AWS cloud account assessment")
+    add_assessment_target(assessment["id"], "aws-account-123456789012", target_type="cloud")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should we do first?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"].lower()
+    assert "prowler" in answer
+    assert "cloud" in answer
+    assert "pass/fail" in answer
+    assert "does not run any tool" in answer
+
+
+def test_tool_decision_contract_covers_all_tools_and_blocks_unsuitable_website_tools() -> None:
+    assessment = create_assessment("Decision Contract", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What should we do first?",
+    )
+    decisions = context["recommendation_context"]["tool_decisions"]
+
+    assert set(decisions) == {
+        "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl",
+        "gitleaks", "prowler", "metasploit", "tshark",
+    }
+    assert context["recommendation_context"]["preferred_next_tools"] == ["nmap", "httpx"]
+    assert decisions["prowler"]["recommendation_allowed"] is False
+    assert "cloud" in decisions["prowler"]["prerequisites"].lower()
+    assert decisions["gitleaks"]["recommendation_allowed"] is False
+    assert decisions["metasploit"]["recommendation_allowed"] is False
+    assert decisions["tshark"]["recommendation_allowed"] is False
+
+
+def test_empty_network_assessment_prefers_nmap_initial_recon() -> None:
+    assessment = create_assessment("Network baseline", user_id=1001)
+    add_assessment_target(assessment["id"], "192.0.2.44", target_type="ip")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should we do first?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"].lower()
+    assert "nmap" in answer
+    assert "reachable ports" in answer
+    assert "prowler" not in answer
+    assert "does not run any tool" in answer
+
+
+def test_empty_repository_assessment_can_prefer_gitleaks_without_secret_absence_claims() -> None:
+    assessment = create_assessment("Repository review", user_id=1001)
+    add_assessment_target(assessment["id"], "https://github.com/example/project", target_type="repository")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should we do first?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"].lower()
+    assert "gitleaks" in answer
+    assert "repository" in answer or "filesystem" in answer
+    assert "not prove secrets are absent" in answer
+    assert "does not run any tool" in answer
+
+
+def test_unsupported_generated_validation_or_capture_recommendations_are_replaced() -> None:
+    assessment = create_assessment("Unsupported generated next", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+
+    with patch(
+        "app.services.assessment_conversation_ai.ask_ai",
+        return_value="I recommend Metasploit and TShark next for this website hostname.",
+    ):
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should we investigate next?",
+        )
+
+    answer = result["answer"].lower()
+    assert "nmap" in answer and "httpx" in answer
+    assert "metasploit" not in answer
+    assert "tshark" not in answer
+    assert "withheld" not in answer
+
+
+def test_failed_scan_state_is_not_treated_as_clean_or_as_prowler_context() -> None:
+    assessment = create_assessment("Failed baseline", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    record_assessment_scan(assessment["id"], "nmap", "failed")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What should we do next?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"].lower()
+    assert "nmap=FAILED".lower() in answer
+    assert "clean" not in answer
+    assert "prowler" in answer
+    assert "not automatic recommendations" in answer
+
+
+def test_summary_intent_does_not_accept_unselected_llm_tool_recommendation() -> None:
+    assessment = create_assessment("Summary no extras", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    _add_nmap_scan(assessment["id"], user_id=1001, port=22, service="ssh")
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What have we learned about this target so far?",
+    )
+
+    assert context["question_intent"] == "assessment_summary"
+    assert context["recommendation_context"]["preferred_next_tools"] == []
+    assert violates_conversation_truthfulness(
+        "Nmap recorded SSH. I recommend Prowler next.",
+        context,
+    ) is True
+
+
+def test_empty_summary_distinguishes_no_evidence_from_remaining_gaps() -> None:
+    assessment = create_assessment("Empty summary distinction", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we learned about this target so far?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "has not stored any scans or findings" in answer
+    assert "Relevant unperformed coverage remains" not in answer
+    assert "Nmap" in answer and "httpx" in answer
+    assert "Prowler" not in answer
+
+
+def test_failed_scan_summary_reports_no_usable_observation_without_calling_it_clean() -> None:
+    assessment = create_assessment("Failed summary distinction", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    record_assessment_scan(assessment["id"], "nmap", "failed")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we learned about this target so far?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "No normalized observations are stored yet" in answer
+    assert "safe or free of vulnerabilities" in answer
+    assert "Relevant unperformed coverage remains" not in answer
+
+
+def test_nmap_web_summary_with_next_step_adds_plain_httpx_guidance() -> None:
+    assessment = create_assessment("Summary plus next", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="I'm a complete novice. What have we learned and what should I do next?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "Nmap recorded exposed TCP services" in answer
+    assert "httpx because" in answer
+    assert "which HTTP(S) endpoints respond" in answer
+    assert "does not run a tool" in answer
+
+
+def test_summary_only_does_not_force_next_step_when_evidence_exists() -> None:
+    assessment = create_assessment("Summary only", user_id=1001)
+    _add_live_web_nmap_scan(assessment["id"], user_id=1001)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we learned about this target so far?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "Nmap recorded exposed TCP services" in answer
+    assert "httpx because" not in answer
+
+
 @pytest.mark.parametrize(
     ("question", "expected"),
     [
@@ -2000,8 +2319,75 @@ def test_broad_prompt_budget_prioritizes_severity_and_preserves_tool_coverage() 
         "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl",
         "gitleaks", "prowler", "metasploit", "tshark",
     }
+    decision_contract = budgeted.get("tool_decision_contract") or {}
+    assert set(decision_contract).issubset({"preferred", "allowed", "blocked", "rules"})
+    assert "prowler" in (decision_contract.get("blocked") or {})
+    assert "prerequisites" not in json.dumps(decision_contract, default=str).lower()
+    assert "limitations" not in json.dumps(decision_contract, default=str).lower()
     assert any(scan["tool"] == "testssl" and scan["status"] == "failed" for scan in budgeted["stored_evidence"]["scans"])
     assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
+
+
+def test_recommendation_prompt_budget_preserves_suitability_without_verbose_contract() -> None:
+    user_id = 1103
+    assessment = create_assessment("Recommendation budget", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    for tool in ("nmap", "nuclei", "bbot"):
+        finding = add_finding(user_id=user_id, finding={
+            "source": tool, "target": "example.com", "observations": [f"{tool}-noise " + ("x" * 1400)] * 12,
+        })
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        question="What should we investigate next?",
+    )
+    budgeted, _ = _apply_prompt_budget(context, _build_prompt_context(context))
+    prompt = build_assessment_conversation_prompt(context, prompt_context=budgeted)
+    contract = budgeted.get("tool_decision_contract") or {}
+
+    assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
+    assert set((budgeted.get("tool_state") or {})) == {
+        "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl",
+        "gitleaks", "prowler", "metasploit", "tshark",
+    }
+    assert set(contract).issubset({"preferred", "allowed", "blocked", "rules"})
+    assert "prowler" in (contract.get("blocked") or {})
+
+
+def test_prompt_budget_ultra_compact_fallback_still_preserves_state_and_failed_scan() -> None:
+    user_id = 1103
+    assessment = create_assessment("Ultra compact budget", user_id=user_id)
+    high = add_finding(user_id=user_id, finding={
+        "source": "nuclei", "target": "example.com",
+        "nuclei_findings": [{"name": "Critical template", "severity": "critical", "description": "d" * 2000}],
+        "observations": ["critical evidence " + ("z" * 2500)] * 25,
+    })
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed", finding_id=high["id"])
+    for tool in ("nmap", "httpx", "katana", "playwright", "ffuf", "bbot", "gitleaks", "prowler", "metasploit", "tshark"):
+        finding = add_finding(user_id=user_id, finding={
+            "source": tool, "target": "example.com", "observations": [f"{tool}-bulk " + ("y" * 2500)] * 25,
+        })
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+    record_assessment_scan(assessment["id"], tool="testssl", status="failed")
+
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        question="Give me a broad assessment-wide review of the evidence and priorities.",
+    )
+    budgeted, reduced = _apply_prompt_budget(context, _build_prompt_context(context))
+    prompt = build_assessment_conversation_prompt(context, prompt_context=budgeted)
+
+    assert reduced is True
+    assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
+    assert set((budgeted.get("tool_state") or {})) == {
+        "nmap", "bbot", "nuclei", "httpx", "playwright", "katana", "ffuf", "testssl",
+        "gitleaks", "prowler", "metasploit", "tshark",
+    }
+    assert any(scan["tool"] == "testssl" and scan["status"] == "failed" for scan in budgeted["stored_evidence"]["scans"])
+    assert "Critical template" in json.dumps(budgeted["stored_evidence"]["findings"], default=str)
 
 
 def test_narrow_prompt_budget_uses_latest_authoritative_same_tool_run() -> None:

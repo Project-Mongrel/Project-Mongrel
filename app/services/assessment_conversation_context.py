@@ -68,6 +68,68 @@ MONGREL_CAPABILITIES = {
     "metasploit": "Perform explicitly approved, allowlisted validation; execution, target response, sessions, and compromise remain distinct facts.",
     "tshark": "Observe packet/capture metadata from uploaded PCAPs, standalone live capture, or capture during approved validation; it does not establish encryption security, exploitability, compromise, or application security.",
 }
+TOOL_SUITABILITY_RULES = {
+    "nmap": {
+        "capability": "Network reachability, exposed ports, and service classifications.",
+        "prerequisites": "An authorized hostname, IP address, CIDR, or network target.",
+        "limitations": "Does not prove application behavior, vulnerability, exploitability, or safety.",
+    },
+    "bbot": {
+        "capability": "Bounded reconnaissance and related asset discovery within authorized scope.",
+        "prerequisites": "A target where broader reconnaissance is in scope.",
+        "limitations": "Discoveries do not prove ownership, breach, reachability, vulnerability, or exploitability.",
+    },
+    "nuclei": {
+        "capability": "Template-based checks against appropriate observed targets.",
+        "prerequisites": "A suitable target or observed endpoint for approved templates.",
+        "limitations": "Template matches preserve scanner severity and do not automatically prove exploitability.",
+    },
+    "httpx": {
+        "capability": "HTTP(S) response, redirect, title, server, and technology-hint observations.",
+        "prerequisites": "An authorized web endpoint, hostname, or web-associated service surface.",
+        "limitations": "Responses and technology hints do not prove vulnerability, misconfiguration, or safety.",
+    },
+    "playwright": {
+        "capability": "Browser-rendered page and client-visible application behavior observations.",
+        "prerequisites": "A web application surface worth observing in a browser.",
+        "limitations": "Rendered state does not prove XSS, SQLi, CSRF, auth weakness, or complete coverage.",
+    },
+    "katana": {
+        "capability": "Web crawl observations such as URLs, paths, forms, and linked resources.",
+        "prerequisites": "An observed or authorized web application surface.",
+        "limitations": "Crawl output does not prove vulnerability or complete hidden-endpoint coverage.",
+    },
+    "ffuf": {
+        "capability": "Bounded web content/path discovery using an approved profile.",
+        "prerequisites": "A web surface where path discovery is authorized and useful.",
+        "limitations": "Status codes and path hits do not automatically prove sensitive exposure or vulnerability.",
+    },
+    "testssl": {
+        "capability": "TLS protocol, cipher, certificate, and scanner finding observations.",
+        "prerequisites": "An appropriate TLS endpoint or HTTPS-associated service.",
+        "limitations": "Individual scanner observations do not prove exploitability or overall TLS safety.",
+    },
+    "gitleaks": {
+        "capability": "Redacted secret-pattern matches in authorized repositories or filesystem content.",
+        "prerequisites": "Authorized repository or filesystem input.",
+        "limitations": "Matches do not prove a credential is active, valid, usable, or compromised; not-run is not no secrets.",
+    },
+    "prowler": {
+        "capability": "Supported cloud-provider check observations for cloud accounts/environments.",
+        "prerequisites": "Authorized cloud account/environment context and access.",
+        "limitations": "PASS/FAIL is scoped to individual checks/resources and is not account-wide security or compliance proof.",
+    },
+    "metasploit": {
+        "capability": "Explicitly approved validation of a supported hypothesis.",
+        "prerequisites": "A supported validation opportunity plus Mongrel's explicit review/approval flow.",
+        "limitations": "Execution, target response, session establishment, exploitation, and compromise remain distinct.",
+    },
+    "tshark": {
+        "capability": "Packet/capture metadata from uploaded PCAPs, standalone capture, or capture during approved validation.",
+        "prerequisites": "Authorized packet capture, PCAP analysis, or traffic-correlation need.",
+        "limitations": "Packets do not prove application success, TLS-handshake completion, exploitability, or compromise.",
+    },
+}
 TELEGRAM_CAPABILITY_GUIDANCE = {
     "httpx": {
         "assessment_action": "Run httpx",
@@ -98,6 +160,7 @@ ASSESSMENT_QUESTION_TERMS = ("what did", "what was found", "what have we found",
 ASSESSMENT_SUMMARY_TERMS = (
     "what have we established", "what do we actually know", "what have we found so far", "summarize what we know",
     "summarise what we know", "what evidence do we have", "what do we know", "what have we found",
+    "what have we learned", "what have we learnt",
     "summarize this assessment", "summarise this assessment", "what does all this tell us",
     "what did the tools find", "what have the tools found", "what did our tools find",
     "what can you actually say with confidence", "what can we say with confidence",
@@ -110,6 +173,7 @@ ASSESSMENT_HIGHLIGHT_TERMS = (
 )
 ASSESSMENT_SUMMARY_PATTERNS = (
     re.compile(r"\bwhat\s+have\s+we\s+(?:actually\s+)?established\b"),
+    re.compile(r"\bwhat\s+have\s+we\s+(?:actually\s+)?(?:learned|learnt)\b"),
     re.compile(r"\bwhat\s+do\s+we\s+(?:actually\s+)?know\b"),
 )
 FALSE_PREMISE_PATTERNS = (
@@ -764,14 +828,54 @@ def _build_recommendation_context(
     completed_tools = [tool for tool, state in tool_states.items() if state == "COMPLETED"]
 
     web_services_observed = _has_nmap_web_service(assessment_context)
+    tls_services_observed = _has_nmap_tls_service(assessment_context)
+    target_context = _classify_assessment_target_context(assessment_context)
+    any_scan_recorded = bool(assessment_context.get("scans"))
+    any_finding_recorded = bool(assessment_context.get("findings"))
+    empty_assessment = not any_scan_recorded and not any_finding_recorded
     traffic_intent = any(term in normalized_question for term in TRAFFIC_QUESTION_TERMS)
     web_intent = any(term in normalized_question for term in WEB_QUESTION_TERMS)
     novice_intent = any(term in normalized_question for term in NOVICE_QUESTION_TERMS)
+    secret_intent = any(term in normalized_question for term in ("secret", "secrets", "credential", "credentials", "repository", "repo"))
+    cloud_intent = any(term in normalized_question for term in ("cloud", "aws", "azure", "gcp", "account", "prowler"))
     preferred_next_tools = []
     rationale = []
     if traffic_intent and "tshark" not in completed_tools:
         preferred_next_tools.append("tshark")
         rationale.append("TShark is Mongrel's packet/capture capability; explain the mode that addresses the evidence gap without claiming packets already exist.")
+    elif empty_assessment and target_context["cloud_context_present"] and "prowler" not in completed_tools:
+        preferred_next_tools.append("prowler")
+        rationale.append(
+            "The assessment has cloud-environment context but no stored scan evidence; Prowler can record authorized cloud check observations. "
+            "PASS/FAIL results remain scoped scanner observations, not account-wide security proof."
+        )
+    elif empty_assessment and target_context["repository_context_present"] and "gitleaks" not in completed_tools:
+        preferred_next_tools.append("gitleaks")
+        rationale.append(
+            "The assessment has repository/filesystem context but no stored scan evidence; Gitleaks can record redacted secret-pattern observations. "
+            "A match would not prove credential validity, and a not-run scan proves no absence of secrets."
+        )
+    elif empty_assessment and target_context["packet_context_present"] and "tshark" not in completed_tools:
+        preferred_next_tools.append("tshark")
+        rationale.append(
+            "The assessment has packet-capture context but no stored packet evidence; TShark can analyze authorized PCAP or capture metadata. "
+            "Packets do not establish exploitation, compromise, or TLS success by themselves."
+        )
+    elif empty_assessment and target_context["external_website_context_present"]:
+        if "nmap" not in completed_tools:
+            preferred_next_tools.append("nmap")
+        if "httpx" not in completed_tools:
+            preferred_next_tools.append("httpx")
+        rationale.append(
+            "The assessment has an external website/hostname target but no stored scan evidence; Nmap can observe reachable ports/services and "
+            "httpx can record HTTP response metadata. Neither tool proves vulnerability or security by itself."
+        )
+    elif empty_assessment and target_context["network_context_present"]:
+        preferred_next_tools.append("nmap")
+        rationale.append(
+            "The assessment has a network-style target but no stored scan evidence; Nmap can record host reachability, ports, and service classifications. "
+            "Those observations do not prove vulnerabilities or security."
+        )
     elif web_services_observed and "httpx" not in completed_tools and (
         web_intent or novice_intent or any(term in normalized_question for term in RECOMMENDATION_QUESTION_TERMS)
         or question_intent in {"next_step_recommendation", "prioritization"}
@@ -797,15 +901,46 @@ def _build_recommendation_context(
                 "The assessment has web characterization and crawl coverage but no stored bounded path-discovery "
                 "coverage; ffuf can add path/status/size observations."
             )
+    elif target_context["repository_context_present"] and secret_intent and "gitleaks" not in completed_tools:
+        preferred_next_tools.append("gitleaks")
+        rationale.append("Repository/filesystem context is present; Gitleaks can add redacted secret-pattern evidence without proving credential validity.")
+    elif target_context["cloud_context_present"] and cloud_intent and "prowler" not in completed_tools:
+        preferred_next_tools.append("prowler")
+        rationale.append("Cloud context is present; Prowler can add scoped cloud check observations without proving account-wide security.")
+
+    tool_decisions = _build_tool_decision_contract(
+        tool_states=tool_states,
+        target_context=target_context,
+        web_services_observed=web_services_observed,
+        tls_services_observed=tls_services_observed,
+        traffic_intent=traffic_intent,
+        secret_intent=secret_intent,
+        cloud_intent=cloud_intent,
+        preferred_next_tools=preferred_next_tools,
+    )
 
     return {
         "tool_states": tool_states,
         "completed_tools": completed_tools,
         "relevant_unperformed_tools": [
             tool for tool in ("bbot", "katana", "playwright", "ffuf") if tool_states.get(tool) != "COMPLETED"
-        ] if web_services_observed else [],
-        "repository_context_present": False,
-        "cloud_context_present": False,
+        ] if web_services_observed else (
+            [tool for tool in ("nmap", "httpx") if tool_states.get(tool) != "COMPLETED"]
+            if empty_assessment and target_context["external_website_context_present"] else []
+        ),
+        "supported_tool_candidates": [
+            tool for tool, decision in tool_decisions.items()
+            if decision.get("recommendation_allowed") and tool_states.get(tool) != "COMPLETED"
+        ],
+        "tool_decisions": tool_decisions,
+        "repository_context_present": target_context["repository_context_present"],
+        "cloud_context_present": target_context["cloud_context_present"],
+        "external_website_context_present": target_context["external_website_context_present"],
+        "network_context_present": target_context["network_context_present"],
+        "packet_context_present": target_context["packet_context_present"],
+        "empty_assessment": empty_assessment,
+        "assessment_has_scans": any_scan_recorded,
+        "assessment_has_findings": any_finding_recorded,
         "web_services_observed_by_nmap": web_services_observed,
         "question_intents": {"web": web_intent, "traffic": traffic_intent, "novice": novice_intent},
         "preferred_next_tools": preferred_next_tools,
@@ -813,11 +948,135 @@ def _build_recommendation_context(
         "rules": [
             "Do not blindly recommend a completed tool when another Mongrel capability fills the current evidence gap.",
             "Do not recommend a tool merely because it has not run; it must answer the question and fill an identified evidence gap.",
+            "For an empty external website/hostname assessment, initial reconnaissance should use Nmap and/or httpx rather than cloud, repository, validation, or packet-capture tools.",
+            "Prowler requires authorized cloud-account or cloud-environment context; it is not a general hostname, operating-system, service, or website reconnaissance scanner.",
+            "Gitleaks requires suitable authorized repository or filesystem context; do not infer no secrets when it has not run.",
+            "Metasploit requires an appropriate approved validation opportunity, and TShark requires packet-capture or traffic-analysis context.",
             "Prefer Mongrel's own capability when it satisfies the request; name an external tool only for a clearly explained capability gap.",
             "Guide the user through the verified Telegram capability guidance; do not provide installation steps, shell commands, or invented navigation labels.",
             "A recommendation is advice only and must never trigger tool execution.",
         ],
     }
+
+
+def _classify_assessment_target_context(assessment_context: dict) -> dict:
+    """Infer broad target suitability context from stored target descriptors only."""
+
+    target_text = " ".join(
+        " ".join(
+            str(target.get(field) or "")
+            for field in ("address", "name", "target_type")
+            if isinstance(target, dict)
+        )
+        for target in (assessment_context.get("targets") or [])
+    ).lower()
+    assessment_text = " ".join(
+        str((assessment_context.get("assessment") or {}).get(field) or "")
+        for field in ("name", "description")
+    ).lower()
+    haystack = f"{target_text} {assessment_text}"
+    target_types = " ".join(
+        str(target.get("target_type") or "")
+        for target in (assessment_context.get("targets") or [])
+        if isinstance(target, dict)
+    ).lower()
+
+    cloud_context = bool(re.search(
+        r"\b(?:aws|amazon web services|azure|gcp|google cloud|cloud account|cloud environment|iam|s3|ec2|subscription|tenant)\b",
+        haystack,
+    )) or "cloud" in target_types
+    repository_context = bool(re.search(
+        r"\b(?:git|github|gitlab|bitbucket|repository|repo|source code|filesystem|file system)\b|"
+        r"(?:^|\s)(?:https?://)?(?:www\.)?(?:github|gitlab|bitbucket)\.com/|\bgit@",
+        haystack,
+    )) or any(term in target_types for term in ("repo", "repository", "filesystem", "file"))
+    packet_context = bool(re.search(r"\b(?:pcap|packet|traffic capture|network capture|capture file)\b", haystack)) or any(
+        term in target_types for term in ("pcap", "packet", "capture")
+    )
+    network_context = bool(re.search(
+        r"\b(?:network|cidr|subnet|ip address|host)\b|"
+        r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b|"
+        r"\[[0-9a-f:]{2,}\]|\b[0-9a-f]{0,4}:[0-9a-f:]{2,}\b",
+        haystack,
+    )) or any(term in target_types for term in ("network", "ip", "cidr", "host"))
+    website_context = bool(re.search(
+        r"\b(?:https?://|www\.|website|web site|webapp|web app|hostname|domain)\b|"
+        r"\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+\b",
+        target_text,
+    ))
+    return {
+        "cloud_context_present": cloud_context,
+        "repository_context_present": repository_context,
+        "packet_context_present": packet_context,
+        "network_context_present": network_context,
+        "external_website_context_present": website_context and not cloud_context and not repository_context and not packet_context,
+    }
+
+
+def _build_tool_decision_contract(
+    *,
+    tool_states: dict,
+    target_context: dict,
+    web_services_observed: bool,
+    tls_services_observed: bool,
+    traffic_intent: bool,
+    secret_intent: bool,
+    cloud_intent: bool,
+    preferred_next_tools: list[str],
+) -> dict:
+    decisions = {}
+    web_context = bool(target_context.get("external_website_context_present") or web_services_observed)
+    network_context = bool(target_context.get("network_context_present") or target_context.get("external_website_context_present"))
+    repo_context = bool(target_context.get("repository_context_present"))
+    cloud_context = bool(target_context.get("cloud_context_present"))
+    packet_context = bool(target_context.get("packet_context_present") or traffic_intent)
+    preferred = {str(tool).lower().removesuffix(".sh") for tool in preferred_next_tools}
+    for tool, rule in TOOL_SUITABILITY_RULES.items():
+        state = str(tool_states.get(tool, "NOT_RUN"))
+        allowed = False
+        reason = ""
+        if tool == "nmap":
+            allowed = network_context
+            reason = "authorized network, hostname, or website target context is present" if allowed else "no network/hostname target context is established"
+        elif tool == "httpx":
+            allowed = web_context
+            reason = "web target or observed web service context is present" if allowed else "no web endpoint or web-service evidence is established"
+        elif tool == "bbot":
+            allowed = network_context or web_context
+            reason = "broader authorized reconnaissance could add discovery observations" if allowed else "no reconnaissance target context is established"
+        elif tool == "nuclei":
+            allowed = web_context
+            reason = "an appropriate target or web surface is available for template checks" if allowed else "no suitable checked target surface is established"
+        elif tool in {"katana", "playwright", "ffuf"}:
+            allowed = web_context
+            reason = "web surface context is present" if allowed else "no web application surface is established"
+        elif tool == "testssl":
+            allowed = web_context or tls_services_observed
+            reason = "TLS/HTTPS endpoint context is present" if allowed else "no TLS endpoint context is established"
+        elif tool == "gitleaks":
+            allowed = repo_context and (secret_intent or state != "NOT_RUN" or tool in preferred)
+            reason = "repository/filesystem context is present" if repo_context else "no repository/filesystem context is established"
+        elif tool == "prowler":
+            allowed = cloud_context and (cloud_intent or state != "NOT_RUN" or tool in preferred)
+            reason = "authorized cloud context is present" if cloud_context else "no authorized cloud account/environment context is established"
+        elif tool == "metasploit":
+            allowed = tool in preferred
+            reason = "an explicit approved validation opportunity is required"
+        elif tool == "tshark":
+            allowed = packet_context
+            reason = "packet/capture or traffic-analysis context is present" if allowed else "no packet/capture context is established"
+        if state == "COMPLETED" and tool not in preferred:
+            allowed = False
+            reason = "already completed; rerun needs a separate justification"
+        decisions[tool] = {
+            "state": state,
+            "recommendation_allowed": bool(allowed),
+            "reason": reason,
+            "capability": rule["capability"],
+            "prerequisites": rule["prerequisites"],
+            "limitations": rule["limitations"],
+        }
+    return decisions
 
 
 def select_latest_tool_scan(scans: list[dict], tool: str) -> dict | None:
@@ -860,6 +1119,21 @@ def _has_nmap_web_service(assessment_context: dict) -> bool:
                 port = None
             service = str(item.get("service") or "").lower() if isinstance(item, dict) else ""
             if port in WEB_SERVICE_PORTS or service in {"http", "https", "http-proxy", "https-alt"}:
+                return True
+    return False
+
+
+def _has_nmap_tls_service(assessment_context: dict) -> bool:
+    for finding in assessment_context.get("findings") or []:
+        if _normalize_tool(finding.get("source")) != "nmap":
+            continue
+        for item in finding.get("open_ports") or []:
+            try:
+                port = int(item.get("port"))
+            except (TypeError, ValueError, AttributeError):
+                port = None
+            service = str(item.get("service") or "").lower() if isinstance(item, dict) else ""
+            if port in {443, 8443} or service in {"https", "https-alt", "ssl", "tls"}:
                 return True
     return False
 

@@ -240,8 +240,13 @@ def answer_assessment_conversation_question(
             else:
                 fallback_reason = "grounded_conversation_fallback" if deterministic_recovery else "truthfulness_guard"
         elif violates_mongrel_native_guidance(answer, context):
-            answer = NATIVE_GUIDANCE_FALLBACK_ANSWER
-            fallback_reason = "native_guidance_guard"
+            if any(pattern.search(answer.lower()) for pattern in INSTALL_OR_RAW_COMMAND_PATTERNS):
+                answer = NATIVE_GUIDANCE_FALLBACK_ANSWER
+                fallback_reason = "native_guidance_guard"
+            else:
+                deterministic_recovery = _recover_rejected_assessment_answer(context)
+                answer = deterministic_recovery or NATIVE_GUIDANCE_FALLBACK_ANSWER
+                fallback_reason = "grounded_conversation_fallback" if deterministic_recovery else "native_guidance_guard"
         elif has_incomplete_product_tool_enumeration(answer, context):
             answer = PRODUCT_TOOL_ENUMERATION_FALLBACK_ANSWER
             fallback_reason = "product_tool_enumeration_guard"
@@ -323,6 +328,9 @@ def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict 
             "- Speak as Mongrel, not as a generic chatbot. When Mongrel provides the capability, use only the supplied verified user-action details.",
             "- Never tell the user to install Mongrel's tools, and never provide raw shell/CLI commands for them. Do not invent buttons, menu labels, or navigation paths.",
             "- Recommend a tool only when it answers the current question and fills an evidence gap; being unrun is not itself a reason. Do not append unrelated tools as optional extras.",
+            "- Evidence-summary questions should summarize evidence first; include next-step guidance only when it directly follows from the supplied decision contract.",
+            "- For an empty external website or hostname assessment, the suitable initial reconnaissance is Nmap and/or httpx. Do not recommend Prowler for website, hostname, operating-system, or service reconnaissance.",
+            "- Recommend Prowler only when the supplied assessment context establishes an authorized cloud account or cloud environment. Recommend Gitleaks only with suitable repository or filesystem context, Metasploit only for an approved validation opportunity, and TShark only for packet-capture or traffic-analysis needs.",
             "- If Nmap already found web-associated services and the user asks how to investigate them, normally recommend httpx first because it fills the HTTP reachability/fingerprinting gap; do not simply repeat Nmap.",
             "- For traffic or packet analysis, recognize TShark and explain the applicable uploaded-PCAP, standalone-capture, or capture-during-approved-validation mode without claiming packet evidence exists.",
             "- You may recommend tools, but every recommendation must explain why and must not execute anything.",
@@ -367,6 +375,8 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
     if _claims_unrun_tool(normalized, context or {}):
         return True
     if _contradicts_assessment_tool_state(normalized, context or {}):
+        return True
+    if _has_unsuitable_tool_recommendation(normalized, context or {}):
         return True
     tool_states = ((context or {}).get("recommendation_context") or {}).get("tool_states") or {}
     if any(state != "NOT_RUN" for state in tool_states.values()) and re.search(
@@ -497,6 +507,7 @@ def _build_prompt_context(context: dict) -> dict:
         "explanation", "simplify_explanation",
     }:
         prompt_context["tool_state"] = recommendation.get("tool_states") or {}
+        prompt_context["tool_decision_contract"] = _compact_tool_decision_contract(recommendation)
     if _question_can_use_relationship_map(context):
         relationship_map = context.get("assessment_map") or {}
         if relationship_map.get("available"):
@@ -526,11 +537,44 @@ def _build_prompt_context(context: dict) -> dict:
     return prompt_context
 
 
+def _compact_tool_decision_contract(recommendation: dict, *, minimal: bool = False) -> dict:
+    decisions = recommendation.get("tool_decisions") or {}
+    preferred = [str(tool).lower().removesuffix(".sh") for tool in recommendation.get("preferred_next_tools") or []]
+    allowed = [
+        str(tool).lower().removesuffix(".sh")
+        for tool, decision in decisions.items()
+        if isinstance(decision, dict) and decision.get("recommendation_allowed")
+    ]
+    blocked = {}
+    for tool in ("gitleaks", "prowler", "metasploit", "tshark"):
+        decision = decisions.get(tool) if isinstance(decisions, dict) else None
+        if isinstance(decision, dict) and not decision.get("recommendation_allowed"):
+            blocked[tool] = str(decision.get("reason") or "prerequisite context is not established")
+    contract = {
+        "preferred": preferred,
+        "allowed": allowed if not minimal else [tool for tool in allowed if tool in set(preferred)],
+        "blocked": blocked,
+        "rules": [
+            "recommend only allowed/preferred tools for the current context",
+            "tool_state carries all 12 authoritative scan states",
+            "recommendations never execute tools",
+        ],
+    }
+    if minimal:
+        contract["rules"] = ["recommend only preferred/allowed tools; never execute"]
+    return contract
+
+
 def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, bool]:
     """Structurally reduce optional context while preserving current and referenced evidence."""
     candidate = deepcopy(prompt_context)
-    if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) <= ASSESSMENT_PROMPT_MAX_CHARS:
+    if _rendered_prompt_fits(context, candidate):
         return candidate, False
+    if "tool_decision_contract" in candidate:
+        candidate["tool_decision_contract"] = _compact_tool_decision_contract(
+            context.get("recommendation_context") or {},
+            minimal=True,
+        )
 
     prior = candidate.get("prior_exchange")
     if isinstance(prior, dict):
@@ -547,7 +591,15 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
         candidate["stored_evidence"] = _compact_generation_evidence(evidence, list_limit=5, text_limit=600)
         candidate["tool_state"] = (context.get("recommendation_context") or {}).get("tool_states") or {}
 
-    if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) > ASSESSMENT_PROMPT_MAX_CHARS:
+    if _rendered_prompt_fits(context, candidate):
+        return candidate, True
+
+    if not _rendered_prompt_fits(context, candidate):
+        if "tool_decision_contract" in candidate:
+            candidate["tool_decision_contract"] = _compact_tool_decision_contract(
+                context.get("recommendation_context") or {},
+                minimal=True,
+            )
         candidate.pop("evidence_semantics", None)
         relationship_map = candidate.get("relationship_map")
         if isinstance(relationship_map, dict):
@@ -561,7 +613,10 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
             candidate["stored_evidence"] = _compact_generation_evidence(
                 candidate["stored_evidence"], list_limit=3, text_limit=300
             )
-    if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) > ASSESSMENT_PROMPT_MAX_CHARS:
+    if _rendered_prompt_fits(context, candidate):
+        return candidate, True
+
+    if not _rendered_prompt_fits(context, candidate):
         if isinstance(candidate.get("stored_evidence"), dict):
             candidate["stored_evidence"] = _compact_generation_evidence(
                 candidate["stored_evidence"], list_limit=2, text_limit=160
@@ -569,14 +624,94 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
         prior = candidate.get("prior_exchange")
         if isinstance(prior, dict):
             prior["messages"] = list(prior.get("messages") or [])[-2:]
-    if len(build_assessment_conversation_prompt(context, prompt_context=candidate)) > ASSESSMENT_PROMPT_MAX_CHARS:
+    if _rendered_prompt_fits(context, candidate):
+        return candidate, True
+
+    if not _rendered_prompt_fits(context, candidate):
         candidate.pop("relationship_map", None)
+    if _rendered_prompt_fits(context, candidate):
+        return candidate, True
+
+    for list_limit, text_limit in ((1, 120), (1, 80), (1, 40)):
+        if isinstance(candidate.get("stored_evidence"), dict):
+            candidate["stored_evidence"] = _compact_generation_evidence(
+                candidate["stored_evidence"], list_limit=list_limit, text_limit=text_limit
+            )
+        prior = candidate.get("prior_exchange")
+        if isinstance(prior, dict):
+            prior["messages"] = list(prior.get("messages") or [])[-1:]
+            prior.pop("summary", None)
+        if _rendered_prompt_fits(context, candidate):
+            return candidate, True
+
+    candidate["stored_evidence"] = _minimal_generation_evidence(context)
+    candidate.pop("evidence_semantics", None)
+    candidate.pop("relationship_map", None)
+    prior = candidate.get("prior_exchange")
+    if isinstance(prior, dict):
+        prior["messages"] = []
+        prior.pop("summary", None)
     return candidate, True
+
+
+def _rendered_prompt_fits(context: dict, prompt_context: dict) -> bool:
+    return len(build_assessment_conversation_prompt(context, prompt_context=prompt_context)) <= ASSESSMENT_PROMPT_MAX_CHARS
 
 
 def _latest_generation_scans(scans: list[dict]) -> list[dict]:
     tools = sorted({str(scan.get("tool") or "unknown").lower().removesuffix(".sh") for scan in scans})
     return [latest for tool in tools if (latest := select_latest_tool_scan(scans, tool)) is not None]
+
+
+def _minimal_generation_evidence(context: dict) -> dict:
+    evidence = (context.get("assessment_context") or {})
+    ranked_findings = _prioritized_generation_findings(context, list(evidence.get("findings") or []))
+    return {
+        "assessment": _minimal_generation_value(evidence.get("assessment") or {}),
+        "targets": _minimal_generation_value(list(evidence.get("targets") or [])[:1]),
+        "scans": [
+            {
+                key: scan.get(key)
+                for key in ("id", "tool", "status", "finding_id")
+                if key in scan
+            }
+            for scan in _latest_generation_scans(list(evidence.get("scans") or []))
+        ],
+        "findings": [_minimal_generation_finding(finding) for finding in ranked_findings[:1]],
+        "budget": {
+            "ultra_compact": True,
+            "reason": "prompt budget",
+            "high_priority_evidence_preserved": True,
+        },
+    }
+
+
+def _minimal_generation_finding(finding: dict) -> dict:
+    minimal = {
+        key: _minimal_generation_value(finding.get(key))
+        for key in ("id", "source", "target", "severity", "risk_level", "status")
+        if key in finding
+    }
+    for key in (
+        "nuclei_findings", "open_ports", "httpx_services", "katana_observations",
+        "playwright_observation", "ffuf_results", "testssl_findings", "observations",
+    ):
+        if key in finding:
+            minimal[key] = _minimal_generation_value(finding.get(key))
+    return minimal
+
+
+def _minimal_generation_value(value: object) -> object:
+    if isinstance(value, list):
+        return [_minimal_generation_value(item) for item in value[:1]]
+    if isinstance(value, dict):
+        return {
+            str(key): _minimal_generation_value(item)
+            for key, item in list(value.items())[:8]
+        }
+    if isinstance(value, str) and len(value) > 80:
+        return value[:80].rstrip() + "... [truncated]"
+    return value
 
 
 _SEVERITY_PRIORITY = {"critical": 5, "high": 4, "medium": 3, "moderate": 3, "low": 2, "info": 1, "informational": 1}
@@ -1285,10 +1420,81 @@ def _build_state_grounded_answer(context: dict) -> str | None:
     return None
 
 
+def _empty_assessment_initial_answer(context: dict, *, include_summary: bool = False) -> str | None:
+    recommendation = context.get("recommendation_context") or {}
+    if not recommendation.get("empty_assessment"):
+        return None
+    preferred = [str(tool).lower().removesuffix(".sh") for tool in recommendation.get("preferred_next_tools") or []]
+    if recommendation.get("external_website_context_present") and {"nmap", "httpx"} & set(preferred):
+        opening = (
+            "So far, Mongrel has not stored any scans or findings for this assessment, so there is not enough evidence to "
+            "assess the target's security. "
+            if include_summary
+            else "I would start by collecting baseline evidence rather than reviewing findings, because this assessment has no stored scans or findings yet. "
+        )
+        return (
+            opening
+            + "For an authorized external website or hostname, Nmap has not been run yet; it is the sensible first step for host reachability, reachable ports, and service classifications. "
+            "httpx is a useful follow-up or companion for HTTP(S) response metadata if a web endpoint is in scope. "
+            "Those observations would establish reconnaissance evidence only; they would not prove vulnerabilities, exploitability, or security. "
+            "This is advice only and does not run any tool."
+        )
+    if recommendation.get("cloud_context_present") and preferred == ["prowler"]:
+        opening = (
+            "So far, Mongrel has not stored any scans or findings for this assessment, so there is not enough evidence to assess the cloud environment. "
+            if include_summary
+            else "I would start with Mongrel's Prowler only because the assessment context indicates an authorized cloud environment and no cloud checks are stored yet. "
+        )
+        return (
+            opening
+            + "Prowler records cloud check observations for supported providers; PASS/FAIL is scoped to individual checks/resources and does not prove account-wide security or compromise. "
+            "This is advice only and does not run any tool."
+        )
+    if recommendation.get("repository_context_present") and preferred == ["gitleaks"]:
+        opening = (
+            "So far, Mongrel has not stored any scans or findings for this repository/filesystem assessment, so there is not enough evidence to assess secret exposure. "
+            if include_summary
+            else "I would start with Mongrel's Gitleaks because the assessment context indicates authorized repository or filesystem input and no secret-pattern evidence is stored yet. "
+        )
+        return (
+            opening
+            + "Gitleaks records redacted secret-pattern matches only; a match would not prove a credential is active or usable, and no result would not prove secrets are absent everywhere. "
+            "This is advice only and does not run any tool."
+        )
+    if recommendation.get("packet_context_present") and preferred == ["tshark"]:
+        opening = (
+            "So far, Mongrel has not stored any packet or capture observations for this assessment, so there is not enough evidence to reason about traffic. "
+            if include_summary
+            else "I would use Mongrel's TShark capability because the assessment context or question is about packet/capture evidence and none is stored yet. "
+        )
+        return (
+            opening
+            + "TShark can analyze an authorized PCAP or capture metadata through Mongrel's supported modes. Packet evidence would not by itself prove application success, exploitation, compromise, or TLS security. "
+            "This is advice only and does not run any tool."
+        )
+    if recommendation.get("network_context_present") and preferred == ["nmap"]:
+        opening = (
+            "So far, Mongrel has not stored any scans or findings for this assessment, so there is not enough evidence to assess the target's security. "
+            if include_summary
+            else "I would start by collecting baseline network evidence because this assessment has no stored scans or findings yet. "
+        )
+        return (
+            opening
+            + "Nmap is the suitable first step for an authorized network/IP/host target because it can observe host reachability, reachable ports, and service classifications. "
+            "Those observations would not prove vulnerabilities, exploitability, or safety. This is advice only and does not run any tool."
+        )
+    return None
+
+
 def _build_grounded_assessment_summary(context: dict) -> str | None:
     intent = str(context.get("question_intent") or "")
     if intent not in {"assessment_summary", "assessment_highlight"}:
         return None
+    recommendation = context.get("recommendation_context") or {}
+    if recommendation.get("empty_assessment"):
+        empty_answer = _empty_assessment_initial_answer(context, include_summary=True)
+        if empty_answer:
+            return empty_answer
     findings = _latest_authoritative_findings(context)
     nmap_ports = []
     for finding in findings:
@@ -1359,7 +1565,6 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
         statements.append(
             f"TShark stored packet/network metadata{packet_scope}; packet presence does not establish an attack, exploitation, or compromise."
         )
-    recommendation = context.get("recommendation_context") or {}
     gaps = [str(tool) for tool in recommendation.get("relevant_unperformed_tools") or []]
     if gaps:
         statements.append("Relevant unperformed coverage remains: " + ", ".join(gaps) + ".")
@@ -1367,7 +1572,43 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
         return "No normalized observations are stored yet. That does not establish that the target is safe or free of vulnerabilities."
     if intent == "assessment_highlight":
         return _build_assessment_wide_synthesis(context, statements)
-    return " ".join(statements) + " These are bounded stored observations, not an overall secure, insecure, or vulnerable conclusion."
+    next_step = _summary_requested_next_step_answer(context)
+    return (
+        " ".join(statements)
+        + " These are bounded stored observations, not an overall secure, insecure, or vulnerable conclusion."
+        + (f" {next_step}" if next_step else "")
+    )
+
+
+def _summary_requested_next_step_answer(context: dict) -> str | None:
+    question = str(context.get("current_question") or "").lower()
+    if not re.search(
+        r"\b(?:what\s+should\s+(?:i|we)\s+do\s+next|what\s+do\s+(?:i|we)\s+do\s+next|"
+        r"what\s+next|next\s+step|do\s+next|run\s+next|investigate\s+next)\b",
+        question,
+    ):
+        return None
+    preferred = [str(tool).lower().removesuffix(".sh") for tool in ((context.get("recommendation_context") or {}).get("preferred_next_tools") or [])]
+    if preferred == ["httpx"]:
+        return (
+            "A sensible next step is Mongrel's httpx because Nmap has observed web-associated services, while no stored "
+            "HTTP response coverage shows which HTTP(S) endpoints respond or how they behave. That recommendation is "
+            "coverage-gathering advice only and does not run a tool."
+        )
+    if preferred == ["katana"]:
+        return (
+            "A sensible next step is Mongrel's Katana because a web surface is established but no crawl coverage is stored. "
+            "It can add URLs, paths, forms, and linked-resource observations without proving a vulnerability."
+        )
+    if preferred == ["playwright"]:
+        return (
+            "A sensible next step is Mongrel's Playwright because browser-rendered behavior remains an evidence gap for the web surface."
+        )
+    if preferred == ["ffuf"]:
+        return (
+            "A sensible next step is Mongrel's ffuf because bounded path-discovery observations are not yet stored for the web surface."
+        )
+    return None
 
 
 def _build_evidence_confidence_answer(context: dict) -> str | None:
@@ -2029,6 +2270,9 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
         if tool_state_answer:
             return tool_state_answer
     if intent in {"next_step_recommendation", "prioritization"}:
+        empty_answer = _empty_assessment_initial_answer(context)
+        if empty_answer:
+            return empty_answer
         preferred = [str(tool) for tool in recommendation.get("preferred_next_tools") or []]
         if preferred == ["httpx"]:
             return (
@@ -2362,6 +2606,63 @@ def _contradicts_assessment_tool_state(answer: str, context: dict) -> bool:
                 return True
     relevant_gaps = recommendation.get("relevant_unperformed_tools") or []
     if relevant_gaps and re.search(r"\b(?:no|not any)\s+(?:further\s+)?(?:evidence\s+|coverage\s+)?gaps?\b|\bnothing (?:else )?(?:remains|to check)\b", answer):
+        return True
+    return False
+
+
+def _has_unsuitable_tool_recommendation(answer: str, context: dict) -> bool:
+    recommendation = context.get("recommendation_context") or {}
+    intent = str(context.get("question_intent") or "")
+    if intent not in {
+        "assessment_summary",
+        "assessment_highlight",
+        "next_step_recommendation",
+        "prioritization",
+        "remaining_coverage_gaps",
+        "significance_interpretation",
+        "simplify_explanation",
+    }:
+        return False
+    preferred = {
+        str(tool).lower().removesuffix(".sh")
+        for tool in recommendation.get("preferred_next_tools") or []
+    }
+    allowed = {
+        str(tool).lower().removesuffix(".sh")
+        for tool, decision in (recommendation.get("tool_decisions") or {}).items()
+        if isinstance(decision, dict) and decision.get("recommendation_allowed")
+    }
+    recommended_tools = {
+        match.lower().removesuffix(".sh")
+        for match in re.findall(
+            r"\b(?:recommend|use|run|try|choose|proceed with|start with|suggest)\s+"
+            r"(?:(?:using|running|trying|choosing)\s+)?(?:mongrel(?:'s)?\s+)?(?:the\s+)?(?:run\s+)?"
+            r"(nmap|bbot|nuclei|httpx|playwright|katana|ffuf|testssl(?:\.sh)?|gitleaks|prowler|metasploit|tshark)\b",
+            answer,
+        )
+    }
+    if intent in {"assessment_summary", "assessment_highlight"} and recommended_tools and not preferred:
+        return True
+    if preferred and recommended_tools - preferred:
+        return True
+    if recommended_tools and not preferred:
+        if allowed:
+            return bool(recommended_tools - allowed)
+        return True
+    if "prowler" in answer and not recommendation.get("cloud_context_present"):
+        if recommended_tools & {"prowler"}:
+            return True
+        if re.search(
+            r"\bprowler\b.{0,120}\b(?:hostname|website|web\s*site|operating systems?|services?|general reconnaissance|"
+            r"potential vulnerabilities|discover)\b",
+            answer,
+        ):
+            return True
+    if "gitleaks" in answer and not recommendation.get("repository_context_present") and recommended_tools & {"gitleaks"}:
+        return True
+    if "metasploit" in answer and recommended_tools & {"metasploit"} and "metasploit" not in preferred:
+        return True
+    if "tshark" in answer and recommended_tools & {"tshark"} and "tshark" not in preferred and not recommendation.get("packet_context_present"):
         return True
     return False
 
