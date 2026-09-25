@@ -4,7 +4,6 @@ import pytest
 
 from app.services.katana_ai_assessment import (
     FALLBACK_LINES,
-    TRUTHFULNESS_FALLBACK_LINES,
     build_katana_ai_assessment_prompt,
     generate_katana_ai_assessment,
 )
@@ -39,6 +38,9 @@ def test_katana_ai_prompt_uses_only_stored_katana_evidence() -> None:
     assert "complete application coverage" in prompt
     assert "crawl visibility was limited" in prompt
     assert "not that site structure is limited" in prompt
+    assert "Do not write that there are no risks, no issues, no exploitation points, or no attack surface" in prompt
+    assert "Follow-up Investigation Areas" in prompt
+    assert "Potential Risks" not in prompt
     assert "URLs/endpoints observed during this crawl: 1" in prompt
     assert "Query parameters observed during this crawl: 1" in prompt
     assert "url=https://example.com/search?q=test type=parameterized_url method=GET status=200 depth=2 source=https://example.com params=q" in prompt
@@ -123,8 +125,11 @@ def test_katana_unsupported_generated_conclusions_are_withheld(unsupported_line:
     with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
         lines = generate_katana_ai_assessment(_single_url_katana_finding())
 
-    assert lines == TRUTHFULNESS_FALLBACK_LINES
-    assert unsupported_line not in "\n".join(lines)
+    rendered = "\n".join(lines)
+    assert lines != response.splitlines()
+    assert unsupported_line not in rendered
+    assert "Katana stored 1 URL/endpoint crawl observation(s) across 1 observed host(s)" in rendered
+    assert "does not establish configured crawl depth or complete crawl coverage" in rendered
 
 
 @pytest.mark.parametrize(
@@ -140,6 +145,10 @@ def test_katana_unsupported_generated_conclusions_are_withheld(unsupported_line:
         "The maximum observed crawl depth was 0.",
         "Only one URL was observed during this crawl, so coverage was limited.",
         "Configured crawl depth was not supplied.",
+        "Depth 0 does not establish configured crawl depth or complete coverage.",
+        "The crawl does not prove complete coverage.",
+        "Zero observations do not establish absence.",
+        "Katana crawl evidence does not establish vulnerability or exploitability.",
     ],
 )
 def test_katana_evidence_scoped_limitations_are_allowed(legitimate_line: str) -> None:
@@ -149,6 +158,78 @@ def test_katana_evidence_scoped_limitations_are_allowed(legitimate_line: str) ->
         lines = generate_katana_ai_assessment(_single_url_katana_finding())
 
     assert lines == response.splitlines()
+
+
+@pytest.mark.parametrize(
+    "unsupported_line",
+    [
+        "The crawl achieved complete coverage.",
+        "All pages were crawled.",
+        "Every page was crawled.",
+        "The site was fully crawled.",
+        "The entire site was crawled.",
+        "The whole site was crawled.",
+        "The application was fully crawled.",
+        "The crawl covered all pages.",
+        "Complete crawl coverage was achieved.",
+        "There is no doubt the crawl achieved complete coverage.",
+        "Not only was the crawl complete, it covered all pages.",
+    ],
+)
+def test_katana_affirmative_complete_coverage_claims_remain_rejected(unsupported_line: str) -> None:
+    response = f"Executive Summary\n- {unsupported_line}"
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding())
+
+    rendered = "\n".join(lines)
+    assert lines != response.splitlines()
+    assert unsupported_line not in rendered
+    assert "Katana stored 1 URL/endpoint crawl observation(s) across 1 observed host(s)" in rendered
+
+
+def test_katana_sparse_compliant_generated_assessment_is_accepted() -> None:
+    response = "\n".join([
+        "Executive Summary",
+        "- This run observed one URL on one host.",
+        "",
+        "Observed Facts",
+        "- No JavaScript files were observed during this crawl.",
+        "- No query parameters were observed during this crawl.",
+        "- No forms/actions were observed during this crawl.",
+        "- The maximum observed crawl depth was 0.",
+        "",
+        "Limitations / Uncertainty",
+        "- Zero observations do not establish absence, and depth 0 does not establish configured crawl depth or complete coverage.",
+        "",
+        "Recommended Next Actions",
+        "- Browser/runtime review or additional authorized crawling can add evidence.",
+    ])
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding())
+
+    assert lines == response.splitlines()
+
+
+def test_katana_sparse_rejected_generation_returns_grounded_observed_facts() -> None:
+    response = "\n".join([
+        "Executive Summary",
+        "- The site appears to have a basic structure with no apparent exploitation points.",
+    ])
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding())
+
+    rendered = "\n".join(lines)
+    assert "basic structure" not in rendered
+    assert "exploitation points" not in rendered
+    assert "Katana stored 1 URL/endpoint crawl observation(s) across 1 observed host(s)" in rendered
+    assert "JavaScript files observed during this crawl: 0" in rendered
+    assert "Query parameters observed during this crawl: 0" in rendered
+    assert "Forms/actions observed during this crawl: 0" in rendered
+    assert "Maximum observed crawl depth: 0" in rendered
+    assert "Zero counts mean those items were not observed during this crawl" in rendered
 
 
 def test_katana_prompt_represents_observed_depth_without_configuration_causation() -> None:

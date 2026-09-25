@@ -53,6 +53,11 @@ EVIDENCE_SCOPED_MARKERS = (
 )
 ALWAYS_UNSUPPORTED_KATANA_CLAIM_PATTERNS = (
     re.compile(r"\b(?:max(?:imum)?\s+)?(?:observed\s+)?crawl\s+depth\b[^.!?]{0,120}\b(?:fully\s+crawled|fully\s+explored|complete(?:d)?\s+(?:crawl|coverage)|all\s+pages)\b"),
+    re.compile(r"\b(?:all|every)\s+pages?\s+(?:were|was|are|is|have\s+been|has\s+been)\s+crawled\b"),
+    re.compile(r"\b(?:the\s+)?(?:site|application|app)\s+(?:was|were|is|are|has\s+been|have\s+been)\s+fully\s+crawled\b"),
+    re.compile(r"\b(?:the\s+)?(?:entire|whole)\s+(?:site|application|app)\s+(?:was|were|is|are|has\s+been|have\s+been)?\s*crawled\b"),
+    re.compile(r"\b(?:the\s+)?crawl\s+(?:covered|covers)\s+(?:all|every)\s+pages?\b"),
+    re.compile(r"\b(?:complete|full)\s+crawl\s+coverage\s+(?:was\s+|is\s+|has\s+been\s+)?achieved\b"),
     re.compile(r"\b(?:configured\s+)?(?:crawl\s+)?depth(?:\s+limit)?\b[^.!?]{0,120}\b(?:caused|limited|prevented|due\s+to|because\s+of)\b"),
     re.compile(r"\b(?:no|zero)\s+pages?\s+beyond\b[^.!?]{0,120}\b(?:due\s+to|because\s+of|caused\s+by)\b"),
     re.compile(r"\b(?:site|application|app)\b[^.!?]{0,80}\b(?:basic|simple)\s+structure\b"),
@@ -112,6 +117,8 @@ def build_katana_ai_assessment_prompt(finding: dict) -> str:
             "- If configured crawl depth is not supplied, do not infer a depth limit or say the depth limit caused the observed result.",
             "- Do not describe forms, parameters, or JavaScript files as suspicious merely because they were present or absent.",
             "- If only one URL was observed, say only one URL was observed and coverage is limited; do not characterize the site's overall structure.",
+            "- Do not write that there are no risks, no issues, no exploitation points, or no attack surface. Katana did not test that.",
+            "- For sparse crawls, explain the observed crawl surface and the evidence gaps instead of filling a risk section with absence claims.",
             "- Do not claim compromise.",
             "- Do not recommend exploitation.",
             "- Do not claim the target is safe, secure, insecure, or vulnerable from crawl evidence alone.",
@@ -126,7 +133,7 @@ def build_katana_ai_assessment_prompt(finding: dict) -> str:
             "Observed Facts",
             "Crawl Surface Notes",
             "Interpretation",
-            "Potential Risks",
+            "Follow-up Investigation Areas",
             "Limitations / Uncertainty",
             "Confidence",
             "Recommended Next Actions",
@@ -189,12 +196,51 @@ def _clean(value: object) -> str:
 
 def _guard_truthfulness_response(lines: list[str], finding: dict) -> list[str]:
     if _contains_unsupported_katana_claim(lines, finding):
-        return list(TRUTHFULNESS_FALLBACK_LINES)
+        return _build_truthfulness_fallback_lines(finding)
     return lines
+
+
+def _build_truthfulness_fallback_lines(finding: dict) -> list[str]:
+    observations = finding.get("katana_observations") if isinstance(finding.get("katana_observations"), list) else []
+    summary = finding.get("katana_summary") if isinstance(finding.get("katana_summary"), dict) else {}
+    observed_count = _as_int(finding.get("finding_count")) or len(observations)
+    host_count = _as_int(summary.get("host_count"))
+    if host_count is None:
+        host_count = len({
+            str(observation.get("host") or "").strip().lower()
+            for observation in observations
+            if isinstance(observation, dict) and str(observation.get("host") or "").strip()
+        })
+    javascript_count = _as_int(summary.get("javascript_count")) or 0
+    parameter_count = _as_int(summary.get("query_parameter_count")) or 0
+    form_count = _as_int(summary.get("form_count")) or 0
+    max_depth = _as_int(summary.get("max_depth")) or 0
+    return [
+        "Executive Summary",
+        f"- Katana stored {observed_count} URL/endpoint crawl observation(s) across {host_count} observed host(s). This is crawl-discovery evidence, not a vulnerability, exploitability, or complete-coverage conclusion.",
+        "",
+        "Observed Facts",
+        f"- JavaScript files observed during this crawl: {javascript_count}.",
+        f"- Query parameters observed during this crawl: {parameter_count}.",
+        f"- Forms/actions observed during this crawl: {form_count}.",
+        f"- Maximum observed crawl depth: {max_depth}.",
+        "",
+        "Crawl Surface Notes",
+        "- Zero counts mean those items were not observed during this crawl; they do not prove those items are absent from the site.",
+        "- The observed depth is the maximum depth represented in stored crawl observations; it does not establish configured crawl depth or complete crawl coverage.",
+        "",
+        "Interpretation",
+        "- This crawl provides a limited view of observed URLs, hosts, scripts, parameters, forms, and depth. Katana evidence alone does not establish vulnerability, exploitability, sensitive exposure, or safety.",
+        "",
+        "Recommended Next Actions",
+        "- Use authorized browser/runtime review, additional scoped crawling, or targeted validation to add evidence before drawing security conclusions.",
+    ]
 
 
 def _contains_unsupported_katana_claim(lines: list[str], finding: dict) -> bool:
     for sentence in _claim_sentences(lines):
+        if _is_safe_katana_limitation(sentence):
+            continue
         if any(pattern.search(sentence) for pattern in ALWAYS_UNSUPPORTED_KATANA_CLAIM_PATTERNS):
             return True
         if _contradicts_katana_summary(sentence, finding):
@@ -204,6 +250,24 @@ def _contains_unsupported_katana_claim(lines: list[str], finding: dict) -> bool:
         if any(pattern.search(sentence) for pattern in UNSUPPORTED_KATANA_CLAIM_PATTERNS):
             return True
     return False
+
+
+def _is_safe_katana_limitation(sentence: str) -> bool:
+    if re.search(r"\b(?:not\s+only|no\s+doubt|achieved|fully\s+crawled|fully\s+explored|covered\s+all|all\s+pages)\b", sentence):
+        return False
+    if re.search(r"\b(?:but|however|although)\b[^.!?]{0,120}\b(?:complete\s+coverage|crawl\s+complete|fully\s+crawled|all\s+pages)\b", sentence):
+        return False
+    limitation_verbs = r"(?:establish|prove|confirm|demonstrate|show)"
+    limitation_objects = (
+        r"(?:complete\s+coverage|configured\s+crawl\s+depth|depth\s+configuration|absence|"
+        r"vulnerabilit(?:y|ies)|exploitability|exploitation|safety|security)"
+    )
+    return bool(
+        re.search(
+            rf"\b(?:does|do|did)\s+not\s+{limitation_verbs}\b[^.!?]{{0,160}}\b{limitation_objects}\b",
+            sentence,
+        )
+    )
 
 
 def _contradicts_katana_summary(sentence: str, finding: dict) -> bool:
