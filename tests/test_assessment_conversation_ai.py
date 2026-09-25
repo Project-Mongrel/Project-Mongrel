@@ -565,14 +565,142 @@ def test_mixed_httpx_summary_and_next_step_recommends_katana_after_evidence_summ
     assert "status 301" in answer or "status 200" in answer
     assert "redirect" in answer
     assert "Squarespace" in answer
-    assert "HSTS metadata" in answer
-    assert "TLS metadata" in answer
+    assert "HSTS observed" in answer
+    assert "TLS 1.3" in answer
+    assert "issuer Example CA" in answer
+    assert "fingerprint_sha256" not in answer
+    assert "AA:BB:CC:DD" not in answer
+    assert "{'version'" not in answer and '"version"' not in answer
     assert "I would use Mongrel's Katana next" in answer
     assert "URLs, paths, forms, and linked resources" in answer
     assert "would not by itself prove a vulnerability" in answer
     assert "httpx next" not in answer
     assert "Prowler" not in answer
     assert "does not run the tool" in answer
+
+
+def test_explicit_httpx_certificate_fingerprint_detail_remains_available() -> None:
+    assessment = create_assessment("httpx fingerprint detail", user_id=1001)
+    _add_realistic_httpx_scan(assessment["id"], user_id=1001)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Show me the httpx certificate fingerprints.",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "fingerprint_sha256: AA:BB:CC:DD" in answer
+
+
+def test_httpx_summary_collapses_semantic_duplicates_but_keeps_distinct_redirects() -> None:
+    assessment = create_assessment("httpx duplicate summary", user_id=1001)
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=1001)
+    finding = add_finding(
+        user_id=1001,
+        finding={
+            "source": "httpx",
+            "target": "https://example.com",
+            "status": "completed",
+            "httpx_services": [
+                {"url": "http://example.com", "status_code": 301, "redirect_location": "https://www.example.com/"},
+                {"url": "http://example.com", "status_code": 301, "redirect_location": "https://www.example.com/"},
+                {"url": "http://example.com", "status_code": 302, "redirect_location": "https://shop.example.com/"},
+            ],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="httpx", status="completed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What did httpx add and what should we investigate next?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert answer.count("http://example.com") == 2
+    assert "https://www.example.com/" in answer
+    assert "https://shop.example.com/" in answer
+    assert "1 semantically duplicate stored observation(s) were collapsed" in answer
+    assert "Katana next" in answer
+
+
+def test_httpx_summary_merges_duplicate_metadata_without_raw_tls_dump() -> None:
+    assessment = create_assessment("httpx duplicate metadata", user_id=1001)
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=1001)
+    finding = add_finding(
+        user_id=1001,
+        finding={
+            "source": "httpx",
+            "target": "https://example.com",
+            "status": "completed",
+            "httpx_services": [
+                {"url": "https://example.com", "status_code": 200, "technologies": ["ExampleTech"]},
+                {
+                    "url": "https://example.com",
+                    "status_code": 200,
+                    "hsts": {"present": True, "max_age": 31536000},
+                    "tls": {
+                        "version": "1.3",
+                        "issuer": "Example CA",
+                        "fingerprint_sha256": "AA:BB:CC:DD",
+                    },
+                },
+            ],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="httpx", status="completed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What did httpx add and what should we investigate next?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert answer.count("https://example.com") == 1
+    assert "1 semantically duplicate stored observation(s) were collapsed" in answer
+    assert "ExampleTech" in answer
+    assert "HSTS observed" in answer
+    assert "TLS 1.3" in answer
+    assert "issuer Example CA" in answer
+    assert "fingerprint_sha256" not in answer
+    assert "AA:BB:CC:DD" not in answer
+    assert "{'version'" not in answer and '"version"' not in answer
+
+
+def test_large_httpx_summary_is_bounded_and_acknowledges_omitted_observations() -> None:
+    assessment = create_assessment("httpx large summary", user_id=1001)
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=1001)
+    services = [
+        {"url": f"https://example.com/page-{index}", "status_code": 200, "technologies": ["ExampleTech"]}
+        for index in range(10)
+    ]
+    finding = add_finding(
+        user_id=1001,
+        finding={"source": "httpx", "target": "https://example.com", "status": "completed", "httpx_services": services},
+    )
+    record_assessment_scan(assessment["id"], tool="httpx", status="completed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What did httpx add and what should we investigate next?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "4 additional distinct stored observation(s) are not shown here" in answer
+    assert "page-0" in answer and "page-5" in answer
+    assert "page-6" not in answer
+    assert len(answer) < 2500
 
 
 def test_mixed_nmap_summary_and_next_step_still_recommends_httpx() -> None:
@@ -2084,9 +2212,11 @@ def _add_realistic_httpx_scan(assessment_id: int, *, user_id: int) -> dict:
                     "technologies": ["Squarespace", "Squarespace Commerce"],
                     "hsts": {"present": True, "max_age": 31536000},
                     "tls": {
+                        "version": "1.3",
                         "subject": "www.example.com",
                         "issuer": "Example CA",
                         "not_after": "2027-01-01T00:00:00Z",
+                        "fingerprint_sha256": "AA:BB:CC:DD",
                     },
                 },
             ],

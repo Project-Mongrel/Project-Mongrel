@@ -278,10 +278,29 @@ def test_live_httpx_direct_question_is_deterministic_and_not_withheld():
     answer = result["answer"]
     assert "status 403" in answer
     assert "technology hints nginx" in answer
-    assert "stored TLS metadata subject_cn=example.com" in answer
+    assert "TLS/certificate metadata collected" in answer
+    assert "subject_cn=example.com" not in answer
     assert "withheld" not in answer.lower()
     assert "WAF" in answer and "do not by themselves establish" in answer
     assert "recommend" not in answer.lower()
+    assert result["instrumentation"]["prompt_chars"] == 0
+    assert result["instrumentation"]["context_chars"] == 0
+
+
+def test_live_httpx_certificate_subject_detail_is_progressively_disclosed():
+    assessment = create_assessment("httpx subject detail", user_id=1001)
+    _add_httpx_evidence(assessment["id"])
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001, assessment_id=assessment["id"], conversation_id=None,
+            question="What certificate subject did httpx observe?",
+        )
+    ask_ai.assert_not_called()
+    answer = result["answer"]
+    assert "certificate subject observation" in answer
+    assert "subject_cn=example.com" in answer
+    assert "overall TLS safety" in answer
+    assert "withheld" not in answer.lower()
     assert result["instrumentation"]["prompt_chars"] == 0
     assert result["instrumentation"]["context_chars"] == 0
 

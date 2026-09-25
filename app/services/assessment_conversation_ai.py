@@ -3,6 +3,7 @@ import re
 from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
+from urllib.parse import urlparse
 
 from app.core.config import get_settings
 from app.parsers.katana_parser import summarize_katana_observations
@@ -1108,23 +1109,242 @@ def _httpx_response_observations(findings: list[dict]) -> list[dict]:
     ]
 
 
+def _deduplicated_httpx_observations(findings: list[dict]) -> tuple[list[dict], int]:
+    services = _httpx_response_observations(findings)
+    deduped_by_identity = {}
+    for service in services:
+        key = _httpx_observation_identity(service)
+        if key not in deduped_by_identity:
+            deduped_by_identity[key] = deepcopy(service)
+            continue
+        deduped_by_identity[key] = _merge_httpx_observation(deduped_by_identity[key], service)
+    return list(deduped_by_identity.values()), len(services)
+
+
+def _merge_httpx_observation(existing: dict, candidate: dict) -> dict:
+    """Merge semantically duplicate httpx observations without losing richer metadata."""
+    merged = deepcopy(existing)
+    for key, value in candidate.items():
+        if value in (None, "", [], {}):
+            continue
+        current = merged.get(key)
+        if current in (None, "", [], {}):
+            merged[key] = deepcopy(value)
+        elif isinstance(current, list) and isinstance(value, list):
+            merged[key] = _merge_unique_list_values(current, value)
+        elif isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_metadata_dict(current, value)
+    return merged
+
+
+def _merge_metadata_dict(existing: dict, candidate: dict) -> dict:
+    merged = deepcopy(existing)
+    for key, value in candidate.items():
+        if value in (None, "", [], {}):
+            continue
+        current = merged.get(key)
+        if current in (None, "", [], {}):
+            merged[key] = deepcopy(value)
+        elif isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_metadata_dict(current, value)
+        elif isinstance(current, list) and isinstance(value, list):
+            merged[key] = _merge_unique_list_values(current, value)
+    return merged
+
+
+def _merge_unique_list_values(existing: list, candidate: list) -> list:
+    merged = deepcopy(existing)
+    seen = {_plain_value(item) for item in merged}
+    for item in candidate:
+        if item in (None, "", [], {}):
+            continue
+        marker = _plain_value(item)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        merged.append(deepcopy(item))
+    return merged
+
+
+def _httpx_observation_identity(service: dict) -> tuple:
+    url = str(service.get("url") or service.get("host") or "").strip()
+    parsed = urlparse(url if "://" in url else f"//{url}")
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or url).lower().strip()
+    port = parsed.port
+    if port is None and scheme == "http":
+        port = 80
+    if port is None and scheme == "https":
+        port = 443
+    path = parsed.path or "/"
+    redirect = str(service.get("redirect_location") or service.get("final_url") or "").strip().lower()
+    return (scheme, host, port, path, str(service.get("status_code") or ""), redirect)
+
+
+def _httpx_tls_summary(tls: object) -> str | None:
+    if not isinstance(tls, dict) or not tls:
+        return None
+    version = _find_nested_metadata_value(tls, ("version", "tls_version", "protocol"))
+    cipher = _find_nested_metadata_value(tls, ("cipher", "cipher_suite"))
+    issuer = _find_nested_metadata_value(tls, ("issuer", "issuer_cn", "issuer_common_name"))
+    expiry = _find_nested_metadata_value(tls, ("not_after", "notafter", "expires", "expiry"))
+    pieces = []
+    if version:
+        pieces.append(f"TLS {version}")
+    if cipher:
+        pieces.append(f"cipher {cipher}")
+    cert = []
+    if issuer:
+        cert.append(f"issuer {issuer}")
+    if expiry:
+        cert.append(f"expires {expiry}")
+    if cert:
+        pieces.append("certificate " + ", ".join(cert))
+    return ", ".join(pieces) if pieces else "TLS/certificate metadata collected"
+
+
+def _httpx_hsts_summary(service: dict) -> str | None:
+    for key in ("hsts", "sts", "strict_transport_security"):
+        value = service.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, dict):
+            present = value.get("present")
+            max_age = value.get("max_age") or value.get("max-age")
+            if present is False:
+                return "HSTS not observed"
+            if max_age not in (None, ""):
+                return f"HSTS observed (max-age {max_age})"
+            return "HSTS observed"
+        if isinstance(value, bool):
+            return "HSTS observed" if value else "HSTS not observed"
+        return "HSTS observed"
+    return None
+
+
+def _find_nested_metadata_value(value: object, keys: tuple[str, ...]) -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in keys and item not in (None, "", [], {}):
+                return _plain_value(item)
+        for item in value.values():
+            found = _find_nested_metadata_value(item, keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _find_nested_metadata_value(item, keys)
+            if found:
+                return found
+    return None
+
+
+def _httpx_fingerprints(tls: object) -> list[str]:
+    fingerprints = []
+    if isinstance(tls, dict):
+        for key, value in tls.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if "fingerprint" in lowered or lowered in {"sha256", "sha1", "md5"}:
+                if value not in (None, "", [], {}):
+                    fingerprints.append(f"{key_text}: {_plain_value(value)}")
+            elif isinstance(value, (dict, list)):
+                fingerprints.extend(_httpx_fingerprints(value))
+    elif isinstance(tls, list):
+        for item in tls:
+            fingerprints.extend(_httpx_fingerprints(item))
+    return fingerprints
+
+
+def _httpx_certificate_subjects(tls: object) -> list[str]:
+    subjects = []
+    if isinstance(tls, dict):
+        for key, value in tls.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if lowered in {"subject", "subject_cn", "subject_dn", "cn", "common_name"}:
+                if value not in (None, "", [], {}):
+                    subjects.append(f"{key_text}={_plain_value(value)}")
+            elif isinstance(value, (dict, list)):
+                subjects.extend(_httpx_certificate_subjects(value))
+    elif isinstance(tls, list):
+        for item in tls:
+            subjects.extend(_httpx_certificate_subjects(item))
+    return subjects
+
+
 def _build_direct_httpx_evidence_answer(context: dict) -> str | None:
     if context.get("question_intent") != "current_assessment_evidence" or _selected_tools(context) != {"httpx"}:
         return None
     question = str(context.get("current_question") or "").lower()
-    if not any(term in question for term in ("what did", "what was observed", "actually observe", "actually find")):
+    if not any(term in question for term in ("what did", "what was observed", "actually observe", "actually find", "fingerprint", "tls version", "all the tls", "tls evidence", "certificate subject", "subject cn", "subject_cn")):
         return None
     findings = _tool_findings(context, "httpx")
     if not findings:
         return None
-    services = _httpx_response_observations(findings)
+    services, total = _deduplicated_httpx_observations(findings)
     if not services:
         return (
             "The stored httpx result contains no normalized HTTP response observations. That does not establish that the "
             "host is down or that a site is absent."
         )
+    if "fingerprint" in question:
+        fingerprints = [
+            fingerprint
+            for service in services
+            for fingerprint in _httpx_fingerprints(service.get("tls"))
+        ]
+        if not fingerprints:
+            return "The selected stored httpx evidence does not contain certificate fingerprints."
+        return "Stored httpx certificate fingerprints: " + "; ".join(list(dict.fromkeys(fingerprints))[:12]) + "."
+    if "certificate subject" in question or "subject cn" in question or "subject_cn" in question:
+        subjects = [
+            subject
+            for service in services
+            for subject in _httpx_certificate_subjects(service.get("tls"))
+        ]
+        if not subjects:
+            return "The selected stored httpx evidence does not contain a normalized certificate subject observation."
+        return (
+            "Stored httpx certificate subject observation(s): "
+            + "; ".join(list(dict.fromkeys(subjects))[:12])
+            + ". Certificate subject metadata is an observed certificate field and does not establish overall TLS safety."
+        )
+    if "tls version" in question or ("tls" in question and "version" in question):
+        versions = [
+            value for value in (
+                _find_nested_metadata_value(service.get("tls"), ("version", "tls_version", "protocol"))
+                for service in services
+            )
+            if value
+        ]
+        if not versions:
+            return "The selected stored httpx evidence does not contain a normalized TLS version observation."
+        return "Stored httpx TLS version observation(s): " + ", ".join(dict.fromkeys(versions)) + ". TLS metadata does not establish overall TLS security."
+    if "all the tls" in question or "tls evidence" in question:
+        tls_lines = []
+        for service in services[:10]:
+            tls = service.get("tls")
+            if not tls:
+                continue
+            endpoint = str(service.get("url") or service.get("host") or "observed endpoint")
+            summary = _httpx_tls_summary(tls) or "TLS/certificate metadata collected"
+            subjects = _httpx_certificate_subjects(tls)
+            if subjects:
+                summary += "; subjects " + "; ".join(list(dict.fromkeys(subjects))[:4])
+            fingerprints = _httpx_fingerprints(tls)
+            if fingerprints:
+                summary += "; fingerprints " + "; ".join(list(dict.fromkeys(fingerprints))[:4])
+            tls_lines.append(f"{endpoint}: {summary}")
+        if not tls_lines:
+            return "The selected stored httpx evidence does not contain normalized TLS metadata."
+        return (
+            "Stored httpx TLS evidence: "
+            + ". ".join(tls_lines)
+            + ". These are TLS/certificate metadata observations and do not establish overall TLS safety."
+        )
     rendered = []
-    for service in services[:10]:
+    for service in services[:6]:
         parts = [str(service.get("url") or service.get("host") or "observed endpoint")]
         if service.get("status_code") is not None:
             parts.append(f"status {service.get('status_code')}")
@@ -1138,12 +1358,20 @@ def _build_direct_httpx_evidence_answer(context: dict) -> str | None:
         technologies = service.get("technologies") or []
         if technologies:
             parts.append("technology hints " + _plain_value(technologies))
-        tls = service.get("tls")
-        if tls:
-            parts.append("stored TLS metadata " + _plain_value(tls))
+        hsts = _httpx_hsts_summary(service)
+        if hsts:
+            parts.append(hsts)
+        tls_summary = _httpx_tls_summary(service.get("tls"))
+        if tls_summary:
+            parts.append(tls_summary)
         rendered.append("; ".join(parts))
+    omitted = ""
+    if len(services) < total:
+        omitted += f" {total - len(services)} semantically duplicate stored observation(s) were collapsed."
+    if len(services) > 6:
+        omitted += f" {len(services) - 6} additional distinct stored observation(s) are not shown here; ask for details to inspect them."
     return (
-        "Stored httpx observations: " + ". ".join(rendered) + ". These are response and metadata observations; they do "
+        "Stored httpx observations: " + ". ".join(rendered) + "." + omitted + " These are response and metadata observations; they do "
         "not by themselves establish a WAF, vulnerability, host availability beyond the observed response, vulnerable "
         "technology, or overall TLS safety."
     )
@@ -1438,7 +1666,7 @@ def _build_httpx_addition_summary(context: dict) -> str | None:
     findings = _tool_findings(context, "httpx")
     if not findings:
         return None
-    services = _httpx_response_observations(findings)
+    services, total = _deduplicated_httpx_observations(findings)
     if not services:
         return (
             "httpx is recorded in the selected evidence, but it did not store normalized HTTP response observations. "
@@ -1457,15 +1685,24 @@ def _build_httpx_addition_summary(context: dict) -> str | None:
         for key, label in (("title", "title"), ("web_server", "server"), ("content_type", "content type")):
             if service.get(key) not in (None, "", [], {}):
                 parts.append(f"{label} {_plain_value(service.get(key))}")
-        if service.get("hsts") not in (None, "", [], {}):
-            parts.append("HSTS metadata " + _plain_value(service.get("hsts")))
-        if service.get("tls") not in (None, "", [], {}):
-            parts.append("TLS metadata " + _plain_value(service.get("tls")))
+        hsts = _httpx_hsts_summary(service)
+        if hsts:
+            parts.append(hsts)
+        tls_summary = _httpx_tls_summary(service.get("tls"))
+        if tls_summary:
+            parts.append(tls_summary)
         rendered.append("; ".join(parts))
+    omitted = ""
+    if len(services) < total:
+        omitted += f" {total - len(services)} semantically duplicate stored observation(s) were collapsed."
+    if len(services) > 6:
+        omitted += f" {len(services) - 6} additional distinct stored observation(s) are not shown here; ask for more httpx detail to inspect them."
     return (
         "httpx added HTTP(S) response-level evidence beyond Nmap's port/service labels: "
         + ". ".join(rendered)
-        + ". These are response, redirect, technology, HSTS, and TLS/certificate metadata observations where stored; they do not establish a vulnerability, exploitability, absence of web functionality, or overall TLS safety."
+        + "."
+        + omitted
+        + " These are response, redirect, technology, HSTS, and TLS/certificate metadata observations where stored; they do not establish a vulnerability, exploitability, absence of web functionality, or overall TLS safety."
     )
 
 
