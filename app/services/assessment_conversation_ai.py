@@ -147,6 +147,7 @@ def answer_assessment_conversation_question(
         or _build_direct_httpx_evidence_answer(context)
         or _build_direct_testssl_evidence_answer(context)
         or _build_direct_tshark_evidence_answer(context)
+        or _build_mixed_intent_answer(context)
         or _build_state_grounded_answer(context)
         or _build_assessment_map_answer(context)
         or _build_grounded_assessment_summary(context)
@@ -481,6 +482,8 @@ def _build_prompt_context(context: dict) -> dict:
     intent = str(context.get("question_intent") or "current_assessment_evidence")
     profile = context.get("mongrel_self_knowledge") or {}
     prompt_context = {"question": context.get("current_question")}
+    if context.get("compound_requirements"):
+        prompt_context["compound_requirements"] = context.get("compound_requirements")
     if intent == "product_self_knowledge":
         prompt_context["product"] = profile
         return prompt_context
@@ -1094,7 +1097,7 @@ def _httpx_response_observations(findings: list[dict]) -> list[dict]:
     """Return only records that prove an HTTP response was actually observed."""
     response_fields = {
         "status_code", "title", "redirect_location", "web_server", "content_type",
-        "technologies", "tls", "response_time", "content_length", "method",
+        "technologies", "tech", "hsts", "tls", "response_time", "content_length", "method",
     }
     return [
         item
@@ -1381,6 +1384,104 @@ def _plain_value(value: object) -> str:
     if isinstance(value, (list, tuple)):
         return ", ".join(_plain_value(item) for item in value)
     return str(value)
+
+
+def _build_mixed_intent_answer(context: dict) -> str | None:
+    requirements = context.get("compound_requirements") or {}
+    if not requirements.get("needs_next_step"):
+        return None
+    parts = []
+    for tool in requirements.get("tool_evidence_summary") or []:
+        summary = _build_tool_addition_summary(context, str(tool).lower().removesuffix(".sh"))
+        if summary:
+            parts.append(summary)
+    if requirements.get("status_summary"):
+        status = _build_status_summary_for_mixed_intent(context)
+        if status:
+            parts.append(status)
+    if not parts:
+        return None
+
+    next_context = dict(context)
+    next_context["question_intent"] = "next_step_recommendation"
+    next_step = _build_grounded_conversational_fallback(next_context)
+    if next_step:
+        parts.append(next_step)
+    if requirements.get("limitations") and not any("do not" in part.lower() or "does not" in part.lower() for part in parts):
+        parts.append("These are bounded observations; they do not establish vulnerability, exploitability, compromise, or overall security.")
+    return " ".join(parts)
+
+
+def _build_tool_addition_summary(context: dict, tool: str) -> str | None:
+    if tool == "httpx":
+        return _build_httpx_addition_summary(context)
+    if tool == "nmap":
+        findings = _tool_findings(context, "nmap")
+        ports = [
+            f"{item.get('port')}/{item.get('protocol') or 'tcp'} ({item.get('service') or 'unknown'})"
+            for finding in findings
+            for item in (finding.get("open_ports") or [])
+            if isinstance(item, dict)
+        ]
+        if not ports:
+            return "Nmap is in scope for this question, but no normalized Nmap service observations are present in the selected evidence."
+        return (
+            "Nmap added stored port/service observations: "
+            + ", ".join(ports[:10])
+            + ". Those service classifications do not establish application behavior, vulnerability, exploitability, or safety."
+        )
+    named = _build_named_tool_evidence_answer(context)
+    return named
+
+
+def _build_httpx_addition_summary(context: dict) -> str | None:
+    findings = _tool_findings(context, "httpx")
+    if not findings:
+        return None
+    services = _httpx_response_observations(findings)
+    if not services:
+        return (
+            "httpx is recorded in the selected evidence, but it did not store normalized HTTP response observations. "
+            "That does not prove the host is down or that web content is absent."
+        )
+    rendered = []
+    for service in services[:6]:
+        parts = [str(service.get("url") or service.get("host") or "observed endpoint")]
+        if service.get("status_code") is not None:
+            parts.append(f"status {service.get('status_code')}")
+        if service.get("redirect_location"):
+            parts.append(f"redirect {_plain_value(service.get('redirect_location'))}")
+        technologies = service.get("technologies") or service.get("tech") or []
+        if technologies:
+            parts.append("technology hints " + _plain_value(technologies))
+        for key, label in (("title", "title"), ("web_server", "server"), ("content_type", "content type")):
+            if service.get(key) not in (None, "", [], {}):
+                parts.append(f"{label} {_plain_value(service.get(key))}")
+        if service.get("hsts") not in (None, "", [], {}):
+            parts.append("HSTS metadata " + _plain_value(service.get("hsts")))
+        if service.get("tls") not in (None, "", [], {}):
+            parts.append("TLS metadata " + _plain_value(service.get("tls")))
+        rendered.append("; ".join(parts))
+    return (
+        "httpx added HTTP(S) response-level evidence beyond Nmap's port/service labels: "
+        + ". ".join(rendered)
+        + ". These are response, redirect, technology, HSTS, and TLS/certificate metadata observations where stored; they do not establish a vulnerability, exploitability, absence of web functionality, or overall TLS safety."
+    )
+
+
+def _build_status_summary_for_mixed_intent(context: dict) -> str | None:
+    states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
+    incomplete = [
+        f"{tool}={state}" for tool, state in states.items()
+        if state in {"FAILED", "PARTIAL", "TIMED_OUT", "CANCELLED", "INTERRUPTED"}
+    ]
+    if not incomplete:
+        return "No failed, timed-out, cancelled, interrupted, or partial tool state is recorded in the current assessment state."
+    return (
+        "Recorded incomplete tool state: "
+        + ", ".join(incomplete)
+        + ". That is execution state, not evidence of a clean result or absence of findings."
+    )
 
 
 def _build_state_grounded_answer(context: dict) -> str | None:

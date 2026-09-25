@@ -289,6 +289,11 @@ def build_assessment_conversation_context(
     )
     selected_tools = detect_question_tools(question)
     question_intent = classify_assessment_conversation_intent(question, selected_tools=selected_tools)
+    compound_requirements = _detect_compound_requirements(
+        question,
+        selected_tools=selected_tools,
+        primary_intent=question_intent,
+    )
     inherited_scope = False
     if not selected_tools and _is_referential_follow_up(question, question_intent):
         selected_tools = _tools_from_immediately_relevant_history(recent_messages, question)
@@ -312,6 +317,7 @@ def build_assessment_conversation_context(
         "schema_version": CONTEXT_SCHEMA_VERSION,
         "current_question": str(question or "").strip(),
         "question_intent": question_intent,
+        "compound_requirements": compound_requirements,
         "uncertainty_subtype": uncertainty_subtype,
         "priority_rules": [
             "current_user_question",
@@ -528,6 +534,34 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
     if any(term in normalized for term in ("explain that", "what does that mean", "what do you mean")):
         return "explanation"
     return "current_assessment_evidence"
+
+
+def _detect_compound_requirements(
+    question: str,
+    *,
+    selected_tools: list[str],
+    primary_intent: str,
+) -> dict:
+    normalized = _normalize_intent_text(question)
+    needs_next_step = (
+        primary_intent in {"next_step_recommendation", "prioritization"}
+        or any(term in normalized for term in RECOMMENDATION_QUESTION_TERMS)
+        or bool(re.search(r"\b(?:what|which)\b.{0,40}\bnext\b", normalized))
+        or bool(re.search(r"\binvestigat\w*.{0,20}\bnext\b", normalized))
+    )
+    tool_summary_terms = re.search(
+        r"\bwhat\s+did\b.{0,80}\b(?:add|find|observe|report|establish|tell|show)\b|"
+        r"\bwhat\s+.+\s+added\s+to\b",
+        normalized,
+    )
+    status_summary = bool(re.search(r"\bwhat\s+(?:failed|timed out|was interrupted|didn'?t complete)\b", normalized))
+    requirements = {
+        "needs_next_step": needs_next_step,
+        "tool_evidence_summary": list(selected_tools) if selected_tools and tool_summary_terms else [],
+        "status_summary": status_summary,
+        "limitations": bool(re.search(r"\b(?:limitations?|what does(?:n'?t| not) (?:this|that|it) prove|what don'?t we know)\b", normalized)),
+    }
+    return {key: value for key, value in requirements.items() if value}
 
 
 def _normalize_intent_text(question: str) -> str:

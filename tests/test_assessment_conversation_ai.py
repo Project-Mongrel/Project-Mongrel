@@ -538,6 +538,82 @@ def test_two_port_nmap_web_summary_only_does_not_force_httpx_recommendation() ->
     assert "httpx because" not in answer
 
 
+def test_mixed_httpx_summary_and_next_step_recommends_katana_after_evidence_summary() -> None:
+    assessment = create_assessment("Mixed httpx and next", user_id=1001)
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=1001)
+    _add_realistic_httpx_scan(assessment["id"], user_id=1001)
+
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        question="What did httpx add to our understanding, and what should we investigate next?",
+    )
+    assert context["compound_requirements"]["tool_evidence_summary"] == ["httpx"]
+    assert context["compound_requirements"]["needs_next_step"] is True
+    assert context["recommendation_context"]["preferred_next_tools"] == ["katana"]
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What did httpx add to our understanding, and what should we investigate next?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "httpx added HTTP(S) response-level evidence" in answer
+    assert "status 301" in answer or "status 200" in answer
+    assert "redirect" in answer
+    assert "Squarespace" in answer
+    assert "HSTS metadata" in answer
+    assert "TLS metadata" in answer
+    assert "I would use Mongrel's Katana next" in answer
+    assert "URLs, paths, forms, and linked resources" in answer
+    assert "would not by itself prove a vulnerability" in answer
+    assert "httpx next" not in answer
+    assert "Prowler" not in answer
+    assert "does not run the tool" in answer
+
+
+def test_mixed_nmap_summary_and_next_step_still_recommends_httpx() -> None:
+    assessment = create_assessment("Mixed nmap and next", user_id=1001)
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=1001)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What did Nmap find and what should we do next?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "Nmap added stored port/service observations" in answer
+    assert "80/tcp (http)" in answer and "443/tcp (https)" in answer
+    assert "httpx next" in answer
+    assert "not evidence of a vulnerability" in answer
+
+
+def test_mixed_failed_status_and_next_step_reports_state_before_recommendation() -> None:
+    assessment = create_assessment("Mixed failure and next", user_id=1001)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    record_assessment_scan(assessment["id"], "testssl", "failed")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What failed and what should we retry next?",
+        )["answer"]
+
+    model.assert_not_called()
+    assert "testssl=FAILED" in answer
+    assert "execution state" in answer
+    assert "clean result" in answer
+    assert "does not identify another automatically required tool" in answer
+
+
 def test_summary_only_does_not_force_next_step_when_evidence_exists() -> None:
     assessment = create_assessment("Summary only", user_id=1001)
     _add_live_web_nmap_scan(assessment["id"], user_id=1001)
@@ -1984,6 +2060,39 @@ def _add_two_port_web_nmap_scan(assessment_id: int, *, user_id: int) -> dict:
         },
     )
     return record_assessment_scan(assessment_id, tool="nmap", status="completed", finding_id=finding["id"])
+
+
+def _add_realistic_httpx_scan(assessment_id: int, *, user_id: int) -> dict:
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "httpx",
+            "target": "https://example.com",
+            "status": "completed",
+            "httpx_services": [
+                {
+                    "url": "http://example.com",
+                    "status_code": 301,
+                    "redirect_location": "https://www.example.com/",
+                    "title": "",
+                    "technologies": ["Squarespace"],
+                },
+                {
+                    "url": "https://www.example.com/",
+                    "status_code": 200,
+                    "title": "Example Joinery",
+                    "technologies": ["Squarespace", "Squarespace Commerce"],
+                    "hsts": {"present": True, "max_age": 31536000},
+                    "tls": {
+                        "subject": "www.example.com",
+                        "issuer": "Example CA",
+                        "not_after": "2027-01-01T00:00:00Z",
+                    },
+                },
+            ],
+        },
+    )
+    return record_assessment_scan(assessment_id, tool="httpx", status="completed", finding_id=finding["id"])
 
 
 def test_referential_confidence_followup_inherits_nuclei_scope_and_stays_bounded() -> None:
