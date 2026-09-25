@@ -1,4 +1,6 @@
 import re
+from collections import Counter
+from urllib.parse import urlsplit
 
 from app.services.ai_client import ask_ai
 
@@ -113,6 +115,9 @@ def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
             "- Missing security headers are contextual configuration observations, not automatically confirmed vulnerabilities or universally required by browsers.",
             "- A deprecated X-XSS-Protection header does not prove or directly enable XSS.",
             "- GraphQL alias batching or similar template findings must preserve the scanner's actual meaning and must not automatically become exploitable vulnerability claims.",
+            "- Nuclei tags are scanner template metadata only. A tag such as 'vuln' does not establish vulnerability, exploitability, impact, or compromise.",
+            "- Use the supplied Template counts exactly; do not recalculate repeated template totals from the total finding count.",
+            "- Keep host and explicit matched-at values separate. Do not present external matched-at URLs as target assets unless the host field also identifies them as target assets.",
             "- Separate observed facts from potential risks and recommendations.",
             *clean_scan_rules,
             "- If the scan is partial or timed out, state that the assessment did not complete.",
@@ -126,12 +131,9 @@ def build_nuclei_ai_assessment_prompt(finding: dict) -> str:
             "",
             "Required sections:",
             "Executive Summary",
-            "Observed Findings",
             "Observed Facts",
             "Observed Assets",
-            "Interpretation",
             "Potential Risks",
-            "Limitations",
             "Confidence",
             "Recommended Next Actions",
             "",
@@ -180,6 +182,11 @@ def _format_nuclei_evidence(finding: dict) -> str:
             lines.append("- Retained findings: findings were collected before timeout, but detail records were not supplied to this AI prompt.")
         return "\n".join(lines)
 
+    template_counts = _template_counts(nuclei_findings)
+    lines.append("- Template counts:")
+    for template_id, count in sorted(template_counts.items()):
+        lines.append(f"  - {_clean(template_id)}={int(count)}")
+
     lines.append("- Matched findings/templates:")
     for item in nuclei_findings[:20]:
         lines.append(_format_finding(item))
@@ -205,11 +212,19 @@ def _format_finding(finding: dict) -> str:
     template_id = _clean(finding.get("template_id") or "unknown-template")
     severity = _clean(finding.get("severity") or "unknown")
     name = _clean(finding.get("name") or "unnamed finding")
-    matched_at = _clean(finding.get("matched_at") or finding.get("host") or "unknown URL")
-    line = f"  - {template_id} severity={severity} name={name} matched={matched_at}"
+    host = _clean(finding.get("host") or "unknown host")
+    matched_at = _clean(finding.get("matched_at") or "")
+    matched_source = _clean(finding.get("matched_surface_source") or "")
+    matcher = _clean(finding.get("matcher_name") or "")
+    line = f"  - {template_id} severity={severity} name={name} host={host}"
+    if matched_at:
+        provenance = f" source={matched_source}" if matched_source else ""
+        line = f"{line} matched-at={matched_at}{provenance}"
+    if matcher:
+        line = f"{line} matcher={matcher}"
     tags = finding.get("tags") or []
     if tags:
-        line = f"{line} tags={', '.join(_clean(tag) for tag in tags[:8])}"
+        line = f"{line} template_tags_metadata_only={', '.join(_clean(tag) for tag in tags[:8])}"
     references = finding.get("references") or []
     if references:
         line = f"{line} references={', '.join(_clean(reference) for reference in references[:5])}"
@@ -219,10 +234,9 @@ def _format_finding(finding: dict) -> str:
 def _observed_assets(nuclei_findings: list[dict]) -> list[str]:
     assets = []
     for finding in nuclei_findings:
-        for key in ("host", "matched_at"):
-            value = _clean(finding.get(key) or "")
-            if value and value.lower() not in {asset.lower() for asset in assets}:
-                assets.append(value)
+        value = _clean(finding.get("host") or "")
+        if value and value.lower() not in {asset.lower() for asset in assets}:
+            assets.append(value)
     return assets
 
 
@@ -287,8 +301,8 @@ def _contradicts_partial_findings(line: str) -> bool:
 
 
 def _guard_truthfulness_response(finding: dict, lines: list[str]) -> list[str]:
-    if _contains_unsupported_nuclei_claim(finding, lines):
-        return list(TRUTHFULNESS_FALLBACK_LINES)
+    if _contains_unsupported_nuclei_claim(finding, lines) or _is_incomplete_nuclei_response(lines):
+        return _deterministic_nuclei_fallback(finding)
     return lines
 
 
@@ -296,16 +310,137 @@ def _contains_unsupported_nuclei_claim(finding: dict, lines: list[str]) -> bool:
     sentences = _claim_sentences(lines)
     all_info = _all_recorded_severities_are_info(finding)
     profile_supplied = bool((finding.get("metadata") or {}).get("scan_profile") or (finding.get("metadata") or {}).get("profile"))
+    template_counts = _template_counts(finding.get("nuclei_findings") or [])
+    external_matched_hosts = _external_matched_at_hosts(finding.get("nuclei_findings") or [])
     for sentence in sentences:
         if _is_evidence_scoped_statement(sentence):
             continue
         if all_info and re.search(r"\blow\s+and\s+info(?:rmational)?\b|\blow\s+and\s+informational\b", sentence):
+            return True
+        if all_info and re.search(r"\b(?:vulnerabilities|vulnerability|exploitable|exploitability|exploited)\b", sentence):
+            return True
+        if _contradicts_template_counts(sentence, template_counts):
+            return True
+        if _claims_external_matched_at_as_asset(sentence, external_matched_hosts):
             return True
         if not profile_supplied and re.search(r"\bfast\s+(?:scan|profile)\b", sentence):
             return True
         if any(pattern.search(sentence) for pattern in UNSUPPORTED_NUCLEI_CLAIM_PATTERNS):
             return True
     return False
+
+
+def _template_counts(nuclei_findings: list[dict]) -> Counter:
+    return Counter(
+        str(item.get("template_id") or item.get("name") or "unknown-template").strip() or "unknown-template"
+        for item in nuclei_findings
+        if isinstance(item, dict)
+    )
+
+
+def _contradicts_template_counts(sentence: str, template_counts: Counter) -> bool:
+    if not template_counts:
+        return False
+    lowered = str(sentence or "").lower()
+    for template_id, count in template_counts.items():
+        terms = {
+            str(template_id).lower(),
+            str(template_id).lower().replace("-", " "),
+        }
+        if template_id == "http-missing-security-headers":
+            terms.update({"missing security headers", "http missing security headers"})
+        if not any(term and term in lowered for term in terms):
+            continue
+        numbers = {int(value) for value in re.findall(r"\b\d+\b", lowered)}
+        if numbers and any(number != int(count) for number in numbers):
+            return True
+    return False
+
+
+def _is_incomplete_nuclei_response(lines: list[str]) -> bool:
+    nonempty = [str(line or "").strip() for line in lines if str(line or "").strip()]
+    if not nonempty:
+        return True
+    headings = {"Executive Summary", "Observed Facts", "Observed Assets", "Potential Risks", "Confidence", "Recommended Next Actions"}
+    present = {line.rstrip(":") for line in nonempty if line.rstrip(":") in headings}
+    if present and nonempty[-1].rstrip(":") in headings:
+        return True
+    return bool(present) and "Executive Summary" in present and "Confidence" not in present and "Recommended Next Actions" not in present
+
+
+def _external_matched_at_hosts(nuclei_findings: list[dict]) -> set[str]:
+    hosts: set[str] = set()
+    for item in nuclei_findings:
+        if not isinstance(item, dict):
+            continue
+        host = str(item.get("host") or "").lower().strip()
+        matched = str(item.get("matched_at") or "").strip()
+        try:
+            netloc = urlsplit(matched).hostname or ""
+        except ValueError:
+            netloc = ""
+        netloc = netloc.lower().strip()
+        if netloc and host and netloc != host:
+            hosts.add(netloc)
+    return hosts
+
+
+def _claims_external_matched_at_as_asset(sentence: str, external_hosts: set[str]) -> bool:
+    lowered = str(sentence or "").lower()
+    if not any(host in lowered for host in external_hosts):
+        return False
+    return bool(re.search(r"\b(?:target|observed|assessment)\s+assets?\b|\bassets?\s+(?:observed|include|includes|were)\b", lowered))
+
+
+def _deterministic_nuclei_fallback(finding: dict) -> list[str]:
+    nuclei_findings = [item for item in (finding.get("nuclei_findings") or []) if isinstance(item, dict)]
+    finding_count = int(finding.get("finding_count") or len(nuclei_findings) or 0)
+    severity_summary = finding.get("severity_summary") if isinstance(finding.get("severity_summary"), dict) else {}
+    template_counts = _template_counts(nuclei_findings)
+    severities = sorted(
+        {
+            str(item.get("severity") or "info").upper()
+            for item in nuclei_findings
+            if str(item.get("severity") or "").strip()
+        }
+    )
+    if not severities and severity_summary:
+        severities = [str(key).upper() for key, value in sorted(severity_summary.items()) if int(value or 0) > 0]
+    assets = _observed_assets(nuclei_findings)
+    metadata = finding.get("metadata") or {}
+    is_partial = metadata.get("partial") is True or metadata.get("timed_out") is True
+    matched_examples = []
+    for item in nuclei_findings[:6]:
+        matched = _clean(item.get("matched_at") or "")
+        source = _clean(item.get("matched_surface_source") or "")
+        template = _clean(item.get("template_id") or item.get("name") or "template")
+        if matched:
+            matched_examples.append(f"{template}: matched-at {matched}" + (f" ({source})" if source else ""))
+    counts_text = ", ".join(f"{_clean(template)}={int(count)}" for template, count in sorted(template_counts.items())) or "none"
+    return [
+        "Executive Summary",
+        f"- Nuclei stored {finding_count} scanner-reported template match(es). Template counts: {counts_text}.",
+        *([f"- {finding_count} {'observation' if finding_count == 1 else 'observations'} were collected before termination."] if is_partial else []),
+        *(["- Scan completion: partial/incomplete; additional selected templates may not have executed before termination."] if is_partial else []),
+        "",
+        "Observed Facts",
+        "- Scanner severities preserved exactly: " + (", ".join(severities) if severities else "none recorded") + ".",
+        "- Tags such as 'vuln' are scanner template metadata only; they do not establish vulnerability, exploitability, impact, or compromise.",
+        *( [ "- Explicit match provenance: " + "; ".join(matched_examples) + "." ] if matched_examples else [] ),
+        "",
+        "Observed Assets",
+        "- Host/target values observed in stored evidence: " + (", ".join(assets[:10]) if assets else "none normalized") + ".",
+        "- External matched-at URLs are match provenance, not automatically target assets.",
+        "",
+        "Potential Risks",
+        "- Missing security headers and exposure/detection templates are contextual scanner observations requiring review; INFO severity is not upgraded.",
+        "",
+        "Confidence",
+        "Medium for reporting stored Nuclei template counts and severities; lower for business impact or exploitability because those are not established by template matches alone.",
+        "",
+        "Recommended Next Actions",
+        "- Review the deterministic Nuclei result by template and matcher, validate any relevant configuration observations manually, and preserve scanner severity when prioritizing follow-up.",
+    ]
 
 
 def _claim_sentences(lines: list[str]) -> list[str]:

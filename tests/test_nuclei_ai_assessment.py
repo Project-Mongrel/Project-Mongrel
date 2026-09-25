@@ -50,8 +50,9 @@ def test_nuclei_ai_prompt_includes_matched_findings_and_templates() -> None:
 
     assert "git-config-exposure" in prompt
     assert "Exposed Git Repository" in prompt
-    assert "https://example.com/.git/config" in prompt
-    assert "tags=git, exposure" in prompt
+    assert "host=https://example.com" in prompt
+    assert "matched-at=https://example.com/.git/config" in prompt
+    assert "template_tags_metadata_only=git, exposure" in prompt
 
 
 def test_nuclei_ai_prompt_includes_evidence_only_constraints() -> None:
@@ -66,8 +67,162 @@ def test_nuclei_ai_prompt_includes_evidence_only_constraints() -> None:
     assert "Do not invent scan-profile labels unless execution metadata explicitly supplies them." in prompt
     assert "A deprecated X-XSS-Protection header does not prove or directly enable XSS." in prompt
     assert "GraphQL alias batching" in prompt
-    assert "Interpretation" in prompt
-    assert "Limitations" in prompt
+    assert "Nuclei tags are scanner template metadata only" in prompt
+    assert "Observed Facts" in prompt
+    assert "Potential Risks" in prompt
+
+
+def _live_nuclei_finding() -> dict:
+    missing_header_names = [
+        "referrer-policy",
+        "cross-origin-opener-policy",
+        "permissions-policy",
+        "x-permitted-cross-domain-policies",
+        "cross-origin-embedder-policy",
+        "cross-origin-resource-policy",
+        "strict-transport-security",
+        "content-security-policy",
+        "x-frame-options",
+        "x-content-type-options",
+    ]
+    findings = [
+        {
+            "template_id": "azure-domain-tenant",
+            "name": "Microsoft Azure Domain Tenant ID - Detect",
+            "severity": "info",
+            "host": "btjoinery.ie",
+            "matched_at": "https://login.microsoftonline.com:443/btjoinery.ie/v2.0/.well-known/openid-configuration",
+            "matched_surface_source": "matched-at",
+            "template_type": "http",
+            "tags": ["azure", "microsoft", "cloud", "exposure", "vuln"],
+            "references": ["https://azure.microsoft.com"],
+        },
+        {
+            "template_id": "waf-detect",
+            "name": "WAF Detection",
+            "severity": "info",
+            "host": "btjoinery.ie",
+            "matched_at": "https://btjoinery.ie",
+            "matched_surface_source": "matched-at",
+            "template_type": "http",
+            "matcher_name": "apachegeneric",
+            "tags": ["waf", "tech", "misc", "discovery"],
+        },
+    ]
+    findings.extend(
+        {
+            "template_id": "http-missing-security-headers",
+            "name": "HTTP Missing Security Headers",
+            "severity": "info",
+            "host": "btjoinery.ie",
+            "matched_at": "https://btjoinery.ie",
+            "matched_surface_source": "matched-at",
+            "template_type": "http",
+            "matcher_name": matcher,
+            "tags": ["misconfig", "headers", "generic", "vuln"],
+        }
+        for matcher in missing_header_names
+    )
+    return {
+        "target": "btjoinery.ie",
+        "risk_level": "info",
+        "finding_count": 12,
+        "severity_summary": {"critical": 0, "high": 0, "info": 12, "low": 0, "medium": 0},
+        "metadata": {"scan_profile": "fast", "elapsed": "284s"},
+        "nuclei_findings": findings,
+    }
+
+
+def test_nuclei_live_shape_prompt_groups_template_counts_and_labels_matched_at_provenance() -> None:
+    prompt = build_nuclei_ai_assessment_prompt(_live_nuclei_finding())
+
+    assert "Finding count: 12" in prompt
+    assert "azure-domain-tenant=1" in prompt
+    assert "waf-detect=1" in prompt
+    assert "http-missing-security-headers=10" in prompt
+    assert "host=btjoinery.ie matched-at=https://login.microsoftonline.com:443/btjoinery.ie" in prompt
+    assert "source=matched-at" in prompt
+    assert "template_tags_metadata_only=azure, microsoft, cloud, exposure, vuln" in prompt
+    assert "template_tags_metadata_only=misconfig, headers, generic, vuln" in prompt
+    assert "A tag such as 'vuln' does not establish vulnerability" in prompt
+
+
+def test_nuclei_live_shape_count_contradiction_falls_back_to_deterministic_summary() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "- Nuclei found 12 repeated HTTP Missing Security Headers findings.",
+            "Observed Facts",
+            "- All severities were INFO.",
+            "Observed Assets",
+            "- btjoinery.ie",
+        ]
+    )
+
+    with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
+        lines = generate_nuclei_ai_assessment(_live_nuclei_finding())
+
+    text = "\n".join(lines)
+    assert "azure-domain-tenant=1" in text
+    assert "waf-detect=1" in text
+    assert "http-missing-security-headers=10" in text
+    assert "Nuclei found 12 repeated" not in text
+    assert "External matched-at URLs are match provenance, not automatically target assets." in text
+    assert "Tags such as 'vuln' are scanner template metadata only" in text
+
+
+def test_nuclei_live_shape_external_matched_at_is_not_rendered_as_observed_asset() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "- Twelve informational template matches were observed.",
+            "Observed Facts",
+            "- Template counts were preserved.",
+            "Observed Assets",
+            "- https://login.microsoftonline.com was observed as a target asset.",
+            "Confidence",
+            "Medium",
+            "Recommended Next Actions",
+            "- Review findings.",
+        ]
+    )
+
+    with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
+        lines = generate_nuclei_ai_assessment(_live_nuclei_finding())
+
+    text = "\n".join(lines)
+    assert "External matched-at URLs are match provenance, not automatically target assets." in text
+    assert "was observed as a target asset" not in text
+
+
+def test_nuclei_live_shape_vuln_tag_cannot_become_vulnerability_proof() -> None:
+    response = "Executive Summary\n- The vuln tags confirm vulnerabilities and exploitability."
+
+    with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
+        lines = generate_nuclei_ai_assessment(_live_nuclei_finding())
+
+    text = "\n".join(lines)
+    assert "vuln' are scanner template metadata only" in text
+    assert "confirm vulnerabilities" not in text
+
+
+def test_nuclei_incomplete_response_ending_at_observed_assets_uses_deterministic_fallback() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "- Twelve informational observations were found.",
+            "Observed Facts",
+            "- Template counts are available.",
+            "Observed Assets",
+        ]
+    )
+
+    with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
+        lines = generate_nuclei_ai_assessment(_live_nuclei_finding())
+
+    text = "\n".join(lines)
+    assert "Template counts: azure-domain-tenant=1" in text
+    assert "Recommended Next Actions" in text
 
 
 def test_nuclei_ai_prompt_clean_scan_includes_template_limitation() -> None:
@@ -135,9 +290,9 @@ def test_nuclei_ai_partial_timeout_response_filters_clean_scan_contradiction() -
         lines = generate_nuclei_ai_assessment(finding)
 
     text = "\n".join(lines)
-    assert "configured execution time limit" in text
+    assert "partial/incomplete" in text
     assert "2 observations were collected before termination" in text
-    assert "additional findings should not be interpreted" in text
+    assert "additional selected templates may not have executed" in text
     assert "No matching Nuclei findings were observed" not in text
 
 
@@ -195,7 +350,9 @@ def test_nuclei_info_only_low_and_info_ai_claim_is_withheld() -> None:
     with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
         lines = generate_nuclei_ai_assessment(finding)
 
-    assert lines == TRUTHFULNESS_FALLBACK_LINES
+    text = "\n".join(lines)
+    assert "tech-detect=1" in text
+    assert "low and informational vulnerabilities" not in text
 
 
 def test_nuclei_empty_clean_scan_does_not_allow_security_conclusion() -> None:
@@ -205,7 +362,7 @@ def test_nuclei_empty_clean_scan_does_not_allow_security_conclusion() -> None:
         lines = generate_nuclei_ai_assessment({"target": "https://example.com", "finding_count": 0, "nuclei_findings": []})
 
     text = "\n".join(lines)
-    assert "unsupported security conclusion" in text
+    assert "Nuclei stored 0 scanner-reported template match" in text
     assert "target is secure" not in text.lower()
 
 
@@ -240,7 +397,9 @@ def test_nuclei_alias_batching_confirmed_vulnerability_claim_is_withheld() -> No
     with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
         lines = generate_nuclei_ai_assessment(finding)
 
-    assert lines == TRUTHFULNESS_FALLBACK_LINES
+    text = "\n".join(lines)
+    assert "graphql-alias-batching=1" in text
+    assert "confirmed vulnerability" not in text
 
 
 def test_nuclei_security_header_claims_remain_contextual() -> None:
@@ -266,7 +425,9 @@ def test_nuclei_deprecated_x_xss_protection_does_not_become_xss_evidence() -> No
     with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
         lines = generate_nuclei_ai_assessment(finding)
 
-    assert lines == TRUTHFULNESS_FALLBACK_LINES
+    text = "\n".join(lines)
+    assert "deprecated-x-xss-protection=1" in text
+    assert "directly enables XSS" not in text
 
 
 def test_nuclei_no_invented_scan_profile_without_metadata() -> None:
@@ -280,7 +441,9 @@ def test_nuclei_no_invented_scan_profile_without_metadata() -> None:
     with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
         lines = generate_nuclei_ai_assessment(finding)
 
-    assert lines == TRUTHFULNESS_FALLBACK_LINES
+    text = "\n".join(lines)
+    assert "tech-detect=1" in text
+    assert "fast profile found" not in text
 
 
 def test_nuclei_compromise_conclusion_is_withheld() -> None:
@@ -289,7 +452,9 @@ def test_nuclei_compromise_conclusion_is_withheld() -> None:
     with patch("app.services.nuclei_ai_assessment.ask_ai", return_value=response):
         lines = generate_nuclei_ai_assessment({"target": "https://example.com", "finding_count": 1, "nuclei_findings": [{"template_id": "one", "severity": "info"}]})
 
-    assert lines == TRUTHFULNESS_FALLBACK_LINES
+    text = "\n".join(lines)
+    assert "one=1" in text
+    assert "not indicative of a compromised system" not in text
 
 
 def test_nuclei_legitimate_limitation_wording_is_allowed() -> None:
