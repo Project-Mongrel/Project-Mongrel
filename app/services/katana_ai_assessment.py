@@ -241,6 +241,16 @@ def _contains_unsupported_katana_claim(lines: list[str], finding: dict) -> bool:
     for sentence in _claim_sentences(lines):
         if _is_safe_katana_limitation(sentence):
             continue
+        if _has_katana_count_contradiction(sentence, finding):
+            return True
+        if _has_unsupported_depth_or_configuration_claim(sentence, finding):
+            return True
+        if _has_unsupported_security_absence_claim(sentence):
+            return True
+        if _has_unsupported_complexity_claim(sentence):
+            return True
+        if _has_absence_to_security_inference(sentence):
+            return True
         if any(pattern.search(sentence) for pattern in ALWAYS_UNSUPPORTED_KATANA_CLAIM_PATTERNS):
             return True
         if _contradicts_katana_summary(sentence, finding):
@@ -250,6 +260,77 @@ def _contains_unsupported_katana_claim(lines: list[str], finding: dict) -> bool:
         if any(pattern.search(sentence) for pattern in UNSUPPORTED_KATANA_CLAIM_PATTERNS):
             return True
     return False
+
+
+def _has_katana_count_contradiction(sentence: str, finding: dict) -> bool:
+    summary = finding.get("katana_summary") if isinstance(finding.get("katana_summary"), dict) else {}
+    observations = finding.get("katana_observations") if isinstance(finding.get("katana_observations"), list) else []
+    observed_count = _as_int(finding.get("finding_count"))
+    if observed_count is None:
+        observed_count = _as_int(summary.get("url_count")) or len(observations)
+    host_count = _as_int(summary.get("host_count"))
+    if host_count is None:
+        host_count = len({
+            str(observation.get("host") or "").strip().lower()
+            for observation in observations
+            if isinstance(observation, dict) and str(observation.get("host") or "").strip()
+        })
+    if observed_count and re.search(r"\b(?:no|zero|absence\s+of)\s+(?:observed\s+)?(?:urls?|endpoints?)\b", sentence):
+        return True
+    if observed_count and re.search(r"\bno\s+observed\s+endpoints?\b", sentence):
+        return True
+    if host_count and re.search(r"\b(?:no|zero|absence\s+of)\s+(?:observed\s+)?(?:unique\s+)?hosts?\b", sentence):
+        return True
+    if host_count and re.search(r"\bno\s+unique\s+hosts?\b", sentence):
+        return True
+    return False
+
+
+def _has_unsupported_depth_or_configuration_claim(sentence: str, finding: dict) -> bool:
+    metadata = finding.get("metadata") if isinstance(finding.get("metadata"), dict) else {}
+    configured_depth = metadata.get("crawl_depth")
+    has_configured_depth = configured_depth not in (None, "", [], {})
+    mentions_configured_depth = re.search(r"\bconfigured\s+(?:crawl\s+)?depth\b|\bdepth\s+limit\b", sentence)
+    if mentions_configured_depth and not has_configured_depth and not re.search(r"\b(?:not\s+supplied|not\s+provided|unknown|unavailable)\b", sentence):
+        return True
+    if mentions_configured_depth and re.search(r"\b(?:indicat(?:e|es|ing)|mean(?:s|ing)?|shows?|proves?|because|due\s+to|within|consistent\s+with)\b", sentence):
+        return True
+    if re.search(r"\b(?:did\s+not|does\s+not|could\s+not|cannot)\s+reach\s+(?:any\s+)?deeper\s+(?:urls?|pages?|endpoints?)\b[^.!?]{0,120}\b(?:configured\s+(?:crawl\s+)?depth|depth\s+limit)\b", sentence):
+        return True
+    return False
+
+
+def _has_unsupported_security_absence_claim(sentence: str) -> bool:
+    if re.search(r"\b(?:no|zero)\s+(?:confirmed\s+)?(?:risks?|security\s+issues?|vulnerabilities|sensitive\s+(?:data\s+)?exposure)\b", sentence):
+        return True
+    if re.search(r"\b(?:there\s+are|there\s+is|shows?|indicates?|suggests?)\s+no\s+(?:confirmed\s+)?(?:risks?|security\s+issues?|vulnerabilities|sensitive\s+(?:data\s+)?exposure)\b", sentence):
+        return True
+    if re.search(r"\b(?:absence|lack)\s+of\s+evidence\b[^.!?]{0,160}\b(?:no\s+(?:confirmed\s+)?(?:risks?|security\s+issues?|vulnerabilities)|safe|secure|not\s+vulnerable|no\s+sensitive\s+(?:data\s+)?exposure)\b", sentence):
+        return True
+    if re.search(r"\bno\s+indications?\s+of\b[^.!?]{0,120}\b(?:vulnerabilities|sensitive\s+(?:data\s+)?exposure|security\s+issues?|risks?)\b", sentence):
+        return True
+    return False
+
+
+def _has_unsupported_complexity_claim(sentence: str) -> bool:
+    if re.search(r"\b(?:simple|basic|straightforward)\s+(?:structure|site|application|app|functionality|core\s+functionality)\b", sentence):
+        return True
+    if re.search(r"\b(?:structure|site|application|app|functionality|core\s+functionality)\b[^.!?]{0,80}\b(?:simple|basic|straightforward)\b", sentence):
+        return True
+    if re.search(r"\b(?:single\s+url|one\s+url|absence\s+of|no\s+forms?|no\s+parameters?|no\s+javascript|no\s+unique\s+hosts?)\b[^.!?]{0,160}\b(?:suggests?|supports?|indicates?)\b[^.!?]{0,80}\b(?:simple|basic|straightforward)\b", sentence):
+        return True
+    return False
+
+
+def _has_absence_to_security_inference(sentence: str) -> bool:
+    absence_terms = r"(?:absence\s+of|no|zero|not\s+observed)"
+    artifact_terms = r"(?:forms?|parameters?|javascript(?:\s+files?)?|scripts?|hosts?|unique\s+hosts?|complex\s+interactions?)"
+    security_terms = r"(?:vulnerabilities|vulnerability|sensitive\s+(?:data\s+)?exposure|risks?|security\s+issues?|exploitability|attack\s+surface)"
+    inference_terms = r"(?:indicat(?:e|es|ing)|suggest(?:s|ing)?|support(?:s|ing)?|implies?|means?|could\s+indicate)"
+    return bool(
+        re.search(rf"\b{absence_terms}\b[^.!?]{{0,120}}\b{artifact_terms}\b[^.!?]{{0,160}}\b{inference_terms}\b[^.!?]{{0,120}}\b{security_terms}\b", sentence)
+        or re.search(rf"\b{artifact_terms}\b[^.!?]{{0,120}}\b{inference_terms}\b[^.!?]{{0,120}}\b{security_terms}\b", sentence)
+    )
 
 
 def _is_safe_katana_limitation(sentence: str) -> bool:

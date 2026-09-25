@@ -99,6 +99,12 @@ def _single_url_katana_finding() -> dict:
     }
 
 
+def _single_url_katana_finding_with_configured_depth() -> dict:
+    finding = _single_url_katana_finding()
+    finding["metadata"] = {"crawl_depth": "3"}
+    return finding
+
+
 @pytest.mark.parametrize(
     "unsupported_line",
     [
@@ -117,6 +123,10 @@ def _single_url_katana_finding() -> dict:
         "No pages beyond the initial one were crawled due to the maximum depth limit.",
         "The site appears to have a basic structure with no apparent exploitation points.",
         "There is an absence of any suspicious elements such as forms, parameters, or JavaScript files.",
+        "The crawl revealed a single URL with no observed endpoints, forms, parameters, JavaScript files, or unique hosts.",
+        "Given these observations and the absence of evidence for vulnerabilities or sensitive data exposure, there are no confirmed risks at this time.",
+        "There are no indications of complex interactions such as forms, parameters, or JavaScript files that could indicate vulnerabilities or sensitive data exposure.",
+        "The absence of unique hosts and JavaScript files further supports the notion that the site's core functionality is straightforward.",
     ],
 )
 def test_katana_unsupported_generated_conclusions_are_withheld(unsupported_line: str) -> None:
@@ -130,6 +140,33 @@ def test_katana_unsupported_generated_conclusions_are_withheld(unsupported_line:
     assert unsupported_line not in rendered
     assert "Katana stored 1 URL/endpoint crawl observation(s) across 1 observed host(s)" in rendered
     assert "does not establish configured crawl depth or complete crawl coverage" in rendered
+
+
+def test_katana_exact_live_generated_assessment_is_rejected_with_grounded_fallback() -> None:
+    response = "\n".join([
+        "Executive Summary",
+        "- The crawl revealed a single URL with no observed endpoints, forms, parameters, JavaScript files, or unique hosts.",
+        "- The max observed crawl depth was 0, indicating that Katana did not reach any deeper URLs within the configured depth limit (3).",
+        "- Given these observations and the absence of evidence for vulnerabilities or sensitive data exposure, there are no confirmed risks at this time.",
+        "- The max observed crawl depth was 0, which is consistent with the configured depth limit of 3.",
+        "- The single URL observed during this crawl suggests a relatively simple structure.",
+        "- There are no indications of complex interactions such as forms, parameters, or JavaScript files that could indicate vulnerabilities or sensitive data exposure.",
+        "- The absence of unique hosts and JavaScript files further supports the notion that the site's core functionality is straightforward.",
+    ])
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding_with_configured_depth())
+
+    rendered = "\n".join(lines)
+    assert lines != response.splitlines()
+    assert "no observed endpoints" not in rendered
+    assert "no unique hosts" not in rendered
+    assert "configured depth limit" not in rendered
+    assert "no confirmed risks" not in rendered
+    assert "simple structure" not in rendered
+    assert "straightforward" not in rendered
+    assert "Katana stored 1 URL/endpoint crawl observation(s) across 1 observed host(s)" in rendered
+    assert "Maximum observed crawl depth: 0" in rendered
 
 
 @pytest.mark.parametrize(
@@ -149,6 +186,9 @@ def test_katana_unsupported_generated_conclusions_are_withheld(unsupported_line:
         "The crawl does not prove complete coverage.",
         "Zero observations do not establish absence.",
         "Katana crawl evidence does not establish vulnerability or exploitability.",
+        "Katana did not establish a vulnerability.",
+        "This crawl does not prove vulnerability or sensitive exposure.",
+        "No vulnerability is confirmed by this crawl alone.",
     ],
 )
 def test_katana_evidence_scoped_limitations_are_allowed(legitimate_line: str) -> None:
@@ -158,6 +198,106 @@ def test_katana_evidence_scoped_limitations_are_allowed(legitimate_line: str) ->
         lines = generate_katana_ai_assessment(_single_url_katana_finding())
 
     assert lines == response.splitlines()
+
+
+@pytest.mark.parametrize(
+    "unsupported_line",
+    [
+        "No endpoints were observed.",
+        "There was an absence of endpoints.",
+        "No URLs were observed.",
+        "No unique hosts were observed.",
+        "There was an absence of unique hosts.",
+        "No hosts were observed.",
+    ],
+)
+def test_katana_count_contradictions_use_normalized_counts(unsupported_line: str) -> None:
+    response = f"Executive Summary\n- {unsupported_line}"
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding())
+
+    rendered = "\n".join(lines)
+    assert lines != response.splitlines()
+    assert unsupported_line not in rendered
+    assert "Katana stored 1 URL/endpoint crawl observation(s) across 1 observed host(s)" in rendered
+
+
+@pytest.mark.parametrize(
+    "unsupported_line",
+    [
+        "The max observed crawl depth was 0, indicating that Katana did not reach deeper URLs within the configured depth limit (3).",
+        "The max observed crawl depth was 0, which is consistent with the configured depth limit of 3.",
+        "Depth 0 means Katana stopped because of the configured depth limit.",
+    ],
+)
+def test_katana_depth_limit_causation_is_rejected_even_when_configured_depth_is_stored(unsupported_line: str) -> None:
+    response = f"Executive Summary\n- {unsupported_line}"
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding_with_configured_depth())
+
+    rendered = "\n".join(lines)
+    assert lines != response.splitlines()
+    assert unsupported_line not in rendered
+    assert "Maximum observed crawl depth: 0" in rendered
+
+
+@pytest.mark.parametrize(
+    "unsupported_line",
+    [
+        "There are no confirmed risks at this time.",
+        "There are no security issues.",
+        "There are no indications of vulnerabilities.",
+        "The absence of evidence for vulnerabilities means there are no confirmed risks.",
+        "No sensitive data exposure was observed.",
+    ],
+)
+def test_katana_security_absence_conclusions_are_rejected(unsupported_line: str) -> None:
+    response = f"Executive Summary\n- {unsupported_line}"
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding())
+
+    assert lines != response.splitlines()
+    assert unsupported_line not in "\n".join(lines)
+
+
+@pytest.mark.parametrize(
+    "unsupported_line",
+    [
+        "The single URL suggests a relatively simple structure.",
+        "The site has straightforward functionality.",
+        "The absence of unique hosts supports the notion that the core functionality is straightforward.",
+        "Sparse crawl artifacts indicate a basic application.",
+    ],
+)
+def test_katana_complexity_inferences_are_rejected(unsupported_line: str) -> None:
+    response = f"Executive Summary\n- {unsupported_line}"
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding())
+
+    assert lines != response.splitlines()
+    assert unsupported_line not in "\n".join(lines)
+
+
+@pytest.mark.parametrize(
+    "unsupported_line",
+    [
+        "No forms, parameters, or JavaScript files indicates fewer vulnerabilities.",
+        "There are no indications of complex interactions such as forms, parameters, or JavaScript files that could indicate vulnerabilities.",
+        "The absence of forms and parameters suggests no sensitive data exposure.",
+    ],
+)
+def test_katana_absence_to_security_inferences_are_rejected(unsupported_line: str) -> None:
+    response = f"Executive Summary\n- {unsupported_line}"
+
+    with patch("app.services.katana_ai_assessment.ask_ai", return_value=response):
+        lines = generate_katana_ai_assessment(_single_url_katana_finding())
+
+    assert lines != response.splitlines()
+    assert unsupported_line not in "\n".join(lines)
 
 
 @pytest.mark.parametrize(
