@@ -1947,7 +1947,37 @@ def _summary_requested_next_step_answer(context: dict) -> str | None:
         return (
             "A sensible next step is Mongrel's ffuf because bounded path-discovery observations are not yet stored for the web surface."
         )
+    remaining_web_security = _remaining_web_security_recommendation(preferred, summary_style=True)
+    if remaining_web_security:
+        return remaining_web_security
     return None
+
+
+def _remaining_web_security_recommendation(preferred: list[str], *, summary_style: bool = False) -> str | None:
+    normalized = [str(tool).lower().removesuffix(".sh") for tool in preferred]
+    eligible = [tool for tool in ("nuclei", "testssl", "bbot") if tool in normalized]
+    if not eligible:
+        return None
+    descriptions = {
+        "nuclei": (
+            "Nuclei for approved template-based checks against the established web surface; matches preserve scanner "
+            "severity and do not automatically prove exploitability"
+        ),
+        "testssl": (
+            "testssl.sh for TLS protocol, cipher, certificate, and scanner finding observations on HTTPS/TLS endpoints; "
+            "those observations do not prove overall TLS safety or exploitability"
+        ),
+        "bbot": (
+            "BBOT for bounded broader reconnaissance and discovery observations if that is in scope; discoveries do not "
+            "prove ownership, breach, reachability, or vulnerability"
+        ),
+    }
+    prefix = "Suitable remaining investigation options are " if summary_style else "At this point, suitable remaining Mongrel investigations are "
+    return (
+        prefix
+        + "; ".join(descriptions[tool] for tool in eligible)
+        + ". Choose among these based on the specific evidence gap you want to close; this answer is advice only and does not run a tool."
+    )
 
 
 def _build_evidence_confidence_answer(context: dict) -> str | None:
@@ -2644,6 +2674,9 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
                 "web surface. Its path, status, and size observations could close that gap, but would not automatically "
                 "prove sensitive exposure or a vulnerability. This answer runs nothing."
             )
+        remaining_web_security = _remaining_web_security_recommendation(preferred)
+        if remaining_web_security:
+            return remaining_web_security
         incomplete = [
             f"{tool}={state}" for tool, state in states.items()
             if state in {"RUNNING", "FAILED", "PARTIAL", "TIMED_OUT", "CANCELLED", "INTERRUPTED", "SKIPPED"}

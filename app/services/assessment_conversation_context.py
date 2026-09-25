@@ -871,6 +871,7 @@ def _build_recommendation_context(
     traffic_intent = any(term in normalized_question for term in TRAFFIC_QUESTION_TERMS)
     web_intent = any(term in normalized_question for term in WEB_QUESTION_TERMS)
     novice_intent = any(term in normalized_question for term in NOVICE_QUESTION_TERMS)
+    recon_intent = any(term in normalized_question for term in ("recon", "reconnaissance", "asset", "assets", "subdomain", "subdomains", "broader"))
     secret_intent = any(term in normalized_question for term in ("secret", "secrets", "credential", "credentials", "repository", "repo"))
     cloud_intent = any(term in normalized_question for term in ("cloud", "aws", "azure", "gcp", "account", "prowler"))
     preferred_next_tools = []
@@ -936,6 +937,25 @@ def _build_recommendation_context(
                 "The assessment has web characterization and crawl coverage but no stored bounded path-discovery "
                 "coverage; ffuf can add path/status/size observations."
             )
+        else:
+            if "nuclei" not in completed_tools:
+                preferred_next_tools.append("nuclei")
+                rationale.append(
+                    "The assessment has a confirmed web surface and core web discovery coverage, but no stored Nuclei "
+                    "template-check coverage; Nuclei can add scanner-severity template match observations."
+                )
+            if tls_services_observed and "testssl" not in completed_tools:
+                preferred_next_tools.append("testssl")
+                rationale.append(
+                    "The assessment has HTTPS/TLS-associated surface evidence, but no stored testssl.sh TLS configuration "
+                    "coverage; testssl.sh can add protocol, cipher, certificate, and scanner finding observations."
+                )
+            if "bbot" not in completed_tools and (recon_intent or target_context["external_website_context_present"]):
+                preferred_next_tools.append("bbot")
+                rationale.append(
+                    "The assessment has a public web target and no stored BBOT reconnaissance coverage; BBOT can add "
+                    "bounded discovery observations if broader reconnaissance is in scope."
+                )
     elif target_context["repository_context_present"] and secret_intent and "gitleaks" not in completed_tools:
         preferred_next_tools.append("gitleaks")
         rationale.append("Repository/filesystem context is present; Gitleaks can add redacted secret-pattern evidence without proving credential validity.")
@@ -958,7 +978,7 @@ def _build_recommendation_context(
         "tool_states": tool_states,
         "completed_tools": completed_tools,
         "relevant_unperformed_tools": [
-            tool for tool in ("bbot", "katana", "playwright", "ffuf") if tool_states.get(tool) != "COMPLETED"
+            tool for tool in ("bbot", "nuclei", "katana", "playwright", "ffuf", "testssl") if tool_states.get(tool) != "COMPLETED"
         ] if web_services_observed else (
             [tool for tool in ("nmap", "httpx") if tool_states.get(tool) != "COMPLETED"]
             if empty_assessment and target_context["external_website_context_present"] else []

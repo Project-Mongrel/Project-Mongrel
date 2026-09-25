@@ -2138,6 +2138,86 @@ def test_named_ffuf_preserves_newest_partial_run_evidence() -> None:
     assert "Custom" not in answer and "19 wordlist entries" not in answer
 
 
+def test_mixed_ffuf_summary_keeps_remaining_web_security_tools_eligible() -> None:
+    user_id = 1103
+    assessment = create_assessment("Completed web discovery next", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=user_id)
+    _add_realistic_httpx_scan(assessment["id"], user_id=user_id)
+    katana = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "katana",
+            "target": "https://example.com",
+            "katana_observations": [{"url": "https://example.com/", "depth": 0}],
+        },
+    )
+    record_assessment_scan(assessment["id"], "katana", "completed", finding_id=katana["id"])
+    playwright = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "playwright",
+            "target": "https://example.com",
+            "playwright_observation": {
+                "final_url": "https://example.com/",
+                "status_code": 200,
+                "load_status": "loaded",
+                "forms_count": 0,
+                "inputs_count": 1,
+                "links_count": 5,
+                "network_events_count": 12,
+            },
+        },
+    )
+    record_assessment_scan(assessment["id"], "playwright", "completed", finding_id=playwright["id"])
+    ffuf = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "ffuf",
+            "target": "https://example.com/FUZZ",
+            "status": "completed",
+            "ffuf_results": [{"url": "https://example.com/admin", "status_code": 403, "content_length": 1234}],
+            "ffuf_summary": {"result_count": 1, "status_codes": {"403": 1}},
+            "metadata": {"ffuf_profile_label": "Standard", "wordlist_count": 30000, "timeout_seconds": 120},
+        },
+    )
+    record_assessment_scan(assessment["id"], "ffuf", "completed", finding_id=ffuf["id"])
+
+    question = "What did ffuf add to our understanding, and what should we investigate next?"
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        question=question,
+    )
+
+    assert context["compound_requirements"]["tool_evidence_summary"] == ["ffuf"]
+    assert context["compound_requirements"]["needs_next_step"] is True
+    assert context["recommendation_context"]["preferred_next_tools"] == ["nuclei", "testssl", "bbot"]
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        answer = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question=question,
+        )["answer"]
+
+    model.assert_not_called()
+    assert "ffuf is recorded as completed" in answer
+    assert "Standard" in answer and "30000" in answer and "403=1" in answer
+    assert "does not establish that hidden content is absent" in answer
+    assert "Nuclei for approved template-based checks" in answer
+    assert "testssl.sh for TLS protocol" in answer
+    assert "BBOT for bounded broader reconnaissance" in answer
+    assert "does not run a tool" in answer
+    assert "Prowler" not in answer
+    assert "Gitleaks" not in answer
+    assert "Metasploit" not in answer
+    assert "TShark" not in answer
+    assert " is vulnerable" not in answer.lower()
+    assert "found a vulnerability" not in answer.lower()
+
+
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:
     finding = add_finding(
         user_id=user_id,
