@@ -1,6 +1,7 @@
 import asyncio
 import ipaddress
 import logging
+import queue
 import re
 import secrets
 import threading
@@ -2110,9 +2111,32 @@ async def _run_cancellable_scanner(
     )
     runner_kwargs = dict(kwargs or {})
     runner_kwargs["cancellation_event"] = cancellation_event
-    worker_task = asyncio.create_task(asyncio.to_thread(runner, *args, **runner_kwargs))
+    worker_results: queue.SimpleQueue[tuple[dict | None, BaseException | None]] = queue.SimpleQueue()
+
+    def run_worker() -> None:
+        try:
+            result = runner(*args, **runner_kwargs)
+        except BaseException as error:
+            worker_results.put((None, error))
+        else:
+            worker_results.put((result, None))
+
+    threading.Thread(
+        target=run_worker,
+        name=f"mongrel-{scan_type}-scanner",
+        daemon=True,
+    ).start()
+
+    async def wait_for_worker() -> dict:
+        while worker_results.empty():
+            await asyncio.sleep(0.02)
+        result, error = worker_results.get()
+        if error is not None:
+            raise error
+        return result
+
     try:
-        result = await asyncio.shield(worker_task)
+        result = await wait_for_worker()
         mark_active_scan_process_complete(user_id, active_scan)
         terminal_status = scan_status_from_result(result)
         mark_active_scan_terminal(user_id, active_scan, terminal_status)
@@ -2120,7 +2144,7 @@ async def _run_cancellable_scanner(
     except asyncio.CancelledError:
         cancellation_event.set()
         try:
-            await asyncio.shield(worker_task)
+            await wait_for_worker()
         except BaseException:
             logger.warning("Scanner worker failed while task cancellation cleanup was in progress.", exc_info=True)
         finally:
@@ -2128,8 +2152,7 @@ async def _run_cancellable_scanner(
             mark_active_scan_terminal(user_id, active_scan, "cancelled")
         raise
     except BaseException:
-        if worker_task.done():
-            mark_active_scan_process_complete(user_id, active_scan)
+        mark_active_scan_process_complete(user_id, active_scan)
         mark_active_scan_terminal(user_id, active_scan, "failed")
         raise
     finally:

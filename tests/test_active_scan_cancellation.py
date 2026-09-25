@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,6 +10,14 @@ from app.bot.handlers.ask import cancel_handler
 from app.bot.handlers.scan import _run_cancellable_scanner
 from app.services.active_scan_state import cancel_active_scan, clear_active_scan, get_active_scan
 from app.services.scan_manager import complete_scan_request, create_scan_request, get_scan_request
+
+
+def test_native_cancellable_scanner_avoids_default_executor_and_to_thread() -> None:
+    source = inspect.getsource(_run_cancellable_scanner)
+    assert "to_thread" not in source
+    assert "run_in_executor" not in source
+    assert "daemon=True" in source
+    assert "SimpleQueue" in source
 
 
 @pytest.mark.parametrize("scan_type", ["bbot", "testssl", "metasploit", "ffuf"])
