@@ -51,6 +51,15 @@ EVIDENCE_SCOPED_MARKERS = (
     "coverage was limited",
     "visibility was limited",
 )
+ALWAYS_UNSUPPORTED_KATANA_CLAIM_PATTERNS = (
+    re.compile(r"\b(?:max(?:imum)?\s+)?(?:observed\s+)?crawl\s+depth\b[^.!?]{0,120}\b(?:fully\s+crawled|fully\s+explored|complete(?:d)?\s+(?:crawl|coverage)|all\s+pages)\b"),
+    re.compile(r"\b(?:configured\s+)?(?:crawl\s+)?depth(?:\s+limit)?\b[^.!?]{0,120}\b(?:caused|limited|prevented|due\s+to|because\s+of)\b"),
+    re.compile(r"\b(?:no|zero)\s+pages?\s+beyond\b[^.!?]{0,120}\b(?:due\s+to|because\s+of|caused\s+by)\b"),
+    re.compile(r"\b(?:site|application|app)\b[^.!?]{0,80}\b(?:basic|simple)\s+structure\b"),
+    re.compile(r"\b(?:no|without)\s+(?:apparent\s+)?(?:exploitation\s+points?|attack\s+surface|security\s+risks?|vulnerabilities)\b"),
+    re.compile(r"\b(?:forms?|parameters?|scripts?|javascript(?:\s+files?)?)\b[^.!?]{0,120}\b(?:suspicious|malicious)\b"),
+    re.compile(r"\bsuspicious\s+elements?\b[^.!?]{0,120}\b(?:forms?|parameters?|scripts?|javascript)\b"),
+)
 UNSUPPORTED_KATANA_CLAIM_PATTERNS = (
     re.compile(r"\b(?:target|site|system|application|app|host|endpoint|url|path|route)\b[^.!?]{0,80}\b(?:is|are|was|were|appears|seems|looks)\s+(?:to\s+be\s+)?(?:safe|secure|insecure|vulnerable|exploitable|compromised)\b"),
     re.compile(r"\b(?:parameter|param|query\s+parameter)\b[^.!?]{0,80}\b(?:is|are|was|were|appears|seems|looks)\s+(?:to\s+be\s+)?(?:injectable|vulnerable|exploitable)\b"),
@@ -61,6 +70,9 @@ UNSUPPORTED_KATANA_CLAIM_PATTERNS = (
     re.compile(r"\b(?:found|discovered|identified)\s+(?:all|every)\s+(?:application\s+)?(?:routes?|endpoints?|paths?|urls?)\b"),
     re.compile(r"\b(?:crawl|crawler)\b[^.!?]{0,80}\b(?:complete|full\s+coverage|covered\s+all|found\s+all)\b"),
     re.compile(r"\b(?:site|application|app)\b[^.!?]{0,80}\b(?:has|contains)\s+no\s+(?:hidden\s+)?(?:endpoints?|routes?|paths?|forms?|parameters?|scripts?)\b"),
+    re.compile(r"\b(?:site|application|app)\b[^.!?]{0,80}\b(?:has|contains)\s+(?:a\s+)?(?:single|one|only\s+one)\s+(?:url|endpoint|page|host)\b"),
+    re.compile(r"\b(?:single|one|only\s+one)\s+observed\s+(?:url|endpoint|page)\b[^.!?]{0,80}\b(?:and|with)\s+no\s+unique\s+hosts?\b"),
+    re.compile(r"\bno\s+unique\s+hosts?\b"),
     re.compile(r"\b(?:no\s+hidden\s+endpoints?|undiscovered\s+content\s+does\s+not\s+exist)\b"),
     re.compile(r"\b(?:endpoint|url|path|route)\b[^.!?]{0,80}\bpublicly\s+accessible\s+at\s+all\s+times\b"),
 )
@@ -78,7 +90,7 @@ def generate_katana_ai_assessment(finding: dict) -> list[str]:
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
     lines = lines or list(FALLBACK_LINES)
-    return _guard_truthfulness_response(lines)
+    return _guard_truthfulness_response(lines, finding)
 
 
 def build_katana_ai_assessment_prompt(finding: dict) -> str:
@@ -96,6 +108,10 @@ def build_katana_ai_assessment_prompt(finding: dict) -> str:
             "- Do not infer that a form is exploitable from its presence in crawl output.",
             "- Do not infer sensitive exposure, ownership, public availability at all times, or complete application coverage.",
             "- If forms, endpoints, parameters, scripts, or paths are absent from the crawl, say they were not observed during this crawl; do not say they do not exist.",
+            "- Treat max_depth as maximum observed crawl depth only. It does not prove configured crawl depth, complete crawling, or why no deeper URLs were observed.",
+            "- If configured crawl depth is not supplied, do not infer a depth limit or say the depth limit caused the observed result.",
+            "- Do not describe forms, parameters, or JavaScript files as suspicious merely because they were present or absent.",
+            "- If only one URL was observed, say only one URL was observed and coverage is limited; do not characterize the site's overall structure.",
             "- Do not claim compromise.",
             "- Do not recommend exploitation.",
             "- Do not claim the target is safe, secure, insecure, or vulnerable from crawl evidence alone.",
@@ -171,18 +187,45 @@ def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").strip()[:500]
 
 
-def _guard_truthfulness_response(lines: list[str]) -> list[str]:
-    if _contains_unsupported_katana_claim(lines):
+def _guard_truthfulness_response(lines: list[str], finding: dict) -> list[str]:
+    if _contains_unsupported_katana_claim(lines, finding):
         return list(TRUTHFULNESS_FALLBACK_LINES)
     return lines
 
 
-def _contains_unsupported_katana_claim(lines: list[str]) -> bool:
+def _contains_unsupported_katana_claim(lines: list[str], finding: dict) -> bool:
     for sentence in _claim_sentences(lines):
+        if any(pattern.search(sentence) for pattern in ALWAYS_UNSUPPORTED_KATANA_CLAIM_PATTERNS):
+            return True
+        if _contradicts_katana_summary(sentence, finding):
+            return True
         if _is_evidence_scoped_statement(sentence):
             continue
         if any(pattern.search(sentence) for pattern in UNSUPPORTED_KATANA_CLAIM_PATTERNS):
             return True
+    return False
+
+
+def _contradicts_katana_summary(sentence: str, finding: dict) -> bool:
+    summary = finding.get("katana_summary") if isinstance(finding.get("katana_summary"), dict) else {}
+    observations = finding.get("katana_observations") if isinstance(finding.get("katana_observations"), list) else []
+    host_count = _as_int(summary.get("host_count"))
+    if host_count is None:
+        observed_hosts = {
+            str(observation.get("host") or "").strip().lower()
+            for observation in observations
+            if isinstance(observation, dict) and str(observation.get("host") or "").strip()
+        }
+        host_count = len(observed_hosts) if observed_hosts else None
+    if host_count and re.search(r"\b(?:no|zero)\s+unique\s+hosts?\b", sentence):
+        return True
+    configured_depth = ((finding.get("metadata") or {}).get("crawl_depth") if isinstance(finding.get("metadata"), dict) else None)
+    if (
+        configured_depth in (None, "", [], {})
+        and re.search(r"\bconfigured\s+(?:crawl\s+)?depth\b|\bdepth\s+limit\b", sentence)
+        and not re.search(r"\b(?:not\s+supplied|not\s+provided|unknown|unavailable)\b", sentence)
+    ):
+        return True
     return False
 
 
@@ -197,6 +240,13 @@ def _claim_sentences(lines: list[str]) -> list[str]:
 
 def _is_evidence_scoped_statement(sentence: str) -> bool:
     return any(marker in sentence for marker in EVIDENCE_SCOPED_MARKERS)
+
+
+def _as_int(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_unavailable_response(response: object) -> bool:
