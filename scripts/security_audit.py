@@ -21,8 +21,9 @@ STATUS_SKIPPED = "SKIPPED"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYTEST_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp"
 PYTEST_AUDIT_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp_audit"
-PYTEST_BASETEMP = str(PYTEST_AUDIT_TEMP_ROOT / f"run-{os.getpid()}-{time.time_ns()}-{uuid4().hex[:8]}")
+PYTEST_AUDIT_STALE_PREFIX = ".pytest_tmp_security_audit_"
 PYTEST_TEMP_ROOT_ENV = "MONGREL_PYTEST_TEMP_ROOT"
+DETECT_SECRETS_EXCLUDE_FILES = r"(^|/)(?:\.pytest_tmp(?:/|$)|\.pytest_tmp_audit(?:/|$)|\.pytest_cache(?:/|$)|\.pytest_tmp_security_audit_[^/]*(?:/|$))"
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,7 @@ class AuditResult:
 DEFAULT_CHECKS = [
     AuditCheck(
         name="Tests",
-        command=[sys.executable, "-m", "pytest", "--basetemp", PYTEST_BASETEMP],
+        command=[sys.executable, "-m", "pytest"],
         module_name="pytest",
         install_hint="Install with: python -m pip install pytest",
         timeout_seconds=180,
@@ -69,7 +70,7 @@ DEFAULT_CHECKS = [
     ),
     AuditCheck(
         name="detect-secrets",
-        command=["detect-secrets", "scan"],
+        command=["detect-secrets", "scan", "--exclude-files", DETECT_SECRETS_EXCLUDE_FILES],
         executable_name="detect-secrets",
         install_hint="Install with: python -m pip install detect-secrets",
         timeout_seconds=120,
@@ -98,6 +99,74 @@ def is_tool_installed(check: AuditCheck) -> bool:
 def prepare_check(check: AuditCheck) -> None:
     if check.name == "Tests":
         PYTEST_AUDIT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+        cleanup_stale_security_audit_pytest_roots()
+
+
+def build_pytest_audit_basetemp() -> Path:
+    return PYTEST_AUDIT_TEMP_ROOT / f"run-{os.getpid()}-{time.time_ns()}-{uuid4().hex[:8]}"
+
+
+def command_for_check(check: AuditCheck, basetemp: Path | None = None) -> list[str]:
+    if check.name != "Tests":
+        return list(check.command)
+    selected_basetemp = basetemp or build_pytest_audit_basetemp()
+    return [*check.command, "--basetemp", str(selected_basetemp)]
+
+
+def cleanup_audit_temp_path(path: Path) -> bool:
+    if not _is_safe_audit_temp_path(path):
+        return False
+    shutil.rmtree(path, ignore_errors=True)
+    return True
+
+
+def cleanup_stale_security_audit_pytest_roots() -> list[Path]:
+    removed: list[Path] = []
+    try:
+        children = list(PROJECT_ROOT.iterdir())
+    except OSError:
+        return removed
+    for child in children:
+        if not _is_safe_stale_security_audit_root(child):
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed.append(child)
+    return removed
+
+
+def _is_safe_audit_temp_path(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        root = PROJECT_ROOT.resolve()
+        audit_root = PYTEST_AUDIT_TEMP_ROOT.resolve()
+    except OSError:
+        return False
+    if not resolved.is_dir():
+        return False
+    if resolved.parent != audit_root:
+        return False
+    if not resolved.name.startswith("run-"):
+        return False
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_safe_stale_security_audit_root(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        root = PROJECT_ROOT.resolve()
+    except OSError:
+        return False
+    if resolved.parent != root:
+        return False
+    if path.name != resolved.name:
+        return False
+    if not path.name.startswith(PYTEST_AUDIT_STALE_PREFIX):
+        return False
+    return resolved.is_dir()
 
 
 def run_check(
@@ -109,13 +178,15 @@ def run_check(
         return AuditResult(check=check, status=STATUS_SKIPPED, error=check.install_hint)
 
     prepare_check(check)
+    pytest_basetemp = build_pytest_audit_basetemp() if check.name == "Tests" else None
+    command = command_for_check(check, pytest_basetemp)
 
     try:
         env = os.environ.copy()
-        if check.name == "Tests":
-            env[PYTEST_TEMP_ROOT_ENV] = str(PYTEST_AUDIT_TEMP_ROOT)
+        if check.name == "Tests" and pytest_basetemp is not None:
+            env[PYTEST_TEMP_ROOT_ENV] = str(pytest_basetemp / "nested-pytest")
         completed = runner(
-            check.command,
+            command,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -145,6 +216,9 @@ def run_check(
             error=f"Unable to decode subprocess output: {exc}",
             returncode=None,
         )
+    finally:
+        if pytest_basetemp is not None:
+            cleanup_audit_temp_path(pytest_basetemp)
 
     status = STATUS_PASS if completed.returncode == 0 else STATUS_FAIL
     return AuditResult(

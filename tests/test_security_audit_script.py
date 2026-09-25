@@ -1,6 +1,8 @@
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from scripts import security_audit
 
 
@@ -98,12 +100,19 @@ def test_subprocess_uses_list_args_and_shell_false() -> None:
 def test_pytest_command_uses_project_local_basetemp() -> None:
     tests_check = next(check for check in security_audit.DEFAULT_CHECKS if check.name == "Tests")
 
-    assert "--basetemp" in tests_check.command
-    assert security_audit.PYTEST_BASETEMP in tests_check.command
-    basetemp = Path(security_audit.PYTEST_BASETEMP)
+    assert tests_check.command == [security_audit.sys.executable, "-m", "pytest"]
+    assert "--basetemp" not in tests_check.command
+    basetemp = security_audit.build_pytest_audit_basetemp()
     assert basetemp.parent == security_audit.PYTEST_AUDIT_TEMP_ROOT
     assert basetemp.name.startswith("run-")
     assert tests_check.timeout_seconds == 180
+
+
+def test_import_time_default_checks_do_not_create_audit_run_directory() -> None:
+    tests_check = next(check for check in security_audit.DEFAULT_CHECKS if check.name == "Tests")
+
+    assert not any(part.startswith("run-") for part in tests_check.command)
+    assert "--basetemp" not in tests_check.command
 
 
 def test_pytest_check_uses_audit_temp_root_environment() -> None:
@@ -116,7 +125,166 @@ def test_pytest_check_uses_audit_temp_root_environment() -> None:
     tests_check = next(check for check in security_audit.DEFAULT_CHECKS if check.name == "Tests")
     security_audit.run_check(tests_check, installed=lambda check: True, runner=runner)
 
-    assert calls[0][1]["env"][security_audit.PYTEST_TEMP_ROOT_ENV] == str(security_audit.PYTEST_AUDIT_TEMP_ROOT)
+    command = calls[0][0][0]
+    assert command[:3] == [security_audit.sys.executable, "-m", "pytest"]
+    assert "--basetemp" in command
+    basetemp = Path(command[command.index("--basetemp") + 1])
+    assert basetemp.parent == security_audit.PYTEST_AUDIT_TEMP_ROOT
+    assert basetemp.name.startswith("run-")
+    assert calls[0][1]["env"][security_audit.PYTEST_TEMP_ROOT_ENV] == str(basetemp / "nested-pytest")
+
+
+def test_pytest_audit_temp_is_cleaned_after_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_root = tmp_path / ".pytest_tmp_audit"
+    basetemp = audit_root / "run-success"
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+    monkeypatch.setattr(security_audit, "build_pytest_audit_basetemp", lambda: basetemp)
+
+    def runner(*args, **kwargs):
+        basetemp.mkdir(parents=True)
+        (basetemp / "mongrel.db").write_text("generated", encoding="utf-8")
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    result = security_audit.run_check(_check("Tests"), installed=lambda check: True, runner=runner)
+
+    assert result.status == security_audit.STATUS_PASS
+    assert not basetemp.exists()
+
+
+def test_pytest_audit_temp_is_cleaned_after_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_root = tmp_path / ".pytest_tmp_audit"
+    basetemp = audit_root / "run-failure"
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+    monkeypatch.setattr(security_audit, "build_pytest_audit_basetemp", lambda: basetemp)
+
+    def runner(*args, **kwargs):
+        basetemp.mkdir(parents=True)
+        (basetemp / "mongrel.db").write_text("generated", encoding="utf-8")
+        return subprocess.CompletedProcess(args=args[0], returncode=1, stdout="", stderr="failed")
+
+    result = security_audit.run_check(_check("Tests"), installed=lambda check: True, runner=runner)
+
+    assert result.status == security_audit.STATUS_FAIL
+    assert not basetemp.exists()
+
+
+def test_pytest_audit_temp_is_cleaned_after_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_root = tmp_path / ".pytest_tmp_audit"
+    basetemp = audit_root / "run-timeout"
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+    monkeypatch.setattr(security_audit, "build_pytest_audit_basetemp", lambda: basetemp)
+
+    def runner(*args, **kwargs):
+        basetemp.mkdir(parents=True)
+        (basetemp / "mongrel.db").write_text("generated", encoding="utf-8")
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=10)
+
+    result = security_audit.run_check(_check("Tests"), installed=lambda check: True, runner=runner)
+
+    assert result.status == security_audit.STATUS_FAIL
+    assert not basetemp.exists()
+
+
+def test_repeated_pytest_audit_runs_do_not_accumulate_run_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_root = tmp_path / ".pytest_tmp_audit"
+    basetemps = [audit_root / "run-first", audit_root / "run-second"]
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+    monkeypatch.setattr(security_audit, "build_pytest_audit_basetemp", lambda: basetemps.pop(0))
+
+    def runner(*args, **kwargs):
+        basetemp = Path(args[0][args[0].index("--basetemp") + 1])
+        basetemp.mkdir(parents=True)
+        (basetemp / "mongrel.db").write_text("generated", encoding="utf-8")
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    check = _check("Tests")
+    first = security_audit.run_check(check, installed=lambda check: True, runner=runner)
+    second = security_audit.run_check(check, installed=lambda check: True, runner=runner)
+
+    assert first.status == second.status == security_audit.STATUS_PASS
+    assert list(audit_root.glob("run-*")) == []
+
+
+def test_nested_pytest_temp_root_is_scoped_under_current_audit_basetemp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_root = tmp_path / ".pytest_tmp_audit"
+    basetemp = audit_root / "run-current"
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+    monkeypatch.setattr(security_audit, "build_pytest_audit_basetemp", lambda: basetemp)
+
+    def runner(*args, **kwargs):
+        basetemp.mkdir(parents=True)
+        nested_root = Path(kwargs["env"][security_audit.PYTEST_TEMP_ROOT_ENV])
+        nested_run = nested_root / "run-nested"
+        nested_run.mkdir(parents=True)
+        (nested_run / "mongrel.db").write_text("nested generated", encoding="utf-8")
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    result = security_audit.run_check(_check("Tests"), installed=lambda check: True, runner=runner)
+
+    assert result.status == security_audit.STATUS_PASS
+    assert not basetemp.exists()
+    assert list(audit_root.glob("run-*")) == []
+
+
+def test_pytest_audit_cleanup_does_not_remove_other_active_run_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_root = tmp_path / ".pytest_tmp_audit"
+    basetemp = audit_root / "run-current"
+    other_run = audit_root / "run-other-active"
+    other_run.mkdir(parents=True)
+    (other_run / "keep.txt").write_text("other invocation", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+    monkeypatch.setattr(security_audit, "build_pytest_audit_basetemp", lambda: basetemp)
+
+    def runner(*args, **kwargs):
+        basetemp.mkdir(parents=True)
+        (basetemp / "mongrel.db").write_text("generated", encoding="utf-8")
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    result = security_audit.run_check(_check("Tests"), installed=lambda check: True, runner=runner)
+
+    assert result.status == security_audit.STATUS_PASS
+    assert not basetemp.exists()
+    assert other_run.exists()
+    assert (other_run / "keep.txt").exists()
+
+
+def test_audit_temp_cleanup_rejects_paths_outside_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project_root = tmp_path / "project"
+    audit_root = project_root / ".pytest_tmp_audit"
+    outside = tmp_path / "outside" / "run-danger"
+    outside.mkdir(parents=True)
+    (outside / "keep.txt").write_text("do not remove", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+
+    assert security_audit.cleanup_audit_temp_path(outside) is False
+    assert outside.exists()
+
+
+def test_stale_security_audit_temp_cleanup_removes_only_safe_direct_children(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stale = tmp_path / ".pytest_tmp_security_audit_123"
+    stale.mkdir()
+    (stale / "mongrel.db").write_text("generated", encoding="utf-8")
+    unrelated = tmp_path / ".pytest_tmp_security_audit_notes.txt"
+    unrelated.write_text("not a directory", encoding="utf-8")
+    nested_parent = tmp_path / "nested"
+    nested_parent.mkdir()
+    nested = nested_parent / ".pytest_tmp_security_audit_456"
+    nested.mkdir()
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", tmp_path)
+
+    removed = security_audit.cleanup_stale_security_audit_pytest_roots()
+
+    assert removed == [stale]
+    assert not stale.exists()
+    assert unrelated.exists()
+    assert nested.exists()
 
 
 def test_bandit_command_does_not_scan_tests() -> None:
@@ -145,7 +313,25 @@ def test_default_audit_excludes_semgrep_and_includes_detect_secrets() -> None:
 
     assert [result.check.name for result in results] == ["Tests", "Bandit", "pip-audit", "detect-secrets"]
     assert "Semgrep" not in [result.check.name for result in results]
-    assert calls[-1] == ["detect-secrets", "scan"]
+    assert calls[-1] == ["detect-secrets", "scan", "--exclude-files", security_audit.DETECT_SECRETS_EXCLUDE_FILES]
+
+
+def test_detect_secrets_excludes_generated_pytest_artifacts_only() -> None:
+    detect_secrets_check = next(check for check in security_audit.DEFAULT_CHECKS if check.name == "detect-secrets")
+
+    assert detect_secrets_check.command == [
+        "detect-secrets",
+        "scan",
+        "--exclude-files",
+        security_audit.DETECT_SECRETS_EXCLUDE_FILES,
+    ]
+    excludes = security_audit.DETECT_SECRETS_EXCLUDE_FILES
+    assert ".pytest_tmp_security_audit_" in excludes
+    assert ".pytest_tmp" in excludes
+    assert ".pytest_tmp_audit" in excludes
+    assert ".pytest_cache" in excludes
+    assert "app" not in excludes
+    assert "tests" not in excludes
 
 
 def test_full_audit_includes_semgrep() -> None:
