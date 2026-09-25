@@ -37,6 +37,10 @@ def _keys(table):
     return "\n".join(row["canonical_key"] for row in _rows(table))
 
 
+def _evidence_paths():
+    return "\n".join(str(row.get("evidence_path") or "") for row in _rows("assessment_map_evidence_links"))
+
+
 def _replace_finding(finding_id, data):
     with _get_connection():
         _get_connection().execute(
@@ -161,6 +165,55 @@ def test_nuclei_input_only_record_is_not_a_matched_finding_and_valid_sibling_sur
     assert "input-only" not in _keys("assessment_map_entities")
     assert "matched" in _keys("assessment_map_entities")
     assert json.loads(ledger["metadata_json"])["skipped_optional_records"] == {"unsupported_nuclei_match": 2}
+
+
+def test_parser_url_and_host_fallbacks_do_not_map_as_explicit_nuclei_matches() -> None:
+    assessment = create_assessment("Nuclei fallback provenance", user_id=518)
+    records = parse_nuclei_results(
+        "\n".join(
+            [
+                (
+                    '{"template-id":"url-fallback","info":{"name":"URL fallback","severity":"info"},'
+                    '"url":"https://url.example/fallback","host":"https://host.example"}'
+                ),
+                (
+                    '{"template-id":"host-fallback","info":{"name":"Host fallback","severity":"info"},'
+                    '"host":"https://hostonly.example"}'
+                ),
+                (
+                    '{"template-id":"explicit-matched-at","info":{"name":"Explicit matched-at","severity":"info"},'
+                    '"matched-at":"https://matched-at.example/path","host":"https://host.example"}'
+                ),
+                (
+                    '{"template-id":"explicit-matched","info":{"name":"Explicit matched","severity":"info"},'
+                    '"matched":"https://matched.example/path","host":"https://host.example"}'
+                ),
+            ]
+        )
+    )
+
+    assert [record["matched_surface_source"] for record in records] == ["url", "host", "matched-at", "matched"]
+
+    scan = _scan(518, assessment["id"], "nuclei", _nuclei_finding(records))
+    ledger = ingest_assessment_scan(user_id=518, assessment_id=assessment["id"], scan_id=scan["id"])
+    combined_entities = _keys("assessment_map_entities")
+    evidence_paths = _evidence_paths()
+    skipped = json.loads(ledger["metadata_json"])["skipped_optional_records"]
+
+    assert ledger["status"] == "complete"
+    assert skipped == {"unsupported_nuclei_match": 2}
+    assert "explicit-matched-at" in combined_entities
+    assert "explicit-matched" in combined_entities
+    assert "url-fallback" not in combined_entities
+    assert "host-fallback" not in combined_entities
+    assert "url.example" not in combined_entities
+    assert "hostonly.example" not in combined_entities
+    assert "matched-at.example" in combined_entities
+    assert "matched.example" in combined_entities
+    assert "finding.nuclei_findings[2].matched_at" in evidence_paths
+    assert "finding.nuclei_findings[3].matched_at" in evidence_paths
+    assert "finding.nuclei_findings[0].matched_at" not in evidence_paths
+    assert "finding.nuclei_findings[1].matched_at" not in evidence_paths
 
 
 def test_nuclei_reuses_finding_identity_but_keeps_scan_provenance() -> None:
