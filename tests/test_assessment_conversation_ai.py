@@ -2218,6 +2218,91 @@ def test_mixed_ffuf_summary_keeps_remaining_web_security_tools_eligible() -> Non
     assert "found a vulnerability" not in answer.lower()
 
 
+def test_followup_tool_explanation_preserves_state_after_bbot_recommendation() -> None:
+    user_id = 1104
+    assessment = create_assessment("BBOT follow-up state", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=user_id)
+    _add_realistic_httpx_scan(assessment["id"], user_id=user_id)
+    for tool in ("nuclei", "katana", "playwright", "ffuf", "testssl"):
+        finding = add_finding(
+            user_id=user_id,
+            finding={"source": tool, "target": "example.com", "status": "completed"},
+        )
+        record_assessment_scan(assessment["id"], tool, "completed", finding_id=finding["id"])
+
+    first_question = "From the tests done so far, what do you recommend I do next?"
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        first = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question=first_question,
+        )["answer"]
+
+    model.assert_not_called()
+    assert "BBOT for bounded broader reconnaissance" in first
+    assert "Nmap" not in first.split("Suitable remaining investigation options are", 1)[-1]
+    assert "httpx" not in first.split("Suitable remaining investigation options are", 1)[-1]
+
+    conversation = create_conversation(assessment["id"], user_id, "BBOT follow-up")
+    append_message(conversation["id"], user_id, "user", first_question)
+    append_message(conversation["id"], user_id, "assistant", first)
+
+    valid_explanation = "BBOT performs bounded reconnaissance and asset discovery within authorized scope."
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=valid_explanation) as model:
+        accepted = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=conversation["id"],
+            question="and what does bbot do?",
+        )
+
+    model.assert_called_once()
+    assert accepted["answer"] == valid_explanation
+    assert accepted["fallback_reason"] is None
+
+    bad_explanation = (
+        "BBOT performs bounded reconnaissance and asset discovery. "
+        "For the next workflow, start with Nmap followed by httpx."
+    )
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=bad_explanation) as model:
+        second = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=conversation["id"],
+            question="and what does bbot do?",
+        )
+
+    model.assert_called_once()
+    assert second["fallback_reason"] == "grounded_conversation_fallback"
+    second = second["answer"]
+    assert "BBOT is not run in this assessment" in second
+    assert "Reconnaissance and asset discovery" in second
+    assert "does not prove ownership" in second
+    assert "prior recommendation context" in second
+    assert "Nmap already completed" in second
+    assert "httpx already completed" in second
+    assert "This explanation does not run any tool" in second
+    assert "Nmap" not in second.split("Current completed-tool state", 1)[0]
+    assert "httpx" not in second.split("Current completed-tool state", 1)[0]
+
+
+def test_completed_tool_followup_recommendation_phrases_are_rejected_without_rerun_reason() -> None:
+    assessment = create_assessment("Completed tool contradiction", user_id=1105)
+    add_assessment_target(assessment["id"], "example.com")
+    _add_two_port_web_nmap_scan(assessment["id"], user_id=1105)
+    _add_realistic_httpx_scan(assessment["id"], user_id=1105)
+    context = build_assessment_conversation_context(
+        user_id=1105,
+        assessment_id=assessment["id"],
+        question="and what does bbot do?",
+    )
+
+    assert violates_conversation_truthfulness("Use Nmap followed by httpx to begin.", context) is True
+    assert violates_conversation_truthfulness("Because evidence changed, rerun Nmap to confirm the host state.", context) is False
+
+
 def _add_nmap_scan(assessment_id: int, *, user_id: int, port: int, service: str) -> dict:
     finding = add_finding(
         user_id=user_id,

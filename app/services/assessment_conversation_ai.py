@@ -2205,6 +2205,83 @@ def _build_individual_tool_state_answer(context: dict) -> str | None:
     return state_sentence + (" " + capability if capability else "")
 
 
+def _build_individual_tool_explanation_answer(context: dict) -> str | None:
+    selected = [str(tool) for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    if not selected:
+        return None
+    tool = selected[0].lower().removesuffix(".sh")
+    recommendation = context.get("recommendation_context") or {}
+    states = {str(name).lower().removesuffix(".sh"): str(state) for name, state in (recommendation.get("tool_states") or {}).items()}
+    names = {name.lower().removesuffix(".sh"): name for name in get_mongrel_tool_names()}
+    display = names.get(tool, tool)
+    state = states.get(tool, "NOT_RUN")
+    capability = str((context.get("mongrel_capabilities") or {}).get(tool) or "")
+    rules = (((context.get("mongrel_self_knowledge") or {}).get("tools") or {}).get(display) or {})
+    if not rules:
+        rules = (((context.get("mongrel_self_knowledge") or {}).get("tools") or {}).get(tool) or {})
+    purpose = str(rules.get("purpose") or capability)
+    evidence = str(rules.get("evidence") or "")
+    limitations = str(rules.get("not_proof") or rules.get("limitations") or "")
+    previous = " ".join(
+        str(message.get("content") or "")
+        for message in ((context.get("conversation") or {}).get("recent_messages") or [])
+        if isinstance(message, dict) and str(message.get("role") or "").lower() == "assistant"
+    ).lower()
+    prior_recommended = tool in previous and any(term in previous for term in ("recommend", "next", "would use", "suitable remaining"))
+    state_phrase = state.replace("_", " ").lower()
+    parts = [
+        f"{display} is {state_phrase} in this assessment.",
+        purpose or capability or f"{display} is one of Mongrel's assessment tools.",
+    ]
+    if evidence:
+        parts.append(f"It can add evidence such as {_sentence_fragment(evidence)}.")
+    if limitations:
+        parts.append(f"It does not prove {_sentence_fragment(limitations)}.")
+    elif capability:
+        parts.append(capability)
+    if prior_recommended and state != "COMPLETED":
+        parts.append(
+            f"That preserves the prior recommendation context: {display} remains uncompleted, so it can fill a current evidence gap if that scope is authorized."
+        )
+    elif state == "COMPLETED":
+        parts.append(
+            f"Because {display} is already completed, I would not recommend it as the next action unless there is a specific evidence-based reason to rerun it."
+        )
+    completed_baseline = [name for name in ("nmap", "httpx") if states.get(name) == "COMPLETED"]
+    if completed_baseline:
+        parts.append(
+            "Current completed-tool state is still authoritative: "
+            + "; ".join(f"{names.get(name, name)} already completed" for name in completed_baseline)
+            + ", so they should not be suggested again as generic next steps without a rerun reason."
+        )
+    parts.append("This explanation does not run any tool.")
+    return " ".join(part for part in parts if part)
+
+
+def _is_simple_named_tool_explanation_question(context: dict) -> bool:
+    question = str(context.get("current_question") or "")
+    normalized = question.lower()
+    if any(term in normalized for term in ("evidence", "prove", "proves", "establish", "established", "findings", "traffic", "network traffic")):
+        return False
+    selected = [str(tool).lower().removesuffix(".sh") for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    if not selected:
+        return False
+    tool = selected[0]
+    display_names = {name.lower().removesuffix(".sh"): name.lower() for name in get_mongrel_tool_names()}
+    display = display_names.get(tool, tool)
+    actual_names = {tool, display}
+    if tool == "testssl":
+        actual_names.update({"testssl.sh", "testssl"})
+    return any(re.search(rf"(?<!\w){re.escape(name)}(?!\w)", normalized) for name in actual_names)
+
+
+def _sentence_fragment(value: str) -> str:
+    text = str(value or "").strip().rstrip(".")
+    if not text:
+        return text
+    return text[:1].lower() + text[1:]
+
+
 def _build_named_tool_evidence_answer(context: dict) -> str | None:
     selected = [str(tool) for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
     if not selected:
@@ -2709,6 +2786,8 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
         follow_up = _build_follow_up_fallback(context)
         if follow_up:
             return follow_up
+    if intent == "individual_tool_explanation" and _is_simple_named_tool_explanation_question(context):
+        return _build_individual_tool_explanation_answer(context)
     if intent == "remaining_coverage_gaps":
         core_web = [
             display
@@ -2970,6 +3049,11 @@ def _contradicts_assessment_tool_state(answer: str, context: dict) -> bool:
         if state == "COMPLETED" and not re.search(r"\b(?:re-?run|run again|repeat|recheck|re-scan)\b", answer):
             completed_as_next = re.search(
                 rf"\b{display}\b\s+(?:(?:is|should be)\s+)?next\b",
+                answer,
+            )
+            completed_as_next = completed_as_next or re.search(
+                rf"\b(?:start\s+with|begin\s+with|followed\s+by|then\s+(?:use|run|try|choose)?|next\s+(?:use|run|try|choose)?)\s+"
+                rf"(?:mongrel(?:'s)?\s+)?(?:the\s+)?{display}\b",
                 answer,
             )
             if context.get("question_intent") in {"next_step_recommendation", "prioritization"}:
