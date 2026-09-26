@@ -254,6 +254,131 @@ def test_pytest_audit_cleanup_does_not_remove_other_active_run_directory(tmp_pat
     assert (other_run / "keep.txt").exists()
 
 
+def test_generated_pytest_cleanup_removes_normal_run_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest_root = tmp_path / ".pytest_tmp"
+    stale_run = pytest_root / "run-stale"
+    stale_run.mkdir(parents=True)
+    (stale_run / "mongrel.db").write_text("generated", encoding="utf-8")
+    unrelated_dir = pytest_root / "not-run"
+    unrelated_dir.mkdir()
+    unrelated_file = pytest_root / "run-file"
+    unrelated_file.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", pytest_root)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", tmp_path / ".pytest_tmp_audit")
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", tmp_path / ".pytest_tmp_runs")
+
+    removed = security_audit.cleanup_generated_pytest_run_roots()
+
+    assert removed == [stale_run]
+    assert not stale_run.exists()
+    assert unrelated_dir.exists()
+    assert unrelated_file.exists()
+
+
+def test_generated_pytest_cleanup_removes_fallback_run_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fallback_root = tmp_path / ".pytest_tmp_runs"
+    stale_run = fallback_root / "run-fallback"
+    stale_run.mkdir(parents=True)
+    (stale_run / "mongrel.db").write_text("generated", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", tmp_path / ".pytest_tmp")
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", tmp_path / ".pytest_tmp_audit")
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", fallback_root)
+
+    removed = security_audit.cleanup_generated_pytest_run_roots()
+
+    assert removed == [stale_run]
+    assert not stale_run.exists()
+
+
+def test_generated_pytest_cleanup_removes_stale_audit_run_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_root = tmp_path / ".pytest_tmp_audit"
+    stale_run = audit_root / "run-stale-audit"
+    stale_run.mkdir(parents=True)
+    (stale_run / "mongrel.db").write_text("generated", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", tmp_path / ".pytest_tmp")
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", tmp_path / ".pytest_tmp_runs")
+
+    removed = security_audit.cleanup_generated_pytest_run_roots()
+
+    assert removed == [stale_run]
+    assert not stale_run.exists()
+
+
+def test_generated_pytest_cleanup_preserves_active_audit_basetemp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_root = tmp_path / ".pytest_tmp_audit"
+    active_run = audit_root / "run-active"
+    stale_run = audit_root / "run-stale"
+    active_run.mkdir(parents=True)
+    stale_run.mkdir()
+    (active_run / "keep.txt").write_text("active", encoding="utf-8")
+    (stale_run / "mongrel.db").write_text("generated", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", tmp_path / ".pytest_tmp")
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", audit_root)
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", tmp_path / ".pytest_tmp_runs")
+
+    removed = security_audit.cleanup_generated_pytest_run_roots(active_basetemp=active_run)
+
+    assert removed == [stale_run]
+    assert active_run.exists()
+    assert (active_run / "keep.txt").exists()
+    assert not stale_run.exists()
+
+
+def test_generated_pytest_cleanup_preserves_live_pid_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest_root = tmp_path / ".pytest_tmp"
+    live_run = pytest_root / f"run-{security_audit.os.getpid()}-live"
+    stale_run = pytest_root / "run-999999999-stale"
+    live_run.mkdir(parents=True)
+    stale_run.mkdir()
+    (live_run / "keep.txt").write_text("active process", encoding="utf-8")
+    (stale_run / "mongrel.db").write_text("generated", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", pytest_root)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", tmp_path / ".pytest_tmp_audit")
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", tmp_path / ".pytest_tmp_runs")
+
+    removed = security_audit.cleanup_generated_pytest_run_roots()
+
+    assert removed == [stale_run]
+    assert live_run.exists()
+    assert (live_run / "keep.txt").exists()
+    assert not stale_run.exists()
+
+
+def test_generated_pytest_cleanup_rejects_symlink_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest_root = tmp_path / ".pytest_tmp"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("do not remove", encoding="utf-8")
+    pytest_root.mkdir()
+    escape = pytest_root / "run-escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", pytest_root)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", tmp_path / ".pytest_tmp_audit")
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", tmp_path / ".pytest_tmp_runs")
+
+    removed = security_audit.cleanup_generated_pytest_run_roots()
+
+    assert removed == []
+    assert escape.exists()
+    assert outside.exists()
+    assert (outside / "keep.txt").exists()
+
+
+def test_detect_secrets_prepare_cleans_pytest_run_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest_root = tmp_path / ".pytest_tmp"
+    stale_run = pytest_root / "run-before-detect-secrets"
+    stale_run.mkdir(parents=True)
+    (stale_run / "mongrel.db").write_text("generated", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", pytest_root)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", tmp_path / ".pytest_tmp_audit")
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", tmp_path / ".pytest_tmp_runs")
+
+    security_audit.prepare_check(_check("detect-secrets"))
+
+    assert not stale_run.exists()
+
+
 def test_audit_temp_cleanup_rejects_paths_outside_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project_root = tmp_path / "project"
     audit_root = project_root / ".pytest_tmp_audit"
@@ -329,6 +454,7 @@ def test_detect_secrets_excludes_generated_pytest_artifacts_only() -> None:
     assert ".pytest_tmp_security_audit_" in excludes
     assert ".pytest_tmp" in excludes
     assert ".pytest_tmp_audit" in excludes
+    assert ".pytest_tmp_runs" in excludes
     assert ".pytest_cache" in excludes
     assert "app" not in excludes
     assert "tests" not in excludes

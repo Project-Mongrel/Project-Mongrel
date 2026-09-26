@@ -21,9 +21,10 @@ STATUS_SKIPPED = "SKIPPED"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYTEST_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp"
 PYTEST_AUDIT_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp_audit"
+PYTEST_FALLBACK_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp_runs"
 PYTEST_AUDIT_STALE_PREFIX = ".pytest_tmp_security_audit_"
 PYTEST_TEMP_ROOT_ENV = "MONGREL_PYTEST_TEMP_ROOT"
-DETECT_SECRETS_EXCLUDE_FILES = r"(^|/)(?:\.pytest_tmp(?:/|$)|\.pytest_tmp_audit(?:/|$)|\.pytest_cache(?:/|$)|\.pytest_tmp_security_audit_[^/]*(?:/|$))"
+DETECT_SECRETS_EXCLUDE_FILES = r"(^|/)(?:\.pytest_tmp(?:/|$)|\.pytest_tmp_audit(?:/|$)|\.pytest_tmp_runs(?:/|$)|\.pytest_cache(?:/|$)|\.pytest_tmp_security_audit_[^/]*(?:/|$))"
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,8 @@ def prepare_check(check: AuditCheck) -> None:
     if check.name == "Tests":
         PYTEST_AUDIT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
         cleanup_stale_security_audit_pytest_roots()
+    elif check.name == "detect-secrets":
+        cleanup_generated_pytest_run_roots()
 
 
 def build_pytest_audit_basetemp() -> Path:
@@ -134,6 +137,35 @@ def cleanup_stale_security_audit_pytest_roots() -> list[Path]:
     return removed
 
 
+def cleanup_generated_pytest_run_roots(active_basetemp: Path | None = None) -> list[Path]:
+    """Remove generated pytest run roots before recursive source audits.
+
+    The cleanup is intentionally limited to direct ``run-*`` children of the
+    known repo-local pytest temp roots.  It skips the current audit basetemp
+    and any run directory whose embedded PID is still alive.
+    """
+    removed: list[Path] = []
+    for root in (PYTEST_TEMP_ROOT, PYTEST_AUDIT_TEMP_ROOT, PYTEST_FALLBACK_TEMP_ROOT):
+        removed.extend(_cleanup_generated_pytest_run_root(root, active_basetemp=active_basetemp))
+    return removed
+
+
+def _cleanup_generated_pytest_run_root(root: Path, active_basetemp: Path | None = None) -> list[Path]:
+    removed: list[Path] = []
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return removed
+    for child in children:
+        if not _is_safe_generated_pytest_run_path(child, root, active_basetemp=active_basetemp):
+            continue
+        if _run_path_pid_is_alive(child):
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed.append(child)
+    return removed
+
+
 def _is_safe_audit_temp_path(path: Path) -> bool:
     try:
         resolved = path.resolve()
@@ -152,6 +184,60 @@ def _is_safe_audit_temp_path(path: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_safe_generated_pytest_run_path(
+    path: Path,
+    expected_root: Path,
+    active_basetemp: Path | None = None,
+) -> bool:
+    try:
+        resolved = path.resolve()
+        resolved_root = expected_root.resolve()
+    except OSError:
+        return False
+    if active_basetemp is not None:
+        try:
+            if resolved == active_basetemp.resolve():
+                return False
+        except OSError:
+            return False
+    if path.is_symlink():
+        return False
+    if not path.is_dir():
+        return False
+    if path.parent.resolve() != resolved_root:
+        return False
+    if resolved.parent != resolved_root:
+        return False
+    if not path.name.startswith("run-"):
+        return False
+    return True
+
+
+def _run_path_pid_is_alive(path: Path) -> bool:
+    pid = _parse_run_path_pid(path.name)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _parse_run_path_pid(name: str) -> int | None:
+    parts = name.split("-", 2)
+    if len(parts) < 3:
+        return None
+    if parts[0] != "run" or not parts[1].isdigit():
+        return None
+    pid = int(parts[1])
+    if pid <= 0:
+        return None
+    return pid
 
 
 def _is_safe_stale_security_audit_root(path: Path) -> bool:
