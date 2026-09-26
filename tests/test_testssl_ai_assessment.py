@@ -4,6 +4,7 @@ import pytest
 
 from app.services.testssl_ai_assessment import (
     FALLBACK_LINES,
+    TESTSSL_AI_NUM_PREDICT,
     build_testssl_ai_assessment_prompt,
     generate_testssl_ai_assessment,
 )
@@ -138,8 +139,11 @@ def test_testssl_ai_prompt_uses_only_stored_tls_evidence() -> None:
 def test_testssl_ai_assessment_success_returns_response_lines() -> None:
     response = "Executive Summary\n- TLS evidence reviewed.\n\nConfidence\nMedium"
 
-    with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response):
+    with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response) as ask_ai:
         assert generate_testssl_ai_assessment({"target": "example.com:443"}) == response.splitlines()
+    ask_ai.assert_called_once()
+    assert ask_ai.call_args.kwargs["num_predict"] == TESTSSL_AI_NUM_PREDICT
+    assert ask_ai.call_args.kwargs["path"] == "testssl_ai_assessment"
 
 
 def test_testssl_ai_assessment_failure_returns_fallback() -> None:
@@ -187,11 +191,16 @@ def test_testssl_prompt_empty_clean_scan_does_not_imply_secure_tls() -> None:
     [
         "TLS configuration appears robust.",
         "The TLS configuration is secure.",
+        "The TLS configuration for btjoinery.ie appears robust.",
+        "This endpoint appears safe.",
+        "The service looks hardened.",
         "All supported ciphers are strong.",
         "The site is vulnerable to BREACH.",
         "BREACH can be exploited against this target.",
         "HIGH early_data means the server is exploitable.",
         "No TLS vulnerabilities were found.",
+        "Secure Renegotiation is supported and not vulnerable.",
+        "DROWN is not vulnerable.",
     ],
 )
 def test_testssl_unsupported_generated_conclusions_are_withheld(unsupported_line: str) -> None:
@@ -288,3 +297,75 @@ def test_testssl_low_warn_observations_cannot_be_promoted_to_exploitability(unsu
     joined = "\n".join(lines)
     assert "unsupported TLS security conclusion" in joined
     assert unsupported_line not in joined
+
+
+def test_testssl_exact_live_escaped_response_is_replaced_by_grounded_fallback() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "- The TLS configuration for btjoinery.ie appears robust based on the scanner output.",
+            "",
+            "Observed Facts",
+            "- TLS 1.2 and TLS 1.3 are supported.",
+            "- Secure Renegotiation is supported and not vulnerable.",
+            "- DROWN is not",
+        ]
+    )
+
+    with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response):
+        lines = generate_testssl_ai_assessment(_live_shaped_testssl_finding())
+
+    joined = "\n".join(lines)
+    assert "unsupported TLS security conclusion" in joined
+    assert "Notable scanner records: 9" in joined
+    assert "secure_renego severity=OK finding=supported" in joined
+    assert "DROWN is not" not in joined
+    assert "appears robust" not in joined
+    assert "supported and not vulnerable" not in joined
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Executive Summary\n- testssl.sh reported secure_renego severity=OK finding=supported.",
+        "Observed Facts\n- Scanner reported DROWN severity=OK finding=not vulnerable on this host and port.",
+        "Observed Facts\n- testssl.sh reported heartbleed severity=OK finding=not vulnerable, no heartbeat extension.",
+    ],
+)
+def test_testssl_scanner_negative_observations_are_allowed_when_attributed(response: str) -> None:
+    with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response):
+        assert generate_testssl_ai_assessment(_live_shaped_testssl_finding()) == response.splitlines()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Observed Facts\n- DROWN is not vulnerable.",
+        "Observed Facts\n- Secure Renegotiation is supported and not vulnerable.",
+        "Observed Facts\n- The endpoint is not vulnerable to Heartbleed.",
+    ],
+)
+def test_testssl_scanner_negative_observations_require_attribution(response: str) -> None:
+    with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response):
+        lines = generate_testssl_ai_assessment(_live_shaped_testssl_finding())
+
+    joined = "\n".join(lines)
+    assert "unsupported TLS security conclusion" in joined
+    assert response.splitlines()[-1] not in joined
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Executive Summary\n- Evidence reviewed.\n\nObserved Facts\n- DROWN is not",
+        "Executive Summary\n- Evidence reviewed.\n\nRecommended Next Actions",
+        "Executive Summary\n- Evidence reviewed.\n\nObserved Facts\n- The scan reported TLS records with",
+    ],
+)
+def test_testssl_incomplete_or_truncated_generated_output_uses_grounded_fallback(response: str) -> None:
+    with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response):
+        lines = generate_testssl_ai_assessment(_live_shaped_testssl_finding())
+
+    joined = "\n".join(lines)
+    assert "unsupported TLS security conclusion" in joined
+    assert "Notable scanner records: 9" in joined

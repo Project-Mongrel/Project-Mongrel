@@ -2,6 +2,8 @@ import re
 
 from app.services.ai_client import ask_ai
 
+TESTSSL_AI_NUM_PREDICT = 512
+
 AI_UNAVAILABLE_MESSAGES = (
     "AI integration is not configured yet.",
     "Unsupported AI provider.",
@@ -54,11 +56,14 @@ EVIDENCE_SCOPED_MARKERS = (
     "finding=",
 )
 UNSUPPORTED_TESTSSL_CLAIM_PATTERNS = (
-    re.compile(r"\b(?:tls|ssl|configuration|endpoint|site|target|server|host|service)\b[^.!?]{0,80}\b(?:is|are|was|were|appears|seems|looks)\s+(?:to\s+be\s+)?(?:secure|safe|robust|hardened|strong|compromised|exploitable)\b"),
+    re.compile(r"\b(?:tls|ssl|configuration|endpoint|site|target|server|host|service)\b[^.!?]{0,120}\b(?:is|are|was|were|appears|seems|looks)\s+(?:to\s+be\s+)?(?:secure|safe|robust|hardened|strong|compromised|exploitable)\b"),
+    re.compile(r"\b(?:appears|seems|looks)\s+(?:secure|safe|robust|hardened|strong)\b"),
     re.compile(r"\ball\s+(?:supported\s+)?ciphers?\b[^.!?]{0,80}\b(?:strong|secure|safe)\b"),
     re.compile(r"\b(?:breach|early[_ -]?data|heartbleed|lucky13|poodle|crime|freak|logjam|drown|sweet32|ticketbleed|ccs)\b[^.!?]{0,100}\b(?:is|are|was|were|can\s+be|has\s+been)?\s*(?:confirmed|exploitable|exploited|vulnerable|compromised)\b"),
     re.compile(r"\b(?:low|warn|warning|medium|high|critical)\b[^.!?]{0,80}\b(?:breach|early[_ -]?data|heartbleed|lucky13|poodle|crime|freak|logjam|drown|sweet32|ticketbleed|ccs)\b[^.!?]{0,100}\b(?:proves?|confirms?|means|shows|demonstrates)\b[^.!?]{0,80}\b(?:exploitable|exploitation|vulnerable|vulnerability|compromise)\b"),
     re.compile(r"\b(?:breach|early[_ -]?data|heartbleed|lucky13|poodle|crime|freak|logjam|drown|sweet32|ticketbleed|ccs)\b[^.!?]{0,100}\b(?:proves?|confirms?|means|shows|demonstrates)\b[^.!?]{0,80}\b(?:exploitable|exploitation|vulnerable|vulnerability|compromise)\b"),
+    re.compile(r"\b(?:secure\s+renegotiation|renegotiation|heartbleed|ccs|ticketbleed|robot|crime|breach|poodle|sweet32|freak|drown|logjam|beast|rc4|lucky13)\b[^.!?]{0,100}\b(?:is|are|was|were)\b[^.!?]{0,60}\b(?:not\s+vulnerable|vulnerable)\b"),
+    re.compile(r"\b(?:not\s+vulnerable|no\s+vulnerability)\b[^.!?]{0,80}\b(?:to|for|from)\s+(?:secure\s+renegotiation|heartbleed|ccs|ticketbleed|robot|crime|breach|poodle|sweet32|freak|drown|logjam|beast|rc4|lucky13)\b"),
     re.compile(r"\b(?:the\s+)?(?:site|target|server|host|endpoint)\b[^.!?]{0,80}\b(?:is|are|was|were)\s+(?:vulnerable|exploitable|compromised)\b"),
     re.compile(r"\bno\s+(?:(?:tls|ssl)\s+)?(?:vulnerabilities|security\s+issues|security\s+risks|weaknesses)\s+(?:exist|were\s+found|were\s+detected|found|detected)\b"),
     re.compile(r"\b(?:no|none)\s+of\s+the\s+(?:(?:tls|ssl)\s+)?(?:configuration|findings?)\b[^.!?]{0,80}\b(?:is|are|was|were)\s+(?:vulnerable|weak|risky)\b"),
@@ -68,7 +73,7 @@ UNSUPPORTED_TESTSSL_CLAIM_PATTERNS = (
 def generate_testssl_ai_assessment(finding: dict) -> list[str]:
     prompt = build_testssl_ai_assessment_prompt(finding)
     try:
-        response = ask_ai(prompt)
+        response = ask_ai(prompt, num_predict=TESTSSL_AI_NUM_PREDICT, path="testssl_ai_assessment")
     except Exception:
         return list(FALLBACK_LINES)
 
@@ -179,7 +184,7 @@ def _clean(value: object) -> str:
 
 
 def _guard_truthfulness_response(lines: list[str], finding: dict | None = None) -> list[str]:
-    if _contains_unsupported_testssl_claim(lines):
+    if _is_incomplete_testssl_response(lines) or _contains_unsupported_testssl_claim(lines):
         return _build_truthfulness_fallback(finding or {})
     return lines
 
@@ -251,6 +256,22 @@ def _claim_sentences(lines: list[str]) -> list[str]:
 
 def _is_evidence_scoped_statement(sentence: str) -> bool:
     return any(marker in sentence for marker in EVIDENCE_SCOPED_MARKERS)
+
+
+def _is_incomplete_testssl_response(lines: list[str]) -> bool:
+    substantive = [str(line or "").strip() for line in lines if str(line or "").strip()]
+    if not substantive:
+        return True
+    last = substantive[-1].lstrip("-•* ").strip()
+    if not last:
+        return True
+    if last in {"Executive Summary", "Observed Facts", "Observed Assets", "Potential Risks", "Confidence", "Recommended Next Actions"}:
+        return True
+    lowered = last.lower()
+    if lowered.endswith((" is", " are", " was", " were", " not", " no", " to", " and", " or", " of", " the", " with", " from", ",")):
+        return True
+    words = re.findall(r"\b[\w'-]+\b", last)
+    return len(words) >= 4 and not re.search(r"[.!?)]$", last)
 
 
 def _is_unavailable_response(response: object) -> bool:
