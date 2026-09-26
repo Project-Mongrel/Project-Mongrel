@@ -22,13 +22,13 @@ TRUTHFULNESS_FALLBACK_LINES = [
     "Executive Summary",
     "- The testssl.sh AI assessment was withheld because the generated response contained an unsupported TLS security conclusion.",
     "",
-    "Observed TLS Facts",
+    "Observed Facts",
     "- Use the deterministic testssl.sh result for scanner-reported protocols, certificate metadata, cipher observations, headers, findings, severities, and wording.",
     "",
-    "Interpretation",
+    "Potential Risks",
     "- testssl.sh evidence is TLS scanner output only; it does not by itself prove exploitability, compromise, robust configuration, or overall endpoint security.",
     "",
-    "Limitations / Uncertainty",
+    "Confidence",
     "- Potential findings require validation in the application and deployment context. Absence of reported findings is not proof that TLS vulnerabilities do not exist.",
     "",
     "Recommended Next Actions",
@@ -57,6 +57,8 @@ UNSUPPORTED_TESTSSL_CLAIM_PATTERNS = (
     re.compile(r"\b(?:tls|ssl|configuration|endpoint|site|target|server|host|service)\b[^.!?]{0,80}\b(?:is|are|was|were|appears|seems|looks)\s+(?:to\s+be\s+)?(?:secure|safe|robust|hardened|strong|compromised|exploitable)\b"),
     re.compile(r"\ball\s+(?:supported\s+)?ciphers?\b[^.!?]{0,80}\b(?:strong|secure|safe)\b"),
     re.compile(r"\b(?:breach|early[_ -]?data|heartbleed|lucky13|poodle|crime|freak|logjam|drown|sweet32|ticketbleed|ccs)\b[^.!?]{0,100}\b(?:is|are|was|were|can\s+be|has\s+been)?\s*(?:confirmed|exploitable|exploited|vulnerable|compromised)\b"),
+    re.compile(r"\b(?:low|warn|warning|medium|high|critical)\b[^.!?]{0,80}\b(?:breach|early[_ -]?data|heartbleed|lucky13|poodle|crime|freak|logjam|drown|sweet32|ticketbleed|ccs)\b[^.!?]{0,100}\b(?:proves?|confirms?|means|shows|demonstrates)\b[^.!?]{0,80}\b(?:exploitable|exploitation|vulnerable|vulnerability|compromise)\b"),
+    re.compile(r"\b(?:breach|early[_ -]?data|heartbleed|lucky13|poodle|crime|freak|logjam|drown|sweet32|ticketbleed|ccs)\b[^.!?]{0,100}\b(?:proves?|confirms?|means|shows|demonstrates)\b[^.!?]{0,80}\b(?:exploitable|exploitation|vulnerable|vulnerability|compromise)\b"),
     re.compile(r"\b(?:the\s+)?(?:site|target|server|host|endpoint)\b[^.!?]{0,80}\b(?:is|are|was|were)\s+(?:vulnerable|exploitable|compromised)\b"),
     re.compile(r"\bno\s+(?:(?:tls|ssl)\s+)?(?:vulnerabilities|security\s+issues|security\s+risks|weaknesses)\s+(?:exist|were\s+found|were\s+detected|found|detected)\b"),
     re.compile(r"\b(?:no|none)\s+of\s+the\s+(?:(?:tls|ssl)\s+)?(?:configuration|findings?)\b[^.!?]{0,80}\b(?:is|are|was|were)\s+(?:vulnerable|weak|risky)\b"),
@@ -74,7 +76,7 @@ def generate_testssl_ai_assessment(finding: dict) -> list[str]:
         return list(FALLBACK_LINES)
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
-    return _guard_truthfulness_response(lines or list(FALLBACK_LINES))
+    return _guard_truthfulness_response(lines or list(FALLBACK_LINES), finding)
 
 
 def build_testssl_ai_assessment_prompt(finding: dict) -> str:
@@ -103,9 +105,8 @@ def build_testssl_ai_assessment_prompt(finding: dict) -> str:
             "",
             "Required sections:",
             "Executive Summary",
-            "Observed TLS Facts",
-            "Certificate Notes",
-            "Protocol and Cipher Notes",
+            "Observed Facts",
+            "Observed Assets",
             "Potential Risks",
             "Confidence",
             "Recommended Next Actions",
@@ -150,24 +151,21 @@ def _format_testssl_evidence(finding: dict) -> str:
                 f"  - {_clean(protocol.get('name') or protocol.get('id') or 'unknown')} "
                 f"severity={_clean(protocol.get('severity') or 'info')} finding={_clean(protocol.get('finding') or '')}"
             )
-    for title, key in (
-        ("Weak/deprecated observations", "weak_protocols"),
-        ("Vulnerabilities/misconfigurations", "vulnerabilities"),
-        ("Cipher findings", "cipher_findings"),
-        ("Security header evidence", "security_headers"),
-        ("Other notable findings", "notable_findings"),
-    ):
-        values = evidence.get(key) or []
-        if values:
-            lines.append(f"- {title}:")
-            for item in values[:20]:
-                if isinstance(item, dict):
-                    lines.append(
-                        f"  - {_clean(item.get('id') or 'finding')} severity={_clean(item.get('severity') or 'info')} "
-                        f"finding={_clean(item.get('finding') or '')}"
-                    )
-                else:
-                    lines.append(f"  - {_clean(item)}")
+    weak_protocols = evidence.get("weak_protocols") or []
+    if weak_protocols:
+        lines.append("- Weak/deprecated protocol observations:")
+        for item in weak_protocols[:20]:
+            lines.append(f"  - {_clean(item)}")
+
+    ok_records, potential_records = _split_scanner_records(evidence)
+    if ok_records:
+        lines.append("- Scanner OK/INFO observations (record IDs are scanner checks, not TLS safety verdicts):")
+        for item in ok_records[:30]:
+            lines.append(_format_record_line(item))
+    if potential_records:
+        lines.append("- Potential scanner findings requiring context/validation:")
+        for item in potential_records[:30]:
+            lines.append(_format_record_line(item))
     for limitation in evidence.get("limitations") or []:
         lines.append(f"- Limitation: {_clean(limitation)}")
     if not evidence:
@@ -180,9 +178,56 @@ def _clean(value: object) -> str:
     return str(value or "").replace("\n", " ").strip()[:500]
 
 
-def _guard_truthfulness_response(lines: list[str]) -> list[str]:
+def _guard_truthfulness_response(lines: list[str], finding: dict | None = None) -> list[str]:
     if _contains_unsupported_testssl_claim(lines):
-        return list(TRUTHFULNESS_FALLBACK_LINES)
+        return _build_truthfulness_fallback(finding or {})
+    return lines
+
+
+def _build_truthfulness_fallback(finding: dict) -> list[str]:
+    evidence = finding.get("testssl_evidence") or {}
+    summary = finding.get("testssl_summary") or {}
+    certificate = evidence.get("certificate") or {}
+    target = _clean(finding.get("target") or evidence.get("target") or evidence.get("host") or "unknown")
+    host = _clean(evidence.get("host") or target)
+    port = _clean(evidence.get("port") or "unknown")
+    protocols = summary.get("supported_protocols") or [
+        item.get("name")
+        for item in evidence.get("protocols") or []
+        if _looks_supported(item.get("finding"), item.get("severity"))
+    ]
+    notable = _collect_notable_records(evidence)
+    lines = [
+        "Executive Summary",
+        "- The generated testssl.sh AI assessment was replaced because it made an unsupported TLS security conclusion. The summary below is deterministic and limited to stored scanner evidence.",
+        "",
+        "Observed Facts",
+        f"- Target: {target}.",
+        f"- Observed service endpoint: {host}:{port}.",
+        f"- Supported protocols reported by testssl.sh: {_clean(', '.join(str(item) for item in protocols if item) or 'none extracted')}.",
+        f"- Certificate common name: {_clean(certificate.get('common_name') or 'not extracted')}.",
+        f"- Certificate expiry: {_clean(certificate.get('not_after') or 'not extracted')}.",
+        f"- Notable scanner records: {len(notable)}.",
+    ]
+    for item in notable:
+        lines.append(_format_record_line(item))
+    lines.extend(
+        [
+            "",
+            "Observed Assets",
+            f"- {host}:{port}",
+            "",
+            "Potential Risks",
+            "- Scanner LOW/WARN/HIGH findings are potential TLS configuration observations requiring deployment context and validation; they are not proof of exploitability or compromise.",
+            "- Scanner OK/INFO records are preserved as scanner wording only and are not an overall secure, safe, robust, or hardened TLS verdict.",
+            "",
+            "Confidence",
+            "- Medium: this is based on stored normalized testssl.sh output. It preserves scanner severities and wording, but testssl.sh alone does not establish overall endpoint security.",
+            "",
+            "Recommended Next Actions",
+            "- Review the scanner-reported records with the service owner and validate any potential finding in application and deployment context before drawing remediation or risk conclusions.",
+        ]
+    )
     return lines
 
 
@@ -211,3 +256,57 @@ def _is_evidence_scoped_statement(sentence: str) -> bool:
 def _is_unavailable_response(response: object) -> bool:
     text = str(response or "").strip()
     return not text or any(text.startswith(message) for message in AI_UNAVAILABLE_MESSAGES)
+
+
+def _split_scanner_records(evidence: dict) -> tuple[list[dict], list[dict]]:
+    records = _all_scanner_records(evidence)
+    ok_records = []
+    potential_records = []
+    for record in records:
+        severity = str(record.get("severity") or "").upper()
+        finding = str(record.get("finding") or "").lower()
+        negative_scanner_observation = any(term in finding for term in ("not vulnerable", "not offered", "not supported", "no vulnerability", "no "))
+        if severity in {"OK", "INFO"} and (
+            negative_scanner_observation or not any(term in finding for term in ("potentially vulnerable", "vulnerable", "weak", "risk"))
+        ):
+            ok_records.append(record)
+        else:
+            potential_records.append(record)
+    return ok_records, potential_records
+
+
+def _all_scanner_records(evidence: dict) -> list[dict]:
+    records = []
+    for key in ("vulnerabilities", "cipher_findings", "security_headers", "notable_findings"):
+        for item in evidence.get(key) or []:
+            if isinstance(item, dict):
+                records.append(item)
+    return records
+
+
+def _collect_notable_records(evidence: dict) -> list[dict]:
+    return [item for item in _all_scanner_records(evidence) if _is_notable_record(item)]
+
+
+def _is_notable_record(item: dict) -> bool:
+    severity = str(item.get("severity") or "").upper()
+    finding = str(item.get("finding") or "").lower()
+    if severity in {"HIGH", "CRITICAL", "MEDIUM", "LOW", "WARN", "WARNING"}:
+        return True
+    return not any(term in finding for term in ("not vulnerable", "not offered", "not supported", "no vulnerability"))
+
+
+def _looks_supported(finding: object, severity: object = None) -> bool:
+    text = str(finding or "").lower()
+    sev = str(severity or "").upper()
+    if sev in {"OK", "INFO"} and any(term in text for term in ("not offered", "not supported", "no ")):
+        return False
+    return any(term in text for term in ("offered", "supported", "yes", "enabled", "available"))
+
+
+def _format_record_line(item: dict) -> str:
+    return (
+        f"  - {_clean(item.get('id') or 'finding')} "
+        f"severity={_clean(item.get('severity') or 'INFO')} "
+        f"finding={_clean(item.get('finding') or '')}"
+    )

@@ -4,10 +4,88 @@ import pytest
 
 from app.services.testssl_ai_assessment import (
     FALLBACK_LINES,
-    TRUTHFULNESS_FALLBACK_LINES,
     build_testssl_ai_assessment_prompt,
     generate_testssl_ai_assessment,
 )
+from app.ui.ai_summary import render_ai_summary_card
+
+
+def _live_shaped_testssl_finding() -> dict:
+    return {
+        "target": "btjoinery.ie:443",
+        "status": "completed",
+        "risk_level": "info",
+        "finding_count": 9,
+        "testssl_summary": {
+            "certificate_summary": "CN=btjoinery.ie; Expires=2026-11-27 14:05",
+            "notable_count": 9,
+            "protocol_count": 6,
+            "supported_protocols": ["TLS 1.2", "TLS 1.3"],
+            "weak_protocol_count": 0,
+        },
+        "testssl_evidence": {
+            "target": "btjoinery.ie:443",
+            "host": "btjoinery.ie",
+            "port": 443,
+            "scan_status": "completed",
+            "protocols": [
+                {"id": "SSLv2", "name": "SSLv2", "finding": "not offered", "severity": "OK"},
+                {"id": "SSLv3", "name": "SSLv3", "finding": "not offered", "severity": "OK"},
+                {"id": "TLS1", "name": "TLS 1.0", "finding": "not offered", "severity": "INFO"},
+                {"id": "TLS1_1", "name": "TLS 1.1", "finding": "not offered", "severity": "INFO"},
+                {"id": "TLS1_2", "name": "TLS 1.2", "finding": "offered", "severity": "OK"},
+                {"id": "TLS1_3", "name": "TLS 1.3", "finding": "offered with final", "severity": "OK"},
+            ],
+            "certificate": {
+                "common_name": "btjoinery.ie",
+                "not_after": "2026-11-27 14:05",
+            },
+            "weak_protocols": [],
+            "vulnerabilities": [
+                {"id": "heartbleed", "finding": "not vulnerable, no heartbeat extension", "severity": "OK"},
+                {"id": "CCS", "finding": "not vulnerable", "severity": "OK"},
+                {"id": "ticketbleed", "finding": "not vulnerable", "severity": "OK"},
+                {"id": "ROBOT", "finding": "not vulnerable, no RSA key transport cipher", "severity": "OK"},
+                {"id": "secure_renego", "finding": "supported", "severity": "OK"},
+                {"id": "secure_client_renego", "finding": "not vulnerable", "severity": "OK"},
+                {"id": "CRIME_TLS", "finding": "not vulnerable", "severity": "OK"},
+                {"id": "BREACH", "finding": "not vulnerable, no gzip/deflate/compress/br HTTP compression  - only supplied '/' tested", "severity": "OK"},
+                {"id": "POODLE_SSL", "finding": "not vulnerable, no SSLv3", "severity": "OK"},
+                {"id": "fallback_SCSV", "finding": "no protocol below TLS 1.2 offered", "severity": "OK"},
+                {"id": "SWEET32", "finding": "not vulnerable", "severity": "OK"},
+                {"id": "FREAK", "finding": "not vulnerable", "severity": "OK"},
+                {"id": "DROWN", "finding": "not vulnerable on this host and port", "severity": "OK"},
+                {
+                    "id": "DROWN_hint",
+                    "finding": "Make sure you don't use this certificate elsewhere with SSLv2 enabled services",
+                    "severity": "INFO",
+                },
+                {"id": "LOGJAM", "finding": "not vulnerable, no DH EXPORT ciphers,", "severity": "OK"},
+                {"id": "LOGJAM-common_primes", "finding": "no DH key with <= TLS 1.2", "severity": "OK"},
+                {"id": "BEAST", "finding": "not vulnerable, no SSL3 or TLS1", "severity": "OK"},
+                {"id": "LUCKY13", "finding": "potentially vulnerable, uses TLS CBC ciphers", "severity": "LOW"},
+                {"id": "RC4", "finding": "not vulnerable", "severity": "OK"},
+            ],
+            "cipher_findings": [
+                {"id": "cipherlist_NULL", "finding": "not offered", "severity": "OK"},
+                {"id": "cipherlist_aNULL", "finding": "not offered", "severity": "OK"},
+                {"id": "cipherlist_EXPORT", "finding": "not offered", "severity": "OK"},
+                {"id": "cipherlist_LOW", "finding": "not offered", "severity": "OK"},
+                {"id": "cipherlist_3DES_IDEA", "finding": "not offered", "severity": "INFO"},
+                {"id": "cipherlist_OBSOLETED", "finding": "offered", "severity": "LOW"},
+                {"id": "cipherlist_STRONG_NOFS", "finding": "not offered", "severity": "INFO"},
+                {"id": "cipherlist_STRONG_FS", "finding": "offered", "severity": "OK"},
+            ],
+            "notable_findings": [
+                {"id": "cert_trust_wildcard", "finding": "trust is via wildcard", "severity": "LOW"},
+                {"id": "QUIC", "finding": "not tested due to lack of local OpenSSL support", "severity": "WARN"},
+            ],
+            "limitations": [
+                "testssl.sh evidence reflects TLS configuration only.",
+                "Findings are not proof of overall site security.",
+            ],
+        },
+    }
 
 
 def test_testssl_ai_prompt_uses_only_stored_tls_evidence() -> None:
@@ -50,6 +128,11 @@ def test_testssl_ai_prompt_uses_only_stored_tls_evidence() -> None:
     assert "Supported protocols: TLS 1.2, TLS 1.3" in prompt
     assert "early_data severity=HIGH finding=supported" in prompt
     assert "Evidence boundary: testssl.sh observations are TLS scanner evidence only" in prompt
+    assert "Observed Facts" in prompt
+    assert "Observed TLS Facts" not in prompt
+    assert "Vulnerabilities/misconfigurations" not in prompt
+    assert "Scanner OK/INFO observations" in prompt
+    assert "Potential scanner findings requiring context/validation" in prompt
 
 
 def test_testssl_ai_assessment_success_returns_response_lines() -> None:
@@ -117,8 +200,12 @@ def test_testssl_unsupported_generated_conclusions_are_withheld(unsupported_line
     with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response):
         lines = generate_testssl_ai_assessment({"target": "example.com:443"})
 
-    assert lines == TRUTHFULNESS_FALLBACK_LINES
+    assert "unsupported TLS security conclusion" in "\n".join(lines)
     assert unsupported_line not in "\n".join(lines)
+    rendered = render_ai_summary_card(lines, title="testssl.sh AI Assessment")
+    assert "Observed Facts" in rendered
+    assert "Potential Risks" in rendered
+    assert "Recommended Next Actions" in rendered
 
 
 @pytest.mark.parametrize(
@@ -138,3 +225,66 @@ def test_testssl_scanner_scoped_uncertainty_wording_is_allowed(legitimate_line: 
         lines = generate_testssl_ai_assessment({"target": "example.com:443"})
 
     assert lines == response.splitlines()
+
+
+def test_testssl_live_shaped_truthfulness_fallback_preserves_notable_scanner_records() -> None:
+    response = "\n".join(
+        [
+            "Executive Summary",
+            "- The TLS configuration appears robust and secure.",
+            "Potential Risks",
+            "- LOW LUCKY13 means the server is exploitable.",
+        ]
+    )
+
+    with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response):
+        lines = generate_testssl_ai_assessment(_live_shaped_testssl_finding())
+
+    joined = "\n".join(lines)
+    assert "unsupported TLS security conclusion" in joined
+    assert "TLS 1.2, TLS 1.3" in joined
+    assert "Certificate common name: btjoinery.ie" in joined
+    assert "Certificate expiry: 2026-11-27 14:05" in joined
+    assert "Notable scanner records: 9" in joined
+    for record_id in (
+        "secure_renego",
+        "fallback_SCSV",
+        "DROWN_hint",
+        "LOGJAM-common_primes",
+        "LUCKY13",
+        "cert_trust_wildcard",
+        "QUIC",
+        "cipherlist_OBSOLETED",
+        "cipherlist_STRONG_FS",
+    ):
+        assert record_id in joined
+    assert "severity=LOW finding=potentially vulnerable, uses TLS CBC ciphers" in joined
+    assert "overall secure, safe, robust, or hardened TLS verdict" in joined
+    assert "The TLS configuration appears robust and secure" not in joined
+    assert "LOW LUCKY13 means the server is exploitable" not in joined
+
+    rendered = render_ai_summary_card(lines, title="testssl.sh AI Assessment")
+    assert "Observed Facts" in rendered
+    assert "Observed Assets" in rendered
+    assert "Potential Risks" in rendered
+    assert "Confidence" in rendered
+    assert "Recommended Next Actions" in rendered
+
+
+@pytest.mark.parametrize(
+    "unsupported_line",
+    [
+        "LOW LUCKY13 means the server is exploitable.",
+        "WARN QUIC proves the endpoint is vulnerable.",
+        "LUCKY13 confirms practical exploitation.",
+    ],
+)
+def test_testssl_low_warn_observations_cannot_be_promoted_to_exploitability(unsupported_line: str) -> None:
+    response = f"Executive Summary\n- {unsupported_line}"
+
+    with patch("app.services.testssl_ai_assessment.ask_ai", return_value=response):
+        lines = generate_testssl_ai_assessment(_live_shaped_testssl_finding())
+
+    joined = "\n".join(lines)
+    assert "unsupported TLS security conclusion" in joined
+    assert unsupported_line not in joined
