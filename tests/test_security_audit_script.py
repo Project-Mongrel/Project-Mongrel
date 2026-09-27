@@ -470,6 +470,17 @@ def test_bandit_command_does_not_scan_tests() -> None:
     assert bandit_check.timeout_seconds == 120
 
 
+def test_default_stage_timeouts_keep_detect_secrets_budgeted_at_300_seconds() -> None:
+    timeouts = {check.name: check.timeout_seconds for check in security_audit.DEFAULT_CHECKS}
+
+    assert timeouts == {
+        "Tests": 180,
+        "Bandit": 120,
+        "pip-audit": 180,
+        "detect-secrets": 300,
+    }
+
+
 def test_default_audit_excludes_semgrep_and_includes_detect_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
     tracked_paths = ["app/main.py", "tests/test_security_audit_script.py", "scripts/security_audit.py"]

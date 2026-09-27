@@ -79,7 +79,7 @@ DEFAULT_CHECKS = [
         command=["detect-secrets", "scan", "--exclude-files", DETECT_SECRETS_EXCLUDE_FILES],
         executable_name="detect-secrets",
         install_hint="Install with: python -m pip install detect-secrets",
-        timeout_seconds=120,
+        timeout_seconds=300,
     ),
 ]
 
