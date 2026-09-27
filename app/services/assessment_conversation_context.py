@@ -205,11 +205,14 @@ FOLLOW_UP_PATTERNS = (
     r"^(?:and\s+)?how do you know\??$",
     r"^(?:and\s+)?what evidence supports (?:this|that|it)\??$",
 )
-PRIORITIZATION_TERMS = ("which one first", "what first", "attention first", "prioriti", "highest priority", "most important")
+PRIORITIZATION_TERMS = (
+    "which one first", "what first", "attention first", "prioriti", "highest priority", "most important",
+    "actually matters",
+)
 COVERAGE_GAP_TERMS = (
     "anything else", "haven't we checked", "have not we checked", "not checked", "coverage gap", "what is missing",
     "what haven't we done", "what have we not done", "what remains", "biggest unknown", "what don't we know",
-    "what do we not know", "gaps remain", "remaining gaps",
+    "what do we not know", "gaps remain", "remaining gaps", "tested properly", "tested thoroughly",
 )
 SIGNIFICANCE_TERMS = ("anything worrying", "is that bad", "does that matter", "how serious", "why should i care")
 UNCERTAINTY_TERMS = (
@@ -256,6 +259,8 @@ TOOL_STATE_OVERVIEW_PATTERNS = (
 )
 CROSS_TOOL_CONFIRMATION_PATTERNS = (
     re.compile(r"\bdo\s+(?:these|the)\s+(?:findings|results|observations)\s+confirm\s+each\s+other\b"),
+    re.compile(r"\b(?:did|does)\s+(?:anything|another\s+tool|any\s+other\s+tool)\s+(?:else\s+)?(?:see|confirm|find|observe)\b"),
+    re.compile(r"\bwas\s+that\s+seen\s+anywhere\s+else\b"),
     re.compile(r"\bmetasploit\b.{0,80}\btshark\b.{0,80}\bconfirm\w*\b.{0,40}\bexploit"),
 )
 TOOL_STATE_QUESTION_PATTERNS = (
@@ -304,8 +309,9 @@ def build_assessment_conversation_context(
         primary_intent=question_intent,
     )
     inherited_scope = False
+    referent_scope = _recent_referent_scope(recent_messages, question)
     if not selected_tools and _is_referential_follow_up(question, question_intent):
-        selected_tools = _tools_from_immediately_relevant_history(recent_messages, question)
+        selected_tools = _tools_from_immediately_relevant_history(recent_messages, question, referent_scope=referent_scope)
         inherited_scope = bool(selected_tools)
         if inherited_scope:
             recent_messages = _relevant_follow_up_messages(recent_messages, question)
@@ -382,6 +388,8 @@ def build_assessment_conversation_context(
         },
         "provenance": provenance,
     }
+    if referent_scope:
+        context["selection"]["recent_referent_scope"] = referent_scope
     context["evidence_context_digest"] = build_context_digest(context)
     return context
 
@@ -439,10 +447,37 @@ def _is_referential_follow_up(question: str, intent: str) -> bool:
     return referential and intent in {
         "follow_up_reference", "explanation", "simplify_explanation", "significance_interpretation",
         "uncertainty_safety", "current_assessment_evidence",
+        "cross_tool_confirmation",
     }
 
 
-def _tools_from_immediately_relevant_history(recent_messages: list[dict], current_question: str) -> list[str]:
+def _recent_referent_scope(recent_messages: list[dict], current_question: str) -> list[str]:
+    """Infer only a bounded topic scope from the immediately preceding exchange."""
+    current_index = None
+    normalized_current = _normalize_intent_text(current_question)
+    for index in range(len(recent_messages) - 1, -1, -1):
+        if _normalize_intent_text(str(recent_messages[index].get("content") or "")) == normalized_current:
+            current_index = index
+            break
+    if current_index is None:
+        current_index = len(recent_messages)
+    prior_user_index = None
+    for index in range(current_index - 1, -1, -1):
+        if str(recent_messages[index].get("role") or "").lower() == "user":
+            prior_user_index = index
+            break
+    if prior_user_index is None:
+        return []
+    exchange = recent_messages[prior_user_index:current_index]
+    topic_text = " ".join(str(message.get("content") or "") for message in exchange).lower()
+    if re.search(r"\b(?:tls|testssl(?:\.sh)?|cert(?:ificate)?|cipher|ssl)\b", topic_text):
+        return ["testssl"]
+    return []
+
+
+def _tools_from_immediately_relevant_history(
+    recent_messages: list[dict], current_question: str, *, referent_scope: list[str] | None = None,
+) -> list[str]:
     skipped_current = False
     for message in reversed(recent_messages):
         if str(message.get("role") or "").lower() != "user":
@@ -454,7 +489,7 @@ def _tools_from_immediately_relevant_history(recent_messages: list[dict], curren
         tools = detect_question_tools(content)
         if tools:
             return tools
-    return []
+    return list(referent_scope or [])
 
 
 def _relevant_follow_up_messages(recent_messages: list[dict], current_question: str) -> list[dict]:
@@ -506,7 +541,9 @@ def classify_assessment_conversation_intent(question: str, *, selected_tools: li
         pattern.search(normalized) for pattern in ASSESSMENT_SUMMARY_PATTERNS
     ):
         return "assessment_summary"
-    if any(term in normalized for term in ASSESSMENT_HIGHLIGHT_TERMS):
+    if any(term in normalized for term in ASSESSMENT_HIGHLIGHT_TERMS) or re.search(
+        r"\bwhat\b.{0,24}\bworth\s+investigating\b", normalized
+    ):
         return "assessment_highlight"
     if any(term in normalized for term in ATTACKER_QUESTION_TERMS):
         return "attacker_informed_defensive_reasoning"

@@ -3170,6 +3170,105 @@ def test_rejected_response_without_assessment_evidence_still_uses_generic_withhe
     assert result["answer"] == TRUTHFULNESS_FALLBACK_ANSWER
 
 
+def test_tls_referent_uses_authoritative_testssl_records_concisely() -> None:
+    user_id = 1122
+    assessment = create_assessment("TLS referent", user_id=user_id)
+    finding = add_finding(user_id=user_id, finding={
+        "source": "testssl", "target": "example.test", "finding_count": 9,
+        "testssl_findings": [
+            {"id": "LUCKY13", "severity": "LOW", "finding": "potentially vulnerable"},
+            {"id": "wildcard", "severity": "LOW", "finding": "wildcard trust"},
+            {"id": "cipher-list", "severity": "LOW", "finding": "obsolete cipher-list"},
+        ] + [{"id": f"record-{index}", "severity": "INFO", "finding": "stored observation"} for index in range(6)],
+    })
+    record_assessment_scan(assessment["id"], tool="testssl", status="completed", finding_id=finding["id"])
+    conversation = create_conversation(assessment["id"], user_id)
+    append_message(conversation["id"], user_id, "user", "What did testssl report?")
+    append_message(conversation["id"], user_id, "assistant", "The TLS observations need review.")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=conversation["id"],
+            question="What about that TLS thing?",
+        )
+
+    model.assert_not_called()
+    assert "9 normalized scanner record(s)" in result["answer"]
+    assert "LUCKY13" in result["answer"]
+    assert "overall TLS security" in result["answer"]
+    assert len(result["answer"]) < 900
+
+
+@pytest.mark.parametrize("claim", [
+    "testssl found no notable findings.",
+    "TLS 1.2 is supported and is not weak.",
+    "The certificate is valid and trusted.",
+    "I recommend httpx for more investigation.",
+])
+def test_testssl_followup_truthfulness_rejects_unsupported_claims(claim: str) -> None:
+    user_id = 1123
+    assessment = create_assessment("TLS truth guard", user_id=user_id)
+    finding = add_finding(user_id=user_id, finding={
+        "source": "testssl", "target": "example.test", "testssl_findings": [
+            {"id": "LUCKY13", "severity": "LOW", "finding": "potentially vulnerable"},
+        ],
+    })
+    record_assessment_scan(assessment["id"], tool="testssl", status="completed", finding_id=finding["id"])
+    httpx = add_finding(user_id=user_id, finding={"source": "httpx", "target": "example.test", "httpx_services": []})
+    record_assessment_scan(assessment["id"], tool="httpx", status="completed", finding_id=httpx["id"])
+    context = build_assessment_conversation_context(
+        user_id=user_id, assessment_id=assessment["id"], question="What about that TLS thing?",
+    )
+    assert violates_conversation_truthfulness(claim, context) is True
+
+
+def test_cross_tool_tls_referent_distinguishes_related_evidence_from_confirmation() -> None:
+    user_id = 1124
+    assessment = create_assessment("TLS cross tool", user_id=user_id)
+    testssl = add_finding(user_id=user_id, finding={
+        "source": "testssl", "target": "example.test", "testssl_findings": [{"id": "cipher", "severity": "LOW"}],
+    })
+    httpx = add_finding(user_id=user_id, finding={
+        "source": "httpx", "target": "example.test", "httpx_services": [{"url": "https://example.test", "tls": {"version": "TLS1.3"}}],
+    })
+    record_assessment_scan(assessment["id"], tool="testssl", status="completed", finding_id=testssl["id"])
+    record_assessment_scan(assessment["id"], tool="httpx", status="completed", finding_id=httpx["id"])
+    conversation = create_conversation(assessment["id"], user_id)
+    append_message(conversation["id"], user_id, "user", "What did testssl report?")
+    append_message(conversation["id"], user_id, "assistant", "The TLS observation needs review.")
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=conversation["id"],
+        question="Did anything else confirm that?",
+    )
+
+    assert "No automatic confirmation" in result["answer"]
+    assert "related evidence" in result["answer"]
+    assert "confirmed" not in result["answer"].lower()
+
+
+def test_coverage_followup_surfaces_completed_tool_limits() -> None:
+    user_id = 1125
+    assessment = create_assessment("Coverage limits", user_id=user_id)
+    fixtures = {
+        "katana": {"katana_observations": [{"url": "https://example.test/", "depth": 0}]},
+        "playwright": {"playwright_observation": {"final_url": "https://example.test/", "inputs_count": 1, "links_count": 2, "network_events_count": 3}},
+        "ffuf": {"ffuf_results": [], "metadata": {"ffuf_profile_label": "Standard", "wordlist_count": 2570}},
+    }
+    for tool, evidence in fixtures.items():
+        finding = add_finding(user_id=user_id, finding={"source": tool, "target": "example.test", **evidence})
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=None,
+        question="What haven't we tested properly yet?",
+    )
+
+    assert "maximum observed depth was 0" in result["answer"]
+    assert "Standard with 2570 entries" in result["answer"]
+    assert "passive browser observation" in result["answer"]
+
+
 def test_valid_generated_answer_is_not_replaced_by_recovery() -> None:
     user_id = 1121
     assessment = create_assessment("Valid qwen retained", user_id=user_id)

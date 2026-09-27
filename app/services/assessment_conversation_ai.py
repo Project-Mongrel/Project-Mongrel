@@ -536,6 +536,8 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
         return True
     if _has_nmap_semantic_overclaim(normalized, context or {}):
         return True
+    if _has_testssl_semantic_overclaim(normalized, context or {}):
+        return True
     if any(pattern.search(normalized) for pattern in INTERNAL_INSTRUCTION_LEAK_PATTERNS):
         return True
     if _leaks_internal_context_language(normalized, context or {}):
@@ -1643,7 +1645,12 @@ def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
     tls_safety_question = context.get("question_intent") == "uncertainty_safety" and any(
         term in question for term in ("safe", "secure", "insecure")
     )
-    if _selected_tools(context) != {"testssl"} or not (direct_question or tls_safety_question):
+    inherited_tls_question = (
+        _selected_tools(context) == {"testssl"}
+        and (context.get("selection") or {}).get("recent_referent_scope") == ["testssl"]
+        and any(term in question for term in ("tls", "ssl", "certificate", "cert", "cipher", "testssl"))
+    )
+    if _selected_tools(context) != {"testssl"} or not (direct_question or tls_safety_question or inherited_tls_question):
         return None
     findings = _tool_findings(context, "testssl")
     evidence_items = []
@@ -1655,9 +1662,17 @@ def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
     if not evidence_items:
         return None
     sections = []
+    concise = inherited_tls_question
     for evidence in evidence_items:
         target = str(evidence.get("target") or evidence.get("host") or "the assessed TLS endpoint")
         details = []
+        records = _testssl_records(evidence)
+        if concise and records:
+            examples = "; ".join(_scanner_record(item) for item in records[:3])
+            details.append(f"{len(records)} normalized scanner record(s), including {examples}")
+            details.append("additional stored records remain in the authoritative result")
+            sections.append(f"For {target}, testssl.sh reported " + "; ".join(details))
+            continue
         protocols = [_scanner_record(item) for item in evidence.get("protocols") or [] if isinstance(item, dict)]
         if protocols:
             details.append("protocol observations: " + "; ".join(protocols))
@@ -1682,6 +1697,15 @@ def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
         ". ".join(sections) + ". Scanner wording and severity are preserved; this does not establish exploitability, "
         "a completed captured TLS handshake, compromise, or overall TLS security."
     )
+
+
+def _testssl_records(evidence: dict) -> list[dict]:
+    if isinstance(evidence.get("testssl_findings"), list):
+        return [item for item in evidence["testssl_findings"] if isinstance(item, dict)]
+    records = []
+    for key in ("weak_protocols", "cipher_findings", "vulnerabilities", "security_headers", "notable_findings"):
+        records.extend(item for item in evidence.get(key) or [] if isinstance(item, dict))
+    return records
 
 
 def _tshark_evidence(context: dict) -> list[dict]:
@@ -2060,12 +2084,35 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
     if not statements:
         return "No normalized observations are stored yet. That does not establish that the target is safe or free of vulnerabilities."
     if intent == "assessment_highlight":
+        if _is_compact_prioritization_question(context):
+            return _build_compact_assessment_priorities(context, statements)
         return _build_assessment_wide_synthesis(context, statements)
     next_step = _summary_requested_next_step_answer(context)
     return (
         " ".join(statements)
         + " These are bounded stored observations, not an overall secure, insecure, or vulnerable conclusion."
         + (f" {next_step}" if next_step else "")
+    )
+
+
+def _is_compact_prioritization_question(context: dict) -> bool:
+    question = str(context.get("current_question") or "").lower()
+    return "worth investigating" in question or "actually matters" in question
+
+
+def _build_compact_assessment_priorities(context: dict, statements: list[str]) -> str:
+    selected = [
+        statement for statement in statements
+        if any(term in statement.lower() for term in ("testssl", "nuclei", "nmap recorded", "httpx recorded"))
+    ][:3]
+    limitations = _build_completed_tool_limitations(context)
+    selected.extend(limitations[:2])
+    if not selected:
+        selected = statements[:2]
+    return (
+        "What stands out for further investigation: "
+        + " ".join(selected)
+        + " These are prioritized observations and bounded coverage limitations, not a vulnerability ranking or proof of exploitability."
     )
 
 
@@ -3114,6 +3161,21 @@ def _build_cross_tool_confirmation(context: dict) -> str:
     })
     attribution = ", ".join(represented) if represented else "the completed tools"
     question = str(context.get("current_question") or "").lower()
+    if _selected_tools(context) == {"testssl"}:
+        testssl_findings = _tool_findings(context, "testssl")
+        testssl_records = [
+            item for finding in testssl_findings
+            for evidence in ([finding.get("testssl_evidence")] if isinstance(finding.get("testssl_evidence"), dict) else [])
+            for item in _testssl_records(evidence)
+        ]
+        httpx_services, _ = _deduplicated_httpx_observations(_tool_findings(context, "httpx"))
+        httpx_tls = [service for service in httpx_services if service.get("tls")]
+        related = "httpx also stored TLS metadata" if httpx_tls else "no other stored tool evidence was found for the same TLS topic"
+        return (
+            f"No automatic confirmation is established. testssl.sh stored {len(testssl_records)} normalized TLS scanner "
+            f"record(s), and {related}. That is related evidence where present, not independent proof of the scanner's "
+            "finding, overall TLS security, or exploitability."
+        )
     if "metasploit" in question and "tshark" in question:
         states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
         metasploit_state = str(states.get("metasploit", "NOT_RUN")).replace("_", " ").lower()
@@ -3129,6 +3191,46 @@ def _build_cross_tool_confirmation(context: dict) -> str:
         "metadata does not turn another tool's observation into proof of vulnerability, exploitability, handshake "
         "completion, or compromise."
     )
+
+
+def _build_completed_tool_limitations(context: dict) -> list[str]:
+    """Render concrete limits of completed coverage without treating bounds as absence."""
+    findings = _latest_authoritative_findings(context)
+    states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
+    limitations = []
+    katana_items = [
+        item for finding in findings if str(finding.get("source") or "").lower() == "katana"
+        for item in (finding.get("katana_observations") or []) if isinstance(item, dict)
+    ]
+    if states.get("katana") == "COMPLETED" and katana_items:
+        katana_summary = summarize_katana_observations(katana_items)
+        if katana_summary.get("max_depth") == 0:
+            limitations.append("Katana's maximum observed depth was 0, so deeper routes were not assessed by that crawl.")
+    ffuf = [finding for finding in findings if str(finding.get("source") or "").lower() == "ffuf"]
+    if states.get("ffuf") == "COMPLETED" and ffuf:
+        latest_scan = select_latest_tool_scan((context.get("assessment_context") or {}).get("scans") or [], "ffuf")
+        latest_id = str((latest_scan or {}).get("finding_id") or "")
+        latest = next((finding for finding in ffuf if str(finding.get("id") or "") == latest_id), ffuf[-1])
+        metadata = latest.get("metadata") if isinstance(latest.get("metadata"), dict) else {}
+        results = latest.get("ffuf_results") if isinstance(latest.get("ffuf_results"), list) else []
+        summary = latest.get("ffuf_summary") if isinstance(latest.get("ffuf_summary"), dict) else {}
+        result_count = summary.get("result_count", len(results))
+        if result_count == 0:
+            profile = metadata.get("ffuf_profile_label") or metadata.get("ffuf_profile") or "the recorded profile"
+            wordlist_count = metadata.get("wordlist_count")
+            run_scope = f"{profile} with {wordlist_count} entries" if wordlist_count is not None else str(profile)
+            limitations.append(
+                f"ffuf's {run_scope} run stored zero structured response observations; that does not prove hidden content is absent."
+            )
+    playwright = next(
+        (finding.get("playwright_observation") for finding in findings
+         if str(finding.get("source") or "").lower() == "playwright"
+         and isinstance(finding.get("playwright_observation"), dict)),
+        None,
+    )
+    if states.get("playwright") == "COMPLETED" and playwright:
+        limitations.append("Playwright coverage is passive browser observation for the observed page, not complete application behavior coverage.")
+    return limitations
 
 
 def _build_grounded_conversational_fallback(context: dict) -> str | None:
@@ -3244,6 +3346,7 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
                 + ", ".join(unperformed_web)
                 + "; each should be considered only where it answers a current evidence gap."
             )
+        parts.extend(_build_completed_tool_limitations(context))
         parts.append(
             "Gitleaks and Prowler are context-dependent, not required for a public web target without suitable repository/filesystem or cloud context."
         )
@@ -3490,6 +3593,11 @@ def _contradicts_assessment_tool_state(answer: str, context: dict) -> bool:
             )
             if context.get("question_intent") in {"next_step_recommendation", "prioritization"}:
                 completed_as_next = completed_as_next or tool in recommended_tools
+            if tool == "httpx" and tool in recommended_tools and context.get("question_intent") in {
+                "current_assessment_evidence", "follow_up_reference", "explanation", "cross_tool_confirmation",
+                "individual_tool_explanation",
+            }:
+                completed_as_next = True
             if completed_as_next and not re.search(rf"\b(?:do not|don'?t|wouldn'?t|would not)\b.{{0,35}}\b{display}\b", answer):
                 return True
     relevant_gaps = recommendation.get("relevant_unperformed_tools") or []
@@ -3568,6 +3676,34 @@ def _recommendation_contradicted_by_stored_evidence(answer: str, context: dict) 
     if re.search(r"\bredirect\b.{0,80}\bhttps\b|\bhttp\b.{0,80}\bredirect(?:s|ed|ing)?\b.{0,80}\bhttps\b", answer):
         if _httpx_has_http_to_https_redirect(context):
             return True
+    return False
+
+
+def _has_testssl_semantic_overclaim(answer: str, context: dict) -> bool:
+    """Reject TLS conclusions that stored scanner observations cannot support."""
+    findings = _tool_findings(context, "testssl")
+    records = []
+    for finding in findings:
+        evidence = finding.get("testssl_evidence")
+        if isinstance(evidence, dict):
+            records.extend(_testssl_records(evidence))
+        elif isinstance(finding.get("testssl_findings"), list):
+            records.extend(item for item in finding["testssl_findings"] if isinstance(item, dict))
+    if not records:
+        return False
+    tls_scope = bool(re.search(r"\b(?:tls|ssl|testssl|certificate|cert|cipher)\b", answer))
+    if not tls_scope:
+        return False
+    if re.search(r"\b(?:no|without|didn'?t report|did not report)\b.{0,35}\b(?:notable|significant|scanner|tls|security)\s+(?:finding|finding(?:s)|issue|issues|vulnerabilit(?:y|ies))\b", answer):
+        return True
+    if re.search(r"\b(?:certificate|cert)\b.{0,30}\b(?:is|was|appears?)\s+(?:valid|trusted|safe)\b", answer):
+        return True
+    if re.search(r"\b(?:tls\s*[12](?:\.\d)?|tls\s+versions?|cipher(?:s)?)\b.{0,55}\b(?:safe|secure|not\s+weak|strong|hardened)\b", answer):
+        return True
+    if re.search(r"\b(?:tls|ssl)\b.{0,55}\b(?:overall|entire|complete)\s+(?:security|safety|secure)\b", answer):
+        return True
+    if re.search(r"\b(?:testssl|scanner)\b.{0,55}\b(?:proves?|confirms?|establishes?)\b.{0,35}\b(?:secure|safe|exploitable|exploitation|vulnerable)\b", answer):
+        return True
     return False
 
 
