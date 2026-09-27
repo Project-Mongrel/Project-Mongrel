@@ -47,6 +47,10 @@ class AuditResult:
     returncode: int | None = None
 
 
+class GitTrackedFilesError(RuntimeError):
+    """Raised when tracked source enumeration cannot be completed safely."""
+
+
 DEFAULT_CHECKS = [
     AuditCheck(
         name="Tests",
@@ -109,11 +113,69 @@ def build_pytest_audit_basetemp() -> Path:
     return PYTEST_AUDIT_TEMP_ROOT / f"run-{os.getpid()}-{time.time_ns()}-{uuid4().hex[:8]}"
 
 
-def command_for_check(check: AuditCheck, basetemp: Path | None = None) -> list[str]:
+def command_for_check(
+    check: AuditCheck,
+    basetemp: Path | None = None,
+    tracked_paths: Sequence[str] | None = None,
+) -> list[str]:
+    if check.name == "detect-secrets" and tracked_paths is not None:
+        return [*check.command, *tracked_paths]
     if check.name != "Tests":
         return list(check.command)
     selected_basetemp = basetemp or build_pytest_audit_basetemp()
     return [*check.command, "--basetemp", str(selected_basetemp)]
+
+
+def list_git_tracked_files(
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[str]:
+    """Return safe repo-relative Git-tracked file paths for source auditing."""
+    command = ["git", "ls-files", "-z"]
+    try:
+        completed = runner(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            cwd=str(PROJECT_ROOT),
+            check=False,
+            shell=False,
+        )
+    except FileNotFoundError as exc:
+        raise GitTrackedFilesError("Unable to enumerate Git-tracked files: git is not installed.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitTrackedFilesError("Unable to enumerate Git-tracked files: git ls-files timed out.") from exc
+    except UnicodeDecodeError as exc:
+        raise GitTrackedFilesError(f"Unable to enumerate Git-tracked files: {exc}") from exc
+
+    if completed.returncode != 0:
+        error = (completed.stderr or completed.stdout or "").strip()
+        detail = f": {error}" if error else "."
+        raise GitTrackedFilesError(f"Unable to enumerate Git-tracked files{detail}")
+
+    tracked_paths: list[str] = []
+    root = PROJECT_ROOT.resolve()
+    for raw_path in completed.stdout.split("\0"):
+        path_text = raw_path
+        if not path_text:
+            continue
+        relative_path = Path(path_text)
+        if relative_path.is_absolute():
+            raise GitTrackedFilesError("Unable to enumerate Git-tracked files: absolute path returned by git.")
+        candidate = (PROJECT_ROOT / relative_path).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise GitTrackedFilesError("Unable to enumerate Git-tracked files: path escapes project root.") from exc
+        if not candidate.is_file():
+            continue
+        tracked_paths.append(path_text)
+
+    if not tracked_paths:
+        raise GitTrackedFilesError("Unable to enumerate Git-tracked files: no tracked files found.")
+    return tracked_paths
 
 
 def cleanup_audit_temp_path(path: Path) -> bool:
@@ -265,7 +327,11 @@ def run_check(
 
     prepare_check(check)
     pytest_basetemp = build_pytest_audit_basetemp() if check.name == "Tests" else None
-    command = command_for_check(check, pytest_basetemp)
+    try:
+        tracked_paths = list_git_tracked_files() if check.name == "detect-secrets" else None
+        command = command_for_check(check, pytest_basetemp, tracked_paths=tracked_paths)
+    except GitTrackedFilesError as exc:
+        return AuditResult(check=check, status=STATUS_FAIL, error=str(exc), returncode=None)
 
     try:
         env = os.environ.copy()

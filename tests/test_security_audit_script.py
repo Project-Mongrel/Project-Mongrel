@@ -427,8 +427,10 @@ def test_bandit_command_does_not_scan_tests() -> None:
     assert bandit_check.timeout_seconds == 120
 
 
-def test_default_audit_excludes_semgrep_and_includes_detect_secrets() -> None:
+def test_default_audit_excludes_semgrep_and_includes_detect_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
+    tracked_paths = ["app/main.py", "tests/test_security_audit_script.py", "scripts/security_audit.py"]
+    monkeypatch.setattr(security_audit, "list_git_tracked_files", lambda: tracked_paths)
 
     def runner(*args, **kwargs):
         calls.append(args[0])
@@ -438,7 +440,14 @@ def test_default_audit_excludes_semgrep_and_includes_detect_secrets() -> None:
 
     assert [result.check.name for result in results] == ["Tests", "Bandit", "pip-audit", "detect-secrets"]
     assert "Semgrep" not in [result.check.name for result in results]
-    assert calls[-1] == ["detect-secrets", "scan", "--exclude-files", security_audit.DETECT_SECRETS_EXCLUDE_FILES]
+    assert calls[-1] == [
+        "detect-secrets",
+        "scan",
+        "--exclude-files",
+        security_audit.DETECT_SECRETS_EXCLUDE_FILES,
+        *tracked_paths,
+    ]
+    assert "." not in calls[-1]
 
 
 def test_detect_secrets_excludes_generated_pytest_artifacts_only() -> None:
@@ -460,7 +469,119 @@ def test_detect_secrets_excludes_generated_pytest_artifacts_only() -> None:
     assert "tests" not in excludes
 
 
-def test_full_audit_includes_semgrep() -> None:
+def test_git_tracked_file_enumeration_uses_safe_explicit_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tracked_paths = [
+        "app/main.py",
+        "tests/test_example.py",
+        "scripts/security_audit.py",
+        "docs/usage.md",
+        "requirements.txt",
+        "data/tracked-fixture.json",
+        "artifacts/tracked-sample.txt",
+    ]
+    untracked_paths = [
+        ".venv/lib/site.py",
+        "data/runtime.db",
+        "uploads/user.bin",
+        ".git/objects/aa/bb",
+        ".pytest_tmp/run-stale/mongrel.db",
+        ".pytest_tmp_audit/run-stale/mongrel.db",
+        ".pytest_tmp_runs/run-stale/mongrel.db",
+    ]
+    for relative_path in [*tracked_paths, *untracked_paths]:
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("content", encoding="utf-8")
+    monkeypatch.setattr(security_audit, "PROJECT_ROOT", tmp_path)
+
+    def runner(*args, **kwargs):
+        assert args[0] == ["git", "ls-files", "-z"]
+        assert kwargs["cwd"] == str(tmp_path)
+        assert kwargs["shell"] is False
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="\0".join(tracked_paths) + "\0",
+            stderr="",
+        )
+
+    result = security_audit.list_git_tracked_files(runner=runner)
+
+    assert result == tracked_paths
+    assert ".venv/lib/site.py" not in result
+    assert "data/runtime.db" not in result
+    assert "uploads/user.bin" not in result
+    assert ".git/objects/aa/bb" not in result
+    assert ".pytest_tmp/run-stale/mongrel.db" not in result
+    assert ".pytest_tmp_audit/run-stale/mongrel.db" not in result
+    assert ".pytest_tmp_runs/run-stale/mongrel.db" not in result
+
+
+def test_detect_secrets_command_uses_tracked_paths_and_not_dot(monkeypatch: pytest.MonkeyPatch) -> None:
+    tracked_paths = [
+        "app/service.py",
+        "tests/test_service.py",
+        "scripts/security_audit.py",
+        "docs/security.md",
+        "requirements.txt",
+    ]
+    monkeypatch.setattr(security_audit, "list_git_tracked_files", lambda: tracked_paths)
+    calls = []
+
+    def runner(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    detect_secrets_check = next(check for check in security_audit.DEFAULT_CHECKS if check.name == "detect-secrets")
+    result = security_audit.run_check(detect_secrets_check, installed=lambda check: True, runner=runner)
+
+    assert result.status == security_audit.STATUS_PASS
+    assert calls == [
+        [
+            "detect-secrets",
+            "scan",
+            "--exclude-files",
+            security_audit.DETECT_SECRETS_EXCLUDE_FILES,
+            *tracked_paths,
+        ]
+    ]
+    assert "." not in calls[0]
+    assert "app/service.py" in calls[0]
+    assert "tests/test_service.py" in calls[0]
+    assert "scripts/security_audit.py" in calls[0]
+    assert "docs/security.md" in calls[0]
+    assert "requirements.txt" in calls[0]
+    assert ".venv/lib/site.py" not in calls[0]
+    assert "data/runtime.db" not in calls[0]
+    assert "uploads/user.bin" not in calls[0]
+    assert ".git/objects/aa/bb" not in calls[0]
+    assert ".pytest_tmp/run-stale/mongrel.db" not in calls[0]
+
+
+def test_detect_secrets_git_ls_files_failure_fails_safely(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        security_audit,
+        "list_git_tracked_files",
+        lambda: (_ for _ in ()).throw(security_audit.GitTrackedFilesError("git ls-files failed")),
+    )
+    calls = []
+
+    def runner(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    detect_secrets_check = next(check for check in security_audit.DEFAULT_CHECKS if check.name == "detect-secrets")
+    result = security_audit.run_check(detect_secrets_check, installed=lambda check: True, runner=runner)
+
+    assert result.status == security_audit.STATUS_FAIL
+    assert result.error == "git ls-files failed"
+    assert result.returncode is None
+    assert calls == []
+
+
+def test_full_audit_includes_semgrep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(security_audit, "list_git_tracked_files", lambda: ["app/main.py"])
+
     def runner(*args, **kwargs):
         return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
 
