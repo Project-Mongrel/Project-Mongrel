@@ -2716,6 +2716,154 @@ def test_rejected_security_and_confidence_intents_use_existing_deterministic_cal
     assert "Exploitability confidence: not established" in confidence
 
 
+def test_rejected_live_evidence_review_question_recovers_with_grounded_next_step() -> None:
+    user_id = 1114
+    assessment = create_assessment("Rejected live evidence recovery", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=80, service="http")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="The target is vulnerable and compromised.") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Ok, looking at the evidence we have, is there anything worth investigating further?",
+        )
+
+    model.assert_called_once()
+    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert "What stands out" in result["answer"]
+    assert "80/tcp" in result["answer"]
+    assert "httpx next" in result["answer"].lower()
+    assert "not evidence of a vulnerability" in result["answer"].lower() or "not proof" in result["answer"].lower()
+    assert "compromised" not in result["answer"].lower()
+
+
+def test_rejected_assessment_wide_findings_summary_recovers_from_stored_evidence() -> None:
+    user_id = 1115
+    assessment = create_assessment("Rejected summary recovery", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=443, service="https")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Nmap proved the site is vulnerable.") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What did we find?",
+        )
+
+    model.assert_called_once()
+    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert "Nmap recorded exposed TCP services" in result["answer"]
+    assert "443/tcp" in result["answer"]
+    assert "site is vulnerable" not in result["answer"].lower()
+
+
+def test_rejected_coverage_and_gap_questions_recover_from_tool_state() -> None:
+    user_id = 1116
+    assessment = create_assessment("Rejected coverage recovery", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=80, service="http")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Everything has been tested and the target is secure."):
+        tested = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What have we tested?",
+        )
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Nothing else needs testing."):
+        gaps = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What haven't we tested?",
+        )
+
+    assert tested["fallback_reason"] == "grounded_conversation_fallback"
+    assert "Completed: Nmap" in tested["answer"]
+    assert "Not run:" in tested["answer"]
+    assert gaps["fallback_reason"] == "grounded_conversation_fallback"
+    assert "Relevant uncompleted" in gaps["answer"]
+    assert "Gitleaks and Prowler are context-dependent" in gaps["answer"]
+
+
+def test_rejected_next_step_recovery_preserves_tool_suitability_rules() -> None:
+    user_id = 1117
+    assessment = create_assessment("Rejected next suitability recovery", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=80, service="http")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Run Prowler next to find website services."):
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What would be worth doing from here?",
+        )
+
+    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert "httpx next" in result["answer"].lower()
+    assert "Prowler" not in result["answer"]
+    assert "no tool has been run" in result["answer"].lower()
+
+
+def test_rejected_tool_specific_followup_recovers_with_named_tool_state() -> None:
+    user_id = 1118
+    assessment = create_assessment("Rejected tool followup recovery", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=80, service="http")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Nmap proved the service is exploitable."):
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What did Nmap find?",
+        )
+
+    assert result["fallback_reason"] is None
+    assert "80/tcp" in result["answer"]
+    assert "did not establish vulnerability" in result["answer"]
+    assert "exploitable" not in result["answer"].lower()
+
+
+def test_rejected_unsupported_security_exploit_and_compromise_claims_are_corrected() -> None:
+    user_id = 1119
+    assessment = create_assessment("Rejected unsafe conclusion recovery", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=22, service="ssh")
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="The host is exploitable and compromised."):
+        result = answer_assessment_conversation_question(
+            user_id=user_id, assessment_id=assessment["id"], conversation_id=None, question="What did we find?",
+        )
+
+    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    assert "22/tcp" in result["answer"]
+    assert "exploitable" not in result["answer"].lower()
+    assert "compromised" not in result["answer"].lower()
+
+
+def test_rejected_response_without_assessment_evidence_still_uses_generic_withheld_message() -> None:
+    user_id = 1120
+    assessment = create_assessment("Rejected insufficient recovery", user_id=user_id)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="The target is vulnerable and compromised.") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Ok, looking at the evidence we have, is there anything worth investigating further?",
+        )
+
+    model.assert_called_once()
+    assert result["fallback_reason"] == "truthfulness_guard"
+    assert result["answer"] == TRUTHFULNESS_FALLBACK_ANSWER
+
+
+def test_valid_generated_answer_is_not_replaced_by_recovery() -> None:
+    user_id = 1121
+    assessment = create_assessment("Valid qwen retained", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=80, service="http")
+    valid_answer = "Stored Nmap evidence records 80/tcp classified as http. That observation does not establish a vulnerability."
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=valid_answer) as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Give me a concise note about the current evidence.",
+        )
+
+    model.assert_called_once()
+    assert result["fallback_reason"] is None
+    assert result["answer"] == valid_answer
+
+
 def test_nuclei_template_match_cannot_be_rendered_as_causal_mitm_path() -> None:
     assessment = create_assessment("Nuclei causal guard", user_id=1106)
     finding = add_finding(user_id=1106, finding={

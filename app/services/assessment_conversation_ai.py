@@ -281,6 +281,9 @@ def _recover_rejected_assessment_answer(context: dict) -> str | None:
     map_answer = _build_assessment_map_answer(context)
     if map_answer:
         return map_answer
+    centralized_recovery = _build_evidence_grounded_recovery_answer(context)
+    if centralized_recovery:
+        return centralized_recovery
     intent = str(context.get("question_intent") or "")
     if intent in {"assessment_highlight", "prioritization"}:
         synthesis_context = dict(context)
@@ -291,6 +294,165 @@ def _recover_rejected_assessment_answer(context: dict) -> str | None:
     if intent == "uncertainty_safety" and str(context.get("uncertainty_subtype") or "overall_security") == "overall_security":
         return _build_grounded_conversational_fallback(context)
     return _build_grounded_conversational_fallback(context)
+
+
+def _build_evidence_grounded_recovery_answer(context: dict) -> str | None:
+    """Central recovery for rejected model answers when stored evidence can answer safely."""
+
+    intent = str(context.get("question_intent") or "")
+    question = str(context.get("current_question") or "").lower()
+    if _recovery_should_preserve_generic_withheld(context):
+        return None
+    if not _has_assessment_state_or_evidence(context):
+        return None
+    selected = [str(tool).lower().removesuffix(".sh") for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    if selected:
+        if intent in {"individual_tool_state", "current_assessment_evidence"} or is_tool_state_question(question):
+            answer = _build_named_tool_evidence_answer(context)
+            if answer:
+                return answer
+        if intent == "individual_tool_explanation" or has_explicit_tool_name(question):
+            answer = _build_individual_tool_state_answer(context) or _build_individual_tool_explanation_answer(context)
+            if answer:
+                return answer
+    if intent in {"tool_state_overview"} or _recovery_asks_coverage_or_tested(question):
+        if _recovery_asks_remaining_gaps(question):
+            return _build_grounded_conversational_fallback({**context, "question_intent": "remaining_coverage_gaps"})
+        return _build_tool_state_overview(context)
+    if intent in {"assessment_summary", "assessment_highlight", "significance_interpretation"} or _recovery_asks_summary_or_significance(question):
+        if _recovery_asks_investigation_significance(question):
+            return _build_recovery_highlight_and_next_step_answer(context)
+        synthesis_context = dict(context)
+        synthesis_context["question_intent"] = "assessment_summary"
+        return _build_grounded_assessment_summary(synthesis_context)
+    if intent in {"next_step_recommendation", "prioritization"} or _recovery_asks_next_step(question):
+        return _build_recovery_next_step_answer(context)
+    if intent in {"follow_up_reference", "explanation"}:
+        follow_up = _build_follow_up_fallback(context)
+        if follow_up:
+            return follow_up
+    if intent == "uncertainty_safety":
+        return _build_grounded_conversational_fallback(context)
+    return None
+
+
+def _recovery_should_preserve_generic_withheld(context: dict) -> bool:
+    question = str(context.get("current_question") or "").lower()
+    selected = [str(tool).lower().removesuffix(".sh") for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    return bool(selected and re.search(r"\b(?:prove|proves|proved|proof)\b", question))
+
+
+def _has_assessment_state_or_evidence(context: dict) -> bool:
+    assessment = context.get("assessment_context") or {}
+    return bool(assessment.get("scans") or assessment.get("findings"))
+
+
+def _recovery_asks_summary_or_significance(question: str) -> bool:
+    return any(
+        phrase in question
+        for phrase in (
+            "what did we find", "what have we found", "what have we learned", "what have we learnt",
+            "what do we know", "what evidence", "looking at the evidence", "from the evidence",
+            "summarize", "summarise", "summary", "established", "worth investigating", "stands out",
+            "interesting", "significant", "matter", "worry", "concern",
+        )
+    )
+
+
+def _recovery_asks_investigation_significance(question: str) -> bool:
+    return any(
+        phrase in question
+        for phrase in (
+            "worth investigating", "investigate further", "worth checking", "pay attention",
+            "stands out", "interesting", "significant", "worry", "concern", "matter",
+        )
+    )
+
+
+def _recovery_asks_coverage_or_tested(question: str) -> bool:
+    return any(
+        phrase in question
+        for phrase in (
+            "what have we tested", "what did we test", "what has been tested", "coverage",
+            "what haven't we tested", "what have we not tested", "what haven't we checked",
+            "what have we not checked", "what remains", "what is missing", "gaps",
+        )
+    )
+
+
+def _recovery_asks_remaining_gaps(question: str) -> bool:
+    return any(
+        phrase in question
+        for phrase in (
+            "haven't", "have not", "not tested", "not checked", "what remains", "missing", "gaps",
+        )
+    )
+
+
+def _recovery_asks_next_step(question: str) -> bool:
+    return any(
+        phrase in question
+        for phrase in (
+            "what next", "what should", "do next", "run next", "investigate next",
+            "recommend", "where do we go", "worth investigating further", "worth doing",
+        )
+    )
+
+
+def _build_recovery_highlight_and_next_step_answer(context: dict) -> str | None:
+    synthesis_context = dict(context)
+    synthesis_context["question_intent"] = "assessment_highlight"
+    synthesis = _build_grounded_assessment_summary(synthesis_context)
+    next_step = _build_recovery_next_step_answer(context)
+    if synthesis and next_step:
+        return synthesis + " " + next_step
+    return synthesis or next_step
+
+
+def _build_recovery_next_step_answer(context: dict) -> str | None:
+    recovery_context = _context_with_recovery_preferred_next_tools(context)
+    answer = _build_grounded_conversational_fallback(recovery_context)
+    if answer:
+        return answer
+    return _build_grounded_conversational_fallback({**context, "question_intent": "next_step_recommendation"})
+
+
+def _context_with_recovery_preferred_next_tools(context: dict) -> dict:
+    recommendation = deepcopy(context.get("recommendation_context") or {})
+    preferred = [str(tool).lower().removesuffix(".sh") for tool in recommendation.get("preferred_next_tools") or []]
+    if not preferred:
+        preferred = _derive_recovery_preferred_next_tools(context)
+    recommendation["preferred_next_tools"] = preferred
+    recovery_context = dict(context)
+    recovery_context["question_intent"] = "next_step_recommendation"
+    recovery_context["recommendation_context"] = recommendation
+    return recovery_context
+
+
+def _derive_recovery_preferred_next_tools(context: dict) -> list[str]:
+    recommendation = context.get("recommendation_context") or {}
+    states = {str(tool).lower().removesuffix(".sh"): str(state) for tool, state in (recommendation.get("tool_states") or {}).items()}
+    if recommendation.get("web_services_observed_by_nmap") and states.get("httpx") != "COMPLETED":
+        return ["httpx"]
+    if recommendation.get("web_services_observed_by_nmap"):
+        for tool in ("katana", "playwright", "ffuf"):
+            if states.get(tool) != "COMPLETED":
+                return [tool]
+        remaining = [
+            tool for tool in ("nuclei", "testssl", "bbot")
+            if states.get(tool) != "COMPLETED"
+            and tool in {str(candidate).lower().removesuffix(".sh") for candidate in recommendation.get("supported_tool_candidates") or []}
+        ]
+        if remaining:
+            return remaining
+    for tool in recommendation.get("supported_tool_candidates") or []:
+        normalized = str(tool).lower().removesuffix(".sh")
+        if states.get(normalized) == "COMPLETED":
+            continue
+        if normalized in {"gitleaks", "prowler", "metasploit", "tshark"}:
+            continue
+        return [normalized]
+    return []
 
 
 def build_assessment_conversation_prompt(context: dict, *, prompt_context: dict | None = None) -> str:
@@ -2527,6 +2689,7 @@ def _question_can_use_relationship_map(context: dict) -> bool:
     question = str(context.get("current_question") or "").lower()
     intent = str(context.get("question_intent") or "")
     if intent not in {
+        "current_assessment_evidence",
         "assessment_summary",
         "assessment_highlight",
         "current_assessment_evidence",
@@ -3070,6 +3233,7 @@ def _has_unsuitable_tool_recommendation(answer: str, context: dict) -> bool:
     recommendation = context.get("recommendation_context") or {}
     intent = str(context.get("question_intent") or "")
     if intent not in {
+        "current_assessment_evidence",
         "assessment_summary",
         "assessment_highlight",
         "next_step_recommendation",
@@ -3078,6 +3242,11 @@ def _has_unsuitable_tool_recommendation(answer: str, context: dict) -> bool:
         "significance_interpretation",
         "simplify_explanation",
     }:
+        return False
+    if intent == "current_assessment_evidence" and not (
+        _recovery_asks_next_step(str(context.get("current_question") or "").lower())
+        or _recovery_asks_investigation_significance(str(context.get("current_question") or "").lower())
+    ):
         return False
     preferred = {
         str(tool).lower().removesuffix(".sh")
