@@ -300,7 +300,7 @@ def _build_evidence_grounded_recovery_answer(context: dict) -> str | None:
     """Central recovery for rejected model answers when stored evidence can answer safely."""
 
     intent = str(context.get("question_intent") or "")
-    question = str(context.get("current_question") or "").lower()
+    question = _normalize_recovery_question(str(context.get("current_question") or ""))
     if _recovery_should_preserve_generic_withheld(context):
         return None
     if not _has_assessment_state_or_evidence(context):
@@ -337,9 +337,26 @@ def _build_evidence_grounded_recovery_answer(context: dict) -> str | None:
 
 
 def _recovery_should_preserve_generic_withheld(context: dict) -> bool:
-    question = str(context.get("current_question") or "").lower()
+    question = _normalize_recovery_question(str(context.get("current_question") or ""))
     selected = [str(tool).lower().removesuffix(".sh") for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
     return bool(selected and re.search(r"\b(?:prove|proves|proved|proof)\b", question))
+
+
+def _normalize_recovery_question(question: str) -> str:
+    """Normalize casual filler only for deterministic recovery intent matching."""
+
+    normalized = " ".join(str(question or "").lower().replace("’", "'").split())
+    normalized = re.sub(r"[?!.,;:]+", " ", normalized)
+    for pattern in (
+        r"\b(?:the\s+)?fuck(?:ing)?\b",
+        r"\bactually\b",
+        r"\bso\b",
+        r"\bok(?:ay)?\b",
+        r"\bplease\b",
+        r"\bjust\b",
+    ):
+        normalized = re.sub(pattern, " ", normalized)
+    return " ".join(normalized.split())
 
 
 def _has_assessment_state_or_evidence(context: dict) -> bool:

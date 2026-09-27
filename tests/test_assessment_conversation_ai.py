@@ -2758,6 +2758,49 @@ def test_rejected_assessment_wide_findings_summary_recovers_from_stored_evidence
     assert "site is vulnerable" not in result["answer"].lower()
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What have we actually found so far?",
+        "What the fuck have we actually found so far?",
+        "So what have we found?",
+    ],
+)
+def test_rejected_summary_recovery_tolerates_casual_filler_and_profanity(question: str) -> None:
+    user_id = 1122
+    assessment = create_assessment("Rejected casual summary recovery", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=443, service="https")
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question=question,
+    )
+
+    answer = _recover_rejected_assessment_answer(context)
+
+    assert answer is not None
+    assert "Nmap recorded exposed TCP services" in answer
+    assert "443/tcp" in answer
+    assert answer != TRUTHFULNESS_FALLBACK_ANSWER
+
+
+def test_unrelated_profanity_does_not_become_summary_recovery_intent() -> None:
+    user_id = 1123
+    assessment = create_assessment("Rejected unrelated profanity recovery", user_id=user_id)
+    _add_nmap_scan(assessment["id"], user_id=user_id, port=443, service="https")
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="This is fucked.",
+    )
+
+    answer = _recover_rejected_assessment_answer(context)
+
+    assert answer is None
+
+
 def test_rejected_coverage_and_gap_questions_recover_from_tool_state() -> None:
     user_id = 1116
     assessment = create_assessment("Rejected coverage recovery", user_id=user_id)
