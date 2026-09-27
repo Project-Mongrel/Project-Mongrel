@@ -132,7 +132,7 @@ def _map_bbot_primary(kind: str, value: str, raw_event: dict, writer: MappingWri
     try:
         if kind == "subdomain":
             return writer.entity(canonical_hostname(value), "bbot_hostname", f"{base}.value")
-        if kind == "ip_address":
+        if kind in {"ip_address", "open_port"}:
             service = _bbot_service(raw_event, value)
             if service is not None:
                 host_identity, service_identity = service
@@ -141,6 +141,8 @@ def _map_bbot_primary(kind: str, value: str, raw_event: dict, writer: MappingWri
                 writer.assertion(host, "exposes_service", object_entity=service_row,
                                  evidence_kind="bbot_open_tcp_port", path=f"{base}.value")
                 return service_row
+            if kind == "open_port":
+                return None
             return writer.entity(canonical_ip(value), "bbot_ip", f"{base}.value")
         if kind == "url":
             application = writer.entity(canonical_application_origin(value), "bbot_url", f"{base}.value")

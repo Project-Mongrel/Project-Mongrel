@@ -8,6 +8,7 @@ ASSET_TYPES = (
     "subdomain",
     "url",
     "ip_address",
+    "open_port",
     "dns_record",
     "technology",
     "certificate",
@@ -17,12 +18,13 @@ ASSET_LABELS = {
     "subdomain": "subdomains",
     "url": "URLs",
     "ip_address": "IP addresses",
+    "open_port": "open ports",
     "dns_record": "DNS records",
     "technology": "technologies",
     "certificate": "certificates",
     "email": "email addresses",
 }
-DISCOVERY_TYPES = ("subdomain", "url", "ip_address", "technology", "certificate", "email", "dns_record")
+DISCOVERY_TYPES = ("subdomain", "url", "ip_address", "open_port", "technology", "certificate", "email", "dns_record")
 ADMIN_HOST_TOKENS = {"admin", "auth", "login", "manage", "management", "portal", "vpn", "staging"}
 MAX_DISCOVERIES = 8
 

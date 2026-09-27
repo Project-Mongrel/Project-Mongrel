@@ -6,6 +6,7 @@ from app.services.investigation_store import get_investigation
 from app.services.observation_store import get_investigation_observations, get_user_observations
 from app.services.target_normalizer import normalize_target_key
 
+BBOT_AI_NUM_PREDICT = 512
 AI_UNAVAILABLE_MESSAGES = (
     "AI integration is not configured yet.",
     "Unsupported AI provider.",
@@ -67,8 +68,11 @@ UNSUPPORTED_RECON_CLAIM_PATTERNS = (
     re.compile(r"\b(?:target|application|app|server|host|subdomains?|domains?|urls?|assets?|technology|technologies)\b[^.!?]{0,80}\bexposes?\s+vulnerabilities\b"),
     re.compile(r"\b(?:compromise|exploitation|breach)\s+(?:was\s+)?(?:observed|detected|identified|confirmed)\b"),
     re.compile(r"\b(?:active|running|live)\s+services?\s+(?:were\s+)?(?:observed|detected|identified|confirmed)\b"),
+    re.compile(r"\bno\s+(?:active|running|live)\s+services?(?:\s+or\s+technologies)?\s+(?:were\s+)?(?:observed|detected|identified|confirmed|found)\b"),
     re.compile(r"\b(?:sensitive\s+data|secrets?|credentials?)\s+(?:were\s+)?(?:observed|detected|identified|exposed|leaked)\b"),
     re.compile(r"\b(?:ip|ip address|address)\b[^.!?]{0,80}\b(?:belongs\s+to|is\s+owned\s+by|owned\s+by)\b"),
+    re.compile(r"\b(?:target|domain|host|site|asset)\b[^.!?]{0,120}\b(?:part\s+of|belongs\s+to|owned\s+by|hosted\s+by)\b[^.!?]{0,80}\binfrastructure\b"),
+    re.compile(r"\b(?:blacknight|outlook|microsoft|squarespace|cloudflare|amazon|aws|azure|google)\b[^.!?]{0,80}\b(?:owns?|owned|infrastructure)\b"),
     re.compile(r"\b(?:attack\s+surface|target)\s+(?:is|was|appears|seems|looks)\s+(?:clean|secure|safe)\b"),
     re.compile(r"\bno\s+vulnerabilities\b"),
 )
@@ -92,6 +96,16 @@ ALLOWED_OBSERVATION_TYPES = {
     "social_profile": "Social profiles",
     "open_port": "Open ports",
     "finding": "Findings",
+}
+REQUIRED_SECTION_HEADINGS = {
+    "executive summary",
+    "observed facts",
+    "observed assets",
+    "interpretation",
+    "potential risks",
+    "limitations",
+    "confidence",
+    "recommended next actions",
 }
 
 
@@ -143,7 +157,7 @@ def generate_bbot_ai_assessment(
         target=target,
     )
     try:
-        response = ask_ai(prompt)
+        response = ask_ai(prompt, num_predict=BBOT_AI_NUM_PREDICT, path="bbot_ai_assessment")
     except Exception:
         return list(FALLBACK_LINES)
 
@@ -154,7 +168,7 @@ def generate_bbot_ai_assessment(
     if not cleaned_response:
         return list(FALLBACK_LINES)
 
-    return _sanitize_response_lines(cleaned_response.splitlines())
+    return _sanitize_response_lines(cleaned_response.splitlines(), observations)
 
 
 def build_bbot_ai_assessment_prompt(
@@ -290,9 +304,11 @@ def _sanitize_recon_summary(recon_summary: str) -> str:
     return "\n".join(sanitized_lines) if sanitized_lines else "- No deterministic summary supplied."
 
 
-def _sanitize_response_lines(lines: list[str]) -> list[str]:
+def _sanitize_response_lines(lines: list[str], observations: list[dict] | None = None) -> list[str]:
+    if _looks_truncated_response(lines):
+        return _deterministic_bbot_assessment_lines(observations or [])
     if _contains_unsupported_recon_claim(lines):
-        return list(UNSUPPORTED_CLAIM_FALLBACK_LINES)
+        return _deterministic_bbot_assessment_lines(observations or [])
     sanitized_lines = []
     for line in lines:
         if _contains_forbidden_term(line):
@@ -301,6 +317,44 @@ def _sanitize_response_lines(lines: list[str]) -> list[str]:
             continue
         sanitized_lines.append(line)
     return sanitized_lines if sanitized_lines else list(FALLBACK_LINES)
+
+
+def _deterministic_bbot_assessment_lines(observations: list[dict]) -> list[str]:
+    counts = _observation_counts(observations)
+    target = _target_from_observations(observations) or "unknown"
+    lines = [
+        "Executive Summary",
+        f"- Normalized reconnaissance evidence for {target} contains {len(observations)} observation(s).",
+        "- These observations identify discovered assets and relationships for follow-up; they do not prove ownership, active service availability, vulnerability, exploitation, compromise, or sensitive data exposure.",
+        "",
+        "Observed Facts",
+    ]
+    lines.extend(_count_lines(counts))
+    lines.extend([
+        "",
+        "Observed Assets",
+    ])
+    lines.extend(_asset_lines(observations))
+    lines.extend([
+        "",
+        "Interpretation",
+        "- DNS/provider relationships should be treated as observed infrastructure relationships only, not proof that the target is owned by or part of a provider's infrastructure.",
+        "- Open-port observations are endpoint observations and require authorized validation before drawing service or security conclusions.",
+        "",
+        "Potential Risks",
+        "- Reconnaissance discoveries can identify surfaces worth validating, but no vulnerability or compromise is established by this evidence alone.",
+        "",
+        "Limitations",
+        "- Zero observed URLs, technologies, certificates, or emails means they were not observed in this evidence set; it does not prove absence.",
+        "- Discovery evidence does not establish active services unless separately validated.",
+        "",
+        "Confidence",
+        "Medium",
+        "",
+        "Recommended Next Actions",
+        "- Review discovered domains, DNS records, IP addresses, and open-port observations with authorized follow-up checks.",
+    ])
+    return lines
 
 
 def _sanitize_text(text: str) -> str:
@@ -321,6 +375,66 @@ def _sanitize_text(text: str) -> str:
     for old, new in replacements.items():
         sanitized = sanitized.replace(old, new)
     return sanitized
+
+
+def _observation_counts(observations: list[dict]) -> dict[str, int]:
+    counts = {key: 0 for key in ALLOWED_OBSERVATION_TYPES}
+    for observation in observations:
+        observation_type = str(observation.get("observation_type") or "")
+        if observation_type in counts:
+            counts[observation_type] += 1
+    return counts
+
+
+def _count_lines(counts: dict[str, int]) -> list[str]:
+    ordered = [
+        ("subdomain", "DNS names/subdomains"),
+        ("url", "URLs"),
+        ("ip_address", "IP addresses"),
+        ("open_port", "Open-port endpoints"),
+        ("dns_record", "DNS records"),
+        ("technology", "Technologies"),
+        ("certificate", "Certificates"),
+        ("email", "Email addresses"),
+    ]
+    return [f"- {label}: {counts.get(key, 0)}" for key, label in ordered]
+
+
+def _asset_lines(observations: list[dict]) -> list[str]:
+    grouped: dict[str, list[str]] = {}
+    for observation in observations:
+        observation_type = str(observation.get("observation_type") or "")
+        label = ALLOWED_OBSERVATION_TYPES.get(observation_type)
+        value = _sanitize_text(str(observation.get("value") or "").strip())
+        if not label or not value:
+            continue
+        grouped.setdefault(label, [])
+        if value.lower() not in {item.lower() for item in grouped[label]}:
+            grouped[label].append(value)
+    if not grouped:
+        return ["- No supported normalized assets were available."]
+    lines: list[str] = []
+    for label in sorted(grouped):
+        values = grouped[label]
+        shown = ", ".join(values[:8])
+        suffix = f" (+{len(values) - 8} more)" if len(values) > 8 else ""
+        lines.append(f"- {label}: {shown}{suffix}")
+    return lines
+
+
+def _looks_truncated_response(lines: list[str]) -> bool:
+    non_empty = [str(line or "").strip() for line in lines if str(line or "").strip()]
+    if not non_empty:
+        return True
+    last = non_empty[-1]
+    normalized_heading = last.strip(" -*#:\t").lower()
+    if normalized_heading in REQUIRED_SECTION_HEADINGS:
+        return True
+    if last in {"High", "Medium", "Low"}:
+        return False
+    if last.endswith((".", "!", "?", ":", ";", ")")):
+        return False
+    return bool(re.search(r"\b\w+\s+\w+\b", last))
 
 
 def _contains_forbidden_term(text: str) -> bool:

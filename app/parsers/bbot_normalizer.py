@@ -30,7 +30,7 @@ TYPE_MAP = {
     "ssl_certificate": "certificate",
     "x509_certificate": "certificate",
     "dns_record": "dns_record",
-    "open_tcp_port": "ip_address",
+    "open_tcp_port": "open_port",
     "web_technology": "technology",
 }
 

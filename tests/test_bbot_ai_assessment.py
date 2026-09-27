@@ -3,10 +3,12 @@ from unittest.mock import patch
 import pytest
 
 from app.services.bbot_ai_assessment import (
+    BBOT_AI_NUM_PREDICT,
     FALLBACK_LINES,
     build_bbot_ai_assessment_prompt,
     generate_bbot_ai_assessment,
 )
+from app.parsers.bbot_normalizer import normalize_bbot_output
 from app.services.findings_store import close_findings_database, configure_findings_database
 from app.services.investigation_store import create_investigation
 from app.services.observation_store import add_observation
@@ -358,6 +360,119 @@ def test_prompt_includes_ip_and_email_without_ownership_or_breach_claims() -> No
     assert "Do not infer sensitive data exposure, breach, or insecure configuration from discovery evidence alone." in prompt
 
 
+def test_open_tcp_port_normalizes_as_open_port_not_ip_address() -> None:
+    observations = normalize_bbot_output(
+        "\n".join([
+            '{"type":"OPEN_TCP_PORT","data":"btjoinery.ie:443"}',
+            '{"type":"IP_ADDRESS","data":"192.0.2.10"}',
+        ]),
+        "btjoinery.ie",
+        11012,
+        investigation_id="inv-live",
+    )
+
+    by_value = {observation["value"]: observation["observation_type"] for observation in observations}
+    assert by_value["btjoinery.ie:443"] == "open_port"
+    assert by_value["192.0.2.10"] == "ip_address"
+
+
+def test_bbot_ai_uses_dedicated_output_budget() -> None:
+    investigation = create_investigation(user_id=11013, target="example.com")
+    add_observation(
+        user_id=11013,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="subdomain",
+        value="app.example.com",
+        target="example.com",
+    )
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value="Executive Summary\n- app.example.com was observed.") as ask_ai:
+        generate_bbot_ai_assessment(11013, investigation_id=investigation["id"], target="example.com")
+
+    assert ask_ai.call_args.kwargs["num_predict"] == BBOT_AI_NUM_PREDICT
+    assert ask_ai.call_args.kwargs["path"] == "bbot_ai_assessment"
+
+
+def test_live_shape_fallback_preserves_counts_and_no_ownership_inference() -> None:
+    observations = _live_shape_observations()
+    ai_response = "\n".join([
+        "Executive Summary",
+        "- The target is part of Blacknight infrastructure.",
+        "Observed Facts",
+        "- No active services or technologies were identified.",
+    ])
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=ai_response):
+        lines = generate_bbot_ai_assessment(
+            11014,
+            target="btjoinery.ie",
+            observations=observations,
+            recon_summary="BBOT Recon Summary",
+        )
+
+    text = "\n".join(lines)
+    assert "DNS names/subdomains: 9" in text
+    assert "IP addresses: 6" in text
+    assert "DNS records: 19" in text
+    assert "Open-port endpoints: 5" in text
+    assert "Technologies: 0" in text
+    assert "target is part of Blacknight infrastructure" not in text
+    assert "No active services or technologies were identified" not in text
+    assert "observed infrastructure relationships only" in text
+    assert "not proof that the target is owned by or part of a provider" in text
+
+
+@pytest.mark.parametrize(
+    "bad_claim",
+    [
+        "No active services were identified.",
+        "No active services or technologies were identified.",
+        "The target is part of Blacknight infrastructure.",
+        "The domain belongs to Blacknight infrastructure.",
+    ],
+)
+def test_bbot_unsupported_live_claim_classes_fall_back(bad_claim: str) -> None:
+    observations = [_observation("subdomain", "www.example.com")]
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=f"Executive Summary\n- {bad_claim}"):
+        lines = generate_bbot_ai_assessment(
+            11015,
+            target="example.com",
+            observations=observations,
+            recon_summary="BBOT Recon Summary",
+        )
+
+    text = "\n".join(lines)
+    assert bad_claim not in text
+    assert "Normalized reconnaissance evidence" in text
+    assert "do not prove ownership" in text
+
+
+@pytest.mark.parametrize(
+    "truncated_response",
+    [
+        "Executive Summary\n- Findings are based on DNS records and IP",
+        "Executive Summary\n- One subdomain was observed.\n\n**Observed Assets",
+    ],
+)
+def test_bbot_truncated_response_uses_grounded_fallback(truncated_response: str) -> None:
+    observations = [_observation("subdomain", "www.example.com")]
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=truncated_response):
+        lines = generate_bbot_ai_assessment(
+            11016,
+            target="example.com",
+            observations=observations,
+            recon_summary="BBOT Recon Summary",
+        )
+
+    text = "\n".join(lines)
+    assert "Normalized reconnaissance evidence" in text
+    assert "Observed Assets" in text
+    assert "Findings are based on DNS records and IP" not in text
+
+
 @pytest.mark.parametrize(
     "unsupported_claim",
     [
@@ -380,7 +495,7 @@ def test_unsupported_recon_security_claims_are_withheld(unsupported_claim: str) 
         lines = generate_bbot_ai_assessment(11010, investigation_id=investigation["id"], target="example.com")
 
     text = "\n".join(lines)
-    assert "unsupported security conclusion" in text
+    assert "Normalized reconnaissance evidence" in text
     assert unsupported_claim not in text
 
 
@@ -420,3 +535,37 @@ def _observation(observation_type: str, value: str) -> dict:
         "risk_level": "info",
         "summary": f"BBOT identified {observation_type}: {value}",
     }
+
+
+def _live_shape_observations() -> list[dict]:
+    observations: list[dict] = []
+    subdomains = [
+        "btjoinery.ie",
+        "www.btjoinery.ie",
+        "ns1.blacknight.com",
+        "ns2.blacknight.com",
+        "ns3.blacknight.com",
+        "ns4.blacknight.com",
+        "btjoinery-ie.mail.protection.outlook.com",
+        "ext-cust.squarespace.com",
+        "autodiscover.btjoinery.ie",
+    ]
+    ips = ["198.51.100.10", "198.51.100.11", "198.51.100.12", "192.0.2.20", "192.0.2.21", "203.0.113.44"]
+    dns_records = [f"host{index}.btjoinery.ie A 192.0.2.{index}" for index in range(1, 20)]
+    open_ports = [
+        "btjoinery.ie:80",
+        "btjoinery.ie:443",
+        "www.btjoinery.ie:443",
+        "btjoinery-ie.mail.protection.outlook.com:25",
+        "btjoinery-ie.mail.protection.outlook.com:80",
+    ]
+    for value in subdomains:
+        observations.append(_observation("subdomain", value))
+    for value in ips:
+        observations.append(_observation("ip_address", value))
+    for value in dns_records:
+        observations.append(_observation("dns_record", value))
+    for value in open_ports:
+        observations.append(_observation("open_port", value))
+    assert len(observations) == 39
+    return observations
