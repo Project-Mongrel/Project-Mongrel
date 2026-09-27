@@ -12,6 +12,7 @@ from app.services.assessment_conversation_ai import (
     answer_assessment_conversation_question,
     _apply_prompt_budget,
     _build_prompt_context,
+    _testssl_authoritative_count,
     _recover_rejected_assessment_answer,
     build_assessment_conversation_prompt,
     violates_conversation_truthfulness,
@@ -3193,6 +3194,7 @@ def test_tls_referent_uses_authoritative_testssl_records_concisely() -> None:
             "cipher_findings": [
                 {"id": "obsolete-cipher-list", "severity": "LOW", "finding": "obsolete cipher-list"},
             ] + [{"id": f"record-{index}", "severity": "INFO", "finding": "stored observation"} for index in range(5)],
+            "security_headers": [{"id": f"header-{index}", "severity": "OK", "finding": "stored check"} for index in range(11)],
         },
     })
     record_assessment_scan(assessment["id"], tool="testssl", status="completed", finding_id=finding["id"])
@@ -3207,10 +3209,53 @@ def test_tls_referent_uses_authoritative_testssl_records_concisely() -> None:
         )
 
     model.assert_not_called()
-    assert "9 normalized scanner record(s)" in result["answer"]
+    assert "9 authoritative normalized scanner record(s)" in result["answer"]
+    assert "20 normalized scanner record(s)" not in result["answer"]
     assert "LUCKY13" in result["answer"]
     assert "overall TLS security" in result["answer"]
     assert len(result["answer"]) < 900
+
+
+def test_testssl_authoritative_count_prefers_persisted_aggregate_over_display_lists() -> None:
+    findings = [{
+        "finding_count": 9,
+        "testssl_summary": {"notable_count": 4, "weak_protocol_count": 1},
+        "testssl_evidence": {"vulnerabilities": [{} for _ in range(20)]},
+    }]
+    assert _testssl_authoritative_count(findings) == 9
+    assert _testssl_authoritative_count([{
+        "testssl_summary": {"notable_count": 8, "weak_protocol_count": 1},
+        "testssl_evidence": {"vulnerabilities": [{} for _ in range(20)]},
+    }]) == 9
+    assert _testssl_authoritative_count([{
+        "testssl_evidence": {"vulnerabilities": [{} for _ in range(20)]},
+    }]) is None
+
+
+def test_cross_tool_tls_confirmation_uses_same_authoritative_testssl_count() -> None:
+    user_id = 1126
+    assessment = create_assessment("TLS cross count", user_id=user_id)
+    testssl = add_finding(user_id=user_id, finding={
+        "source": "testssl", "target": "example.test", "finding_count": 9,
+        "testssl_summary": {"notable_count": 9, "weak_protocol_count": 0},
+        "testssl_evidence": {"vulnerabilities": [{"id": f"record-{index}"} for index in range(20)]},
+    })
+    httpx = add_finding(user_id=user_id, finding={
+        "source": "httpx", "target": "example.test", "httpx_services": [{"url": "https://example.test", "tls": {"version": "TLS1.3"}}],
+    })
+    record_assessment_scan(assessment["id"], tool="testssl", status="completed", finding_id=testssl["id"])
+    record_assessment_scan(assessment["id"], tool="httpx", status="completed", finding_id=httpx["id"])
+    conversation = create_conversation(assessment["id"], user_id)
+    append_message(conversation["id"], user_id, "user", "What did testssl report?")
+    append_message(conversation["id"], user_id, "assistant", "The TLS observations need review.")
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id, assessment_id=assessment["id"], conversation_id=conversation["id"],
+        question="Did anything else confirm that?",
+    )
+
+    assert "9 normalized TLS scanner record(s)" in result["answer"]
+    assert "20 normalized TLS scanner record(s)" not in result["answer"]
 
 
 @pytest.mark.parametrize("claim", [

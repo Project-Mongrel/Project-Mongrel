@@ -1664,17 +1664,19 @@ def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
         return None
     sections = []
     concise = inherited_tls_question
+    authoritative_count = _testssl_authoritative_count(findings)
     for evidence in evidence_items:
         target = str(evidence.get("target") or evidence.get("host") or "the assessed TLS endpoint")
         details = []
         records = _testssl_records(evidence)
-        if concise and records:
+        if concise and (records or authoritative_count is not None):
             representative = [
                 item for item in records
                 if str(item.get("severity") or "").upper() not in {"OK", "INFO"}
             ][:4] or records[:3]
-            examples = "; ".join(_scanner_record(item) for item in representative)
-            details.append(f"{len(records)} normalized scanner record(s), including {examples}")
+            examples = "; ".join(_scanner_record(item) for item in representative) or "no representative records in the bounded display data"
+            count_text = str(authoritative_count) if authoritative_count is not None else "an unavailable"
+            details.append(f"{count_text} authoritative normalized scanner record(s), including {examples}")
             details.append("additional stored records remain in the authoritative result")
             sections.append(f"For {target}, testssl.sh reported " + "; ".join(details))
             continue
@@ -1711,6 +1713,31 @@ def _testssl_records(evidence: dict) -> list[dict]:
     for key in ("weak_protocols", "cipher_findings", "vulnerabilities", "security_headers", "notable_findings"):
         records.extend(item for item in evidence.get(key) or [] if isinstance(item, dict))
     return records
+
+
+def _testssl_authoritative_count(findings: list[dict]) -> int | None:
+    """Return the persisted testssl aggregate, never the size of display categories."""
+    for finding in findings:
+        value = finding.get("finding_count")
+        if isinstance(value, bool):
+            continue
+        try:
+            if value is not None and int(value) >= 0:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    for finding in findings:
+        summary = finding.get("testssl_summary")
+        if not isinstance(summary, dict):
+            continue
+        notable = summary.get("notable_count")
+        weak = summary.get("weak_protocol_count")
+        try:
+            if notable is not None or weak is not None:
+                return max(0, int(notable or 0)) + max(0, int(weak or 0))
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _tshark_evidence(context: dict) -> list[dict]:
@@ -3168,16 +3195,13 @@ def _build_cross_tool_confirmation(context: dict) -> str:
     question = str(context.get("current_question") or "").lower()
     if _selected_tools(context) == {"testssl"}:
         testssl_findings = _tool_findings(context, "testssl")
-        testssl_records = [
-            item for finding in testssl_findings
-            for evidence in ([finding.get("testssl_evidence")] if isinstance(finding.get("testssl_evidence"), dict) else [])
-            for item in _testssl_records(evidence)
-        ]
+        authoritative_count = _testssl_authoritative_count(testssl_findings)
         httpx_services, _ = _deduplicated_httpx_observations(_tool_findings(context, "httpx"))
         httpx_tls = [service for service in httpx_services if service.get("tls")]
         related = "httpx also stored TLS metadata" if httpx_tls else "no other stored tool evidence was found for the same TLS topic"
+        count_text = str(authoritative_count) if authoritative_count is not None else "an unavailable number of"
         return (
-            f"No automatic confirmation is established. testssl.sh stored {len(testssl_records)} normalized TLS scanner "
+            f"No automatic confirmation is established. testssl.sh stored {count_text} normalized TLS scanner "
             f"record(s), and {related}. That is related evidence where present, not independent proof of the scanner's "
             "finding, overall TLS security, or exploitability."
         )
