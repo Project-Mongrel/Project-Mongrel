@@ -33,19 +33,21 @@ def build_bbot_recon_summary(
     user_id,
     investigation_id=None,
     target=None,
+    completed_tools: set[str] | None = None,
 ):
     observations = _load_bbot_observations(user_id, investigation_id=investigation_id, target=target)
-    return build_bbot_recon_summary_from_observations(observations, target=target)
+    return build_bbot_recon_summary_from_observations(observations, target=target, completed_tools=completed_tools)
 
 
 def build_bbot_recon_summary_from_observations(
     observations: list[dict],
     target=None,
+    completed_tools: set[str] | None = None,
 ) -> str:
     target_label = _summary_target(target, observations)
     counts = Counter(str(observation.get("observation_type") or "") for observation in observations)
     discoveries = _interesting_discoveries(observations)
-    recommendations = _recommended_actions(observations)
+    recommendations = _recommended_actions(observations, completed_tools=completed_tools)
 
     lines = [
         section_label("bbot", "BBOT Recon Summary"),
@@ -121,11 +123,12 @@ def _interesting_discoveries(observations: list[dict]) -> list[str]:
     return values
 
 
-def _recommended_actions(observations: list[dict]) -> list[str]:
+def _recommended_actions(observations: list[dict], completed_tools: set[str] | None = None) -> list[str]:
     types = {str(observation.get("observation_type") or "") for observation in observations}
     values = [str(observation.get("value") or "") for observation in observations]
+    completed = {str(tool or "").strip().lower().removesuffix(".sh") for tool in (completed_tools or set())}
     recommendations = []
-    if "subdomain" in types or "url" in types:
+    if ("subdomain" in types or "url" in types) and "nuclei" not in completed:
         recommendations.append("Run Nuclei against discovered domains or URLs where authorized.")
     if "technology" in types:
         recommendations.append("Review observed technologies and versions against current advisories where version evidence exists.")
@@ -134,7 +137,10 @@ def _recommended_actions(observations: list[dict]) -> list[str]:
     if any(_is_admin_like_host(value) for value in values):
         recommendations.append("Review authentication requirements and intended exposure for admin-like hostnames.")
     if not recommendations:
-        recommendations.append("Continue reconnaissance using additional observation sources.")
+        if completed_tools is None:
+            recommendations.append("Continue reconnaissance using additional observation sources.")
+        else:
+            recommendations.append("Review the discovered reconnaissance evidence and ask Mongrel for assessment-aware next steps if needed.")
     return recommendations
 
 

@@ -2187,6 +2187,20 @@ def _record_assessment_scan(
     )
 
 
+def _completed_assessment_tools(assessment_context: dict | None) -> set[str] | None:
+    if not isinstance(assessment_context, dict) or assessment_context.get("assessment_id") is None:
+        return None
+    try:
+        scans = list_assessment_scans(int(assessment_context["assessment_id"]))
+    except Exception:
+        return set()
+    return {
+        str(scan.get("tool") or "").strip().lower().removesuffix(".sh")
+        for scan in scans
+        if str(scan.get("status") or "").strip().lower() == "completed"
+    }
+
+
 def _ingest_assessment_map_after_scan(
     assessment_context: dict | None,
     *,
@@ -4489,10 +4503,12 @@ async def _handle_bbot_target(
     event_status, event_suffix, event_wording = _scan_event_outcome(result)
     observation_count = len(observations)
     recon_summary = None
+    current_assessment_context = _current_assessment_scan_context(context, "bbot")
     if is_successful_or_partial:
         recon_summary = build_bbot_recon_summary_from_observations(
             observations,
             target=str(result.get("target") or display_target),
+            completed_tools=_completed_assessment_tools(current_assessment_context),
         )
     add_investigation_event(
         investigation_id=investigation["id"],

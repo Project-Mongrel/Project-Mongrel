@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.bbot_summary import build_bbot_recon_summary
+from app.services.bbot_summary import build_bbot_recon_summary, build_bbot_recon_summary_from_observations
 from app.services.findings_store import close_findings_database, configure_findings_database
 from app.services.observation_store import add_observation
 
@@ -31,6 +31,28 @@ def test_subdomains_summary() -> None:
     assert "1 subdomains" in summary
     assert "app.example.com" in summary
     assert "Run Nuclei against discovered domains or URLs where authorized." in summary
+
+
+def test_subdomains_summary_suppresses_nuclei_when_completed_in_assessment_state() -> None:
+    observations = [
+        {
+            "source": "bbot",
+            "observation_type": "subdomain",
+            "value": "app.example.com",
+            "target": "example.com",
+        }
+    ]
+
+    summary = build_bbot_recon_summary_from_observations(
+        observations,
+        target="example.com",
+        completed_tools={"nuclei"},
+    )
+
+    assert "1 subdomains" in summary
+    assert "app.example.com" in summary
+    assert "Run Nuclei against discovered domains or URLs where authorized." not in summary
+    assert "Review the discovered reconnaissance evidence" in summary
 
 
 def test_urls_summary() -> None:

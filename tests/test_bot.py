@@ -58,6 +58,7 @@ from app.bot.handlers.scan import (
     NUCLEI_STATUS_UPDATE_INTERVAL_SECONDS,
     PENDING_NMAP_REQUEST_KEY,
     _finalize_nuclei_status,
+    _completed_assessment_tools,
     _ffuf_scan_profiles,
     _metasploit_pending_context,
     _scan_recovery_tokens,
@@ -656,6 +657,17 @@ def test_assessment_bbot_button_records_assessment_scan() -> None:
         user_id=8121, assessment_id=assessment["id"], scan_id=scans[0]["id"]
     )
     assert "BBOT: Completed" in query_message.reply_text.call_args_list[-1].args[0]
+
+
+def test_completed_assessment_tools_reads_persisted_completed_state() -> None:
+    assessment = create_assessment("Assessment Completed Tools", user_id=81211)
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed")
+    record_assessment_scan(assessment["id"], tool="httpx", status="failed")
+    record_assessment_scan(assessment["id"], tool="testssl.sh", status="completed")
+
+    completed = _completed_assessment_tools({"assessment_id": assessment["id"], "tool": "bbot"})
+
+    assert completed == {"nuclei", "testssl"}
 
 
 def test_assessment_nuclei_button_records_assessment_scan() -> None:
