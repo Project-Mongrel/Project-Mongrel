@@ -1647,8 +1647,9 @@ def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
     )
     inherited_tls_question = (
         _selected_tools(context) == {"testssl"}
-        and (context.get("selection") or {}).get("recent_referent_scope") == ["testssl"]
+        and ("what about" in question or context.get("question_intent") in {"follow_up_reference", "cross_tool_confirmation"})
         and any(term in question for term in ("tls", "ssl", "certificate", "cert", "cipher", "testssl"))
+        and not is_tool_state_question(question)
     )
     if _selected_tools(context) != {"testssl"} or not (direct_question or tls_safety_question or inherited_tls_question):
         return None
@@ -1668,7 +1669,11 @@ def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
         details = []
         records = _testssl_records(evidence)
         if concise and records:
-            examples = "; ".join(_scanner_record(item) for item in records[:3])
+            representative = [
+                item for item in records
+                if str(item.get("severity") or "").upper() not in {"OK", "INFO"}
+            ][:4] or records[:3]
+            examples = "; ".join(_scanner_record(item) for item in representative)
             details.append(f"{len(records)} normalized scanner record(s), including {examples}")
             details.append("additional stored records remain in the authoritative result")
             sections.append(f"For {target}, testssl.sh reported " + "; ".join(details))

@@ -3174,12 +3174,26 @@ def test_tls_referent_uses_authoritative_testssl_records_concisely() -> None:
     user_id = 1122
     assessment = create_assessment("TLS referent", user_id=user_id)
     finding = add_finding(user_id=user_id, finding={
-        "source": "testssl", "target": "example.test", "finding_count": 9,
-        "testssl_findings": [
-            {"id": "LUCKY13", "severity": "LOW", "finding": "potentially vulnerable"},
-            {"id": "wildcard", "severity": "LOW", "finding": "wildcard trust"},
-            {"id": "cipher-list", "severity": "LOW", "finding": "obsolete cipher-list"},
-        ] + [{"id": f"record-{index}", "severity": "INFO", "finding": "stored observation"} for index in range(6)],
+        "source": "testssl", "target": "btjoinery.ie:443", "status": "completed", "finding_count": 9,
+        "testssl_summary": {
+            "notable_count": 9, "supported_protocols": ["TLS 1.2", "TLS 1.3"], "weak_protocol_count": 0,
+        },
+        "testssl_evidence": {
+            "target": "btjoinery.ie:443", "host": "btjoinery.ie", "port": 443, "scan_status": "completed",
+            "protocols": [
+                {"id": "TLS1_2", "name": "TLS 1.2", "finding": "offered", "severity": "OK"},
+                {"id": "TLS1_3", "name": "TLS 1.3", "finding": "offered with final", "severity": "OK"},
+            ],
+            "certificate": {"common_name": "btjoinery.ie", "not_after": "2026-11-27 14:05"},
+            "vulnerabilities": [
+                {"id": "LUCKY13", "severity": "LOW", "finding": "potentially vulnerable"},
+                {"id": "wildcard-trust", "severity": "LOW", "finding": "wildcard trust"},
+                {"id": "QUIC", "severity": "WARN", "finding": "not tested"},
+            ],
+            "cipher_findings": [
+                {"id": "obsolete-cipher-list", "severity": "LOW", "finding": "obsolete cipher-list"},
+            ] + [{"id": f"record-{index}", "severity": "INFO", "finding": "stored observation"} for index in range(5)],
+        },
     })
     record_assessment_scan(assessment["id"], tool="testssl", status="completed", finding_id=finding["id"])
     conversation = create_conversation(assessment["id"], user_id)
