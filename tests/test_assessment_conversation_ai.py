@@ -17,7 +17,7 @@ from app.services.assessment_conversation_ai import (
     violates_conversation_truthfulness,
     violates_mongrel_native_guidance,
 )
-from app.services.assessment_conversation_context import build_assessment_conversation_context
+from app.services.assessment_conversation_context import build_assessment_conversation_context, classify_assessment_conversation_intent
 from app.services.assessment_conversation_store import append_message, create_conversation
 from app.services.assessment_store import add_assessment_artifact, add_assessment_target, create_assessment, record_assessment_scan
 from app.services.findings_store import add_finding, close_findings_database, configure_findings_database
@@ -2390,6 +2390,105 @@ def _add_realistic_httpx_scan(assessment_id: int, *, user_id: int) -> dict:
     return record_assessment_scan(assessment_id, tool="httpx", status="completed", finding_id=finding["id"])
 
 
+def _add_eight_tool_web_assessment(assessment_id: int, *, user_id: int) -> None:
+    _add_two_port_web_nmap_scan(assessment_id, user_id=user_id)
+    _add_realistic_httpx_scan(assessment_id, user_id=user_id)
+    katana = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "katana",
+            "target": "https://www.example.com/",
+            "status": "completed",
+            "katana_observations": [
+                {
+                    "url": "https://www.example.com/",
+                    "host": "www.example.com",
+                    "path": "/",
+                    "status_code": 200,
+                    "depth": 0,
+                    "endpoint_type": "url",
+                }
+            ],
+        },
+    )
+    record_assessment_scan(assessment_id, tool="katana", status="completed", finding_id=katana["id"])
+    playwright = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "playwright",
+            "target": "https://www.example.com/",
+            "status": "completed",
+            "playwright_observation": {
+                "requested_url": "https://example.com/",
+                "final_url": "https://www.example.com/",
+                "status_code": 200,
+                "load_status": "loaded",
+                "forms_count": 0,
+                "inputs_count": 12,
+                "links_count": 56,
+                "network_events": [{"url": "https://www.example.com/", "status": 200}],
+                "console_issue_count": 8,
+                "network_issue_count": 0,
+                "page_error_count": 0,
+                "screenshot": {"path": "screenshots/example.png"},
+            },
+        },
+    )
+    record_assessment_scan(assessment_id, tool="playwright", status="completed", finding_id=playwright["id"])
+    ffuf = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "ffuf",
+            "target": "https://www.example.com/",
+            "status": "completed",
+            "ffuf_results": [{"path": "/about", "status": 200, "size": 1234}],
+            "ffuf_summary": {"result_count": 1, "status_codes": {"200": 1}},
+            "metadata": {"ffuf_profile_label": "small web profile", "wordlist_count": 100},
+        },
+    )
+    record_assessment_scan(assessment_id, tool="ffuf", status="completed", finding_id=ffuf["id"])
+    nuclei = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nuclei",
+            "target": "https://www.example.com/",
+            "status": "completed",
+            "nuclei_findings": [
+                {"template_id": "waf-detect", "name": "WAF Detection", "severity": "info"},
+                {"template_id": "http-missing-security-headers", "name": "HTTP Missing Security Headers", "severity": "info"},
+            ],
+        },
+    )
+    record_assessment_scan(assessment_id, tool="nuclei", status="completed", finding_id=nuclei["id"])
+    testssl = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "testssl",
+            "target": "https://www.example.com/",
+            "status": "completed",
+            "testssl_findings": [
+                {"id": "TLS1_3", "severity": "OK", "finding": "TLS 1.3 offered"},
+                {"id": "cert_commonName", "severity": "INFO", "finding": "www.example.com"},
+            ],
+        },
+    )
+    record_assessment_scan(assessment_id, tool="testssl", status="completed", finding_id=testssl["id"])
+    bbot = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "bbot",
+            "target": "example.com",
+            "status": "completed",
+            "bbot_observations": [
+                {"observation_type": "subdomain", "value": "www.example.com"},
+                {"observation_type": "ip_address", "value": "192.0.2.10"},
+                {"observation_type": "dns_record", "value": "www.example.com A 192.0.2.10"},
+            ],
+        },
+    )
+    record_assessment_scan(assessment_id, tool="bbot", status="completed", finding_id=bbot["id"])
+
+
 def test_referential_confidence_followup_inherits_nuclei_scope_and_stays_bounded() -> None:
     user_id = 1101
     assessment = create_assessment("Follow-up scope", user_id=user_id)
@@ -2783,6 +2882,187 @@ def test_rejected_summary_recovery_tolerates_casual_filler_and_profanity(questio
     assert "Nmap recorded exposed TCP services" in answer
     assert "443/tcp" in answer
     assert answer != TRUTHFULNESS_FALLBACK_ANSWER
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What have we actually found so far?",
+        "What the fuck have we actually found so far?",
+        "So what have we found?",
+        "ok please just what do we actually know?",
+    ],
+)
+def test_shared_intent_normalization_routes_casual_summary_questions(question: str) -> None:
+    assert classify_assessment_conversation_intent(question) == "assessment_summary"
+
+
+def test_unrelated_profanity_does_not_become_primary_summary_intent() -> None:
+    assert classify_assessment_conversation_intent("This is fucked.") == "current_assessment_evidence"
+
+
+def test_live_shaped_eight_tool_summary_is_deterministic_and_cross_tool_grounded() -> None:
+    user_id = 1124
+    assessment = create_assessment("Live broad synthesis", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    _add_eight_tool_web_assessment(assessment["id"], user_id=user_id)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What the fuck have we actually found so far?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"]
+    assert result["fallback_reason"] is None
+    assert "Nmap recorded exposed TCP services" in answer
+    assert "httpx recorded HTTP(S) response metadata" in answer
+    assert "redirect https://www.example.com/" in answer
+    assert "Katana stored" in answer
+    assert "Playwright recorded passive browser state" in answer
+    assert "ffuf stored" in answer
+    assert "Nuclei stored" in answer
+    assert "testssl.sh stored" in answer
+    assert "BBOT stored" in answer
+    assert "unencrypted web service" not in answer.lower()
+    assert "low-risk" not in answer.lower()
+    assert "redirect traffic to https" not in answer.lower()
+    assert "is vulnerable" not in answer.lower()
+    assert "confirmed vulnerability" not in answer.lower()
+
+
+def test_nuclei_summary_uses_persisted_aggregate_counts_after_context_caps_list() -> None:
+    user_id = 1128
+    assessment = create_assessment("Nuclei aggregate budget", user_id=user_id)
+    nuclei_findings = (
+        [{"name": "HTTP Missing Security Headers", "severity": "info"}] * 10
+        + [
+            {"name": "WAF Detection", "severity": "info"},
+            {"name": "Microsoft Azure Domain Tenant ID", "severity": "info"},
+        ]
+    )
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nuclei",
+            "target": "example.com",
+            "status": "completed",
+            "finding_count": 12,
+            "severity_summary": {"critical": 0, "high": 0, "info": 12, "low": 0, "medium": 0},
+            "nuclei_findings": nuclei_findings,
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="nuclei", status="completed", finding_id=finding["id"])
+
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="What have we actually found so far?",
+    )
+    stored = context["assessment_context"]["findings"][0]
+    assert len(stored["nuclei_findings"]) == 10
+    assert stored["nuclei_template_counts"] == {
+        "HTTP Missing Security Headers": 10,
+        "WAF Detection": 1,
+        "Microsoft Azure Domain Tenant ID": 1,
+    }
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="What have we actually found so far?",
+    )
+    answer = result["answer"]
+    assert "Nuclei stored 12 template match(es)" in answer
+    assert "aggregate severity INFO=12" in answer
+    assert "HTTP Missing Security Headers=10" in answer
+    assert "WAF Detection=1" in answer
+    assert "Microsoft Azure Domain Tenant ID=1" in answer
+
+
+def test_summary_plus_next_step_uses_synopsis_without_forcing_redirect_remediation() -> None:
+    user_id = 1125
+    assessment = create_assessment("Live broad synthesis next", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    _add_eight_tool_web_assessment(assessment["id"], user_id=user_id)
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What have we actually found so far, and what should we investigate next?",
+        )
+
+    model.assert_not_called()
+    answer = result["answer"]
+    assert "Nmap recorded exposed TCP services" in answer
+    assert "httpx recorded HTTP(S) response metadata" in answer
+    assert "redirect https://www.example.com/" in answer
+    assert "redirect traffic to HTTPS" not in answer
+    assert "Suitable remaining investigation options" not in answer
+
+
+def test_bad_live_broad_summary_is_rejected_and_recovers_to_grounded_summary() -> None:
+    user_id = 1126
+    assessment = create_assessment("Bad live summary recovery", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    _add_eight_tool_web_assessment(assessment["id"], user_id=user_id)
+    bad_answer = (
+        "So far, we have found a low-risk open port on the target `example.com` (192.0.2.10), "
+        "specifically port `80/tcp` for HTTP. This indicates that an unencrypted web service is exposed.\n\n"
+        "The recommendation based on this finding is to redirect traffic to HTTPS and review the exposed web application functionality."
+    )
+
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value=bad_answer):
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="Compare what we have found so far.",
+        )
+
+    assert result["fallback_reason"] == "grounded_conversation_fallback"
+    answer = result["answer"]
+    assert "Nmap recorded exposed TCP services" in answer
+    assert "httpx recorded HTTP(S) response metadata" in answer
+    assert "Katana stored" in answer
+    assert "low-risk" not in answer.lower()
+    assert "unencrypted web service" not in answer.lower()
+    assert "redirect traffic to https" not in answer.lower()
+
+
+def test_broad_prompt_budget_preserves_compact_synopsis() -> None:
+    user_id = 1127
+    assessment = create_assessment("Broad synopsis budget", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    _add_eight_tool_web_assessment(assessment["id"], user_id=user_id)
+    for index in range(12):
+        finding = add_finding(user_id=user_id, finding={
+            "source": f"noise-{index}",
+            "target": "example.com",
+            "observations": ["bulk " + ("x" * 1600)] * 10,
+        })
+        record_assessment_scan(assessment["id"], tool=f"noise-{index}", status="completed", finding_id=finding["id"])
+
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="Give me a broad assessment-wide review of the evidence and priorities.",
+    )
+    budgeted, _ = _apply_prompt_budget(context, _build_prompt_context(context))
+    prompt = build_assessment_conversation_prompt(context, prompt_context=budgeted)
+
+    assert len(prompt) <= ASSESSMENT_PROMPT_MAX_CHARS
+    synopsis = json.dumps(budgeted.get("assessment_evidence_synopsis") or [], default=str)
+    assert "Nmap recorded exposed TCP services" in synopsis
+    assert "httpx recorded HTTP(S) response metadata" in synopsis
 
 
 def test_unrelated_profanity_does_not_become_summary_recovery_intent() -> None:

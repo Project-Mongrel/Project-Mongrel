@@ -24,6 +24,7 @@ PYTEST_AUDIT_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp_audit"
 PYTEST_FALLBACK_TEMP_ROOT = PROJECT_ROOT / ".pytest_tmp_runs"
 PYTEST_AUDIT_STALE_PREFIX = ".pytest_tmp_security_audit_"
 PYTEST_TEMP_ROOT_ENV = "MONGREL_PYTEST_TEMP_ROOT"
+PYTEST_TEMP_STALE_SECONDS = 24 * 60 * 60
 DETECT_SECRETS_EXCLUDE_FILES = r"(^|/)(?:\.pytest_tmp(?:/|$)|\.pytest_tmp_audit(?:/|$)|\.pytest_tmp_runs(?:/|$)|\.pytest_cache(?:/|$)|\.pytest_tmp_security_audit_[^/]*(?:/|$))"
 
 
@@ -204,7 +205,8 @@ def cleanup_generated_pytest_run_roots(active_basetemp: Path | None = None) -> l
 
     The cleanup is intentionally limited to direct ``run-*`` children of the
     known repo-local pytest temp roots.  It skips the current audit basetemp
-    and any run directory whose embedded PID is still alive.
+    and recent run directories whose embedded PID is still alive.  Age bounds
+    liveness so reused or unrelated PIDs cannot preserve stale roots forever.
     """
     removed: list[Path] = []
     for root in (PYTEST_TEMP_ROOT, PYTEST_AUDIT_TEMP_ROOT, PYTEST_FALLBACK_TEMP_ROOT):
@@ -221,7 +223,7 @@ def _cleanup_generated_pytest_run_root(root: Path, active_basetemp: Path | None 
     for child in children:
         if not _is_safe_generated_pytest_run_path(child, root, active_basetemp=active_basetemp):
             continue
-        if _run_path_pid_is_alive(child):
+        if _run_path_pid_is_alive(child) and not _run_path_is_stale(child):
             continue
         shutil.rmtree(child, ignore_errors=True)
         removed.append(child)
@@ -288,6 +290,13 @@ def _run_path_pid_is_alive(path: Path) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _run_path_is_stale(path: Path) -> bool:
+    try:
+        return path.stat().st_mtime <= time.time() - PYTEST_TEMP_STALE_SECONDS
+    except OSError:
+        return False
 
 
 def _parse_run_path_pid(name: str) -> int | None:

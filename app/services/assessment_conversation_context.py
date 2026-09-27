@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from collections import Counter
 from datetime import datetime
 from typing import Any
 
@@ -164,7 +165,7 @@ ASSESSMENT_SUMMARY_TERMS = (
     "what have we learned", "what have we learnt",
     "summarize this assessment", "summarise this assessment", "what does all this tell us",
     "what did the tools find", "what have the tools found", "what did our tools find",
-    "what can you actually say with confidence", "what can we say with confidence",
+    "what can you actually say with confidence", "what can you say with confidence", "what can we say with confidence",
 )
 ASSESSMENT_HIGHLIGHT_TERMS = (
     "most interesting thing", "what stands out", "most significant", "what's significant", "what is significant",
@@ -223,6 +224,14 @@ CASUAL_SECURITY_TERM_ALIASES = (
     (re.compile(r"\bdont\b"), "don't"),
     (re.compile(r"\bwat\b"), "what"),
     (re.compile(r"\bnxt\b"), "next"),
+)
+CASUAL_INTENT_FILLER_PATTERNS = (
+    re.compile(r"\b(?:the\s+)?fuck(?:ing)?\b"),
+    re.compile(r"\bactually\b"),
+    re.compile(r"\bso\b"),
+    re.compile(r"\bok(?:ay)?\b"),
+    re.compile(r"\bplease\b"),
+    re.compile(r"\bjust\b"),
 )
 TOOL_RELEVANCE_PATTERNS = (
     re.compile(r"\b(?:why|what)\s+wouldn'?t\s+(?:you|we)\s+(?:use|run)\b"),
@@ -568,6 +577,10 @@ def _normalize_intent_text(question: str) -> str:
     normalized = " ".join(str(question or "").lower().replace("’", "'").split())
     for pattern, replacement in CASUAL_SECURITY_TERM_ALIASES:
         normalized = pattern.sub(replacement, normalized)
+    for pattern in CASUAL_INTENT_FILLER_PATTERNS:
+        normalized = pattern.sub(" ", normalized)
+    normalized = re.sub(r"[?!.,;:]+", " ", normalized)
+    normalized = " ".join(normalized.split())
     return normalized
 
 
@@ -807,6 +820,14 @@ def _sanitize(value: Any, *, drop_finding: bool = False) -> Any:
             if "secret" in key_lower and key_lower not in SECRET_FIELD_ALLOWLIST and not key_lower.startswith("redacted_"):
                 sanitized[key_text] = "<REDACTED>"
                 continue
+            if key_lower == "nuclei_findings" and isinstance(item, list):
+                template_counts = Counter(
+                    str(entry.get("name") or entry.get("template_id") or "unnamed template")
+                    for entry in item
+                    if isinstance(entry, dict)
+                )
+                if template_counts and "nuclei_template_counts" not in sanitized:
+                    sanitized["nuclei_template_counts"] = dict(template_counts)
             sanitized[key_text] = _sanitize(item)
         return sanitized
     if isinstance(value, list):

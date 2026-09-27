@@ -16,6 +16,7 @@ from app.services.assessment_conversation_context import (
     is_tool_relevance_question,
     is_tool_state_question,
     select_latest_tool_scan,
+    _normalize_intent_text,
 )
 from app.services.assessment_evidence_semantics import get_represented_evidence_semantics
 from app.services.mongrel_self_knowledge import get_mongrel_tool_names
@@ -345,18 +346,7 @@ def _recovery_should_preserve_generic_withheld(context: dict) -> bool:
 def _normalize_recovery_question(question: str) -> str:
     """Normalize casual filler only for deterministic recovery intent matching."""
 
-    normalized = " ".join(str(question or "").lower().replace("’", "'").split())
-    normalized = re.sub(r"[?!.,;:]+", " ", normalized)
-    for pattern in (
-        r"\b(?:the\s+)?fuck(?:ing)?\b",
-        r"\bactually\b",
-        r"\bso\b",
-        r"\bok(?:ay)?\b",
-        r"\bplease\b",
-        r"\bjust\b",
-    ):
-        normalized = re.sub(pattern, " ", normalized)
-    return " ".join(normalized.split())
+    return _normalize_intent_text(question)
 
 
 def _has_assessment_state_or_evidence(context: dict) -> bool:
@@ -369,6 +359,7 @@ def _recovery_asks_summary_or_significance(question: str) -> bool:
         phrase in question
         for phrase in (
             "what did we find", "what have we found", "what have we learned", "what have we learnt",
+            "we have found",
             "what do we know", "what evidence", "looking at the evidence", "from the evidence",
             "summarize", "summarise", "summary", "established", "worth investigating", "stands out",
             "interesting", "significant", "matter", "worry", "concern",
@@ -559,6 +550,10 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
         return True
     if _has_unsuitable_tool_recommendation(normalized, context or {}):
         return True
+    if _recommendation_contradicted_by_stored_evidence(normalized, context or {}):
+        return True
+    if _broad_summary_collapses_to_one_tool(normalized, context or {}):
+        return True
     tool_states = ((context or {}).get("recommendation_context") or {}).get("tool_states") or {}
     if any(state != "NOT_RUN" for state in tool_states.values()) and re.search(
         r"\bno\s+(?:findings(?:\s+or\s+scans)?|scans(?:\s+or\s+findings)?)\s+(?:are\s+)?associated\s+with\s+(?:the\s+)?target\b",
@@ -685,6 +680,10 @@ def _build_prompt_context(context: dict) -> dict:
         return prompt_context
 
     prompt_context["stored_evidence"] = _evidence_for_generation(assessment_context, intent)
+    if intent in {"assessment_summary", "assessment_highlight"}:
+        synopsis = _build_assessment_evidence_synopsis(context)
+        if synopsis:
+            prompt_context["assessment_evidence_synopsis"] = synopsis[:12]
     if intent in {
         "next_step_recommendation", "prioritization", "remaining_coverage_gaps", "follow_up_reference",
         "explanation", "simplify_explanation",
@@ -783,6 +782,8 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
                 context.get("recommendation_context") or {},
                 minimal=True,
             )
+        if isinstance(candidate.get("assessment_evidence_synopsis"), list):
+            candidate["assessment_evidence_synopsis"] = list(candidate["assessment_evidence_synopsis"])[:8]
         candidate.pop("evidence_semantics", None)
         relationship_map = candidate.get("relationship_map")
         if isinstance(relationship_map, dict):
@@ -804,6 +805,8 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
             candidate["stored_evidence"] = _compact_generation_evidence(
                 candidate["stored_evidence"], list_limit=2, text_limit=160
             )
+        if isinstance(candidate.get("assessment_evidence_synopsis"), list):
+            candidate["assessment_evidence_synopsis"] = list(candidate["assessment_evidence_synopsis"])[:4]
         prior = candidate.get("prior_exchange")
         if isinstance(prior, dict):
             prior["messages"] = list(prior.get("messages") or [])[-2:]
@@ -820,6 +823,8 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
             candidate["stored_evidence"] = _compact_generation_evidence(
                 candidate["stored_evidence"], list_limit=list_limit, text_limit=text_limit
             )
+        if isinstance(candidate.get("assessment_evidence_synopsis"), list) and list_limit == 1:
+            candidate["assessment_evidence_synopsis"] = list(candidate["assessment_evidence_synopsis"])[:3]
         prior = candidate.get("prior_exchange")
         if isinstance(prior, dict):
             prior["messages"] = list(prior.get("messages") or [])[-1:]
@@ -828,12 +833,38 @@ def _apply_prompt_budget(context: dict, prompt_context: dict) -> tuple[dict, boo
             return candidate, True
 
     candidate["stored_evidence"] = _minimal_generation_evidence(context)
+    # Tool state remains authoritative; scan IDs are redundant in this final
+    # fallback and would crowd out the compact cross-tool synopsis.
+    scans = candidate["stored_evidence"].get("scans")
+    if isinstance(scans, list):
+        candidate["stored_evidence"]["scans"] = [
+            {key: scan.get(key) for key in ("tool", "status", "finding_id") if key in scan}
+            for scan in scans
+            if isinstance(scan, dict)
+        ]
+    synopsis = list(candidate.get("assessment_evidence_synopsis") or [])
+    if not synopsis:
+        synopsis = _build_assessment_evidence_synopsis(context)
+    candidate["assessment_evidence_synopsis"] = _compact_synopsis_lines(
+        synopsis[:2],
+        text_limit=240,
+    )
     candidate.pop("evidence_semantics", None)
     candidate.pop("relationship_map", None)
     prior = candidate.get("prior_exchange")
     if isinstance(prior, dict):
         prior["messages"] = []
         prior.pop("summary", None)
+    if not _rendered_prompt_fits(context, candidate):
+        candidate["assessment_evidence_synopsis"] = _compact_synopsis_lines(
+            list(candidate.get("assessment_evidence_synopsis") or [])[:2],
+            text_limit=120,
+        )
+    if not _rendered_prompt_fits(context, candidate):
+        candidate["assessment_evidence_synopsis"] = _compact_synopsis_lines(
+            list(candidate.get("assessment_evidence_synopsis") or [])[:1],
+            text_limit=120,
+        )
     return candidate, True
 
 
@@ -1004,6 +1035,16 @@ def _compact_generation_value(value: object, *, list_limit: int, text_limit: int
     if isinstance(value, str) and len(value) > text_limit:
         return value[:text_limit].rstrip() + "... [truncated]"
     return value
+
+
+def _compact_synopsis_lines(lines: list[object], *, text_limit: int) -> list[str]:
+    compacted = []
+    for line in lines:
+        text = str(line)
+        if len(text) > text_limit:
+            text = text[:text_limit].rstrip() + "... [truncated]"
+        compacted.append(text)
+    return compacted
 
 
 def _prompt_evidence_item_counts(prompt_context: dict) -> dict[str, int]:
@@ -1201,7 +1242,7 @@ def _has_nmap_semantic_overclaim(answer: str, context: dict) -> bool:
     if not any(str(finding.get("source") or "").lower() == "nmap" for finding in findings if isinstance(finding, dict)):
         return False
     question = str(context.get("current_question") or "").lower()
-    if "risk" not in question and re.search(r"\b(?:low|medium|moderate|high|critical) risk(?: level)?\b", answer):
+    if "risk" not in question and re.search(r"\b(?:low|medium|moderate|high|critical)[-\s]+risk(?: level)?\b", answer):
         return True
     safe = re.compile(
         r"\b(?:does not|do not|did not|not proven|not established|not confirmed|hypothes(?:is|es)|"
@@ -1213,7 +1254,7 @@ def _has_nmap_semantic_overclaim(answer: str, context: dict) -> bool:
         r"open proxy|actual proxy|proxy misconfigur|misconfigured http proxy|exploitab|compromis|encrypted|unencrypted|"
         r"encryption (?:was )?negotiated|secure tls)"
     )
-    service = re.compile(r"\b(?:nmap|port(?:s)?|http|https|http-proxy|https-alt|80|443|8080|8443)\b")
+    service = re.compile(r"\b(?:nmap|port(?:s)?|http|https|http-proxy|https-alt|web service|service|80|443|8080|8443)\b")
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", answer):
         if service.search(sentence) and dangerous.search(sentence) and not safe.search(sentence):
             return True
@@ -2012,76 +2053,7 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
         empty_answer = _empty_assessment_initial_answer(context, include_summary=True)
         if empty_answer:
             return empty_answer
-    findings = _latest_authoritative_findings(context)
-    nmap_ports = []
-    for finding in findings:
-        if str(finding.get("source") or "").lower() != "nmap":
-            continue
-        for item in finding.get("open_ports") or []:
-            if isinstance(item, dict) and item.get("port") is not None:
-                nmap_ports.append(
-                    f"{item.get('port')}/{item.get('protocol') or 'tcp'} ({item.get('service') or 'unknown'})"
-                )
-    statements = []
-    if nmap_ports:
-        statements.append("Nmap recorded exposed TCP services: " + ", ".join(nmap_ports[:10]) + ".")
-    httpx_items = _httpx_response_observations([
-        finding for finding in findings if str(finding.get("source") or "").lower() == "httpx"
-    ])
-    if httpx_items:
-        observed = []
-        seen = set()
-        for item in httpx_items[:10]:
-            label = str(item.get("url") or item.get("host") or "HTTP endpoint")
-            if item.get("status_code") is not None:
-                label += f" (status {item.get('status_code')})"
-            if label not in seen:
-                seen.add(label)
-                observed.append(label)
-        statements.append("httpx recorded HTTP response metadata for " + ", ".join(observed) + ".")
-    nuclei_matches = [
-        item for finding in findings if str(finding.get("source") or "").lower() == "nuclei"
-        for item in (finding.get("nuclei_findings") or []) if isinstance(item, dict)
-    ]
-    if nuclei_matches:
-        severities = [str(item.get("severity") or "unknown").upper() for item in nuclei_matches]
-        match_names = [str(item.get("name") or item.get("template_id") or "unnamed template") for item in nuclei_matches[:5]]
-        statements.append(
-            f"Nuclei stored {len(nuclei_matches)} template match(es) with scanner severity "
-            + ", ".join(dict.fromkeys(severities))
-            + " including " + ", ".join(match_names)
-            + "; template matches do not automatically establish exploitability."
-        )
-    testssl_findings = [
-        finding
-        for finding in findings
-        if str(finding.get("source") or "").lower().removesuffix(".sh") == "testssl"
-    ]
-    if any(_has_structured_tool_evidence(finding, "testssl") for finding in testssl_findings):
-        statements.append("testssl.sh stored scanner TLS observations; they do not establish exploitability or overall TLS security.")
-    elif testssl_findings:
-        testssl_state = str(
-            ((context.get("recommendation_context") or {}).get("tool_states") or {}).get("testssl", "NOT_RUN")
-        )
-        missing_evidence = _build_missing_structured_evidence_statement(
-            "testssl.sh", "TLS configuration", testssl_state
-        )
-        if missing_evidence:
-            statements.append(missing_evidence)
-    metasploit = [finding for finding in findings if str(finding.get("source") or "").lower() == "metasploit"]
-    if metasploit:
-        session = _metasploit_session_established(context)
-        statements.append(
-            "Metasploit stored validation metadata"
-            + (" including explicit session evidence." if session else "; it does not establish successful exploitation or a session.")
-        )
-    tshark_items = _tshark_evidence(context)
-    if tshark_items:
-        packet_counts = [int(item["packet_count"]) for item in tshark_items if item.get("packet_count") is not None]
-        packet_scope = f" covering {sum(packet_counts)} packet(s)" if packet_counts else " with an unknown packet count"
-        statements.append(
-            f"TShark stored packet/network metadata{packet_scope}; packet presence does not establish an attack, exploitation, or compromise."
-        )
+    statements = _build_assessment_evidence_synopsis(context)
     gaps = [str(tool) for tool in recommendation.get("relevant_unperformed_tools") or []]
     if gaps:
         statements.append("Relevant unperformed coverage remains: " + ", ".join(gaps) + ".")
@@ -2095,6 +2067,286 @@ def _build_grounded_assessment_summary(context: dict) -> str | None:
         + " These are bounded stored observations, not an overall secure, insecure, or vulnerable conclusion."
         + (f" {next_step}" if next_step else "")
     )
+
+
+def _build_assessment_evidence_synopsis(context: dict) -> list[str]:
+    """Compact, per-tool synopsis from latest authoritative persisted findings."""
+    findings = _latest_authoritative_findings(context)
+    statements: list[str] = []
+    by_tool: dict[str, list[dict]] = {}
+    for finding in findings:
+        tool = str(finding.get("source") or "").lower().removesuffix(".sh")
+        by_tool.setdefault(tool, []).append(finding)
+
+    nmap_ports = []
+    for finding in by_tool.get("nmap", []):
+        for item in finding.get("open_ports") or []:
+            if isinstance(item, dict) and item.get("port") is not None:
+                nmap_ports.append(
+                    f"{item.get('port')}/{item.get('protocol') or 'tcp'} ({item.get('service') or 'unknown'})"
+                )
+    if "nmap" in by_tool:
+        statements.append(
+            "Nmap recorded exposed TCP services: "
+            + (", ".join(nmap_ports[:10]) if nmap_ports else "no normalized open-port observations")
+            + ". Service labels are observations, not application-security or transport-security conclusions."
+        )
+
+    httpx_services, httpx_total = _deduplicated_httpx_observations(by_tool.get("httpx", []))
+    if "httpx" in by_tool:
+        rendered = []
+        for service in httpx_services[:6]:
+            parts = [str(service.get("url") or service.get("host") or "HTTP endpoint")]
+            if service.get("status_code") is not None:
+                parts[0] += f" (status {service.get('status_code')})"
+            if service.get("redirect_location"):
+                parts.append(f"redirect {_plain_value(service.get('redirect_location'))}")
+            technologies = service.get("technologies") or service.get("tech") or []
+            if technologies:
+                parts.append("technology hints " + _plain_value(technologies))
+            hsts = _httpx_hsts_summary(service)
+            if hsts:
+                parts.append(hsts)
+            tls_summary = _httpx_tls_summary(service.get("tls"))
+            if tls_summary:
+                parts.append(tls_summary)
+            rendered.append("; ".join(parts))
+        omitted = ""
+        if len(httpx_services) < httpx_total:
+            omitted = f" {httpx_total - len(httpx_services)} duplicate httpx observation(s) were collapsed."
+        statements.append(
+            "httpx recorded HTTP(S) response metadata: "
+            + (". ".join(rendered) if rendered else "no normalized responding endpoint observations")
+            + "."
+            + omitted
+            + " These response observations do not establish security weakness, WAF proof, exploitable technology, or overall TLS safety."
+        )
+
+    katana = [
+        item for finding in by_tool.get("katana", [])
+        for item in (finding.get("katana_observations") or []) if isinstance(item, dict)
+    ]
+    if "katana" in by_tool:
+        summary = summarize_katana_observations(katana)
+        stored_summary = next(
+            (finding.get("katana_summary") for finding in by_tool["katana"] if isinstance(finding.get("katana_summary"), dict)),
+            {},
+        )
+        url_count = stored_summary.get("url_count", next((finding.get("finding_count") for finding in by_tool["katana"] if finding.get("finding_count") is not None), summary["url_count"]))
+        host_count = stored_summary.get("host_count", summary["host_count"])
+        javascript_count = stored_summary.get("javascript_count", summary["javascript_count"])
+        query_parameter_count = stored_summary.get("query_parameter_count", summary["query_parameter_count"])
+        form_count = stored_summary.get("form_count", summary["form_count"])
+        max_depth = stored_summary.get("max_depth", summary["max_depth"])
+        statements.append(
+            f"Katana stored {url_count} URL/endpoint observation(s), {host_count} unique host(s), "
+            f"{javascript_count} JavaScript file(s), {query_parameter_count} query parameter(s), "
+            f"{form_count} form/action observation(s), and max observed depth {max_depth}. "
+            "Zero counts are limited to this crawl and do not prove absence or complete coverage."
+        )
+
+    playwright = next(
+        (
+            finding.get("playwright_observation")
+            for finding in by_tool.get("playwright", [])
+            if isinstance(finding.get("playwright_observation"), dict)
+        ),
+        None,
+    )
+    if "playwright" in by_tool:
+        if not playwright:
+            statements.append(
+                "Playwright completed with no normalized browser observation; that bounded result does not prove safe, vulnerable, or complete behavior."
+            )
+        else:
+            summary = summarize_playwright_observation(playwright)
+            statements.append(
+                f"Playwright recorded passive browser state for {summary.get('final_url') or 'the observed page'} "
+                f"with status {summary.get('status_code')}, load status {summary['load_status']}, "
+                f"{summary['forms_count']} form(s), {summary['inputs_count']} input(s), {summary['links_count']} link(s), "
+                f"and {summary['network_events_count']} network event(s). Passive observation does not establish vulnerability, safety, or complete functionality."
+            )
+
+    ffuf_findings = by_tool.get("ffuf", [])
+    if ffuf_findings:
+        latest_ffuf_scan = select_latest_tool_scan((context.get("assessment_context") or {}).get("scans") or [], "ffuf")
+        latest_ffuf_id = str((latest_ffuf_scan or {}).get("finding_id") or "")
+        latest = next((finding for finding in ffuf_findings if str(finding.get("id") or "") == latest_ffuf_id), ffuf_findings[-1])
+        results = latest.get("ffuf_results") if isinstance(latest.get("ffuf_results"), list) else []
+        summary = latest.get("ffuf_summary") if isinstance(latest.get("ffuf_summary"), dict) else {}
+        result_count = latest.get("finding_count")
+        if result_count is None:
+            result_count = summary.get("result_count", len(results))
+        status_codes = summary.get("status_codes") if isinstance(summary.get("status_codes"), dict) else {}
+        status_text = (
+            " with status summary " + ", ".join(f"{code}={count}" for code, count in status_codes.items())
+            if status_codes else ""
+        )
+        statements.append(
+            f"ffuf stored {result_count} bounded path/content-discovery response observation(s){status_text}; "
+            "hits and zero results do not automatically prove sensitive exposure, vulnerability, or absence of hidden content."
+        )
+
+    nuclei_findings = by_tool.get("nuclei", [])
+    if nuclei_findings:
+        total, severity_text, template_text, representative_templates = _nuclei_aggregate_summary(nuclei_findings)
+        count_text = f"{total} " if total is not None else ""
+        detail = template_text or ("including " + ", ".join(representative_templates) if representative_templates else "")
+        severity_clause = ""
+        if severity_text:
+            labels = ", ".join(part.split("=", 1)[0] for part in severity_text.split(", "))
+            severity_clause = f" with scanner severity {labels}"
+            if "=" in severity_text:
+                severity_clause += f" (aggregate severity {severity_text})"
+        statements.append(
+            f"Nuclei stored {count_text}template match(es)"
+            + severity_clause
+            + (f"; {detail}" if detail else "")
+            + "; template metadata and matches do not automatically establish exploitability."
+        )
+
+    testssl_findings = by_tool.get("testssl", [])
+    if testssl_findings and any(_has_structured_tool_evidence(finding, "testssl") for finding in testssl_findings):
+        items = [
+            item for finding in testssl_findings for item in (finding.get("testssl_findings") or [])
+            if isinstance(item, dict)
+        ]
+        stored_count = next((finding.get("finding_count") for finding in testssl_findings if finding.get("finding_count") is not None), None)
+        notable = f" {stored_count if stored_count is not None else len(items)} scanner record(s) are normalized." if (items or stored_count is not None) else ""
+        statements.append(
+            "testssl.sh stored scanner TLS observations."
+            + notable
+            + " Scanner wording and severities are preserved and do not establish exploitability or overall TLS security."
+        )
+    elif testssl_findings:
+        testssl_state = str(((context.get("recommendation_context") or {}).get("tool_states") or {}).get("testssl", "NOT_RUN"))
+        missing_evidence = _build_missing_structured_evidence_statement("testssl.sh", "TLS configuration", testssl_state)
+        statements.append(
+            missing_evidence
+            or "testssl.sh completed without normalized TLS observations; that bounded result does not establish TLS safety or insecurity."
+        )
+
+    bbot_items = [
+        item
+        for finding in by_tool.get("bbot", [])
+        for key in ("bbot_observations", "observations")
+        for item in (finding.get(key) or [])
+        if isinstance(item, dict)
+    ]
+    if "bbot" in by_tool:
+        stored_count = next((finding.get("finding_count") for finding in by_tool["bbot"] if finding.get("finding_count") is not None), None)
+        observation_count = stored_count if stored_count is not None else len(bbot_items)
+        type_counts: dict[str, int] = {}
+        for item in bbot_items:
+            observed_type = str(item.get("observation_type") or item.get("type") or "observation").lower()
+            type_counts[observed_type] = type_counts.get(observed_type, 0) + 1
+        type_text = (
+            " across " + ", ".join(f"{kind}={count}" for kind, count in sorted(type_counts.items())[:6])
+            if type_counts else ""
+        )
+        statements.append(
+            f"BBOT stored {observation_count} reconnaissance observation item(s){type_text}; discoveries do not prove ownership, reachability, breach, or vulnerability."
+        )
+
+    metasploit = by_tool.get("metasploit", [])
+    if metasploit:
+        session = _metasploit_session_established(context)
+        statements.append(
+            "Metasploit stored validation metadata"
+            + (" including explicit session evidence." if session else "; it does not establish successful exploitation or a session.")
+        )
+
+    tshark_items = _tshark_evidence(context)
+    if tshark_items:
+        packet_counts = [int(item["packet_count"]) for item in tshark_items if item.get("packet_count") is not None]
+        packet_scope = f" covering {sum(packet_counts)} packet(s)" if packet_counts else " with an unknown packet count"
+        statements.append(
+            f"TShark stored packet/network metadata{packet_scope}; packet presence does not establish an attack, exploitation, or compromise."
+        )
+
+    gitleaks = by_tool.get("gitleaks", [])
+    if gitleaks:
+        count = sum(int((finding.get("gitleaks_evidence") or {}).get("finding_count") or 0) for finding in gitleaks)
+        statements.append(
+            f"Gitleaks stored {count} redacted secret-pattern match(es); matches do not establish active, valid, usable, or compromised credentials."
+        )
+
+    prowler = by_tool.get("prowler", [])
+    if prowler:
+        checks = [
+            item for finding in prowler
+            for item in ((finding.get("prowler_evidence") or {}).get("findings") or [])
+            if isinstance(item, dict)
+        ]
+        statuses = {}
+        for item in checks:
+            status = str(item.get("status") or "unknown").upper()
+            statuses[status] = statuses.get(status, 0) + 1
+        status_text = " with " + ", ".join(f"{key}={value}" for key, value in sorted(statuses.items())) if statuses else ""
+        statements.append(
+            f"Prowler stored {len(checks)} cloud check observation(s){status_text}; PASS/FAIL is check-scoped and not organization-wide compliance or security proof."
+        )
+
+    return statements
+
+
+def _nuclei_aggregate_summary(findings: list[dict]) -> tuple[int | None, str, str, list[str]]:
+    """Use persisted Nuclei aggregates; sanitized match lists are representative only."""
+
+    total: int | None = None
+    severity_counts: dict[str, int] = {}
+    template_counts: dict[str, int] = {}
+    representative_templates: list[str] = []
+    for finding in findings:
+        if total is None and finding.get("finding_count") is not None:
+            try:
+                total = int(finding.get("finding_count") or 0)
+            except (TypeError, ValueError):
+                pass
+        severity_summary = finding.get("severity_summary")
+        if isinstance(severity_summary, dict) and not severity_counts:
+            for severity, count in severity_summary.items():
+                try:
+                    severity_counts[str(severity).upper()] = int(count or 0)
+                except (TypeError, ValueError):
+                    continue
+        aggregate = finding.get("nuclei_template_counts") or finding.get("template_counts")
+        if not isinstance(aggregate, dict):
+            summary = finding.get("nuclei_summary")
+            aggregate = summary.get("template_counts") if isinstance(summary, dict) else None
+        if isinstance(aggregate, dict) and not template_counts:
+            for template, count in aggregate.items():
+                try:
+                    template_counts[str(template)] = int(count or 0)
+                except (TypeError, ValueError):
+                    continue
+        if not representative_templates:
+            representative_templates = list(dict.fromkeys(
+                str(item.get("name") or item.get("template_id") or "unnamed template")
+                for item in (finding.get("nuclei_findings") or [])
+                if isinstance(item, dict)
+            ))[:5]
+
+    if total is None and severity_counts:
+        total = sum(severity_counts.values())
+    if not severity_counts:
+        severity_labels = sorted({
+            str(item.get("severity") or "unknown").upper()
+            for finding in findings
+            for item in (finding.get("nuclei_findings") or [])
+            if isinstance(item, dict) and item.get("severity")
+        })
+        severity_text = ", ".join(severity_labels)
+    else:
+        severity_text = ", ".join(
+            f"{severity}={count}" for severity, count in sorted(severity_counts.items()) if count > 0
+        )
+    template_text = ""
+    if template_counts:
+        template_text = "template counts: " + ", ".join(
+            f"{template}={count}" for template, count in sorted(template_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+    return total, severity_text, template_text, representative_templates
 
 
 def _summary_requested_next_step_answer(context: dict) -> str | None:
@@ -3307,6 +3559,62 @@ def _has_unsuitable_tool_recommendation(answer: str, context: dict) -> bool:
     if "tshark" in answer and recommended_tools & {"tshark"} and "tshark" not in preferred and not recommendation.get("packet_context_present"):
         return True
     return False
+
+
+def _recommendation_contradicted_by_stored_evidence(answer: str, context: dict) -> bool:
+    """Reject remediation advice that authoritative stored observations already contradict."""
+    if not re.search(r"\b(?:recommend|should|need(?:s)? to|must|redirect)\b", answer):
+        return False
+    if re.search(r"\bredirect\b.{0,80}\bhttps\b|\bhttp\b.{0,80}\bredirect(?:s|ed|ing)?\b.{0,80}\bhttps\b", answer):
+        if _httpx_has_http_to_https_redirect(context):
+            return True
+    return False
+
+
+def _httpx_has_http_to_https_redirect(context: dict) -> bool:
+    for service in _httpx_response_observations(_tool_findings(context, "httpx")):
+        redirect = str(service.get("redirect_location") or service.get("final_url") or "").strip().lower()
+        if not redirect.startswith("https://"):
+            continue
+        url = str(service.get("url") or service.get("host") or "").strip().lower()
+        if url.startswith("http://"):
+            return True
+        if not url.startswith("https://") and service.get("status_code") in {301, 302, 307, 308}:
+            return True
+    return False
+
+
+def _broad_summary_collapses_to_one_tool(answer: str, context: dict) -> bool:
+    question = _normalize_recovery_question(str(context.get("current_question") or ""))
+    intent = str(context.get("question_intent") or "")
+    broad_summary = intent in {"assessment_summary", "assessment_highlight"} or _recovery_asks_summary_or_significance(question)
+    if not broad_summary:
+        return False
+    if (context.get("selection") or {}).get("selected_tools"):
+        return False
+    represented = _represented_authoritative_tools(context)
+    if len(represented) < 3:
+        return False
+    mentioned = {
+        tool for tool in represented
+        if re.search(rf"(?<!\w){re.escape('testssl' if tool == 'testssl' else tool)}(?:\.sh)?(?!\w)", answer)
+    }
+    # A broad assessment answer with several completed tools should not render
+    # only one named evidence source.  This check is intentionally limited to
+    # broad full-assessment questions and does not apply to scoped tool answers.
+    return len(mentioned) <= 1
+
+
+def _represented_authoritative_tools(context: dict) -> set[str]:
+    represented = set()
+    states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
+    for finding in _latest_authoritative_findings(context):
+        tool = str(finding.get("source") or "").lower().removesuffix(".sh")
+        if not tool:
+            continue
+        if str(states.get(tool, "COMPLETED")) == "COMPLETED":
+            represented.add(tool)
+    return represented
 
 
 def _leaks_internal_context_language(answer: str, context: dict) -> bool:

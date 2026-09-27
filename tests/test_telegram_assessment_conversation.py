@@ -336,6 +336,36 @@ def test_grounded_summary_and_highlight_variants_use_public_telegram_path() -> N
     ask_ai.assert_not_called()
 
 
+def test_eight_tool_deterministic_summary_is_delivered_intact_through_telegram() -> None:
+    user_id = 1129
+    assessment = create_assessment("Telegram eight-tool summary", user_id=user_id)
+    add_assessment_target(assessment["id"], "example.com")
+    evidence_by_tool = {
+        "nmap": {"open_ports": [{"port": 443, "protocol": "tcp", "service": "https"}]},
+        "httpx": {"httpx_services": [{"url": "https://example.com", "status_code": 200}]},
+        "katana": {"katana_observations": [{"url": "https://example.com/", "host": "example.com", "depth": 0}]},
+        "playwright": {"playwright_observation": {"final_url": "https://example.com", "status_code": 200, "load_status": "loaded"}},
+        "ffuf": {"ffuf_results": [{"url": "https://example.com/about", "status_code": 200}], "ffuf_summary": {"result_count": 1, "status_codes": {"200": 1}}},
+        "nuclei": {"nuclei_findings": [{"name": "Example template", "severity": "info"}]},
+        "testssl": {"testssl_findings": [{"id": "TLS1_3", "severity": "OK", "finding": "TLS 1.3 offered"}]},
+        "bbot": {"observations": [{"observation_type": "subdomain", "value": "www.example.com"}]},
+    }
+    for tool, evidence in evidence_by_tool.items():
+        finding = add_finding(user_id=user_id, finding={"source": tool, "target": "example.com", "status": "completed", **evidence})
+        record_assessment_scan(assessment["id"], tool=tool, status="completed", finding_id=finding["id"])
+
+    context, _ = _enter(assessment["id"], user_id)
+    update, message = _text("What the fuck have we actually found so far?", user_id)
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        _run_text_handler(update, context)
+
+    answer = message.reply_text.call_args_list[-1].args[0]
+    for tool_label in ("Nmap", "httpx", "Katana", "Playwright", "ffuf", "Nuclei", "testssl.sh", "BBOT"):
+        assert tool_label in answer
+    assert len(answer) < 4096
+    ask_ai.assert_not_called()
+
+
 def test_final_judge_conversation_chains_remain_grounded_and_state_consistent() -> None:
     user_id = 1060
     assessment = _test1_assessment(user_id)

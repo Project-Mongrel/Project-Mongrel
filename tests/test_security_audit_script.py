@@ -1,4 +1,6 @@
+import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,14 @@ def test_missing_tool_becomes_skipped() -> None:
     assert result.status == security_audit.STATUS_SKIPPED
     assert result.error == "Install example"
     assert result.returncode is None
+
+
+def test_requirements_declares_starlette_full_extra_without_changing_httpx_pin() -> None:
+    requirements = (security_audit.PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+    assert "starlette[full]==1.3.1" in requirements.splitlines()
+    assert "httpx==0.28.1" in requirements.splitlines()
+    assert "httpx2" not in requirements
 
 
 def test_passing_command_becomes_pass() -> None:
@@ -343,6 +353,39 @@ def test_generated_pytest_cleanup_preserves_live_pid_run(tmp_path: Path, monkeyp
     assert live_run.exists()
     assert (live_run / "keep.txt").exists()
     assert not stale_run.exists()
+
+
+def test_generated_pytest_cleanup_removes_stale_live_pid_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest_root = tmp_path / ".pytest_tmp"
+    stale_live_run = pytest_root / f"run-{os.getpid()}-stale"
+    stale_live_run.mkdir(parents=True)
+    (stale_live_run / "mongrel.db").write_text("generated", encoding="utf-8")
+    stale_time = time.time() - security_audit.PYTEST_TEMP_STALE_SECONDS - 1
+    os.utime(stale_live_run, (stale_time, stale_time))
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", pytest_root)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", tmp_path / ".pytest_tmp_audit")
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", tmp_path / ".pytest_tmp_runs")
+
+    removed = security_audit.cleanup_generated_pytest_run_roots()
+
+    assert removed == [stale_live_run]
+    assert not stale_live_run.exists()
+
+
+def test_generated_pytest_cleanup_removes_stale_dead_pid_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest_root = tmp_path / ".pytest_tmp"
+    stale_dead_run = pytest_root / "run-999999999-stale"
+    stale_dead_run.mkdir(parents=True)
+    stale_time = time.time() - security_audit.PYTEST_TEMP_STALE_SECONDS - 1
+    os.utime(stale_dead_run, (stale_time, stale_time))
+    monkeypatch.setattr(security_audit, "PYTEST_TEMP_ROOT", pytest_root)
+    monkeypatch.setattr(security_audit, "PYTEST_AUDIT_TEMP_ROOT", tmp_path / ".pytest_tmp_audit")
+    monkeypatch.setattr(security_audit, "PYTEST_FALLBACK_TEMP_ROOT", tmp_path / ".pytest_tmp_runs")
+
+    removed = security_audit.cleanup_generated_pytest_run_roots()
+
+    assert removed == [stale_dead_run]
+    assert not stale_dead_run.exists()
 
 
 def test_generated_pytest_cleanup_rejects_symlink_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
