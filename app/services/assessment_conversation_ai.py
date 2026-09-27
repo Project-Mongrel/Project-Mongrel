@@ -2241,7 +2241,7 @@ def _build_assessment_evidence_synopsis(context: dict) -> list[str]:
             observed_type = str(item.get("observation_type") or item.get("type") or "observation").lower()
             type_counts[observed_type] = type_counts.get(observed_type, 0) + 1
         type_text = (
-            " across " + ", ".join(f"{kind}={count}" for kind, count in sorted(type_counts.items())[:6])
+            ", including " + ", ".join(f"{kind}={count}" for kind, count in sorted(type_counts.items())[:6])
             if type_counts else ""
         )
         statements.append(

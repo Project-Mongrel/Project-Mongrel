@@ -2479,6 +2479,7 @@ def _add_eight_tool_web_assessment(assessment_id: int, *, user_id: int) -> None:
             "source": "bbot",
             "target": "example.com",
             "status": "completed",
+            "finding_count": 37,
             "bbot_observations": [
                 {"observation_type": "subdomain", "value": "www.example.com"},
                 {"observation_type": "ip_address", "value": "192.0.2.10"},
@@ -2927,6 +2928,7 @@ def test_live_shaped_eight_tool_summary_is_deterministic_and_cross_tool_grounded
     assert "Nuclei stored" in answer
     assert "testssl.sh stored" in answer
     assert "BBOT stored" in answer
+    assert "BBOT stored 37 reconnaissance observation item(s), including dns_record=1, ip_address=1, subdomain=1" in answer
     assert "unencrypted web service" not in answer.lower()
     assert "low-risk" not in answer.lower()
     assert "redirect traffic to https" not in answer.lower()
