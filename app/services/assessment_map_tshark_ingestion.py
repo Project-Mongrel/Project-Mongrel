@@ -103,11 +103,12 @@ def _map_tshark_evidence(data: dict[str, Any], writer: MappingWriter) -> None:
         for predicate, field in (
             ("has_packet_count", "packet_count"),
             ("has_byte_count", "byte_count"),
+            ("has_capture_duration_seconds", "duration_seconds"),
             ("has_capture_start", "capture_start"),
             ("has_capture_end", "capture_end"),
             ("has_execution_status", "execution_status"),
         ):
-            value = _safe_value(data.get(field))
+            value = _nonnegative_number(data.get(field)) if field == "duration_seconds" else _safe_value(data.get(field))
             if value not in (None, ""):
                 writer.assertion(capture, predicate, value=value, evidence_kind=predicate, path=f"{writer.root_path}.{field}")
 
@@ -356,6 +357,7 @@ def _project_tshark_evidence(data: dict[str, Any]) -> dict[str, Any]:
         "success": data.get("success") is True,
         "packet_count": _nonnegative_int(data.get("packet_count")),
         "byte_count": _nonnegative_int(data.get("byte_count")),
+        "duration_seconds": data.get("duration_seconds"),
         "capture_start": _safe_label(data.get("capture_start")),
         "capture_end": _safe_label(data.get("capture_end")),
         "observed_protocols": [_project_item(item, ("protocol", "packet_count")) for item in (data.get("observed_protocols") or [])[:20] if isinstance(item, dict)],
@@ -547,6 +549,18 @@ def _nonnegative_int(value: object) -> int | None:
     except ValueError:
         return None
     return parsed if parsed >= 0 else None
+
+
+def _nonnegative_number(value: object) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return int(parsed) if parsed.is_integer() else parsed
 
 
 def _hash_id(value: object) -> str:

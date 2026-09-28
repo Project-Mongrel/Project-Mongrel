@@ -121,6 +121,23 @@ def test_tshark_maps_packet_flows_dns_http_tls_without_security_upgrade() -> Non
     assert "exploit" not in serialized.lower()
 
 
+def test_tshark_authoritative_capture_summary_is_retained_in_map() -> None:
+    assessment = create_assessment("TShark capture summary", user_id=9208)
+    evidence = _tshark_evidence()
+    evidence.update({"packet_count": 2055, "byte_count": 7067089, "duration_seconds": 19.9})
+    scan = _scan_with_tshark_artifact(9208, assessment["id"], evidence)
+
+    ingest_assessment_scan(user_id=9208, assessment_id=assessment["id"], scan_id=scan["id"])
+
+    summary_values: dict[str, list[object]] = {}
+    for row in _rows("assessment_map_assertions"):
+        if row["predicate"] in {"has_packet_count", "has_byte_count", "has_capture_duration_seconds"}:
+            summary_values.setdefault(row["predicate"], []).append(json.loads(row["normalized_value_json"]))
+    assert 2055 in summary_values["has_packet_count"]
+    assert 7067089 in summary_values["has_byte_count"]
+    assert 19.9 in summary_values["has_capture_duration_seconds"]
+
+
 def test_tshark_secret_bearing_http_uri_is_not_mapped() -> None:
     assessment = create_assessment("TShark secret URI", user_id=9202)
     scan = _scan_with_tshark_artifact(9202, assessment["id"], _tshark_evidence(secret_uri=True))

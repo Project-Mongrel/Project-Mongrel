@@ -3717,6 +3717,56 @@ def test_canonical_projection_uses_latest_capture_not_later_related_artifact() -
     assert "captured 0" not in result["answer"]
 
 
+def test_large_tshark_artifact_preserves_authoritative_capture_summary() -> None:
+    user_id = 1204
+    assessment = create_assessment("Large TShark capture", user_id=user_id)
+    scan = record_assessment_scan(assessment["id"], "tshark", "completed")
+    content = {
+        "source": "tshark",
+        "execution_status": "completed",
+        "success": True,
+        "packet_count": 2055,
+        "byte_count": 7067089,
+        "duration_seconds": 19.9,
+        "capture_start": "1710000000.1",
+        "capture_end": "1710000020.0",
+        "observed_protocols": [
+            {"protocol": f"protocol-{index}", "packet_count": index + 1}
+            for index in range(30)
+        ],
+        "http_observations": [],
+        "tls_observations": [{"sni": "example.test", "version": "TLS 1.3"}],
+        "evidence_limitations": ["Capture scope limits conclusions."] * 30,
+    }
+    add_assessment_artifact(
+        assessment["id"],
+        scan_id=scan["id"],
+        artifact_type="tshark_normalized_evidence",
+        title="Large authoritative capture",
+        content=json.dumps(content),
+    )
+
+    context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        question="What did TShark actually observe?",
+    )
+    stored = context["assessment_context"]["artifacts"][0]["content"]
+    assert stored["packet_count"] == 2055
+    assert stored["byte_count"] == 7067089
+    assert stored["duration_seconds"] == 19.9
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="What did TShark actually observe?",
+    )
+    assert "captured 2055 packets (7067089 bytes)" in result["answer"]
+    assert "capture duration 19.9s" in result["answer"]
+    assert "packet count is unknown" not in result["answer"]
+
+
 def test_missing_tshark_packet_count_remains_unknown_not_zero() -> None:
     assessment = create_assessment("Unknown capture count", user_id=1203)
     finding = add_finding(user_id=1203, finding={

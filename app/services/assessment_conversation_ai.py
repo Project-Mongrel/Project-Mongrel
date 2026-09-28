@@ -1852,6 +1852,16 @@ def _build_direct_tshark_evidence_answer(context: dict) -> str | None:
             details = [f"captured {int(packet_count)} packets"]
             if byte_count is not None:
                 details[-1] += f" ({int(byte_count)} bytes)"
+        duration = next(
+            (
+                evidence.get(field)
+                for field in ("duration_seconds", "duration", "elapsed_seconds")
+                if evidence.get(field) not in (None, "")
+            ),
+            None,
+        )
+        if duration is not None:
+            details.append(f"capture duration {duration}s")
         endpoints = [str(item.get("address")) for item in evidence.get("observed_endpoints") or [] if isinstance(item, dict) and item.get("address")]
         if endpoints:
             details.append("observed endpoints " + ", ".join(endpoints[:10]))

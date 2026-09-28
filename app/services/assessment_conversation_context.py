@@ -800,7 +800,10 @@ def _artifact_for_context(artifact: dict) -> dict:
     }
     content = artifact.get("content")
     if isinstance(content, str) and content.strip():
-        safe_artifact["content"] = _parse_or_excerpt(content)
+        if str(artifact.get("artifact_type") or "").strip().lower() == "tshark_normalized_evidence":
+            safe_artifact["content"] = _parse_tshark_artifact_or_excerpt(content)
+        else:
+            safe_artifact["content"] = _parse_or_excerpt(content)
     return _sanitize(safe_artifact)
 
 
@@ -813,6 +816,34 @@ def _parse_or_excerpt(value: str) -> Any:
     except ValueError:
         return _truncate(trimmed)
     return _sanitize(decoded)
+
+
+def _parse_tshark_artifact_or_excerpt(value: str) -> Any:
+    """Preserve bounded capture aggregates before compacting packet collections."""
+
+    try:
+        decoded = json.loads(value.strip())
+    except ValueError:
+        return _parse_or_excerpt(value)
+    if not isinstance(decoded, dict):
+        return _parse_or_excerpt(value)
+
+    scalar_fields = (
+        "source", "execution_status", "success", "packet_count", "byte_count",
+        "capture_start", "capture_end", "duration", "duration_seconds", "elapsed_seconds",
+        "error_type",
+    )
+    collection_fields = (
+        "source_file", "observed_protocols", "observed_endpoints", "observed_conversations",
+        "dns_observations", "http_observations", "tls_observations", "parser_warnings",
+        "truncation", "evidence_limitations",
+    )
+    bounded = {
+        key: decoded[key]
+        for key in (*scalar_fields, *collection_fields)
+        if key in decoded
+    }
+    return _sanitize(bounded)
 
 
 def _include_artifact(artifact: dict, selected_tools: list[str], full_assessment: bool, selected_scan_ids: set[object]) -> bool:
