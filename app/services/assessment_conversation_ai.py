@@ -148,6 +148,7 @@ def answer_assessment_conversation_question(
         or _build_direct_nmap_evidence_fallback(context)
         or _build_direct_httpx_evidence_answer(context)
         or _build_direct_testssl_evidence_answer(context)
+        or _build_direct_metasploit_evidence_answer(context)
         or _build_direct_tshark_evidence_answer(context)
         or _build_mixed_intent_answer(context)
         or _build_state_grounded_answer(context)
@@ -536,6 +537,8 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
         return True
     if _has_nmap_semantic_overclaim(normalized, context or {}):
         return True
+    if _has_metasploit_semantic_overclaim(normalized, context or {}):
+        return True
     if _has_testssl_semantic_overclaim(normalized, context or {}):
         return True
     if any(pattern.search(normalized) for pattern in INTERNAL_INSTRUCTION_LEAK_PATTERNS):
@@ -564,7 +567,11 @@ def violates_conversation_truthfulness(answer: str, context: dict | None = None)
         return True
     if OWASP_MAPPING_PATTERN.search(normalized) and not _owasp_mapping_supported(context or {}):
         return True
-    if SESSION_CLAIM_PATTERN.search(normalized) and not _metasploit_session_established(context or {}):
+    if (
+        SESSION_CLAIM_PATTERN.search(normalized)
+        and not _metasploit_session_established(context or {})
+        and not re.search(r"\b(?:no|not|without)\b[^.!?]{0,20}\bsession\b", normalized)
+    ):
         return True
     question = str((context or {}).get("current_question") or "").lower()
     if any(term in question for term in TRAFFIC_TERMS) and any(tool in normalized for tool in EXTERNAL_TRAFFIC_TOOLS) and "tshark" not in normalized:
@@ -1706,6 +1713,45 @@ def _build_direct_testssl_evidence_answer(context: dict) -> str | None:
     )
 
 
+def _build_direct_metasploit_evidence_answer(context: dict) -> str | None:
+    if _selected_tools(context) != {"metasploit"}:
+        return None
+    findings = _tool_findings(context, "metasploit")
+    if not findings:
+        return None
+
+    finding = findings[-1]
+    evidence = finding.get("metasploit_evidence") if isinstance(finding.get("metasploit_evidence"), dict) else {}
+    state = str(evidence.get("validation_state") or "INCONCLUSIVE").strip().upper()
+    target = str(evidence.get("target") or finding.get("target") or "the assessed target").strip()
+    module = str(evidence.get("module") or (finding.get("metadata") or {}).get("module") or "unknown").strip()
+    port = evidence.get("port") or (finding.get("metadata") or {}).get("port")
+    endpoint = f"{target}:{port}" if port not in (None, "") and ":" not in target.rsplit("/", 1)[-1] else target
+    explicit_version = next(
+        (
+            str(evidence.get(field)).strip()
+            for field in ("http_version", "https_version", "service_version", "version")
+            if evidence.get(field) not in (None, "")
+        ),
+        "",
+    )
+    session = "was established" if evidence.get("session_established") is True else "was not established"
+
+    if state == "DETECTED":
+        version_text = f" Stored explicit version metadata: {explicit_version}." if explicit_version else " No specific HTTP version is stored."
+        return (
+            f"Metasploit completed module {module} for {endpoint} and observed service/version metadata only "
+            f"(validation state: DETECTED).{version_text} No vulnerability condition was validated, exploit success "
+            f"or compromise was established, and a session {session}."
+        )
+
+    summary = str(evidence.get("summary") or finding.get("summary") or "No conclusive normalized validation result was stored.").strip()
+    return (
+        f"Metasploit completed module {module} for {endpoint}. Validation state: {state}. {summary} "
+        f"A session {session}; this does not by itself establish exploit success or compromise."
+    )
+
+
 def _testssl_records(evidence: dict) -> list[dict]:
     if isinstance(evidence.get("testssl_findings"), list):
         return [item for item in evidence["testssl_findings"] if isinstance(item, dict)]
@@ -2831,7 +2877,7 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
         rendered = [str(item.get("url") or item.get("host") or "endpoint") + (f" (status {item.get('status_code')})" if item.get("status_code") is not None else "") for item in items[:10]]
         return "httpx stored response metadata for " + (", ".join(rendered) if rendered else "no normalized responding endpoints") + ". This does not establish vulnerability, security posture, or that an unresponsive host is down."
     if tool == "metasploit":
-        return (
+        return _build_direct_metasploit_evidence_answer(context) or (
             "Metasploit is recorded as completed. Stored validation metadata "
             + ("includes explicit session evidence." if _metasploit_session_established(context) else "does not establish successful exploitation or a session.")
         )
@@ -3588,14 +3634,7 @@ def _contradicts_assessment_tool_state(answer: str, context: dict) -> bool:
         str(tool).lower().removesuffix(".sh"): str(state)
         for tool, state in (recommendation.get("tool_states") or {}).items()
     }
-    recommended_tools = {
-        match.lower().removesuffix(".sh")
-        for match in re.findall(
-            r"\b(?:recommend|use|run|try|choose|proceed with|start with)\s+(?:mongrel(?:'s)?\s+)?(?:the\s+)?(?:run\s+)?"
-            r"(nmap|bbot|nuclei|httpx|playwright|katana|ffuf|testssl(?:\.sh)?|gitleaks|prowler|metasploit|tshark)\b",
-            answer,
-        )
-    }
+    recommended_tools = _recommended_tools_in_answer(answer)
     for tool, state in states.items():
         display = r"testssl(?:\.sh)?" if tool == "testssl" else re.escape(tool)
         if state == "NOT_RUN":
@@ -3610,7 +3649,7 @@ def _contradicts_assessment_tool_state(answer: str, context: dict) -> bool:
                 false_state.group(0),
             ):
                 return True
-        if state == "COMPLETED" and not re.search(r"\b(?:re-?run|run again|repeat|recheck|re-scan)\b", answer):
+        if state == "COMPLETED" and not _has_rerun_reason(answer, tool):
             completed_as_next = re.search(
                 rf"\b{display}\b\s+(?:(?:is|should be)\s+)?next\b",
                 answer,
@@ -3663,15 +3702,7 @@ def _has_unsuitable_tool_recommendation(answer: str, context: dict) -> bool:
         for tool, decision in (recommendation.get("tool_decisions") or {}).items()
         if isinstance(decision, dict) and decision.get("recommendation_allowed")
     }
-    recommended_tools = {
-        match.lower().removesuffix(".sh")
-        for match in re.findall(
-            r"\b(?:recommend|use|run|try|choose|proceed with|start with|suggest)\s+"
-            r"(?:(?:using|running|trying|choosing)\s+)?(?:mongrel(?:'s)?\s+)?(?:the\s+)?(?:run\s+)?"
-            r"(nmap|bbot|nuclei|httpx|playwright|katana|ffuf|testssl(?:\.sh)?|gitleaks|prowler|metasploit|tshark)\b",
-            answer,
-        )
-    }
+    recommended_tools = _recommended_tools_in_answer(answer)
     if intent in {"assessment_summary", "assessment_highlight"} and recommended_tools and not preferred:
         return True
     if preferred and recommended_tools - preferred:
@@ -3696,6 +3727,43 @@ def _has_unsuitable_tool_recommendation(answer: str, context: dict) -> bool:
     if "tshark" in answer and recommended_tools & {"tshark"} and "tshark" not in preferred and not recommendation.get("packet_context_present"):
         return True
     return False
+
+
+_RECOMMENDABLE_TOOL_PATTERN = r"nmap|bbot|nuclei|httpx|playwright|katana|ffuf|testssl(?:\.sh)?|gitleaks|prowler|metasploit|tshark"
+
+
+def _recommended_tools_in_answer(answer: str) -> set[str]:
+    """Extract direct and list-style tool recommendations for state checks."""
+    text = str(answer or "")
+    matches = set(
+        re.findall(
+            rf"\b(?:recommend|use|run|try|choose|proceed with|start with|suggest)\s+"
+            rf"(?:(?:using|running|trying|choosing)\s+)?(?:mongrel(?:'s)?\s+)?(?:the\s+)?(?:run\s+)?"
+            rf"({_RECOMMENDABLE_TOOL_PATTERN})\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    for match in re.finditer(
+        r"\b(?:using|with|via)\s+(?:the\s+)?(?:tools?\s+)?(?:like|such as)?\s*([^.!?\n]{0,140})",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        matches.update(
+            re.findall(rf"(?<!\w)({_RECOMMENDABLE_TOOL_PATTERN})(?!\w)", match.group(1), flags=re.IGNORECASE)
+        )
+    return {tool.lower().removesuffix(".sh") for tool in matches}
+
+
+def _has_rerun_reason(answer: str, tool: str) -> bool:
+    display = r"testssl(?:\.sh)?" if tool == "testssl" else re.escape(tool)
+    return bool(
+        re.search(
+            rf"\b(?:re-?run|run again|repeat|recheck|re-scan)\b.{{0,100}}\b{display}\b",
+            str(answer or ""),
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _recommendation_contradicted_by_stored_evidence(answer: str, context: dict) -> bool:
@@ -3732,6 +3800,29 @@ def _has_testssl_semantic_overclaim(answer: str, context: dict) -> bool:
     if re.search(r"\b(?:tls|ssl)\b.{0,55}\b(?:overall|entire|complete)\s+(?:security|safety|secure)\b", answer):
         return True
     if re.search(r"\b(?:testssl|scanner)\b.{0,55}\b(?:proves?|confirms?|establishes?)\b.{0,35}\b(?:secure|safe|exploitable|exploitation|vulnerable)\b", answer):
+        return True
+    return False
+
+
+def _has_metasploit_semantic_overclaim(answer: str, context: dict) -> bool:
+    """Keep DETECTED Metasploit metadata distinct from validation success."""
+    findings = _tool_findings(context, "metasploit")
+    detected = []
+    for finding in findings:
+        evidence = finding.get("metasploit_evidence")
+        if isinstance(evidence, dict) and str(evidence.get("validation_state") or "").upper() == "DETECTED":
+            detected.append(evidence)
+    if not detected:
+        return False
+    if re.search(r"\b(?:validation|validated)\b[^.!?]{0,50}\b(?:was|is|successful|succeeded)\b", answer):
+        return True
+    has_explicit_version = any(
+        any(evidence.get(field) not in (None, "") for field in ("http_version", "https_version", "service_version", "version"))
+        for evidence in detected
+    )
+    if not has_explicit_version and re.search(r"\b(?:supported|specific)\s+(?:http|https)\s+version\b", answer):
+        return True
+    if re.search(r"\b(?:metasploit|the\s+module)\b[^.!?]{0,80}\b(?:confirmed|proved|established)\b[^.!?]{0,50}\b(?:vulnerab|exploit|compromis|access|session)\b", answer):
         return True
     return False
 

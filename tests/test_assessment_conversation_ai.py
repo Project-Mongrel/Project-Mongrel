@@ -845,6 +845,114 @@ def test_tool_state_contradictions_are_rejected_deterministically() -> None:
     assert violates_conversation_truthfulness("httpx is completed; I would use Katana next.", context) is False
 
 
+def test_live_metasploit_detected_evidence_renders_without_upgrading_metadata() -> None:
+    assessment = create_assessment("Live Metasploit", user_id=1001)
+    finding = add_finding(user_id=1001, finding={
+        "source": "metasploit",
+        "target": "btjoinery.ie",
+        "status": "completed",
+        "metadata": {
+            "module": "auxiliary/scanner/http/http_version",
+            "port": 80,
+        },
+        "metasploit_evidence": {
+            "source": "metasploit",
+            "module": "auxiliary/scanner/http/http_version",
+            "action_type": "auxiliary_validation",
+            "target": "btjoinery.ie",
+            "port": 80,
+            "validation_state": "DETECTED",
+            "subprocess_success": True,
+            "module_executed": True,
+            "session_established": False,
+            "summary": "Metasploit reported service or version metadata. This is detection evidence, not proof of vulnerability, exploitation, or compromise.",
+        },
+    })
+    record_assessment_scan(assessment["id"], tool="metasploit", status="completed", finding_id=finding["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as ask_ai:
+        result = answer_assessment_conversation_question(
+            user_id=1001,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question="What did Metasploit find?",
+        )
+
+    ask_ai.assert_not_called()
+    answer = result["answer"]
+    assert "validation state: DETECTED" in answer
+    assert "service/version metadata only" in answer
+    assert "No specific HTTP version is stored" in answer
+    assert "No vulnerability condition was validated" in answer
+    assert "a session was not established" in answer
+    assert "validation was successful" not in answer.lower()
+    assert "supported HTTP version" not in answer.lower()
+
+
+def test_metasploit_detected_guard_rejects_generated_upgrade_and_recovers() -> None:
+    assessment = create_assessment("Metasploit guard", user_id=1001)
+    finding = add_finding(user_id=1001, finding={
+        "source": "metasploit",
+        "target": "btjoinery.ie",
+        "metasploit_evidence": {
+            "module": "auxiliary/scanner/http/http_version",
+            "target": "btjoinery.ie",
+            "port": 80,
+            "validation_state": "DETECTED",
+            "subprocess_success": True,
+            "session_established": False,
+        },
+    })
+    record_assessment_scan(assessment["id"], tool="metasploit", status="completed", finding_id=finding["id"])
+    context = build_assessment_conversation_context(
+        user_id=1001, assessment_id=assessment["id"], question="What did Metasploit find?",
+    )
+    overclaim = "Metasploit validated that the target supports a supported HTTP version; validation was successful."
+
+    assert violates_conversation_truthfulness(overclaim, context) is True
+    recovered = _recover_rejected_assessment_answer(context)
+    assert recovered is not None
+    assert "validation state: DETECTED" in recovered
+    assert "supported HTTP version" not in recovered.lower()
+
+
+def test_metasploit_process_completion_wording_remains_allowed() -> None:
+    assessment = create_assessment("Metasploit completion", user_id=1001)
+    finding = add_finding(user_id=1001, finding={
+        "source": "metasploit",
+        "metasploit_evidence": {
+            "validation_state": "DETECTED",
+            "subprocess_success": True,
+            "session_established": False,
+        },
+    })
+    record_assessment_scan(assessment["id"], tool="metasploit", status="completed", finding_id=finding["id"])
+    context = build_assessment_conversation_context(
+        user_id=1001, assessment_id=assessment["id"], question="What did Metasploit find?",
+    )
+
+    assert violates_conversation_truthfulness(
+        "msfconsole completed; service/version metadata was observed and no session was established.", context
+    ) is False
+
+
+def test_list_style_recommendations_for_completed_tools_are_rejected_but_reruns_are_allowed() -> None:
+    assessment = create_assessment("Recommendation phrasing", user_id=1001)
+    _add_nmap_scan(assessment["id"], user_id=1001, port=80, service="http")
+    httpx = add_finding(user_id=1001, finding={"source": "httpx", "target": "example.com", "httpx_services": []})
+    record_assessment_scan(assessment["id"], tool="httpx", status="completed", finding_id=httpx["id"])
+    context = build_assessment_conversation_context(
+        user_id=1001, assessment_id=assessment["id"], question="What should we investigate next?",
+    )
+
+    assert violates_conversation_truthfulness(
+        "Next steps should include a more comprehensive scan using tools like Nmap and httpx.", context
+    ) is True
+    assert violates_conversation_truthfulness(
+        "Because evidence changed, rerun Nmap to confirm the host state.", context
+    ) is False
+
+
 @pytest.mark.parametrize(
     "claim",
     [
