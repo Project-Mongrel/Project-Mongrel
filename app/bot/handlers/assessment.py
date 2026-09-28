@@ -7,6 +7,7 @@ from time import perf_counter
 from uuid import uuid4
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
@@ -492,7 +493,6 @@ async def assessment_chat_text_handler(update: Update, context: ContextTypes.DEF
         return True
     user_persistence_ms = _assessment_ask_elapsed_ms(user_persistence_started)
 
-    await update.message.reply_text("Reviewing assessment evidence...")
     state["active_turn_id"] = turn_id
     context.user_data[ASSESSMENT_ASK_TASK_KEY] = asyncio.create_task(
         _complete_assessment_ask_turn(
@@ -519,26 +519,34 @@ async def _complete_assessment_ask_turn(
     conversation_id: str, question: str, turn_id: str, turn_started: float, lookup_ms: float,
     user_persistence_ms: float,
 ) -> None:
+    typing_task = asyncio.create_task(_keep_assessment_typing(update, context))
     try:
-        result = await _run_assessment_answer_off_loop(
-            worker_user_id=user_id,
-            worker_token=turn_id,
-            user_id=user_id,
-            assessment_id=assessment_id,
-            conversation_id=conversation_id,
-            question=question,
-        )
-    except asyncio.CancelledError:
-        _finish_assessment_ask_turn(context, conversation_id, turn_id)
-        return
-    except Exception:
-        result = {
-            "answer": FALLBACK_ANSWER,
-            "evidence_refs": {},
-            "evidence_context_digest": None,
-            "provenance": {"assessment_id": assessment_id, "user_id": user_id, "conversation_id": conversation_id},
-            "fallback_reason": "exception",
-        }
+        try:
+            result = await _run_assessment_answer_off_loop(
+                worker_user_id=user_id,
+                worker_token=turn_id,
+                user_id=user_id,
+                assessment_id=assessment_id,
+                conversation_id=conversation_id,
+                question=question,
+            )
+        except asyncio.CancelledError:
+            _finish_assessment_ask_turn(context, conversation_id, turn_id)
+            return
+        except Exception:
+            result = {
+                "answer": FALLBACK_ANSWER,
+                "evidence_refs": {},
+                "evidence_context_digest": None,
+                "provenance": {"assessment_id": assessment_id, "user_id": user_id, "conversation_id": conversation_id},
+                "fallback_reason": "exception",
+            }
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     if not isinstance(result, dict):
         result = {
@@ -590,6 +598,27 @@ async def _complete_assessment_ask_turn(
         total_ms=_assessment_ask_elapsed_ms(turn_started), instrumentation=result.get("instrumentation") or {},
         fallback_reason=result.get("fallback_reason"), delivery_ms=_assessment_ask_elapsed_ms(delivery_started),
     )
+
+
+async def _keep_assessment_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = getattr(update, "effective_chat", None) or getattr(getattr(update, "message", None), "chat", None)
+    chat_id = getattr(chat, "id", None)
+    bot = getattr(context, "bot", None)
+    send_chat_action = getattr(bot, "send_chat_action", None)
+    if chat_id is None or send_chat_action is None:
+        return
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(
+                    send_chat_action(chat_id=chat_id, action=ChatAction.TYPING),
+                    timeout=2,
+                )
+            except Exception:
+                logger.debug("Assessment Ask typing indicator unavailable", exc_info=True)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        raise
 
 
 def _finish_assessment_ask_turn(context: ContextTypes.DEFAULT_TYPE, conversation_id: str, turn_id: str) -> None:

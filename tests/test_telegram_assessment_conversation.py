@@ -732,8 +732,72 @@ def test_duplicate_same_assessment_ask_callback_does_not_cancel_or_duplicate_act
     assert question_message.reply_text.call_args_list[-1].args[0] == "ONE ANSWER"
     assert duplicate_query.message.reply_text.call_count == 1
     assert get_latest_assessment_conversation(user_id, assessment["id"])["id"] == conversation_id
+
+
+def test_assessment_ask_typing_indicator_is_best_effort_during_generation() -> None:
+    user_id = 1003
+    assessment = create_assessment("Typing feedback", user_id=user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    typing_action = AsyncMock()
+    context.bot = SimpleNamespace(send_chat_action=typing_action)
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_answer(**_kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return {"answer": "TYPING ANSWER", "evidence_refs": {}, "provenance": {}}
+
+    async def scenario():
+        message = SimpleNamespace(text="A slow question", reply_text=AsyncMock())
+        update = SimpleNamespace(
+            message=message,
+            effective_user=SimpleNamespace(id=user_id),
+            effective_chat=SimpleNamespace(id=7003),
+        )
+        with patch("app.bot.handlers.assessment.answer_assessment_conversation_question", side_effect=delayed_answer):
+            await scan_target_handler(update, context)
+            task = context.user_data[ASSESSMENT_ASK_TASK_KEY]
+            for _ in range(100):
+                if started.is_set() and typing_action.await_count:
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+            assert typing_action.await_count >= 1
+            release.set()
+            await task
+        return message
+
+    message = asyncio.run(scenario())
+    assert message.reply_text.call_args_list[-1].args[0] == "TYPING ANSWER"
+
+
+def test_assessment_ask_typing_failure_does_not_suppress_answer() -> None:
+    user_id = 1004
+    assessment = create_assessment("Typing failure", user_id=user_id)
+    context, _ = _enter(assessment["id"], user_id)
+    conversation_id = context.user_data[ASSESSMENT_CHAT_STATE_KEY]["conversation_id"]
+    context.bot = SimpleNamespace(send_chat_action=AsyncMock(side_effect=RuntimeError("typing unavailable")))
+
+    async def scenario():
+        message = SimpleNamespace(text="Question", reply_text=AsyncMock())
+        update = SimpleNamespace(
+            message=message,
+            effective_user=SimpleNamespace(id=user_id),
+            effective_chat=SimpleNamespace(id=7004),
+        )
+        with patch(
+            "app.bot.handlers.assessment.answer_assessment_conversation_question",
+            return_value={"answer": "ANSWER AFTER TYPING FAILURE", "evidence_refs": {}, "provenance": {}},
+        ):
+            await scan_target_handler(update, context)
+            await context.user_data[ASSESSMENT_ASK_TASK_KEY]
+        return message
+
+    message = asyncio.run(scenario())
+    assert message.reply_text.call_args_list[-1].args[0] == "ANSWER AFTER TYPING FAILURE"
     assert [(item["role"], item["content"]) for item in list_recent_messages(user_id, conversation_id)] == [
-        ("user", "One question"), ("assistant", "ONE ANSWER"),
+        ("user", "Question"), ("assistant", "ANSWER AFTER TYPING FAILURE"),
     ]
 
 
