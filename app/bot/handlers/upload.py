@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import ContextTypes
 
 from app.bot.keyboards import build_main_menu_keyboard
@@ -70,6 +70,9 @@ MAX_OPEN_SERVICES_IN_UPLOAD_SUMMARY = 10
 MAX_NUCLEI_FINDINGS_IN_REPORT = 10
 MAX_UPLOAD_REPORT_LENGTH = 3800
 MAX_TSHARK_CARD_LENGTH = 3800
+TSHARK_TELEGRAM_FILE_READ_TIMEOUT_SECONDS = 120
+TSHARK_TELEGRAM_FILE_CONNECT_TIMEOUT_SECONDS = 15
+TSHARK_TELEGRAM_FILE_POOL_TIMEOUT_SECONDS = 10
 NUCLEI_SEVERITIES = ("critical", "high", "medium", "low", "info")
 _upload_states: dict[int, str] = {}
 _tshark_assessment_upload_contexts: dict[int, dict] = {}
@@ -1230,8 +1233,28 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
     temp_path: Path | None = None
     fallback_status = "failed"
     try:
-        telegram_file = await document.get_file()
-        file_bytes = bytes(await telegram_file.download_as_bytearray())
+        try:
+            telegram_file = await document.get_file(
+                read_timeout=TSHARK_TELEGRAM_FILE_READ_TIMEOUT_SECONDS,
+                connect_timeout=TSHARK_TELEGRAM_FILE_CONNECT_TIMEOUT_SECONDS,
+                pool_timeout=TSHARK_TELEGRAM_FILE_POOL_TIMEOUT_SECONDS,
+            )
+            file_bytes = bytes(
+                await telegram_file.download_as_bytearray(
+                    read_timeout=TSHARK_TELEGRAM_FILE_READ_TIMEOUT_SECONDS,
+                    connect_timeout=TSHARK_TELEGRAM_FILE_CONNECT_TIMEOUT_SECONDS,
+                    pool_timeout=TSHARK_TELEGRAM_FILE_POOL_TIMEOUT_SECONDS,
+                )
+            )
+        except TimedOut:
+            clear_upload_state(user_id)
+            try:
+                await update.message.reply_text(
+                    "TShark capture download timed out. Please retry the PCAP upload."
+                )
+            except TimedOut:
+                logger.warning("Unable to send TShark download timeout message to Telegram.")
+            return
         if not file_bytes:
             clear_upload_state(user_id)
             await update.message.reply_text("TShark capture file is empty.")

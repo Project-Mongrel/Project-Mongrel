@@ -6779,6 +6779,36 @@ def test_tshark_offline_upload_result_card_uses_original_safe_filename_not_temp_
     assert get_upload_state(user_id) is None
 
 
+def test_tshark_pcap_download_timeout_is_bounded_before_tshark_execution() -> None:
+    user_id = 5921
+    set_upload_state(user_id, UPLOAD_STATE_AWAITING_TSHARK_PCAP)
+    update = _tshark_upload_update(user_id, content=b"pcap")
+    telegram_file = SimpleNamespace(
+        download_as_bytearray=AsyncMock(side_effect=TimedOut("download timeout")),
+    )
+    update.message.document.get_file = AsyncMock(return_value=telegram_file)
+
+    with (
+        patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
+        patch("app.bot.handlers.upload.run_tshark_offline_analysis") as runner,
+    ):
+        asyncio.run(upload_document_handler(update, SimpleNamespace()))
+
+    update.message.document.get_file.assert_awaited_once_with(
+        read_timeout=120,
+        connect_timeout=15,
+        pool_timeout=10,
+    )
+    telegram_file.download_as_bytearray.assert_awaited_once_with(
+        read_timeout=120,
+        connect_timeout=15,
+        pool_timeout=10,
+    )
+    runner.assert_not_called()
+    assert update.message.reply_text.call_args.args[0] == "TShark capture download timed out. Please retry the PCAP upload."
+    assert get_upload_state(user_id) is None
+
+
 def test_tshark_scan_callback_prompts_for_upload_or_live_choice() -> None:
     query = SimpleNamespace(data="scan:tshark", answer=AsyncMock(), edit_message_text=AsyncMock())
     context = SimpleNamespace(user_data={})
