@@ -33,6 +33,8 @@ from app.services.assessment_store import (
     record_assessment_scan,
     start_assessment_scan,
 )
+from app.services.assessment_map_ingestion import AssessmentMapIngestionError, ingest_assessment_scan
+from app.services.assessment_map_store import AssessmentMapScopeError
 from app.services.chat_state import clear_finding_analysis_context
 from app.services.findings_store import add_finding
 from app.services.icon_helper import icon_label, section_label
@@ -51,11 +53,13 @@ from app.services.tshark_metasploit_correlation import (
     build_tshark_metasploit_correlation_record,
     generate_tshark_metasploit_correlated_assessment,
 )
+from app.services.tshark_ai_assessment import FALLBACK_LINES as TSHARK_AI_FALLBACK_LINES, generate_tshark_ai_assessment
 from app.services.tshark_policy import build_tshark_capture_request
 from app.services.tshark_validation_capture import DEFAULT_POST_VALIDATION_TAIL_SECONDS, run_tshark_capture_during_validation
 from app.services.verdict_engine import generate_mongrel_verdict
 from app.tools.tshark_live_runner import check_tshark_live_readiness, run_tshark_live_capture
 from app.tools.tshark_runner import check_tshark_readiness, run_tshark_offline_analysis
+from app.ui.ai_summary import render_ai_summary_card
 
 UPLOAD_STATE_AWAITING_NMAP_XML = "awaiting_nmap_xml"
 UPLOAD_STATE_AWAITING_TSHARK_PCAP = "awaiting_tshark_pcap"
@@ -361,7 +365,9 @@ def set_upload_state(user_id: int, state: str) -> None:
 
 
 def set_tshark_assessment_upload_context(user_id: int, assessment_context: dict) -> None:
-    _tshark_assessment_upload_contexts[user_id] = dict(assessment_context)
+    context = dict(assessment_context)
+    context.setdefault("user_id", int(user_id))
+    _tshark_assessment_upload_contexts[user_id] = context
 
 
 def get_tshark_assessment_upload_context(user_id: int) -> dict | None:
@@ -1250,6 +1256,7 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
             await asyncio.to_thread(_persist_tshark_assessment_evidence, assessment_context, result, normalized)
         display_result = {**result, "uploaded_filename": _safe_uploaded_filename(file_name)}
         await update.message.reply_text(build_tshark_result_text(normalized, display_result))
+        await _send_tshark_ai_assessment(update.message, normalized=normalized, tool_mode=assessment_context is None)
         if assessment_context:
             await _send_tshark_assessment_dashboard(update.message, int(assessment_context["assessment_id"]))
     except asyncio.CancelledError:
@@ -1265,7 +1272,13 @@ async def _handle_tshark_document_upload(update: Update, user_id: int) -> None:
                 logger.warning("Unable to remove temporary TShark upload file: %s", temp_path)
 
 
-def _persist_tshark_assessment_evidence(assessment_context: dict, result: dict, normalized: dict) -> None:
+def _persist_tshark_assessment_evidence(
+    assessment_context: dict,
+    result: dict,
+    normalized: dict,
+    *,
+    ingest_map: bool = True,
+) -> dict:
     assessment_id = int(assessment_context["assessment_id"])
     status = scan_status_from_result(result)
     scan_id = assessment_context.get("assessment_scan_id")
@@ -1293,6 +1306,28 @@ def _persist_tshark_assessment_evidence(assessment_context: dict, result: dict, 
         content=json.dumps(_bounded_tshark_artifact_payload(normalized), sort_keys=True),
         file_path=None,
     )
+    if ingest_map:
+        _ingest_tshark_assessment_map(assessment_context, scan)
+    return scan
+
+
+def _ingest_tshark_assessment_map(assessment_context: dict | None, scan: dict | None) -> None:
+    if not isinstance(assessment_context, dict) or not scan:
+        return
+    user_id = _parse_optional_int(assessment_context.get("user_id"))
+    assessment_id = _parse_optional_int(assessment_context.get("assessment_id"))
+    scan_id = _parse_optional_int(scan.get("id"))
+    if user_id is None or assessment_id is None or scan_id is None:
+        return
+    try:
+        ingest_assessment_scan(user_id=user_id, assessment_id=assessment_id, scan_id=scan_id)
+    except (AssessmentMapIngestionError, AssessmentMapScopeError, ValueError) as exc:
+        logger.warning(
+            "Assessment map ingestion skipped for tshark scan_id=%s assessment_id=%s: %s",
+            scan_id,
+            assessment_id,
+            exc,
+        )
 
 
 def _start_tshark_assessment_scan(assessment_context: dict) -> None:
@@ -1320,12 +1355,13 @@ def _finalize_tshark_assessment_scan_if_running(
     return finalize_assessment_scan(assessment_id=assessment_id, scan_id=scan_id, status=status)
 
 
-def _persist_tshark_capture_validation_provenance(assessment_id: int, result: dict) -> str | None:
+def _persist_tshark_capture_validation_provenance(assessment_id: int, result: dict, *, scan_id: int | None = None) -> str | None:
     provenance = result.get("provenance") if isinstance(result, dict) else {}
     if not isinstance(provenance, dict) or not provenance:
         return None
     artifact = add_assessment_artifact(
         assessment_id=int(assessment_id),
+        scan_id=scan_id,
         artifact_type="tshark_validation_capture_provenance",
         title="TShark capture during validation provenance",
         content=json.dumps(
@@ -1361,6 +1397,7 @@ def _persist_tshark_metasploit_correlation(
     capture_provenance_ref: str | None,
     result: dict,
     normalized_tshark: dict,
+    scan_id: int | None = None,
 ) -> dict:
     logger.info(
         "Start TShark/Metasploit correlation persistence: user_id=%s assessment_id=%s validation_proposal_id=%s capture_provenance_ref=%s",
@@ -1378,7 +1415,9 @@ def _persist_tshark_metasploit_correlation(
     normalized_metasploit = parse_metasploit_validation_result(validation_result)
     validation_ref = "current_run.validation_result"
     if assessment_id is not None:
-        validation_ref = _persist_metasploit_capture_validation_artifact(assessment_id, validation_result, normalized_metasploit, validation_proposal_id)
+        validation_ref = _persist_metasploit_capture_validation_artifact(
+            assessment_id, validation_result, normalized_metasploit, validation_proposal_id, scan_id=scan_id
+        )
         record_metasploit_result_reference(validation_proposal_id, validation_ref)
     correlation = build_tshark_metasploit_correlation_record(
         user_id=user_id,
@@ -1393,6 +1432,7 @@ def _persist_tshark_metasploit_correlation(
     if assessment_id is not None:
         correlation_artifact = add_assessment_artifact(
             assessment_id=int(assessment_id),
+            scan_id=scan_id,
             artifact_type="tshark_metasploit_correlation_record",
             title="TShark and Metasploit correlation record",
             content=json.dumps(correlation, sort_keys=True),
@@ -1472,9 +1512,31 @@ async def _send_tshark_metasploit_correlated_assessment(
         logger.info("Capture During Validation dashboard sent: assessment_id=%s", assessment_id)
 
 
-def _persist_metasploit_capture_validation_artifact(assessment_id: int, result: dict, normalized: dict, proposal_id: str) -> str:
+async def _send_tshark_ai_assessment(message: object, *, normalized: dict, tool_mode: bool) -> None:
+    try:
+        assessment_lines = await asyncio.to_thread(generate_tshark_ai_assessment, normalized)
+        if not assessment_lines or assessment_lines == TSHARK_AI_FALLBACK_LINES:
+            return
+        assessment_text = render_ai_summary_card(assessment_lines, title="TShark AI Assessment")
+        chunks = split_report_text(assessment_text)
+        for index, chunk in enumerate(chunks):
+            markup = build_tool_mode_post_scan_keyboard("tshark") if tool_mode and index == len(chunks) - 1 else None
+            await message.reply_text(chunk, **({"reply_markup": markup} if markup else {}))
+    except Exception:
+        logger.info("TShark specialist AI unavailable; deterministic result remains authoritative.", exc_info=True)
+
+
+def _persist_metasploit_capture_validation_artifact(
+    assessment_id: int,
+    result: dict,
+    normalized: dict,
+    proposal_id: str,
+    *,
+    scan_id: int | None = None,
+) -> str:
     artifact = add_assessment_artifact(
         assessment_id=int(assessment_id),
+        scan_id=scan_id,
         artifact_type="metasploit_validation_normalized_evidence",
         title=f"Metasploit validation evidence {normalized.get('target') or result.get('target') or 'target'}",
         content=json.dumps(
@@ -1874,9 +1936,17 @@ async def _tshark_callback_handler_impl(update: Update, context: ContextTypes.DE
                 normalized.get("packet_count") if isinstance(normalized, dict) else None,
             )
             provenance_ref = None
+            tshark_scan = None
             if assessment_id is not None:
-                _persist_tshark_assessment_evidence(live_context, result, normalized)
-                provenance_ref = _persist_tshark_capture_validation_provenance(assessment_id, result)
+                tshark_scan = _persist_tshark_assessment_evidence(
+                    live_context,
+                    result,
+                    normalized,
+                    ingest_map=False,
+                )
+                provenance_ref = _persist_tshark_capture_validation_provenance(
+                    assessment_id, result, scan_id=int(tshark_scan["id"])
+                )
             correlation_result = await asyncio.to_thread(
                 _persist_tshark_metasploit_correlation,
                 user_id,
@@ -1885,7 +1955,10 @@ async def _tshark_callback_handler_impl(update: Update, context: ContextTypes.DE
                 provenance_ref,
                 result,
                 normalized,
+                int(tshark_scan["id"]) if isinstance(tshark_scan, dict) else None,
             )
+            if assessment_id is not None and isinstance(tshark_scan, dict):
+                _ingest_tshark_assessment_map(live_context, tshark_scan)
             logger.info(
                 "Capture During Validation caller received correlation result: has_record=%s has_ai_lines=%s ai_line_count=%s artifact_ref=%s",
                 isinstance(correlation_result, dict) and bool(correlation_result.get("correlation")),
@@ -1915,6 +1988,7 @@ async def _tshark_callback_handler_impl(update: Update, context: ContextTypes.DE
             _persist_tshark_assessment_evidence(live_context, result, normalized)
         if query.message is not None:
             await query.message.reply_text(build_tshark_result_text(normalized, result.get("offline_result") or result))
+            await _send_tshark_ai_assessment(query.message, normalized=normalized, tool_mode=assessment_id is None)
             if assessment_id is not None:
                 await _send_tshark_assessment_dashboard(query.message, assessment_id)
         clear_tshark_live_context(proposal_id)

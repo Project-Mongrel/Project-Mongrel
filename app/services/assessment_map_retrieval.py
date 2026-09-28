@@ -15,7 +15,7 @@ from app.services.findings_store import _get_connection
 MAP_RETRIEVAL_VERSION = "assessment-map.retrieval.v1"
 MAP_EVIDENCE_TOOLS = (
     "nmap", "bbot", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl", "gitleaks",
-    "prowler", "metasploit",
+    "prowler", "metasploit", "tshark",
 )
 MAX_ENTITY_CANDIDATES = 40
 MAX_ASSERTION_CANDIDATES = 80
@@ -468,6 +468,11 @@ def _fit_context(context: dict, *, max_chars: int) -> dict:
     reduced["truncated"] = True
     reduced["relationships"] = list(reduced.get("relationships") or [])
     reduced["entities"] = list(reduced.get("entities") or [])
+    for item in list(reduced.get("entities") or []) + list(reduced.get("relationships") or []):
+        if isinstance(item, dict):
+            item["provenance"] = list(item.get("provenance") or [])[:1]
+            item.pop("attributes", None)
+            item.pop("identity", None)
     while len(json.dumps(reduced, sort_keys=True, default=str)) > budget and (
         len(reduced["relationships"]) > 4 or len(reduced["entities"]) > 4
     ):
@@ -475,16 +480,13 @@ def _fit_context(context: dict, *, max_chars: int) -> dict:
             reduced["relationships"] = reduced["relationships"][:-1]
         elif len(reduced["entities"]) > 4:
             reduced["entities"] = reduced["entities"][:-1]
-    for item in list(reduced.get("entities") or []) + list(reduced.get("relationships") or []):
-        if isinstance(item, dict):
-            item["provenance"] = list(item.get("provenance") or [])[:1]
-            item.pop("attributes", None)
-            item.pop("identity", None)
     if len(json.dumps(reduced, sort_keys=True, default=str)) > budget:
-        reduced["relationships"] = []
         reduced["entities"] = list(reduced.get("entities") or [])[:3]
+        reduced["relationships"] = list(reduced.get("relationships") or [])[:3]
     while len(json.dumps(reduced, sort_keys=True, default=str)) > budget and reduced["entities"]:
         reduced["entities"] = reduced["entities"][:-1]
+    while len(json.dumps(reduced, sort_keys=True, default=str)) > budget and reduced["relationships"]:
+        reduced["relationships"] = reduced["relationships"][:-1]
     if len(json.dumps(reduced, sort_keys=True, default=str)) > budget:
         reduced["coverage"] = {
             "represented_tools": list((reduced.get("coverage") or {}).get("represented_tools") or []),

@@ -42,6 +42,12 @@ from app.services.assessment_map_recon_secret_ingestion import (
     project_recon_secret_source,
     recon_secret_coverage_metadata,
 )
+from app.services.assessment_map_tshark_ingestion import (
+    STRUCTURED_ARTIFACT_TYPES as TSHARK_STRUCTURED_ARTIFACT_TYPES,
+    map_tshark_source,
+    project_tshark_source,
+    tshark_coverage_metadata,
+)
 from app.services.assessment_map_web_ingestion import (
     STRUCTURED_ARTIFACT_TYPES as WEB_STRUCTURED_ARTIFACT_TYPES,
     map_web_source,
@@ -55,7 +61,7 @@ INGESTION_VERSION = 1
 DIGEST_VERSION = "assessment-map.ingestion-source.v1"
 SUPPORTED_TOOLS = frozenset({
     "nmap", "httpx", "katana", "playwright", "ffuf", "nuclei", "testssl", "bbot", "gitleaks",
-    "prowler", "metasploit",
+    "prowler", "metasploit", "tshark",
 })
 STRUCTURED_ARTIFACT_TYPES = {
     "nmap": frozenset({"nmap_normalized_evidence", "nmap_structured_evidence", "nmap_json"}),
@@ -64,6 +70,7 @@ STRUCTURED_ARTIFACT_TYPES = {
     **SECURITY_STRUCTURED_ARTIFACT_TYPES,
     **RECON_SECRET_STRUCTURED_ARTIFACT_TYPES,
     **CLOUD_VALIDATION_STRUCTURED_ARTIFACT_TYPES,
+    **TSHARK_STRUCTURED_ARTIFACT_TYPES,
 }
 _SAFE_RESPONSE_HEADER_NAMES = frozenset(
     {
@@ -186,7 +193,7 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
         try:
             counts = _Counts.empty()
             projection_metadata: dict[str, Any] = {}
-            if tool in {"katana", "playwright", "ffuf", "nuclei", "testssl", "bbot", "gitleaks", "prowler", "metasploit"}:
+            if tool in {"katana", "playwright", "ffuf", "nuclei", "testssl", "bbot", "gitleaks", "prowler", "metasploit", "tshark"}:
                 if tool in {"katana", "playwright", "ffuf"}:
                     metadata_function = web_coverage_metadata
                     metadata_version = "assessment-map.web-coverage.v1"
@@ -196,9 +203,12 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
                 elif tool in {"bbot", "gitleaks"}:
                     metadata_function = recon_secret_coverage_metadata
                     metadata_version = "assessment-map.recon-secret-coverage.v1"
-                else:
+                elif tool in {"prowler", "metasploit"}:
                     metadata_function = cloud_validation_coverage_metadata
                     metadata_version = "assessment-map.cloud-validation-coverage.v1"
+                else:
+                    metadata_function = tshark_coverage_metadata
+                    metadata_version = "assessment-map.tshark-coverage.v1"
                 projection_metadata = {
                     "metadata_version": metadata_version,
                     "tool": tool,
@@ -226,6 +236,10 @@ def ingest_assessment_scan(*, user_id: int, assessment_id: int, scan_id: int) ->
                     ))
                 elif tool in {"prowler", "metasploit"}:
                     map_cloud_validation_source(tool, source.data, _MappingWriter(
+                        active, user_id, assessment_id, scan, source, counts, projection_metadata
+                    ))
+                elif tool == "tshark":
+                    map_tshark_source(tool, source.data, _MappingWriter(
                         active, user_id, assessment_id, scan, source, counts, projection_metadata
                     ))
                 else:
@@ -361,6 +375,8 @@ def _canonical_digest_projection(
             projection = project_recon_secret_source(tool, source.data)
         elif tool in {"prowler", "metasploit"}:
             projection = project_cloud_validation_source(tool, source.data)
+        elif tool == "tshark":
+            projection = project_tshark_source(tool, source.data)
         else:
             projection = {"unsupported": True}
         projected_sources.append(

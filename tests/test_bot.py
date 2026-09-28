@@ -7003,6 +7003,8 @@ def test_tshark_capture_validation_approve_invokes_orchestrator_and_persists_pro
     with (
         patch("app.bot.handlers.upload.run_tshark_capture_during_validation", return_value=result) as orchestrator,
         patch("app.bot.handlers.upload.generate_tshark_metasploit_correlated_assessment", return_value=["Executive Summary", "Correlated evidence reviewed."]) as correlated_ai,
+        patch("app.bot.handlers.upload.generate_tshark_ai_assessment") as standalone_ai,
+        patch("app.bot.handlers.upload.ingest_assessment_scan") as ingest_map,
     ):
         asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5922)), SimpleNamespace(user_data={})))
 
@@ -7031,6 +7033,8 @@ def test_tshark_capture_validation_approve_invokes_orchestrator_and_persists_pro
     assert correlation["agreement_disagreement_state"] == "agreement"
     assert any(artifact["artifact_type"] == "tshark_metasploit_correlated_ai_assessment" for artifact in artifacts)
     correlated_ai.assert_called_once()
+    standalone_ai.assert_not_called()
+    ingest_map.assert_called_once_with(user_id=5922, assessment_id=assessment["id"], scan_id=artifacts[0]["scan_id"])
 
 
 def test_tshark_capture_validation_tool_mode_sends_correlated_assessment_without_assessment_context() -> None:
@@ -7370,7 +7374,11 @@ def test_tshark_assessment_live_success_and_permission_failure_persist_and_clean
     approve_query = SimpleNamespace(data=f"tshark:approve:{proposal_id}", answer=AsyncMock(), edit_message_text=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
     live_result = {"success": True, "elapsed_seconds": 1.2, "offline_result": {"success": True}, "normalized_evidence": _tshark_normalized()}
 
-    with patch("app.bot.handlers.upload.run_tshark_live_capture", return_value=live_result):
+    with (
+        patch("app.bot.handlers.upload.run_tshark_live_capture", return_value=live_result),
+        patch("app.bot.handlers.upload.generate_tshark_ai_assessment", return_value=["Observed live packet metadata."]) as tshark_ai,
+        patch("app.bot.handlers.upload.ingest_assessment_scan") as ingest_map,
+    ):
         asyncio.run(tshark_callback_handler(SimpleNamespace(callback_query=approve_query, effective_user=SimpleNamespace(id=5908)), SimpleNamespace(user_data={})))
 
     scans = list_assessment_scans(assessment["id"])
@@ -7379,6 +7387,8 @@ def test_tshark_assessment_live_success_and_permission_failure_persist_and_clean
     assert scans[-1]["status"] == "completed"
     assert artifacts[-1]["artifact_type"] == "tshark_normalized_evidence"
     assert "TShark: Completed" in approve_query.message.reply_text.call_args_list[-1].args[0]
+    tshark_ai.assert_called_once_with(_tshark_normalized())
+    ingest_map.assert_called_once_with(user_id=5908, assessment_id=assessment["id"], scan_id=scans[-1]["id"])
 
     create_query = SimpleNamespace(data=f"tshark:iface_assessment:{assessment['id']}:ZXRoMA", answer=AsyncMock(), edit_message_text=AsyncMock())
     with (
@@ -7464,6 +7474,8 @@ def test_valid_tshark_assessment_upload_records_scan_artifact_and_dashboard() ->
         patch("app.bot.handlers.upload.check_tshark_readiness", return_value={"ready": True}),
         patch("app.bot.handlers.upload.run_tshark_offline_analysis", side_effect=fake_runner),
         patch("app.bot.handlers.upload.normalize_tshark_result", return_value=_tshark_normalized()),
+        patch("app.bot.handlers.upload.generate_tshark_ai_assessment", return_value=["Observed packet metadata."]) as tshark_ai,
+        patch("app.bot.handlers.upload.ingest_assessment_scan") as ingest_map,
     ):
         asyncio.run(upload_document_handler(update, SimpleNamespace()))
 
@@ -7479,6 +7491,8 @@ def test_valid_tshark_assessment_upload_records_scan_artifact_and_dashboard() ->
     assert "-i" not in str(update.message.reply_text.call_args_list[0].args[0])
     assert "TShark PCAP Analysis" in update.message.reply_text.call_args_list[0].args[0]
     assert "TShark: Completed" in update.message.reply_text.call_args_list[-1].args[0]
+    tshark_ai.assert_called_once_with(_tshark_normalized())
+    ingest_map.assert_called_once_with(user_id=user_id, assessment_id=assessment["id"], scan_id=scans[0]["id"])
     assert get_upload_state(user_id) is None
     assert get_tshark_assessment_upload_context(user_id) is None
 
