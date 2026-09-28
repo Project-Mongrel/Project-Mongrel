@@ -1723,6 +1723,15 @@ def _build_direct_metasploit_evidence_answer(context: dict) -> str | None:
 
     finding = findings[-1]
     evidence = finding.get("metasploit_evidence") if isinstance(finding.get("metasploit_evidence"), dict) else {}
+    assessment_state = str(
+        ((context.get("recommendation_context") or {}).get("tool_states") or {}).get("metasploit") or ""
+    ).strip().upper()
+    lifecycle = (
+        "Metasploit is recorded as completed in this assessment. Completion does not imply successful validation, "
+        "exploitation, vulnerability, or compromise. "
+        if assessment_state == "COMPLETED"
+        else ""
+    )
     state = str(evidence.get("validation_state") or "INCONCLUSIVE").strip().upper()
     target = str(evidence.get("target") or finding.get("target") or "the assessed target").strip()
     module = str(evidence.get("module") or (finding.get("metadata") or {}).get("module") or "unknown").strip()
@@ -1741,15 +1750,17 @@ def _build_direct_metasploit_evidence_answer(context: dict) -> str | None:
     if state == "DETECTED":
         version_text = f" Stored explicit version metadata: {explicit_version}." if explicit_version else " No specific HTTP version is stored."
         return (
-            f"Metasploit completed module {module} for {endpoint} and observed service/version metadata only "
-            f"(validation state: DETECTED).{version_text} No vulnerability condition was validated, exploit success "
-            f"or compromise was established, and a session {session}."
+            f"{lifecycle}Metasploit completed module {module} for {endpoint} and observed service/version metadata only "
+            f"(validation state: DETECTED).{version_text} No vulnerability condition was validated, and exploit success "
+            f"or compromise was not established; the stored result does not establish successful exploitation; a session "
+            f"{session}; that does not prove exploitation could not occur."
         )
 
     summary = str(evidence.get("summary") or finding.get("summary") or "No conclusive normalized validation result was stored.").strip()
     return (
-        f"Metasploit completed module {module} for {endpoint}. Validation state: {state}. {summary} "
-        f"A session {session}; this does not by itself establish exploit success or compromise."
+        f"{lifecycle}Metasploit completed module {module} for {endpoint}. Validation state: {state}. {summary} "
+        f"The stored result does not establish successful exploitation or compromise; a session {session}; "
+        f"that does not prove exploitation could not occur."
     )
 
 
