@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from app.core.config import get_settings
 from app.parsers.katana_parser import summarize_katana_observations
 from app.parsers.playwright_parser import summarize_playwright_observation
+from app.parsers.tshark_parser import format_tshark_tls_version
 from app.services.ai_client import ask_ai
 from app.services.assessment_ai import AI_UNAVAILABLE_MESSAGES
 from app.services.assessment_conversation_context import (
@@ -1868,13 +1869,22 @@ def _build_direct_tshark_evidence_answer(context: dict) -> str | None:
         protocols = [str(item.get("protocol")) for item in evidence.get("observed_protocols") or [] if isinstance(item, dict) and item.get("protocol")]
         if protocols:
             details.append("protocol metadata " + ", ".join(protocols[:10]))
-        dns = [str(item.get("query_name")) for item in evidence.get("dns_observations") or [] if isinstance(item, dict) and item.get("query_name")]
+        dns = []
+        seen_dns: set[str] = set()
+        for item in evidence.get("dns_observations") or []:
+            name = str(item.get("query_name") or "").strip() if isinstance(item, dict) else ""
+            if name and name not in seen_dns:
+                seen_dns.add(name)
+                dns.append(name)
         if dns:
             details.append("DNS names " + ", ".join(dns[:10]))
         tls = []
         for item in evidence.get("tls_observations") or []:
             if isinstance(item, dict):
-                values = [f"SNI {item.get('sni')}" if item.get("sni") else "", f"version {item.get('version')}" if item.get("version") else ""]
+                values = [
+                    f"SNI {item.get('sni')}" if item.get("sni") else "",
+                    f"version {format_tshark_tls_version(item.get('version'))}" if item.get("version") else "",
+                ]
                 tls.append(", ".join(value for value in values if value) or "TLS metadata")
         if tls:
             details.append("TLS observations " + "; ".join(tls[:10]))

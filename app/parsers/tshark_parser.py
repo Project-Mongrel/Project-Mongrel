@@ -21,6 +21,33 @@ EVIDENCE_LIMITATIONS = [
 _SENSITIVE_QUERY_KEYS = frozenset({"authorization", "cookie", "password", "passwd", "token", "secret", "api_key", "apikey", "access_key", "session", "sessionid"})
 
 
+def dedupe_tshark_dns_observations(observations: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str, str]] = set()
+    unique = []
+    for item in observations:
+        key = (
+            str(item.get("query_name") or ""),
+            str(item.get("response_name") or ""),
+            str(item.get("response_address") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def format_tshark_tls_version(version: object) -> str:
+    raw = str(version or "n/a").strip()
+    versions = {
+        "0x0301": "TLS 1.0",
+        "0x0302": "TLS 1.1",
+        "0x0303": "TLS 1.2",
+        "0x0304": "TLS 1.3",
+    }
+    return versions.get(raw.lower(), raw or "n/a")
+
+
 def normalize_tshark_result(result: dict) -> dict:
     settings = get_settings()
     limits = {

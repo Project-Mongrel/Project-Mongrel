@@ -22,7 +22,7 @@ from app.bot.handlers.reports import split_report_text
 from app.parsers.nmap_xml_parser import parse_nmap_xml
 from app.parsers.nuclei_parser import NucleiParserError, parse_nuclei_results
 from app.parsers.metasploit_parser import parse_metasploit_validation_result
-from app.parsers.tshark_parser import normalize_tshark_result
+from app.parsers.tshark_parser import dedupe_tshark_dns_observations, format_tshark_tls_version, normalize_tshark_result
 from app.services.ai_client import ask_ai
 from app.services.assessment_store import (
     add_assessment_artifact,
@@ -2306,30 +2306,11 @@ def _dedupe_tshark_warnings(warnings: list[str]) -> list[str]:
 
 
 def _dedupe_tshark_dns(observations: list[dict]) -> list[dict]:
-    seen: set[tuple[str, str, str]] = set()
-    unique = []
-    for item in observations:
-        key = (
-            str(item.get("query_name") or ""),
-            str(item.get("response_name") or ""),
-            str(item.get("response_address") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-    return unique
+    return dedupe_tshark_dns_observations(observations)
 
 
 def _format_tshark_tls_version(version: object) -> str:
-    raw = str(version or "n/a").strip()
-    versions = {
-        "0x0301": "TLS 1.0",
-        "0x0302": "TLS 1.1",
-        "0x0303": "TLS 1.2",
-        "0x0304": "TLS 1.3",
-    }
-    return versions.get(raw.lower(), raw or "n/a")
+    return format_tshark_tls_version(version)
 
 
 def _capture_duration_from_timestamps(start: object, end: object) -> float | None:

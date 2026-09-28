@@ -3767,6 +3767,49 @@ def test_large_tshark_artifact_preserves_authoritative_capture_summary() -> None
     assert "packet count is unknown" not in result["answer"]
 
 
+def test_tshark_ask_presentation_deduplicates_dns_and_formats_tls_versions() -> None:
+    user_id = 1205
+    assessment = create_assessment("TShark presentation", user_id=user_id)
+    scan = record_assessment_scan(assessment["id"], "tshark", "completed")
+    content = {
+        "source": "tshark",
+        "packet_count": 4,
+        "byte_count": 400,
+        "dns_observations": [
+            {"query_name": "www.example.test"},
+            {"query_name": "www.example.test"},
+            {"query_name": "google.com"},
+            {"query_name": "www.example.test"},
+        ],
+        "tls_observations": [
+            {"sni": "example.test", "version": "0x0303"},
+            {"sni": "unknown.test", "version": "0x9999"},
+        ],
+    }
+    add_assessment_artifact(
+        assessment["id"],
+        scan_id=scan["id"],
+        artifact_type="tshark_normalized_evidence",
+        title="Presentation capture",
+        content=json.dumps(content),
+    )
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="What did TShark actually observe?",
+    )
+    answer = result["answer"]
+    assert "DNS names www.example.test, google.com" in answer
+    assert answer.count("www.example.test") == 1
+    assert "version TLS 1.2" in answer
+    assert "version 0x9999" in answer
+    assert "version TLS 1.2 handshake" not in answer
+    assert "does not establish a completed TLS handshake" in answer
+    assert "vulnerability, exploitation, or compromise" in answer
+
+
 def test_missing_tshark_packet_count_remains_unknown_not_zero() -> None:
     assessment = create_assessment("Unknown capture count", user_id=1203)
     finding = add_finding(user_id=1203, finding={
