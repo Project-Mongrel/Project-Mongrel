@@ -86,7 +86,7 @@ def generate_nmap_ai_assessment(finding: dict) -> list[str]:
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
     if _contains_unsupported_safety_claim(lines):
-        return list(UNSUPPORTED_CLAIM_FALLBACK_LINES)
+        return _build_unsupported_claim_fallback(finding)
     return lines or list(FALLBACK_LINES)
 
 
@@ -284,6 +284,64 @@ def _build_inconclusive_assessment_lines(finding: dict) -> list[str]:
         "- Verify DNS resolution, routing, VPN/interface selection, and authorization scope.",
         "- Re-run the scan after confirming the target can be reached from the scanner.",
     ]
+
+
+def _build_unsupported_claim_fallback(finding: dict) -> list[str]:
+    target = _clean(finding.get("target") or "unknown")
+    resolved_ip = _clean(finding.get("resolved_ip") or finding.get("ip_address") or "")
+    host_status = _clean(finding.get("host_status") or "unknown")
+    host_status_lower = host_status.lower()
+    reachable = host_status_lower in {"up", "reachable", "host up", "online"}
+    open_ports = [item for item in finding.get("open_ports") or [] if isinstance(item, dict)]
+    comparison = finding.get("comparison") or {}
+    lines = [
+        "Executive Summary",
+        "- The generated Nmap interpretation was withheld because it made an unsupported safety or vulnerability-absence claim.",
+        f"- Deterministic evidence shows {target} with {len(open_ports)} observed open TCP service(s).",
+        "",
+        "Observed Facts",
+        f"- Target: {target}",
+    ]
+    if resolved_ip:
+        lines.append(f"- Observed/resolved IP: {resolved_ip}")
+    if reachable:
+        lines.append(f"- Host reachability: established by Nmap status {host_status}.")
+    else:
+        lines.append(f"- Host status: {host_status}; reachability was not established beyond this recorded status.")
+    if open_ports:
+        lines.append("- Observed open ports and service labels:")
+        for item in open_ports[:20]:
+            port = _clean(item.get("port") or "unknown")
+            protocol = _clean(item.get("protocol") or "tcp")
+            service = _clean(item.get("service") or "unknown")
+            version = _clean(item.get("version") or "")
+            suffix = f"; scanner-reported version/product: {version}" if version else ""
+            lines.append(f"  - {port}/{protocol} {service}{suffix}")
+    else:
+        lines.append("- No open TCP services were observed in this scan.")
+    if comparison:
+        lines.append(f"- Comparison/baseline: {_clean(comparison.get('summary') or 'comparison data recorded')}")
+    lines.extend(
+        [
+            "",
+            "Interpretation",
+            "- The observed ports indicate network-level service exposure for authorized follow-up; service labels and scanner-reported versions are identification evidence only.",
+            "- HTTP/HTTPS labels do not confirm application behavior, TLS quality, vulnerability, exploitability, or compromise.",
+            "- The Nmap evidence does not prove that a target is safe or free of vulnerabilities.",
+            "",
+            "Limitations / Uncertainty",
+            "- This is a bounded Nmap observation, not complete coverage. Open ports do not establish vulnerabilities, and unobserved findings do not prove that none exist.",
+            "- A first scan stored as a baseline does not establish stability or prove that later state has not changed.",
+            "",
+            "Confidence",
+            "Medium for the recorded host, port, and service observations; no confidence is assigned to overall safety or vulnerability absence.",
+            "",
+            "Recommended Next Actions",
+            "- Verify the observed HTTP/HTTPS services with authorized response-level checks and review the exposed service configurations and versions.",
+            "- Compare a later authorized scan against this baseline when change detection is needed.",
+        ]
+    )
+    return lines
 
 
 def _is_unavailable_response(response: object) -> bool:

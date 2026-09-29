@@ -179,6 +179,35 @@ def test_nmap_ai_assessment_withholds_unsupported_safety_claims() -> None:
     assert "does not prove that a target is safe" in text
 
 
+def test_rejected_nmap_ai_output_uses_useful_deterministic_live_evidence_fallback() -> None:
+    finding = {
+        "target": "btjoinery.ie",
+        "resolved_ip": "198.185.159.144",
+        "host_status": "Up",
+        "summary": "Host reachable.",
+        "open_ports": [
+            {"port": 80, "protocol": "tcp", "service": "http"},
+            {"port": 443, "protocol": "tcp", "service": "https"},
+        ],
+        "comparison": {"summary": "No previous scan found. This scan stored as baseline."},
+    }
+    with patch("app.services.nmap_ai_assessment.ask_ai", return_value="Executive Summary\nThe host is secure and no vulnerabilities were found."):
+        lines = generate_nmap_ai_assessment(finding)
+
+    text = "\n".join(lines)
+    assert "withheld" in text.lower()
+    assert "btjoinery.ie" in text
+    assert "198.185.159.144" in text
+    assert "Host reachability: established" in text
+    assert "80/tcp http" in text
+    assert "443/tcp https" in text
+    assert "No previous scan found. This scan stored as baseline." in text
+    assert "service exposure" in text
+    assert "does not establish" in text
+    assert "secure" not in text.lower()
+    assert "no vulnerabilities were found" not in text.lower()
+
+
 def test_nmap_ai_assessment_withholds_unsupported_safety_variants() -> None:
     unsupported_claims = [
         "The host is secure.",
