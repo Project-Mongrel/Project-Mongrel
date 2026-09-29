@@ -3,6 +3,7 @@ import json
 import re
 from collections import Counter
 from datetime import datetime
+from ipaddress import ip_address
 from typing import Any
 
 from app.services.assessment_context import build_assessment_context
@@ -316,7 +317,7 @@ def build_assessment_conversation_context(
             recent_messages = _relevant_follow_up_messages(recent_messages, question)
     uncertainty_subtype = classify_uncertainty_subtype(question) if question_intent == "uncertainty_safety" else None
     full_assessment = not selected_tools
-    evidence = _build_evidence_context(assessment_context, selected_tools)
+    evidence = _build_evidence_context(assessment_context, selected_tools, question=question)
     provenance = _build_provenance(
         assessment_context=assessment_context,
         evidence=evidence,
@@ -690,7 +691,7 @@ def _resolve_conversation(user_id: int, assessment_id: int, conversation_id: str
     return get_latest_assessment_conversation(user_id, assessment_id)
 
 
-def _build_evidence_context(assessment_context: dict, selected_tools: list[str]) -> dict:
+def _build_evidence_context(assessment_context: dict, selected_tools: list[str], *, question: str = "") -> dict:
     full_assessment = not selected_tools
     source_scans = [scan for scan in assessment_context.get("scans") or [] if isinstance(scan, dict)]
     tools = selected_tools or sorted({_normalize_tool(scan.get("tool")) for scan in source_scans})
@@ -712,7 +713,10 @@ def _build_evidence_context(assessment_context: dict, selected_tools: list[str])
         if finding is None and isinstance(scan.get("finding"), dict):
             finding = scan["finding"]
         if finding is not None:
-            findings.append(_sanitize(finding))
+            sanitized_finding = _sanitize(finding)
+            if str(finding.get("source") or "").lower() == "bbot":
+                _preserve_requested_bbot_ip_observations(sanitized_finding, finding, question)
+            findings.append(sanitized_finding)
 
     artifacts = []
     for artifact in reversed(assessment_context.get("artifacts") or []):
@@ -906,6 +910,64 @@ def _sanitize(value: Any, *, drop_finding: bool = False) -> Any:
     if isinstance(value, str):
         return _truncate(value)
     return value
+
+
+def _preserve_requested_bbot_ip_observations(sanitized_finding: dict, finding: dict, question: str) -> None:
+    """Keep an exact queried BBOT IP visible within the bounded evidence slice."""
+    requested = _extract_ip_literals(question)
+    if not requested:
+        return
+    observations = finding.get("observations")
+    if not isinstance(observations, list):
+        observations = finding.get("bbot_observations")
+    if not isinstance(observations, list):
+        return
+    matching = [
+        item for item in observations
+        if isinstance(item, dict)
+        and str(item.get("observation_type") or item.get("type") or "").lower() == "ip_address"
+        and str(item.get("value") or "").strip() in requested
+    ]
+    if not matching:
+        return
+    existing = sanitized_finding.get("observations")
+    if not isinstance(existing, list):
+        existing = sanitized_finding.get("bbot_observations")
+    if not isinstance(existing, list):
+        return
+    existing_values = {
+        str(item.get("value") or "").strip()
+        for item in existing
+        if isinstance(item, dict)
+    }
+    additions = [_sanitize(item) for item in matching if str(item.get("value") or "").strip() not in existing_values]
+    if not additions:
+        return
+    bounded = list(existing)
+    for addition in additions:
+        if len(bounded) >= MAX_ITEMS_PER_LIST:
+            bounded.pop()
+        bounded.append(addition)
+    if "observations" in sanitized_finding:
+        sanitized_finding["observations"] = bounded[:MAX_ITEMS_PER_LIST]
+    else:
+        sanitized_finding["bbot_observations"] = bounded[:MAX_ITEMS_PER_LIST]
+
+
+def _extract_ip_literals(value: object) -> set[str]:
+    candidates = re.findall(
+        r"(?<![A-Za-z0-9])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9])|"
+        r"(?<![A-Za-z0-9])(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:]+(?![A-Za-z0-9])",
+        str(value or ""),
+    )
+    valid = set()
+    for candidate in candidates:
+        try:
+            ip_address(candidate)
+        except ValueError:
+            continue
+        valid.add(candidate)
+    return valid
 
 
 def _truncate(value: str) -> str:

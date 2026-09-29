@@ -3080,6 +3080,56 @@ def test_bbot_exact_ip_question_does_not_substitute_nearby_observation() -> None
     assert "198.185.159.144" in present["answer"]
 
 
+def test_bbot_exact_ip_questions_retain_real_bounded_observation_shape() -> None:
+    user_id = 1126
+    assessment = create_assessment("BBOT bounded observations", user_id=user_id)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    observations = [
+        {"observation_type": "subdomain", "value": f"host-{index}.btjoinery.ie"}
+        for index in range(11)
+    ]
+    observations.append({"observation_type": "ip_address", "value": "198.185.159.144"})
+    observations.append({"observation_type": "dns_record", "value": "btjoinery.ie A 198.185.159.144"})
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "bbot",
+            "target": "btjoinery.ie",
+            "status": "completed",
+            "finding_count": len(observations),
+            "observations": observations,
+            "observation_counts": {"subdomain": 11, "ip_address": 1, "dns_record": 1},
+            "metadata": {"observation_count": len(observations)},
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="bbot", status="completed", finding_id=finding["id"])
+    conversation = create_conversation(assessment["id"], user_id, "BBOT exact indicator")
+    first_question = "Did BBOT observe 198.185.159.144?"
+    append_message(conversation["id"], user_id, "user", first_question)
+
+    present = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=conversation["id"],
+        question=first_question,
+    )
+    append_message(conversation["id"], user_id, "assistant", present["answer"])
+    second_question = "Did BBOT observe 198.185.159.0?"
+    append_message(conversation["id"], user_id, "user", second_question)
+    absent = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=conversation["id"],
+        question=second_question,
+    )
+
+    assert present["answer"].startswith("Yes.")
+    assert "198.185.159.144" in present["answer"]
+    assert absent["answer"].startswith("No.")
+    assert "198.185.159.0" in absent["answer"]
+    assert "198.185.159.144" not in absent["answer"]
+
+
 def test_nuclei_summary_uses_persisted_aggregate_counts_after_context_caps_list() -> None:
     user_id = 1128
     assessment = create_assessment("Nuclei aggregate budget", user_id=user_id)
