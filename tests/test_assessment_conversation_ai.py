@@ -3232,6 +3232,60 @@ def test_combined_established_and_unknown_question_precedes_gaps_with_selected_e
     assert "not proof of ownership" in answer
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What did BBOT and Nmap find?",
+        "Compare what BBOT and Nmap found.",
+    ],
+)
+def test_multi_tool_evidence_questions_render_each_selected_tool(question: str) -> None:
+    user_id = 1130
+    assessment = create_assessment("BBOT and Nmap direct evidence", user_id=user_id)
+    nmap = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nmap",
+            "target": "btjoinery.ie",
+            "status": "completed",
+            "open_ports": [
+                {"port": 80, "protocol": "tcp", "service": "http"},
+                {"port": 443, "protocol": "tcp", "service": "https"},
+            ],
+        },
+    )
+    bbot = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "bbot",
+            "target": "btjoinery.ie",
+            "status": "completed",
+            "finding_count": 36,
+            "observations": [
+                {"observation_type": "ip_address", "value": "198.185.159.144"},
+                {"observation_type": "subdomain", "value": "www.btjoinery.ie"},
+            ],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", finding_id=nmap["id"])
+    record_assessment_scan(assessment["id"], tool="bbot", status="completed", finding_id=bbot["id"])
+
+    with patch("app.services.assessment_conversation_ai.ask_ai") as model:
+        result = answer_assessment_conversation_question(
+            user_id=user_id,
+            assessment_id=assessment["id"],
+            conversation_id=None,
+            question=question,
+        )
+
+    model.assert_not_called()
+    answer = result["answer"]
+    assert "BBOT is recorded as completed with 36 stored observation item(s)" in answer
+    assert "ip_address=1" in answer and "subdomain=1" in answer
+    assert "Nmap is recorded as completed" in answer
+    assert "80/tcp (http)" in answer and "443/tcp (https)" in answer
+
+
 def test_bbot_dns_record_does_not_answer_exact_ip_query() -> None:
     user_id = 1127
     assessment = create_assessment("BBOT DNS-only indicator", user_id=user_id)

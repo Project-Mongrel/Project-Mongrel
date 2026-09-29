@@ -2185,6 +2185,8 @@ def _build_state_grounded_answer(context: dict) -> str | None:
         return _build_grounded_conversational_fallback(context)
     if intent == "follow_up_reference":
         return _build_follow_up_fallback(context)
+    if intent == "current_assessment_evidence" and len((context.get("selection") or {}).get("selected_tools") or []) > 1:
+        return _build_multi_tool_evidence_answer(context)
     if intent == "individual_tool_explanation" and has_explicit_tool_name(question) and is_tool_relevance_question(question):
         return _build_individual_tool_state_answer(context)
     if intent == "individual_tool_state" and has_explicit_tool_name(question) and is_tool_state_question(question):
@@ -3092,6 +3094,23 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
         if key.endswith(("_observations", "_results")) and isinstance(value, list)
     )
     return f"{display} is recorded as completed with {observation_count} normalized observation item(s). {capability} Completion or observations do not automatically establish a vulnerability or complete coverage."
+
+
+def _build_multi_tool_evidence_answer(context: dict) -> str | None:
+    """Render each explicitly selected tool through the existing bounded renderer."""
+    selected = [str(tool) for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    if len(selected) < 2:
+        return None
+    sections = []
+    for tool in selected:
+        scoped = dict(context)
+        scoped_selection = dict(context.get("selection") or {})
+        scoped_selection["selected_tools"] = [tool]
+        scoped["selection"] = scoped_selection
+        answer = _build_named_tool_evidence_answer(scoped)
+        if answer:
+            sections.append(answer)
+    return " ".join(sections) if sections else None
 
 
 def _build_named_ffuf_evidence_answer(context: dict, state: str, findings: list[dict]) -> str:
