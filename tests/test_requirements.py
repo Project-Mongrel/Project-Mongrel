@@ -26,7 +26,7 @@ def test_runtime_requirements_exclude_semgrep_dependency_conflict() -> None:
 
     assert "bbot" not in names
     assert "semgrep" not in names
-    assert _requirement_for(requirements, "PyJWT").specifier.contains("2.13.0")
+    assert _requirement_for(requirements, "PyJWT").specifier.contains("2.14.0")
     assert _requirement_for(requirements, "click").specifier.contains("8.3.3")
 
 
