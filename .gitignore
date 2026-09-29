@@ -65,3 +65,5 @@ security_audit.txt
 # Temporary files
 *.tmp
 *.swp
+*.pcap
+*.pcapng
