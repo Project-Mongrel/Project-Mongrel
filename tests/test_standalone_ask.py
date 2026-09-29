@@ -6,7 +6,7 @@ from app.bot.handlers.ask import ask_handler
 from app.bot.handlers.scan import scan_target_handler
 from app.services.chat_state import append_ai_conversation_exchange, clear_ai_waiting, get_ai_conversation_history
 from app.services.mongrel_self_knowledge import get_mongrel_tool_names
-from app.services.standalone_ask import answer_standalone_product_question
+from app.services.standalone_ask import answer_standalone_product_question, build_standalone_ask_prompt
 
 
 FORBIDDEN_EXTERNAL_TOOLS = (
@@ -81,6 +81,40 @@ def test_standalone_ask_gives_mongrel_aware_web_assessment_order() -> None:
     assert "not every" in answer.lower()
 
 
+def test_standalone_ask_first_step_questions_stay_within_mongrel_capabilities() -> None:
+    for question in ("what should we do first?", "what tool should we use first?", "what tool first?", "where should I start?"):
+        answer = _answer(question).lower()
+        assert "nmap" in answer and "httpx" in answer
+        assert not any(tool in answer for tool in ("openvas", "qualys", "rapid7"))
+
+
+def test_standalone_ask_followup_first_step_question_uses_bounded_context() -> None:
+    history = (("user", "what should we do first?"), ("assistant", _answer("what should we do first?")))
+    answer = _answer("elaborate. what tool first?", history).lower()
+
+    assert "mongrel" in answer.lower()
+    assert "nmap" in answer and "httpx" in answer
+    assert "openvas" not in answer and "qualys" not in answer and "rapid7" not in answer
+
+
+def test_standalone_generic_prompt_is_bounded_and_has_no_assessment_context() -> None:
+    prompt = build_standalone_ask_prompt(
+        "How does SSRF work?",
+        (("user", "What did the assessment find?"), ("assistant", "No assessment evidence is available here.")),
+    )
+
+    assert len(prompt) <= 9000
+    assert "Standalone Ask Mongrel context:" in prompt
+    assert "What did the assessment find?" in prompt
+    assert "no assessment findings" in prompt.lower()
+    assert "assessment_map" not in prompt.lower()
+    assert "finding_id" not in prompt.lower()
+
+
+def test_standalone_external_tool_question_remains_general_knowledge_fallback() -> None:
+    assert answer_standalone_product_question("How does OpenVAS work?", ()) is None
+
+
 def test_standalone_ask_investigation_uses_only_relevant_mongrel_tools() -> None:
     history = (("user", "Mongrel found exposed services. What should I inspect?"),)
 
@@ -151,8 +185,56 @@ def test_standalone_ask_telegram_keeps_general_security_knowledge_path() -> None
         patch("app.bot.handlers.scan.ask_ai", return_value="Grounded SSRF explanation") as ask_ai,
         patch("app.bot.handlers.scan.asyncio.to_thread", side_effect=run_inline),
     ):
+        asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id), effective_chat=SimpleNamespace(id=user_id)), context))
+
+    ask_ai.assert_called_once()
+    assert ask_ai.call_args.kwargs == {"path": "generic_ask"}
+    assert "How does SSRF work?" in ask_ai.call_args.args[0]
+    assert "general cybersecurity and educational questions" in ask_ai.call_args.args[0]
+    assert message.reply_text.call_args_list[-1].args[0] == "Grounded SSRF explanation"
+    clear_ai_waiting(user_id)
+
+
+def test_standalone_ask_external_tool_question_reaches_general_ai_without_claiming_support() -> None:
+    user_id = 81203
+    clear_ai_waiting(user_id)
+    context = SimpleNamespace(user_data={})
+    asyncio.run(
+        ask_handler(
+            SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=user_id)),
+            context,
+        )
+    )
+    message = SimpleNamespace(text="How does OpenVAS work?", reply_text=AsyncMock())
+
+    with patch("app.services.standalone_ask.answer_standalone_product_question", return_value=None), patch(
+        "app.bot.handlers.scan.ask_ai", return_value="General OpenVAS explanation"
+    ) as ask_ai:
+        asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id), effective_chat=SimpleNamespace(id=user_id)), context))
+
+    ask_ai.assert_called_once()
+    prompt = ask_ai.call_args.args[0]
+    assert "How does OpenVAS work?" in prompt
+    assert "do not claim Mongrel supports it" in prompt
+    assert message.reply_text.call_args_list[-1].args[0] == "General OpenVAS explanation"
+    clear_ai_waiting(user_id)
+
+
+def test_standalone_ask_typing_failure_does_not_block_persistence_or_delivery() -> None:
+    user_id = 81204
+    clear_ai_waiting(user_id)
+    context = SimpleNamespace(user_data={}, bot=SimpleNamespace(send_chat_action=AsyncMock(side_effect=RuntimeError("unavailable"))))
+    asyncio.run(
+        ask_handler(
+            SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=user_id)),
+            context,
+        )
+    )
+    message = SimpleNamespace(text="How does SSRF work?", reply_text=AsyncMock())
+
+    with patch("app.bot.handlers.scan.ask_ai", return_value="Stored general answer"):
         asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id)), context))
 
-    ask_ai.assert_called_once_with("How does SSRF work?", path="generic_ask")
-    assert message.reply_text.call_args_list[-1].args[0] == "Grounded SSRF explanation"
+    assert message.reply_text.call_args_list[-1].args[0] == "Stored general answer"
+    assert get_ai_conversation_history(user_id)[-2:] == (("user", "How does SSRF work?"), ("assistant", "Stored general answer"))
     clear_ai_waiting(user_id)

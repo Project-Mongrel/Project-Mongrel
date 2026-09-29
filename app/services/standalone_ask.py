@@ -7,6 +7,7 @@ from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_pro
 
 
 History = Sequence[tuple[str, str]]
+STANDALONE_ASK_PROMPT_MAX_CHARS = 9000
 
 
 _TOOL_ANSWERS = {
@@ -31,6 +32,50 @@ def _normalized(text: str) -> str:
 
 def _history_text(history: History) -> str:
     return " ".join(text for _role, text in history[-8:]).lower()
+
+
+def build_standalone_ask_prompt(question: str, history: History = ()) -> str:
+    """Build bounded standalone context without assessment evidence."""
+
+    profile = build_mongrel_self_knowledge_profile()
+    bounded_question = str(question)[:2000]
+    history_lines = []
+    for role, text in history[-8:]:
+        history_lines.append(f"{str(role).lower()[:20]}: {str(text)[:600]}")
+    capability_lines = []
+    for name, details in profile["tools"].items():
+        capability_lines.append(
+            f"- {name}: {details['purpose']} Evidence: {details['evidence']} Boundary: {details['not_proof']}"
+        )
+    prompt = "\n".join(
+        [
+            "Standalone Ask Mongrel context:",
+            "- Answer general cybersecurity and educational questions generally when appropriate.",
+            "- When describing what Mongrel can run, use, or recommend, use only the supported capabilities below.",
+            "- Standalone Ask has no assessment findings, target observations, scan evidence, or persisted assessment context.",
+            "- Do not fabricate execution, evidence, or security conclusions, and do not execute tools.",
+            "- A question about an external tool may be answered as general education, but do not claim Mongrel supports it.",
+            "",
+            "Supported Mongrel capabilities:",
+            *capability_lines,
+            "",
+            "Bounded standalone conversation history:",
+            *(history_lines or ["(none)"]),
+            "",
+            f"Current user question:\n{bounded_question}",
+            "\nReply with the final answer only.",
+        ]
+    )
+    if len(prompt) <= STANDALONE_ASK_PROMPT_MAX_CHARS:
+        return prompt
+    compact_history = "\n".join(history_lines[-4:]) or "(none)"
+    prompt = prompt.replace("\n".join(history_lines) or "(none)", compact_history)
+    if len(prompt) <= STANDALONE_ASK_PROMPT_MAX_CHARS:
+        return prompt
+    suffix = f"\nCurrent user question:\n{bounded_question}\nReply with the final answer only."
+    return prompt[:STANDALONE_ASK_PROMPT_MAX_CHARS - len(suffix)] + (
+        suffix
+    )
 
 
 def _mentioned_tool(question: str) -> str | None:
@@ -91,6 +136,15 @@ def answer_standalone_product_question(question: str, history: History = ()) -> 
         return _tool_list_answer()
 
     if "assess a web target" in normalized or "assessment order" in normalized and "web" in normalized:
+        return _web_assessment_flow()
+
+    first_step_question = normalized.rstrip(" ?.!\n")
+    if first_step_question in {
+        "what should we do first",
+        "what should i do first",
+        "where should we start",
+        "where should i start",
+    } or re.search(r"\bwhat\s+tool(?:\s+should\s+(?:we|i)\s+use)?\s+first\b", normalized):
         return _web_assessment_flow()
 
     tls_context = "tls" in normalized or "tls" in prior

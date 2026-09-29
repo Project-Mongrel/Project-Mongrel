@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
@@ -108,6 +109,7 @@ from app.services.scan_manager import (
 )
 from app.services.scan_status import scan_status_from_result
 from app.services.scan_ai_summary import FALLBACK_SUMMARY_LINES, generate_scan_ai_summary
+from app.services.standalone_ask import answer_standalone_product_question, build_standalone_ask_prompt
 from app.services.nmap_ai_assessment import FALLBACK_LINES as NMAP_AI_FALLBACK_LINES
 from app.services.nmap_ai_assessment import generate_nmap_ai_assessment
 from app.services.nmap_interpretation import apply_nmap_assessment_interpretation, is_nmap_assessment_inconclusive
@@ -128,7 +130,6 @@ from app.services.prowler_ai_assessment import generate_prowler_ai_assessment
 from app.services.testssl_ai_assessment import FALLBACK_LINES as TESTSSL_AI_FALLBACK_LINES
 from app.services.testssl_ai_assessment import generate_testssl_ai_assessment
 from app.services.service_intelligence import get_service_intelligence
-from app.services.standalone_ask import answer_standalone_product_question
 from app.services.target_normalizer import normalize_for_bbot, normalize_for_ffuf, normalize_for_httpx, normalize_for_katana, normalize_for_nmap, normalize_for_nuclei, normalize_for_playwright, normalize_target_key
 from app.tools.nmap_parser import parse_nmap_output
 from app.tools.nmap_runner import DANGEROUS_SHELL_CHARACTERS, run_nmap_scan
@@ -2831,6 +2832,26 @@ async def scan_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         _finalize_guarded_assessment_scan(context, status=fallback_status)
 
 
+async def _keep_standalone_ask_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = getattr(update, "effective_chat", None) or getattr(getattr(update, "message", None), "chat", None)
+    chat_id = getattr(chat, "id", None)
+    send_chat_action = getattr(getattr(context, "bot", None), "send_chat_action", None)
+    if chat_id is None or send_chat_action is None:
+        return
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(
+                    send_chat_action(chat_id=chat_id, action=ChatAction.TYPING),
+                    timeout=2,
+                )
+            except Exception:
+                logger.debug("Standalone Ask typing indicator unavailable", exc_info=True)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        raise
+
+
 async def _scan_target_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -2881,38 +2902,50 @@ async def _scan_target_handler_impl(update: Update, context: ContextTypes.DEFAUL
     if not pending_scan_input and user_id is not None and is_ai_waiting(user_id):
         request_started = time.perf_counter()
         logger.info("Ask Mongrel question received for user_id=%s", user_id)
-        await update.message.reply_text("Analyzing...")
-        question = update.message.text or ""
-        context_started = time.perf_counter()
-        direct_answer = answer_standalone_product_question(question, get_ai_conversation_history(user_id))
-        context_ms = (time.perf_counter() - context_started) * 1000
-        ai_ms = 0.0
+        typing_task = asyncio.create_task(_keep_standalone_ask_typing(update, context))
         try:
-            if direct_answer is not None:
-                ai_response = direct_answer
-            else:
-                logger.info("AI request started for user_id=%s", user_id)
-                ai_started = time.perf_counter()
-                ai_response = await asyncio.to_thread(ask_ai, question, path="generic_ask")
-                ai_ms = (time.perf_counter() - ai_started) * 1000
-                logger.info("AI request completed for user_id=%s", user_id)
-        except Exception:
-            logger.exception("AI request failed for user_id=%s", user_id)
-            await update.message.reply_text("AI request failed. Check bot logs.")
-            return
+            question = update.message.text or ""
+            history = get_ai_conversation_history(user_id)
+            context_started = time.perf_counter()
+            direct_answer = answer_standalone_product_question(question, history)
+            context_ms = (time.perf_counter() - context_started) * 1000
+            ai_ms = 0.0
+            try:
+                if direct_answer is not None:
+                    ai_response = direct_answer
+                else:
+                    logger.info("AI request started for user_id=%s", user_id)
+                    ai_started = time.perf_counter()
+                    ai_response = await asyncio.to_thread(
+                        ask_ai,
+                        build_standalone_ask_prompt(question, history),
+                        path="generic_ask",
+                    )
+                    ai_ms = (time.perf_counter() - ai_started) * 1000
+                    logger.info("AI request completed for user_id=%s", user_id)
+            except Exception:
+                logger.exception("AI request failed for user_id=%s", user_id)
+                await update.message.reply_text("AI request failed. Check bot logs.")
+                return
 
-        postprocess_started = time.perf_counter()
-        append_ai_conversation_exchange(user_id, question, ai_response)
-        postprocess_ms = (time.perf_counter() - postprocess_started) * 1000
-        send_started = time.perf_counter()
-        await update.message.reply_text(ai_response)
-        send_ms = (time.perf_counter() - send_started) * 1000
-        if direct_answer is None:
-            logger.info(
-                "AI path timing path=generic_ask user_id=%s total_ms=%.3f context_ms=%.3f prompt_ms=0.000 "
-                "ai_ms=%.3f postprocess_ms=%.3f telegram_send_ms=%.3f",
-                user_id, (time.perf_counter() - request_started) * 1000, context_ms, ai_ms, postprocess_ms, send_ms,
-            )
+            postprocess_started = time.perf_counter()
+            append_ai_conversation_exchange(user_id, question, ai_response)
+            postprocess_ms = (time.perf_counter() - postprocess_started) * 1000
+            send_started = time.perf_counter()
+            await update.message.reply_text(ai_response)
+            send_ms = (time.perf_counter() - send_started) * 1000
+            if direct_answer is None:
+                logger.info(
+                    "AI path timing path=generic_ask user_id=%s total_ms=%.3f context_ms=%.3f prompt_ms=0.000 "
+                    "ai_ms=%.3f postprocess_ms=%.3f telegram_send_ms=%.3f",
+                    user_id, (time.perf_counter() - request_started) * 1000, context_ms, ai_ms, postprocess_ms, send_ms,
+                )
+        finally:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except (asyncio.CancelledError, Exception):
+                pass
         return
 
     if update.message.text in MAIN_MENU_BUTTONS:

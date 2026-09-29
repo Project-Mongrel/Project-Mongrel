@@ -1135,11 +1135,14 @@ def test_assessment_ask_mongrel_answers_with_assessment_evidence() -> None:
     context = SimpleNamespace(user_data={ASSESSMENT_CHAT_STATE_KEY: {"assessment_id": assessment["id"], "conversation_id": conversation["id"]}})
     message = SimpleNamespace(text="What ports are open?", reply_text=AsyncMock())
 
-    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Observed evidence shows 22/tcp ssh."):
+    with patch("app.services.assessment_conversation_ai.ask_ai", return_value="Observed evidence shows 22/tcp ssh.") as assessment_ask_ai:
         _run_scan_handler_and_wait(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=8130)), context)
 
-    assert message.reply_text.call_args_list[0].args[0] == "Reviewing assessment evidence..."
-    assert message.reply_text.call_args_list[1].args[0] == "Observed evidence shows 22/tcp ssh."
+    assessment_ask_ai.assert_called_once()
+    assessment_prompt = assessment_ask_ai.call_args.args[0]
+    assert "scanme.nmap.org" in assessment_prompt
+    assert "22" in assessment_prompt and "ssh" in assessment_prompt
+    assert message.reply_text.call_args_list[0].args[0] == "Observed evidence shows 22/tcp ssh."
     assert ASSESSMENT_CHAT_STATE_KEY in context.user_data
 
 
@@ -1170,8 +1173,7 @@ def test_assessment_chat_followup_does_not_call_generic_ask_mongrel() -> None:
 
     assessment_ask_ai.assert_not_called()
     generic_ask_ai.assert_not_called()
-    assert message.reply_text.call_args_list[0].args[0] == "Reviewing assessment evidence..."
-    assert "22/tcp (ssh)" in message.reply_text.call_args_list[1].args[0]
+    assert "22/tcp (ssh)" in message.reply_text.call_args_list[0].args[0]
     assert ASSESSMENT_CHAT_STATE_KEY in context.user_data
 
 
@@ -1923,30 +1925,33 @@ def test_ask_mongrel_sets_ai_waiting_state() -> None:
 def test_ai_question_triggers_ask_ai_and_keeps_state() -> None:
     clear_ai_waiting(7002)
     message = SimpleNamespace(text="How do I harden SSH?", reply_text=AsyncMock())
-    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7002))
+    typing_action = AsyncMock()
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7002), effective_chat=SimpleNamespace(id=7002))
     asyncio.run(ask_handler(SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=7002)), SimpleNamespace()))
 
     with patch("app.bot.handlers.scan.ask_ai", return_value="AI integration is not configured yet.") as ask_ai:
-        asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
+        asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={}, bot=SimpleNamespace(send_chat_action=typing_action))))
 
-    ask_ai.assert_called_once_with("How do I harden SSH?", path="generic_ask")
+    ask_ai.assert_called_once()
+    assert "Standalone Ask Mongrel context:" in ask_ai.call_args.args[0]
+    assert "How do I harden SSH?" in ask_ai.call_args.args[0]
+    assert ask_ai.call_args.kwargs == {"path": "generic_ask"}
+    assert typing_action.await_count >= 1
     assert is_ai_waiting(7002) is True
-    assert message.reply_text.call_args_list[0].args[0] == "Analyzing..."
-    assert message.reply_text.call_args_list[1].args[0] == "AI integration is not configured yet."
+    assert [call.args[0] for call in message.reply_text.call_args_list] == ["AI integration is not configured yet."]
 
 
 def test_ai_question_failure_returns_safe_message() -> None:
     clear_ai_waiting(7005)
     message = SimpleNamespace(text="How do I harden SSH?", reply_text=AsyncMock())
-    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7005))
+    update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=7005), effective_chat=SimpleNamespace(id=7005))
     asyncio.run(ask_handler(SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()), effective_user=SimpleNamespace(id=7005)), SimpleNamespace()))
 
     with patch("app.bot.handlers.scan.ask_ai", side_effect=RuntimeError("boom")):
         asyncio.run(scan_target_handler(update, SimpleNamespace(user_data={})))
 
     assert is_ai_waiting(7005) is True
-    assert message.reply_text.call_args_list[0].args[0] == "Analyzing..."
-    assert message.reply_text.call_args_list[1].args[0] == "AI request failed. Check bot logs."
+    assert [call.args[0] for call in message.reply_text.call_args_list] == ["AI request failed. Check bot logs."]
 
 
 def test_multiple_consecutive_ai_questions_stay_in_session() -> None:
@@ -1974,10 +1979,10 @@ def test_multiple_consecutive_ai_questions_stay_in_session() -> None:
             )
         )
 
-    assert ask_ai.call_args_list[0].args[0] == "What is Linux?"
-    assert ask_ai.call_args_list[1].args[0] == "What is Nmap?"
-    assert first_message.reply_text.call_args_list[1].args[0] == "Linux answer"
-    assert second_message.reply_text.call_args_list[1].args[0] == "Nmap answer"
+    assert "What is Linux?" in ask_ai.call_args_list[0].args[0]
+    assert "What is Nmap?" in ask_ai.call_args_list[1].args[0]
+    assert "Linux answer" == first_message.reply_text.call_args_list[0].args[0]
+    assert "Nmap answer" == second_message.reply_text.call_args_list[0].args[0]
     assert is_ai_waiting(7006) is True
 
 
