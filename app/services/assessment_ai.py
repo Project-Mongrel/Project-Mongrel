@@ -1,4 +1,5 @@
 import logging
+import re
 from time import perf_counter
 
 from app.services.ai_client import ask_ai
@@ -65,6 +66,8 @@ def generate_assessment_ai_report(context: dict) -> str:
     postprocess_started = perf_counter()
     report = str(response or "").strip()
     result = _sanitize_assessment_ai_report(report, context) if report else FALLBACK_REPORT
+    if result != FALLBACK_REPORT and _assessment_ai_report_violates_truthfulness(result):
+        result = _build_deterministic_assessment_ai_report(context)
     postprocess_ms = (perf_counter() - postprocess_started) * 1000
     logger.info(
         "AI path timing path=assessment_ai_report total_ms=%.3f context_ms=0.000 prompt_ms=%.3f "
@@ -353,6 +356,134 @@ def _sanitize_assessment_ai_report(report: str, context: dict) -> str:
                 line = f"testssl.sh: {label}; no completed structured TLS configuration evidence was stored."
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def _assessment_ai_report_violates_truthfulness(report: str) -> bool:
+    """Reject global absence/safety conclusions while allowing bounded negation."""
+    bounded = re.compile(
+        r"\b(?:does not establish|doesn't establish|not evidence of|does not prove|"
+        r"cannot conclude|cannot determine|not supported by|not enough evidence)\b",
+        re.IGNORECASE,
+    )
+    patterns = (
+        re.compile(r"\bno\s+(?:confirmed\s+)?vulnerabilit(?:y|ies)\b[^.!?]{0,80}\b(?:detected|found|identified|exist|present)\b", re.IGNORECASE),
+        re.compile(r"\bno\s+(?:specific\s+)?security\s+issues?\b[^.!?]{0,80}\b(?:detected|found|identified|exist|present)\b", re.IGNORECASE),
+        re.compile(r"\bno\s+(?:specific\s+)?risks?\b[^.!?]{0,80}\b(?:detected|found|identified|exist|present)\b", re.IGNORECASE),
+        re.compile(r"\b(?:clean\s+(?:bill\s+of\s+health|result)|all\s+clear)\b", re.IGNORECASE),
+        re.compile(r"\b(?:target|assessment|system|host|site|application)\b[^.!?]{0,35}\b(?:is|appears|seems|looks)\s+(?:safe|secure)\b", re.IGNORECASE),
+    )
+    for line in report.splitlines():
+        if bounded.search(line):
+            continue
+        lowered = line.lower()
+        if any(pattern.search(line) for pattern in patterns):
+            return True
+        if re.search(r"\b(?:absence|lack)\s+of\s+(?:reported\s+)?findings?\b", lowered) and re.search(
+            r"\b(?:security|secure|safe|vulnerabilit|risk|issue)", lowered
+        ):
+            return True
+        if re.search(r"\bno\s+findings?\b", lowered) and re.search(
+            r"\b(?:security|secure|safe|vulnerabilit|risk|issue)", lowered
+        ):
+            return True
+    return False
+
+
+def _build_deterministic_assessment_ai_report(context: dict) -> str:
+    """Render bounded persisted observations when model semantics are unsafe."""
+    latest_scans = select_latest_scans(context.get("scans") or [])
+    findings = [scan.get("finding") or {} for scan in latest_scans if scan.get("finding")]
+    tools = [str(scan.get("tool") or "unknown") for scan in latest_scans if str(scan.get("status") or "").lower() in {"completed", "partial"}]
+    target_values = [str(target.get("address") or "").strip() for target in context.get("targets") or [] if target.get("address")]
+    target_text = ", ".join(dict.fromkeys(target_values)) or "the configured assessment scope"
+
+    bbot_findings = [finding for finding in findings if str(finding.get("source") or "").lower().removesuffix(".sh") == "bbot"]
+    bbot_items = []
+    bbot_types = {}
+    bbot_count = 0
+    for finding in bbot_findings:
+        observations = finding.get("observations")
+        legacy = finding.get("bbot_observations")
+        source = observations if isinstance(observations, list) and observations else legacy if isinstance(legacy, list) else observations
+        items = [item for item in (source or []) if isinstance(item, dict)]
+        bbot_items.extend(items)
+        count = finding.get("finding_count")
+        if count is None and isinstance(finding.get("metadata"), dict):
+            count = finding["metadata"].get("observation_count")
+        try:
+            bbot_count += max(0, int(count)) if count is not None else len(items)
+        except (TypeError, ValueError):
+            bbot_count += len(items)
+        persisted_types = finding.get("observation_counts")
+        if isinstance(persisted_types, dict) and persisted_types:
+            for kind, value in persisted_types.items():
+                try:
+                    bbot_types[str(kind).lower()] = bbot_types.get(str(kind).lower(), 0) + max(0, int(value))
+                except (TypeError, ValueError):
+                    continue
+    if not bbot_types:
+        for item in bbot_items[:10]:
+            kind = str(item.get("observation_type") or item.get("type") or "observation").lower()
+            bbot_types[kind] = bbot_types.get(kind, 0) + 1
+
+    nmap_findings = [finding for finding in findings if str(finding.get("source") or "").lower() == "nmap"]
+    nmap_facts = []
+    for finding in nmap_findings:
+        if finding.get("host_status"):
+            nmap_facts.append(f"host status {finding['host_status']}")
+        resolved_ip = finding.get("resolved_ip") or finding.get("ip_address") or finding.get("ip")
+        if resolved_ip:
+            nmap_facts.append(f"resolved IP {resolved_ip}")
+        for port in finding.get("open_ports") or []:
+            if isinstance(port, dict) and port.get("port") is not None:
+                nmap_facts.append(f"{port['port']}/{port.get('protocol') or 'tcp'} {port.get('service') or 'unknown'}")
+
+    completed_text = ", ".join(dict.fromkeys(tools)) or "none represented"
+    missing = [tool for tool in ("httpx", "nuclei", "katana", "playwright", "ffuf", "testssl.sh", "gitleaks", "prowler", "metasploit", "tshark") if tool not in {tool.lower() for tool in tools}]
+    bbot_text = (
+        f"BBOT completed and recorded {bbot_count} reconnaissance observation(s)"
+        + (" including " + ", ".join(f"{kind}={count}" for kind, count in sorted(bbot_types.items())[:6]) if bbot_types else "")
+        + "."
+        if bbot_findings else "BBOT evidence was not represented."
+    )
+    nmap_text = (
+        "Nmap completed and recorded " + (", ".join(nmap_facts[:10]) if nmap_facts else "no normalized host or port facts") + "."
+        if nmap_findings else "Nmap evidence was not represented."
+    )
+    return "\n".join(
+        [
+            "✦ Assessment AI Report",
+            "",
+            "Executive Summary",
+            f"The stored assessment evidence for {target_text} supports bounded reconnaissance and network-exposure observations only.",
+            "",
+            "Assessment Overview",
+            f"Represented completed or partial tools: {completed_text}.",
+            "",
+            "Completed Activities",
+            bbot_text,
+            nmap_text,
+            "",
+            "Observed Assets",
+            f"Nmap and BBOT evidence is scoped to {target_text}; no broader asset or ownership conclusion is established.",
+            "",
+            "Key Findings",
+            "The represented evidence records discovery observations and observed service exposure; persisted evidence records are not confirmed vulnerabilities.",
+            "",
+            "Potential Risks / Interpretation",
+            "Open or reachable services and reconnaissance observations may warrant authorized follow-up, but they do not establish that a vulnerability is present or absent.",
+            "",
+            "Recommended Next Actions",
+            "Review the observed services and perform only authorized application, TLS, or vulnerability-specific coverage appropriate to the scope."
+            + (f" Missing or unrepresented coverage includes: {', '.join(missing)}." if missing else ""),
+            "",
+            "Confidence",
+            "High confidence in the listed persisted observations; no confidence is assigned to vulnerability absence or overall security.",
+            "",
+            "Evidence Limitations",
+            "Tool completion is not complete security coverage. Absence of vulnerability-specific results does not establish security, vulnerability absence, or exploitability absence.",
+        ]
+    ).strip()
 
 
 def _format_finding(finding: dict) -> list[str]:

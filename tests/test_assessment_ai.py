@@ -424,6 +424,85 @@ def test_generate_assessment_ai_report_unavailable_returns_fallback() -> None:
         assert generate_assessment_ai_report({"assessment": {"name": "A"}}) == FALLBACK_REPORT
 
 
+def test_assessment_ai_report_rejects_global_absence_and_safety_conclusions() -> None:
+    context = {"assessment": {"name": "Boundary", "status": "active"}, "scans": [], "findings": []}
+    rejected = (
+        "No vulnerabilities were detected within the scope of the current tools used.",
+        "No security issues have been identified at this time.",
+        "There are no specific risks identified based on the current evidence.",
+        "The target appears secure and has a clean bill of health.",
+    )
+
+    for response in rejected:
+        with patch("app.services.assessment_ai.ask_ai", return_value=response):
+            report = generate_assessment_ai_report(context)
+        assert report != response
+        assert "does not establish" in report.lower()
+
+
+def test_assessment_ai_report_allows_evidence_scoped_negation() -> None:
+    allowed = (
+        "The evidence does not establish that a vulnerability is present.",
+        "Absence of findings does not establish that the target is secure.",
+    )
+    context = {"assessment": {"name": "Bounded wording", "status": "active"}, "scans": [], "findings": []}
+
+    for response in allowed:
+        with patch("app.services.assessment_ai.ask_ai", return_value=response):
+            assert generate_assessment_ai_report(context) == response
+
+
+def test_rejected_assessment_ai_report_uses_live_shaped_bbot_nmap_fallback() -> None:
+    context = {
+        "assessment": {"name": "Competition Demo", "status": "completed"},
+        "targets": [{"address": "btjoinery.ie"}],
+        "scans": [
+            {
+                "id": 1,
+                "tool": "nmap",
+                "status": "completed",
+                "finding": {
+                    "source": "nmap",
+                    "target": "btjoinery.ie",
+                    "host_status": "Up",
+                    "open_ports": [
+                        {"port": 80, "protocol": "tcp", "service": "http"},
+                        {"port": 443, "protocol": "tcp", "service": "https"},
+                    ],
+                },
+            },
+            {
+                "id": 2,
+                "tool": "bbot",
+                "status": "completed",
+                "finding": {
+                    "source": "bbot",
+                    "target": "btjoinery.ie",
+                    "finding_count": 36,
+                    "observation_counts": {"dns_record": 5, "raw_event": 2, "subdomain": 3},
+                    "observations": [{"observation_type": "raw_event", "value": f"event-{index}"} for index in range(10)],
+                },
+            },
+        ],
+        "findings": [],
+        "artifacts": [],
+        "notes": [],
+    }
+    response = "No vulnerabilities were detected within the scope of the current tools used."
+
+    with patch("app.services.assessment_ai.ask_ai", return_value=response):
+        report = generate_assessment_ai_report(context)
+
+    assert "BBOT completed and recorded 36 reconnaissance observation(s)" in report
+    assert "dns_record=5" in report and "raw_event=2" in report and "subdomain=3" in report
+    assert "Nmap completed and recorded host status Up, 80/tcp http, 443/tcp https" in report
+    assert "reconnaissance and network-exposure observations only" in report
+    assert "do not establish that a vulnerability is present or absent" in report
+    assert "Executive Summary" in report
+    assert "Evidence Limitations" in report
+    assert "no vulnerabilities were detected" not in report.lower()
+
+
 def test_ai_report_uses_latest_tool_evidence_and_corrects_scanner_semantics() -> None:
     older = {
         "id": 10, "tool": "ffuf", "status": "completed", "created_at": datetime(2026, 1, 1, tzinfo=UTC),
