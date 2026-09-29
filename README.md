@@ -1,5 +1,9 @@
 # Project Mongrel
 
+<p align="center">
+  <img src="docs/assets/project-mongrel-logo.png" alt="Project Mongrel" width="700">
+</p>
+
 Project Mongrel is an evidence-first AI security assessment assistant with a Telegram interface. It runs bounded security-tool workflows, preserves normalized evidence and provenance, and helps a human interpret what the evidence does—and does not—establish.
 
 Mongrel is deliberately uncertainty-honest. A completed scan is not proof that a target is secure, a scanner match is not automatically an exploitable vulnerability, and tool execution is not proof of compromise.
