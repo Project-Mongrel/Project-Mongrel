@@ -3153,6 +3153,85 @@ def test_bbot_exact_ip_questions_retain_real_bounded_observation_shape() -> None
     assert "bounded to this BBOT result" in missing["answer"]
 
 
+def test_bbot_named_evidence_uses_persisted_count_with_bounded_observations() -> None:
+    user_id = 1128
+    assessment = create_assessment("BBOT named evidence", user_id=user_id)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "bbot",
+            "target": "btjoinery.ie",
+            "status": "completed",
+            "finding_count": 36,
+            "metadata": {"observation_count": 36},
+            "observations": [
+                {"observation_type": "raw_event", "value": f"event-{index}"}
+                for index in range(10)
+            ],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="bbot", status="completed", finding_id=finding["id"])
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="What did BBOT specifically find in this assessment?",
+    )
+
+    assert "BBOT is recorded as completed with 36 stored observation item(s)" in result["answer"]
+    assert "with 10 stored observation item(s)" not in result["answer"]
+
+
+def test_combined_established_and_unknown_question_precedes_gaps_with_selected_evidence() -> None:
+    user_id = 1129
+    assessment = create_assessment("BBOT and Nmap evidence plus gaps", user_id=user_id)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    nmap = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "nmap",
+            "target": "btjoinery.ie",
+            "status": "completed",
+            "host_status": "reachable",
+            "open_ports": [
+                {"port": 80, "protocol": "tcp", "service": "http"},
+                {"port": 443, "protocol": "tcp", "service": "https"},
+            ],
+        },
+    )
+    bbot = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "bbot",
+            "target": "btjoinery.ie",
+            "status": "completed",
+            "finding_count": 36,
+            "observations": [
+                {"observation_type": "ip_address", "value": "198.185.159.144"},
+                {"observation_type": "subdomain", "value": "www.btjoinery.ie"},
+            ],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="nmap", status="completed", finding_id=nmap["id"])
+    record_assessment_scan(assessment["id"], tool="bbot", status="completed", finding_id=bbot["id"])
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="What have BBOT and Nmap established so far, and what remains unknown?",
+    )
+
+    answer = result["answer"]
+    assert answer.index("BBOT stored 36 reconnaissance observation item(s)") < answer.index("Completed core web coverage")
+    assert "Nmap recorded" in answer
+    assert "80/tcp http" in answer
+    assert "relevant uncompleted web or reconnaissance coverage" in answer.lower()
+    assert "not proof of ownership" in answer
+
+
 def test_bbot_dns_record_does_not_answer_exact_ip_query() -> None:
     user_id = 1127
     assessment = create_assessment("BBOT DNS-only indicator", user_id=user_id)

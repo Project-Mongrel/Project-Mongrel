@@ -1371,6 +1371,44 @@ def _tool_findings(context: dict, tool: str) -> list[dict]:
     ]
 
 
+def _bbot_observations(finding: dict) -> list[dict]:
+    """Use canonical observations, retaining the legacy BBOT field as fallback."""
+    observations = finding.get("observations")
+    legacy = finding.get("bbot_observations")
+    if isinstance(observations, list) and observations:
+        source = observations
+    elif isinstance(legacy, list):
+        source = legacy
+    elif isinstance(observations, list):
+        source = observations
+    else:
+        source = []
+    return [item for item in source if isinstance(item, dict)]
+
+
+def _bbot_authoritative_count(findings: list[dict]) -> int:
+    """Return persisted BBOT totals without treating bounded context as truth."""
+    total = 0
+    for finding in findings:
+        count = finding.get("finding_count")
+        try:
+            parsed_count = max(0, int(count)) if count is not None else None
+        except (TypeError, ValueError):
+            parsed_count = None
+        if parsed_count is None:
+            metadata = finding.get("metadata")
+            count = metadata.get("observation_count") if isinstance(metadata, dict) else None
+            try:
+                parsed_count = max(0, int(count)) if count is not None else None
+            except (TypeError, ValueError):
+                parsed_count = None
+        if parsed_count is None:
+            total += len(_bbot_observations(finding))
+        else:
+            total += parsed_count
+    return total
+
+
 def _httpx_response_observations(findings: list[dict]) -> list[dict]:
     """Return only records that prove an HTTP response was actually observed."""
     response_fields = {
@@ -2429,16 +2467,9 @@ def _build_assessment_evidence_synopsis(context: dict) -> list[str]:
             or "testssl.sh completed without normalized TLS observations; that bounded result does not establish TLS safety or insecurity."
         )
 
-    bbot_items = [
-        item
-        for finding in by_tool.get("bbot", [])
-        for key in ("bbot_observations", "observations")
-        for item in (finding.get(key) or [])
-        if isinstance(item, dict)
-    ]
+    bbot_items = [item for finding in by_tool.get("bbot", []) for item in _bbot_observations(finding)]
     if "bbot" in by_tool:
-        stored_count = next((finding.get("finding_count") for finding in by_tool["bbot"] if finding.get("finding_count") is not None), None)
-        observation_count = stored_count if stored_count is not None else len(bbot_items)
+        observation_count = _bbot_authoritative_count(by_tool["bbot"])
         type_counts: dict[str, int] = {}
         for item in bbot_items:
             observed_type = str(item.get("observation_type") or item.get("type") or "observation").lower()
@@ -2988,9 +3019,17 @@ def _build_named_tool_evidence_answer(context: dict) -> str | None:
             "does not by itself establish a vulnerability or complete coverage."
         )
     if tool == "bbot":
-        field = "bbot_observations"
-        items = [item for finding in findings for item in (finding.get(field) or []) if isinstance(item, dict)]
-        return f"{display} is recorded as completed with {len(items)} stored observation item(s). These discovery observations do not automatically establish ownership, vulnerability, sensitive exposure, or complete coverage."
+        items = [item for finding in findings for item in _bbot_observations(finding)]
+        count = _bbot_authoritative_count(findings)
+        type_counts: dict[str, int] = {}
+        for item in items[:10]:
+            observed_type = str(item.get("observation_type") or item.get("type") or "observation").lower()
+            type_counts[observed_type] = type_counts.get(observed_type, 0) + 1
+        categories = (
+            ", including " + ", ".join(f"{kind}={value}" for kind, value in sorted(type_counts.items())[:6])
+            if type_counts else ""
+        )
+        return f"{display} is recorded as completed with {count} stored observation item(s){categories}. These discovery observations do not automatically establish ownership, vulnerability, sensitive exposure, or complete coverage."
     if tool == "playwright":
         playwright_findings = [
             finding
@@ -3386,6 +3425,56 @@ def _build_completed_tool_limitations(context: dict) -> list[str]:
     return limitations
 
 
+def _question_requests_completed_tool_evidence(context: dict) -> bool:
+    question = str(context.get("current_question") or "").lower()
+    return bool(re.search(r"\b(?:established|found|finding|findings|observed|evidence|results?)\b", question))
+
+
+def _build_selected_completed_tool_evidence(context: dict) -> str:
+    """Prepend only selected completed-tool facts to evidence-plus-gap answers."""
+    states = ((context.get("recommendation_context") or {}).get("tool_states") or {})
+    selected = [str(tool).lower().removesuffix(".sh") for tool in ((context.get("selection") or {}).get("selected_tools") or [])]
+    sections = []
+    for tool in selected:
+        if states.get(tool) != "COMPLETED":
+            continue
+        findings = _tool_findings(context, tool)
+        if tool == "bbot":
+            items = [item for finding in findings for item in _bbot_observations(finding)]
+            type_counts: dict[str, int] = {}
+            for item in items[:10]:
+                kind = str(item.get("observation_type") or item.get("type") or "observation").lower()
+                type_counts[kind] = type_counts.get(kind, 0) + 1
+            categories = (
+                ", including " + ", ".join(f"{kind}={count}" for kind, count in sorted(type_counts.items())[:6])
+                if type_counts else ""
+            )
+            sections.append(
+                f"BBOT stored {_bbot_authoritative_count(findings)} reconnaissance observation item(s){categories}; "
+                "these are bounded discovery observations, not proof of ownership or vulnerability."
+            )
+        elif tool == "nmap":
+            facts = []
+            for finding in findings:
+                target = finding.get("target")
+                host_status = finding.get("host_status")
+                resolved_ip = finding.get("resolved_ip") or finding.get("ip_address") or finding.get("ip")
+                if target and host_status:
+                    facts.append(f"{target} host status {host_status}")
+                elif target:
+                    facts.append(str(target))
+                if resolved_ip:
+                    facts.append(f"resolved IP {resolved_ip}")
+                for item in finding.get("open_ports") or []:
+                    if isinstance(item, dict) and item.get("port") is not None:
+                        facts.append(f"{item.get('port')}/{item.get('protocol') or 'tcp'} {item.get('service') or 'unknown'}")
+            sections.append(
+                "Nmap recorded " + (", ".join(facts[:10]) if facts else "no normalized host or open-port observations") + "; "
+                "these are exposure observations, not vulnerability or exploitability conclusions."
+            )
+    return " ".join(sections)
+
+
 def _build_grounded_conversational_fallback(context: dict) -> str | None:
     attacker_answer = _build_attacker_reasoning_fallback(context)
     if attacker_answer:
@@ -3484,7 +3573,12 @@ def _build_grounded_conversational_fallback(context: dict) -> str | None:
             )
             if states.get(tool) == "COMPLETED"
         ]
-        parts = ["Completed core web coverage: " + (", ".join(core_web) if core_web else "none") + "."]
+        parts = []
+        if _question_requests_completed_tool_evidence(context):
+            evidence_summary = _build_selected_completed_tool_evidence(context)
+            if evidence_summary:
+                parts.append(evidence_summary)
+        parts.append("Completed core web coverage: " + (", ".join(core_web) if core_web else "none") + ".")
         testssl_state = states.get("testssl", "NOT_RUN")
         if testssl_state == "FAILED":
             parts.append("testssl.sh is FAILED, so completed structured TLS configuration coverage remains missing.")
