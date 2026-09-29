@@ -151,6 +151,42 @@ def test_no_false_tls_handshake_or_http_service_response_claim_in_record_and_pro
     assert "If session_established is false, correlated packets must not be described as shell/session access or exploit success." in prompt
 
 
+def test_live_shaped_metadata_does_not_authorize_tls_handshake_or_user_attribution_claims() -> None:
+    tshark = _tshark()
+    tshark["tls_observations"] = [
+        {
+            "sni": "example.com",
+            "version": "0x0303",
+            "handshake_success": "not established by stored metadata",
+            "src": "192.0.2.10",
+            "dst": "93.184.216.34",
+        }
+    ]
+    record = _record(metasploit=_metasploit("DETECTED"), tshark=tshark)
+    unsafe_response = "\n".join(
+        [
+            "Executive Summary",
+            "The validation result is supported as evidenced by the observed TLS handshake.",
+            "The user initiated several UDP and TCP connections during validation.",
+        ]
+    )
+
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value=unsafe_response):
+        lines = generate_tshark_metasploit_correlated_assessment(record)
+
+    assert lines == TRUTHFULNESS_FALLBACK_LINES
+    assert record["tshark"]["tls_handshake_evidence"]["successful_handshake_observed"] is False
+
+
+def test_process_completion_does_not_become_validation_success_for_detected_state() -> None:
+    response = "Executive Summary\nThe validation completed successfully and the target was confirmed."
+
+    with patch("app.services.tshark_metasploit_correlation.ask_ai", return_value=response):
+        lines = generate_tshark_metasploit_correlated_assessment(_record(metasploit=_metasploit("DETECTED")))
+
+    assert lines == TRUTHFULNESS_FALLBACK_LINES
+
+
 @pytest.mark.parametrize(
     "observations, request_count, response_count",
     [

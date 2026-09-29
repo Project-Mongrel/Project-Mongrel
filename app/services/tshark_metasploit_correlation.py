@@ -81,6 +81,8 @@ UNSUPPORTED_CORRELATED_CLAIM_PATTERNS = (
     re.compile(r"\btls\b[^.!?]{0,100}\b(?:handshake|connection)\b[^.!?]{0,100}\b(?:succeeded|successful|completed|established)\b"),
     re.compile(r"\bhttp\b[^.!?]{0,100}\b(?:transaction|exchange|request\s*/?\s*response)\b[^.!?]{0,100}\b(?:completed|succeeded|successful)\b"),
     re.compile(r"\bhigh\s+correlation\s+confidence\b[^.!?]{0,120}\b(?:confirms|proves|means)\b[^.!?]{0,80}\b(?:exploit|exploitation|compromise|vulnerab)\b"),
+    re.compile(r"\b(?:as\s+)?(?:evidence|evidenced|shown)\s+by\b[^.!?]{0,100}\b(?:observed\s+)?tls\s+handshake\b"),
+    re.compile(r"\b(?:the\s+)?user\s+(?:initiated|started|established|made|opened)\b"),
 )
 CORRELATED_SECTION_HEADINGS = {
     "executive summary", "metasploit evidence", "tshark evidence", "correlation outcome",
@@ -199,12 +201,15 @@ def build_tshark_metasploit_correlated_prompt(correlation_record: dict) -> str:
             "- Do not claim packets belong to the validation solely because they occurred in the same time window.",
             "- Use hostname, resolved IP, expected port, and timing alignment only as represented in the record.",
             "- Never claim a successful TLS handshake unless successful_handshake_observed is true.",
+            "- TLS SNI, version, or handshake-related metadata may be described as observed metadata or handshake-related traffic only; do not call it a successful, established, or completed handshake unless successful_handshake_observed is true.",
             "- Never claim an HTTP response identified a service unless packet metadata explicitly proves that service identification.",
             "- Packet evidence must not upgrade Metasploit detection into a vulnerability.",
             "- Correlation confidence describes attribution to the approved validation, not exploitability confidence.",
             "- Do not claim Metasploit validation succeeded because packets were correlated.",
             "- Do not claim successful exploitation, compromise, authentication success, or vulnerability confirmation from packet evidence.",
             "- Preserve Metasploit subprocess_success, module_executed, session_established, and validation state exactly.",
+            "- Do not attribute packet activity to the user merely because it occurred during the validation window; say the capture or traffic was observed.",
+            "- Process completion is not validation success unless the normalized validation state explicitly supports that conclusion.",
             "- If session_established is false, correlated packets must not be described as shell/session access or exploit success.",
             "- If session_established is true, packet absence must not downgrade the Metasploit session evidence.",
             "- Failed or missing capture/validation evidence must remain inconclusive or not corroborated.",
@@ -543,6 +548,7 @@ def _contains_unsupported_correlated_claim(lines: list[str], record: dict) -> bo
     metasploit = record.get("metasploit") or {}
     tshark = record.get("tshark") or {}
     session_established = bool(metasploit.get("session_established"))
+    validation_state = _clean(metasploit.get("state")).upper()
     tls_success = bool((tshark.get("tls_handshake_evidence") or {}).get("successful_handshake_observed"))
     http_transaction = bool((tshark.get("http_evidence") or {}).get("responses") and (tshark.get("http_evidence") or {}).get("requests"))
     for sentence in _claim_sentences(lines):
@@ -553,6 +559,11 @@ def _contains_unsupported_correlated_claim(lines: list[str], record: dict) -> bo
         if not tls_success and re.search(r"\btls\b[^.!?]{0,100}\b(?:handshake|connection)\b[^.!?]{0,100}\b(?:succeeded|successful|completed|established)\b", sentence):
             return True
         if not http_transaction and re.search(r"\bhttp\b[^.!?]{0,100}\b(?:transaction|exchange|request\s*/?\s*response)\b[^.!?]{0,100}\b(?:completed|succeeded|successful)\b", sentence):
+            return True
+        if validation_state not in {"VALIDATED", "SESSION_ESTABLISHED"} and re.search(
+            r"\bvalidation\b[^.!?]{0,80}\b(?:completed|finished)\b[^.!?]{0,40}\bsuccessfully\b",
+            sentence,
+        ):
             return True
         if any(pattern.search(sentence) for pattern in UNSUPPORTED_CORRELATED_CLAIM_PATTERNS):
             return True
