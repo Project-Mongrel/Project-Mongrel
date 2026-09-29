@@ -234,7 +234,7 @@ def _format_key_findings(scans: list[dict]) -> list[str]:
         elif tshark_evidence:
             lines.append(f"- {tool}: {int(tshark_evidence.get('packet_count') or 0)} packet metadata observation(s) recorded.")
         elif observation_counts:
-            total = sum(int(value or 0) for value in observation_counts.values())
+            total = _bbot_observation_total(finding) if str(scan.get("tool") or "").lower() == "bbot" else sum(int(value or 0) for value in observation_counts.values())
             lines.append(f"- {tool}: {total} reconnaissance observation(s) recorded.")
         elif str(scan.get("tool") or "").lower() == "nuclei":
             lines.append("- Nuclei: no matching findings were observed with the selected template/profile.")
@@ -348,7 +348,7 @@ def _scan_summary(scan: dict) -> str:
         return "No matching Nuclei findings were observed with the selected template/profile."
     if tool == "bbot":
         counts = finding.get("observation_counts") or {}
-        total = sum(int(value or 0) for value in counts.values())
+        total = _bbot_observation_total(finding)
         return f"{total} reconnaissance observation(s) recorded." if counts else "Reconnaissance completed."
     if tool == "nmap":
         open_ports = finding.get("open_ports") or []
@@ -381,6 +381,20 @@ def _scan_summary(scan: dict) -> str:
         evidence = scan.get("tshark_evidence") or finding.get("tshark_evidence") or {}
         return f"TShark normalized {int(evidence.get('packet_count') or 0)} packet metadata observation(s)." if evidence else "TShark completed with no normalized PCAP evidence."
     return "Completed scan evidence recorded."
+
+
+def _bbot_observation_total(finding: dict) -> int:
+    """Use persisted BBOT totals; category counts are a fallback only."""
+    for value in (
+        finding.get("finding_count"),
+        (finding.get("metadata") or {}).get("observation_count") if isinstance(finding.get("metadata"), dict) else None,
+    ):
+        try:
+            if value is not None:
+                return max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return sum(int(value or 0) for value in (finding.get("observation_counts") or {}).values())
 
 
 def _has_structured_evidence(tool: str, finding: dict) -> bool:

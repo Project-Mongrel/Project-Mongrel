@@ -181,6 +181,56 @@ def test_assessment_markdown_report_renders_multi_tool_evidence() -> None:
     assert "latest recorded state, including completed, partial, and failed runs" in report
 
 
+def test_bbot_markdown_total_uses_authoritative_count_over_bounded_category_breakdown() -> None:
+    finding = {
+        "source": "bbot",
+        "target": "btjoinery.ie",
+        "finding_count": 36,
+        "metadata": {"observation_count": 36},
+        "observation_counts": {
+            "dns_record": 19,
+            "ip_address": 2,
+            "raw_event": 4,
+            "subdomain": 9,
+            "open_port": 2,
+        },
+    }
+    report = generate_assessment_markdown_report({
+        "assessment": {"name": "BBOT authoritative total", "status": "active"},
+        "targets": [{"address": "btjoinery.ie"}],
+        "scans": [{"id": 1, "tool": "bbot", "status": "completed", "finding": finding}],
+        "findings": [], "artifacts": [], "notes": [],
+    })
+
+    assert "Summary\n36 reconnaissance observation(s) recorded." in report
+    assert "- BBOT: 36 reconnaissance observation(s) recorded." in report
+    assert "- DNS records: 19" in report
+    assert "- IP addresses: 2" in report
+    assert "- Raw events: 4" in report
+    assert "- Subdomains: 9" in report
+
+
+def test_bbot_markdown_total_falls_back_to_observation_categories_without_authoritative_count() -> None:
+    report = generate_assessment_markdown_report({
+        "assessment": {"name": "BBOT category fallback", "status": "active"},
+        "targets": [{"address": "example.com"}],
+        "scans": [{
+            "id": 2,
+            "tool": "bbot",
+            "status": "completed",
+            "finding": {
+                "source": "bbot",
+                "target": "example.com",
+                "observation_counts": {"subdomain": 2, "url": 3, "technology": 1},
+            },
+        }],
+        "findings": [], "artifacts": [], "notes": [],
+    })
+
+    assert "Summary\n6 reconnaissance observation(s) recorded." in report
+    assert "- BBOT: 6 reconnaissance observation(s) recorded." in report
+
+
 def test_assessment_markdown_report_includes_partial_bbot_evidence() -> None:
     report = generate_assessment_markdown_report(
         {
