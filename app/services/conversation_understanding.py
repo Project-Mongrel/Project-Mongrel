@@ -26,6 +26,22 @@ _CASUAL_FILLERS = (
     re.compile(r"\bplease\b"),
     re.compile(r"\bjust\b"),
 )
+_TECHNICAL_TOKEN_PATTERNS = (
+    re.compile(r"https?://[^\s<>]+", re.IGNORECASE),
+    re.compile(r"(?<![\w])/(?:[^\s/]+/)*[^\s]+"),
+    re.compile(r"(?<![\w])(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:.]+"),
+    re.compile(r"(?<![\w])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?"),
+    re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE),
+    re.compile(r"\bport\s+\d{1,5}\b", re.IGNORECASE),
+    re.compile(r"(?<![\w])[A-Za-z][\w.-]*:[A-Za-z][\w.-]*(?![\w])"),
+    re.compile(r"(?<![\w])(?:[A-Za-z][\w.-]*)\s+-[A-Za-z0-9][^\s]*"),
+    re.compile(r"(?<![\w])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{1,5})?(?:/[^\s]*)?"),
+)
+_TECHNICAL_CONTEXT_WORDS = {
+    "can", "could", "does", "do", "will", "would", "should", "run", "use", "support", "supported",
+    "recommend", "have", "has", "what", "which", "tool", "tools", "mongrel", "please", "the", "a", "an",
+    "for", "with", "in", "on", "as", "my", "this", "that", "it", "first", "next", "now", "is", "right",
+}
 
 
 @dataclass(frozen=True)
@@ -50,6 +66,35 @@ def normalize_conversational_text(text: str) -> str:
     for pattern in _CASUAL_FILLERS:
         normalized = pattern.sub(" ", normalized)
     return " ".join(normalized.split())
+
+
+def extract_technical_tokens(text: str) -> tuple[str, ...]:
+    """Extract complete opaque technical values without interpreting their meaning."""
+
+    source = str(text or "")
+    matches: list[tuple[int, int, str]] = []
+    for pattern in _TECHNICAL_TOKEN_PATTERNS:
+        for match in pattern.finditer(source):
+            value = match.group(0).rstrip(".,;!?)]}")
+            if value:
+                matches.append((match.start(), match.end(), value))
+    selected: list[tuple[int, int, str]] = []
+    for start, end, value in sorted(matches, key=lambda item: (item[0], -(item[1] - item[0]))):
+        if any(start < chosen_end and end > chosen_start for chosen_start, chosen_end, _ in selected):
+            continue
+        selected.append((start, end, value))
+
+    tokens = [value for _start, _end, value in selected]
+    for word_match in re.finditer(r"(?<![\w])([A-Za-z][A-Za-z0-9_.-]{2,})(?![\w])", source):
+        word = word_match.group(1)
+        if any(
+            word_match.start() < chosen_end and word_match.end() > chosen_start
+            for chosen_start, chosen_end, _ in selected
+        ):
+            continue
+        if word.lower() not in _TECHNICAL_CONTEXT_WORDS and word not in tokens:
+            tokens.append(word)
+    return tuple(tokens)
 
 
 def understand_conversation(text: str, history: History = ()) -> ConversationUnderstanding:

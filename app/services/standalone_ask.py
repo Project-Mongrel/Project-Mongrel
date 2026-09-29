@@ -3,7 +3,12 @@
 import re
 from collections.abc import Sequence
 
-from app.services.conversation_understanding import ConversationUnderstanding, normalize_conversational_text, understand_conversation
+from app.services.conversation_understanding import (
+    ConversationUnderstanding,
+    extract_technical_tokens,
+    normalize_conversational_text,
+    understand_conversation,
+)
 from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile, get_mongrel_tool_names
 
 
@@ -57,19 +62,20 @@ def _profile_tool(name: str) -> tuple[str, dict] | None:
 
 def _unknown_capability_token(question: str) -> str | None:
     known = {name.lower().removesuffix(".sh") for name in get_mongrel_tool_names()}
-    ignored = {
-        "can", "could", "does", "do", "will", "would", "should", "run", "use", "support", "recommend",
-        "have", "has", "what", "which", "tool", "tools", "mongrel", "please", "the", "a", "an", "for",
-        "with", "in", "on", "as", "my", "this", "that", "it", "first", "next", "now",
-        "tls", "ssl", "ssh", "http", "https", "dns", "pcap", "traffic", "network", "web", "cloud",
-        "repository", "filesystem", "file",
-    }
-    for match in re.finditer(r"(?<![\w])([A-Za-z][A-Za-z0-9_.-]{2,})(?![\w])", str(question or "")):
-        token = match.group(1)
+    for token in extract_technical_tokens(question):
         lowered = token.lower().removesuffix(".sh")
-        if lowered not in known and lowered not in ignored:
+        if lowered not in known and not any(lowered.startswith(f"{name} ") for name in known):
             return token
     return None
+
+
+def _is_target_like_token(token: str) -> bool:
+    return bool(
+        token.startswith(("/", "http://", "https://"))
+        or re.fullmatch(r"port\s+\d{1,5}", token, re.IGNORECASE)
+        or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?", token)
+        or "." in token and not token.upper().startswith("CVE-")
+    )
 
 
 def _is_mongrel_capability_question(normalized: str) -> bool:
@@ -79,11 +85,25 @@ def _is_mongrel_capability_question(normalized: str) -> bool:
     )
 
 
-def _standalone_capability_answer(question: str, normalized: str) -> str | None:
-    if not _is_mongrel_capability_question(normalized):
+def _standalone_capability_answer(
+    question: str,
+    normalized: str,
+    understanding: ConversationUnderstanding,
+) -> str | None:
+    inherited = bool(
+        understanding.previous_user_text
+        and _is_mongrel_capability_question(_normalized(understanding.previous_user_text))
+        and re.search(r"\b(?:supported|support|available|run|capability)\b", normalized)
+    )
+    if not _is_mongrel_capability_question(normalized) and not inherited:
         return None
-    unknown = _unknown_capability_token(question)
+    unknown = _unknown_capability_token(question) or _unknown_capability_token(understanding.previous_user_text)
     if unknown:
+        if _is_target_like_token(unknown):
+            return (
+                f"`{unknown}` looks like target or input data, not a Mongrel capability. "
+                "Please clarify the authorized workflow or environment you mean; I will not infer support or execution from that value."
+            )
         return (
             f"I do not recognize `{unknown}` as one of Mongrel's supported capabilities. "
             "Please clarify the product or environment you mean; I can discuss an external technology generally, "
@@ -238,7 +258,7 @@ def answer_standalone_product_question(question: str, history: History = ()) -> 
     prior = _history_text(history)
     understanding = understand_conversation(question, history)
 
-    capability_answer = _standalone_capability_answer(question, normalized)
+    capability_answer = _standalone_capability_answer(question, normalized, understanding)
     if capability_answer is not None:
         return capability_answer
 

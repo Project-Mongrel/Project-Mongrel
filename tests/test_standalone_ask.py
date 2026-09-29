@@ -8,7 +8,7 @@ from app.bot.handlers.ask import ask_handler
 from app.bot.handlers.scan import scan_target_handler
 from app.services.chat_state import append_ai_conversation_exchange, clear_ai_waiting, get_ai_conversation_history
 from app.services.mongrel_self_knowledge import get_mongrel_tool_names
-from app.services.conversation_understanding import normalize_conversational_text, understand_conversation
+from app.services.conversation_understanding import extract_technical_tokens, normalize_conversational_text, understand_conversation
 from app.services.standalone_ask import answer_standalone_product_question, build_standalone_ask_prompt
 
 
@@ -149,6 +149,32 @@ def test_standalone_unknown_technical_capability_is_not_silently_substituted() -
     assert "openVPS" in answer
     assert "OpenVZ" not in answer
     assert "do not recognize" in answer
+
+
+@pytest.mark.parametrize(
+    ("question", "value"),
+    (
+        ("Can Mongrel run /etc/mongrel/config?", "/etc/mongrel/config"),
+        ("Can Mongrel run port 8443?", "port 8443"),
+        ("Can Mongrel run 192.0.2.10?", "192.0.2.10"),
+        ("Can Mongrel run https://example.invalid/a?x=1?", "https://example.invalid/a?x=1"),
+        ("Can Mongrel run CVE-2026-12345?", "CVE-2026-12345"),
+    ),
+)
+def test_standalone_capability_preserves_opaque_technical_values(question: str, value: str) -> None:
+    assert value in extract_technical_tokens(question)
+    answer = _answer(question)
+    assert value in answer
+    assert "exactly 12 competition tools" not in answer
+
+
+def test_standalone_capability_followup_preserves_unknown_product_uncertainty() -> None:
+    history = [("user", "Can Mongrel run OpenVZ?"), ("assistant", _answer("Can Mongrel run OpenVZ?"))]
+    answer = _answer("So OpenVZ is supported, right?", history)
+
+    assert "OpenVZ" in answer
+    assert "do not recognize" in answer
+    assert "supported capabilities" in answer
 
 
 def test_standalone_generic_prompt_is_bounded_and_has_no_assessment_context() -> None:
