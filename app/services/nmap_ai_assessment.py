@@ -51,6 +51,19 @@ UNSUPPORTED_SAFETY_CLAIM_PATTERNS = (
     re.compile(r"\bfree\s+of\s+vulnerabilities\b"),
     re.compile(r"\bfirewall\s+(?:is\s+)?protect(?:s|ing)\b"),
 )
+UNSUPPORTED_VULNERABILITY_SPECULATION_PATTERN = re.compile(
+    r"\b(?:xss|cross[- ]site scripting|sql\s+injection|sqli|command\s+injection|"
+    r"remote\s+code\s+execution|rce|authentication\s+bypass|"
+    r"man[- ]in[- ]the[- ]middle|mitm|cve[- ]\d{4}[- ]\d{4,})\b",
+    re.IGNORECASE,
+)
+UNSUPPORTED_COMPARISON_SECURITY_PATTERN = re.compile(
+    r"\b(?:security\s+(?:posture|status|risk)|safety|vulnerabilit(?:y|ies))\b"
+    r"[^.!?]{0,80}\b(?:unchanged|stable|the\s+same|unchanged)\b|"
+    r"\b(?:unchanged|stable|the\s+same)\b[^.!?]{0,80}\b"
+    r"(?:security\s+(?:posture|status|risk)|safety|vulnerabilit(?:y|ies))\b",
+    re.IGNORECASE,
+)
 
 EVIDENCE_SCOPED_NEGATION_MARKERS = (
     "nmap did not report",
@@ -64,6 +77,8 @@ EVIDENCE_SCOPED_NEGATION_MARKERS = (
     "can't determine",
     "unable to determine",
     "does not prove",
+    "does not establish",
+    "do not establish",
     "doesn't prove",
     "not proof",
     "no vulnerability evidence",
@@ -85,7 +100,7 @@ def generate_nmap_ai_assessment(finding: dict) -> list[str]:
         return list(FALLBACK_LINES)
 
     lines = [line.rstrip() for line in str(response or "").strip().splitlines()]
-    if _contains_unsupported_safety_claim(lines):
+    if _contains_unsupported_safety_claim(lines, finding):
         return _build_unsupported_claim_fallback(finding)
     return lines or list(FALLBACK_LINES)
 
@@ -349,13 +364,25 @@ def _is_unavailable_response(response: object) -> bool:
     return not text or any(text.startswith(message) for message in AI_UNAVAILABLE_MESSAGES)
 
 
-def _contains_unsupported_safety_claim(lines: list[str]) -> bool:
+def _contains_unsupported_safety_claim(lines: list[str], finding: dict | None = None) -> bool:
     for sentence in _claim_sentences(lines):
         if _is_evidence_scoped_negation(sentence):
             continue
         if any(pattern.search(sentence) for pattern in UNSUPPORTED_SAFETY_CLAIM_PATTERNS):
             return True
+        if UNSUPPORTED_COMPARISON_SECURITY_PATTERN.search(sentence):
+            return True
+        if UNSUPPORTED_VULNERABILITY_SPECULATION_PATTERN.search(sentence) and not _has_explicit_vulnerability_evidence(finding or {}):
+            if not re.search(r"\b(?:review|validate|test|check|assess|investigate)\b", sentence):
+                return True
     return False
+
+
+def _has_explicit_vulnerability_evidence(finding: dict) -> bool:
+    return any(
+        isinstance(finding.get(key), list) and bool(finding.get(key))
+        for key in ("vulnerabilities", "nmap_vulnerabilities", "cves")
+    )
 
 
 def _claim_sentences(lines: list[str]) -> list[str]:

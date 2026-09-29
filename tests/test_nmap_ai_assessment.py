@@ -208,6 +208,54 @@ def test_rejected_nmap_ai_output_uses_useful_deterministic_live_evidence_fallbac
     assert "no vulnerabilities were found" not in text.lower()
 
 
+def test_nmap_rejects_live_vulnerability_speculation_from_http_services() -> None:
+    finding = {
+        "target": "btjoinery.ie",
+        "resolved_ip": "198.185.159.144",
+        "host_status": "Up",
+        "open_ports": [
+            {"port": 80, "protocol": "tcp", "service": "http"},
+            {"port": 443, "protocol": "tcp", "service": "https"},
+        ],
+        "comparison": {"summary": "No material exposure changes; 2 unchanged ports."},
+    }
+    response = (
+        "Executive Summary\n"
+        "The presence of open HTTP and HTTPS services could expose the system to cross-site scripting (XSS) attacks, "
+        "man-in-the-middle (MITM) attacks. These services may be vulnerable to SQL injection and command injection."
+    )
+
+    with patch("app.services.nmap_ai_assessment.ask_ai", return_value=response):
+        text = "\n".join(generate_nmap_ai_assessment(finding))
+
+    assert "withheld" in text.lower()
+    assert "198.185.159.144" in text
+    assert "80/tcp http" in text
+    assert "443/tcp https" in text
+    assert all(term not in text.lower() for term in ("xss", "sql injection", "command injection", "mitm"))
+    assert "security posture unchanged" not in text.lower()
+
+
+def test_nmap_accepts_bounded_observations_and_follow_up_recommendation() -> None:
+    finding = {
+        "target": "btjoinery.ie",
+        "resolved_ip": "198.185.159.144",
+        "host_status": "Up",
+        "open_ports": [{"port": 80, "protocol": "tcp", "service": "http"}],
+        "comparison": {"summary": "No material exposure changes; 1 unchanged port."},
+    }
+    response = (
+        "Observed Facts\n- 80/tcp http was observed on btjoinery.ie.\n"
+        "Interpretation\n- Review the HTTP service with authorized response-level validation.\n"
+        "Limitations / Uncertainty\n- Unchanged ports do not establish unchanged security posture."
+    )
+
+    with patch("app.services.nmap_ai_assessment.ask_ai", return_value=response):
+        lines = generate_nmap_ai_assessment(finding)
+
+    assert lines == response.splitlines()
+
+
 def test_nmap_ai_assessment_withholds_unsupported_safety_variants() -> None:
     unsupported_claims = [
         "The host is secure.",
