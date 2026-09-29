@@ -191,6 +191,15 @@ def test_standalone_generic_prompt_is_bounded_and_has_no_assessment_context() ->
     assert "finding_id" not in prompt.lower()
 
 
+def test_standalone_comparison_prompt_preserves_bounded_tool_truthfulness() -> None:
+    prompt = build_standalone_ask_prompt("Actually compare Nmap and BBOT")
+
+    prompt_lower = prompt.lower()
+    assert "never call reconnaissance comprehensive or complete" in prompt_lower
+    assert "does not establish ownership, reachability, vulnerability, or complete attack-surface coverage" in prompt_lower
+    assert "does not establish application behavior, vulnerability" in prompt_lower
+
+
 def test_standalone_external_tool_question_remains_general_knowledge_fallback() -> None:
     assert answer_standalone_product_question("How does OpenVAS work?", ()) is None
 

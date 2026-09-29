@@ -173,7 +173,8 @@ def build_standalone_ask_prompt(question: str, history: History = ()) -> str:
     capability_lines = []
     for name, details in profile["tools"].items():
         capability_lines.append(
-            f"- {name}: {details['purpose']} Evidence: {details['evidence']} Boundary: {details['not_proof']}"
+            f"- {name}: {details['purpose']} Evidence: {details['evidence']} "
+            f"Boundary: Does not establish {details['not_proof']}"
         )
     prompt = "\n".join(
         [
@@ -183,6 +184,7 @@ def build_standalone_ask_prompt(question: str, history: History = ()) -> str:
             "- Standalone Ask has no assessment findings, target observations, scan evidence, or persisted assessment context.",
             "- Do not fabricate execution, evidence, or security conclusions, and do not execute tools.",
             "- A question about an external tool may be answered as general education, but do not claim Mongrel supports it.",
+            "- When comparing tools, describe bounded capabilities and observed evidence types only. Never call reconnaissance comprehensive or complete, and never turn discovery into proof of ownership, reachability, vulnerability, exploitability, compromise, or full attack-surface coverage.",
             "",
             "Supported Mongrel capabilities:",
             *capability_lines,
