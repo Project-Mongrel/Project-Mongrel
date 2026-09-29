@@ -61,6 +61,29 @@ def test_recent_messages_are_bounded_and_ordered() -> None:
     assert context["conversation"]["recent_message_limit"] == 3
 
 
+def test_narrowing_followup_uses_recent_exchange_as_routing_context() -> None:
+    assessment = create_assessment("Follow-up Context", user_id=1001)
+    conversation = create_conversation(assessment["id"], user_id=1001)
+    append_message(conversation["id"], user_id=1001, role="user", content="What should we do first?")
+    append_message(
+        conversation["id"],
+        user_id=1001,
+        role="assistant",
+        content="Start with BBOT for discovery, then Nmap and httpx for exposure and response observations.",
+    )
+
+    context = build_assessment_conversation_context(
+        user_id=1001,
+        assessment_id=assessment["id"],
+        conversation_id=conversation["id"],
+        question="elaborate. what tool first?",
+    )
+
+    assert context["question_intent"] == "follow_up_reference"
+    assert context["conversation_understanding"]["follow_up"] is True
+    assert context["assessment_context"]["findings"] == []
+
+
 @pytest.mark.parametrize(
     ("question", "expected"),
     [

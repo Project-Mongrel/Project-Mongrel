@@ -14,6 +14,7 @@ from app.services.assessment_conversation_store import (
 from app.services.assessment_guard import build_assessment_guard, build_guard_prompt_section
 from app.services.assessment_map_retrieval import build_assessment_map_context
 from app.services.assessment_store import get_user_assessment
+from app.services.conversation_understanding import normalize_conversational_text, understand_conversation
 from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile, get_mongrel_tool_names
 from app.services.scan_status import normalize_scan_status
 
@@ -148,7 +149,8 @@ NOVICE_QUESTION_TERMS = ("novice", "beginner", "don't know", "do not know", "new
 WEB_SERVICE_PORTS = {80, 443, 8080, 8443}
 PRODUCT_QUESTION_PATTERNS = (
     "what can mongrel", "what does mongrel do", "what are your tools", "what tools do you have",
-    "what modes does mongrel", "difference between assessment mode", "can you run tools automatically",
+    "what modes does mongrel", "can you run tools automatically",
+    "difference between assessment mode",
 )
 RECOMMENDATION_QUESTION_TERMS = (
     "what next", "what is next", "do next", "run next", "should i run", "which tool", "which mongrel tool",
@@ -219,23 +221,6 @@ UNCERTAINTY_TERMS = (
     "are we secure", "is it secure", "do we know it's vulnerable", "do we know it is vulnerable", "is it vulnerable",
     "is that a vulnerability", "does that mean it is vulnerable", "does that mean it's vulnerable", "are we safe",
 )
-CASUAL_SECURITY_TERM_ALIASES = (
-    (re.compile(r"\b(?:vulnerabilty|vunerability|vuln)\b"), "vulnerability"),
-    (re.compile(r"\bexploitible\b"), "exploitable"),
-    (re.compile(r"\bonw\b"), "one"),
-    (re.compile(r"\bwouldnt\b"), "wouldn't"),
-    (re.compile(r"\bdont\b"), "don't"),
-    (re.compile(r"\bwat\b"), "what"),
-    (re.compile(r"\bnxt\b"), "next"),
-)
-CASUAL_INTENT_FILLER_PATTERNS = (
-    re.compile(r"\b(?:the\s+)?fuck(?:ing)?\b"),
-    re.compile(r"\bactually\b"),
-    re.compile(r"\bso\b"),
-    re.compile(r"\bok(?:ay)?\b"),
-    re.compile(r"\bplease\b"),
-    re.compile(r"\bjust\b"),
-)
 TOOL_RELEVANCE_PATTERNS = (
     re.compile(r"\b(?:why|what)\s+wouldn'?t\s+(?:you|we)\s+(?:use|run)\b"),
     re.compile(r"\bwhy\s+not\b"),
@@ -303,6 +288,20 @@ def build_assessment_conversation_context(
     )
     selected_tools = detect_question_tools(question)
     question_intent = classify_assessment_conversation_intent(question, selected_tools=selected_tools)
+    understanding = understand_conversation(
+        question,
+        tuple(
+            (str(message.get("role") or ""), str(message.get("content") or ""))
+            for message in recent_messages
+            if isinstance(message, dict)
+        ),
+    )
+    if (
+        understanding.is_follow_up
+        and (understanding.requests_detail or understanding.narrows_selection)
+        and question_intent in {"current_assessment_evidence", "next_step_recommendation", "prioritization"}
+    ):
+        question_intent = "follow_up_reference"
     compound_requirements = _detect_compound_requirements(
         question,
         selected_tools=selected_tools,
@@ -332,6 +331,12 @@ def build_assessment_conversation_context(
         "schema_version": CONTEXT_SCHEMA_VERSION,
         "current_question": str(question or "").strip(),
         "question_intent": question_intent,
+        "conversation_understanding": {
+            "follow_up": understanding.is_follow_up,
+            "requests_detail": understanding.requests_detail,
+            "narrows_selection": understanding.narrows_selection,
+            "referenced_ordinal": understanding.referenced_ordinal,
+        },
         "compound_requirements": compound_requirements,
         "uncertainty_subtype": uncertainty_subtype,
         "priority_rules": [
@@ -611,11 +616,7 @@ def _detect_compound_requirements(
 
 
 def _normalize_intent_text(question: str) -> str:
-    normalized = " ".join(str(question or "").lower().replace("’", "'").split())
-    for pattern, replacement in CASUAL_SECURITY_TERM_ALIASES:
-        normalized = pattern.sub(replacement, normalized)
-    for pattern in CASUAL_INTENT_FILLER_PATTERNS:
-        normalized = pattern.sub(" ", normalized)
+    normalized = normalize_conversational_text(question)
     normalized = re.sub(r"[?!.,;:]+", " ", normalized)
     normalized = " ".join(normalized.split())
     return normalized

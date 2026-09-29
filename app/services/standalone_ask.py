@@ -3,6 +3,7 @@
 import re
 from collections.abc import Sequence
 
+from app.services.conversation_understanding import ConversationUnderstanding, normalize_conversational_text, understand_conversation
 from app.services.mongrel_self_knowledge import build_mongrel_self_knowledge_profile, get_mongrel_tool_names
 
 
@@ -27,11 +28,96 @@ _TOOL_ANSWERS = {
 
 
 def _normalized(text: str) -> str:
-    return re.sub(r"\s+", " ", text.strip().lower().replace("’", "'"))
+    return normalize_conversational_text(text)
 
 
 def _history_text(history: History) -> str:
     return " ".join(text for _role, text in history[-8:]).lower()
+
+
+def _tool_names_in_text(text: str) -> list[str]:
+    normalized = _normalized(text)
+    aliases = {name.lower(): name for name in get_mongrel_tool_names()}
+    aliases["testssl"] = "testssl.sh"
+    matches = []
+    for alias, name in aliases.items():
+        match = re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", normalized)
+        if match:
+            matches.append((match.start(), name))
+    return [name for _position, name in sorted(set(matches))]
+
+
+def _profile_tool(name: str) -> tuple[str, dict] | None:
+    profile = build_mongrel_self_knowledge_profile()
+    for display, details in profile["tools"].items():
+        if display.lower().removesuffix(".sh") == name.lower().removesuffix(".sh"):
+            return display, details
+    return None
+
+
+def _unknown_capability_token(question: str) -> str | None:
+    known = {name.lower().removesuffix(".sh") for name in get_mongrel_tool_names()}
+    ignored = {
+        "can", "could", "does", "do", "will", "would", "should", "run", "use", "support", "recommend",
+        "have", "has", "what", "which", "tool", "tools", "mongrel", "please", "the", "a", "an", "for",
+        "with", "in", "on", "as", "my", "this", "that", "it", "first", "next", "now",
+        "tls", "ssl", "ssh", "http", "https", "dns", "pcap", "traffic", "network", "web", "cloud",
+        "repository", "filesystem", "file",
+    }
+    for match in re.finditer(r"(?<![\w])([A-Za-z][A-Za-z0-9_.-]{2,})(?![\w])", str(question or "")):
+        token = match.group(1)
+        lowered = token.lower().removesuffix(".sh")
+        if lowered not in known and lowered not in ignored:
+            return token
+    return None
+
+
+def _is_mongrel_capability_question(normalized: str) -> bool:
+    return bool(
+        re.search(r"\b(?:can|could|does|do|will|would|should)\s+mongrel\b", normalized)
+        or re.search(r"\bmongrel\b.{0,50}\b(?:run|support|recommend|capabilit)\b", normalized)
+    )
+
+
+def _standalone_capability_answer(question: str, normalized: str) -> str | None:
+    if not _is_mongrel_capability_question(normalized):
+        return None
+    unknown = _unknown_capability_token(question)
+    if unknown:
+        return (
+            f"I do not recognize `{unknown}` as one of Mongrel's supported capabilities. "
+            "Please clarify the product or environment you mean; I can discuss an external technology generally, "
+            "but I will not silently substitute another name or claim Mongrel can run it."
+        )
+    tool = _mentioned_tool(question)
+    if tool:
+        profile_tool = _profile_tool(tool)
+        display = profile_tool[0] if profile_tool else tool
+        return f"Mongrel can use {display} within its authorized workflow. {_TOOL_ANSWERS[tool]}"
+    return _tool_list_answer()
+
+
+def _focused_follow_up_answer(understanding: ConversationUnderstanding) -> str | None:
+    prior_tools = _tool_names_in_text(understanding.previous_assistant_text)
+    if not prior_tools:
+        return None
+    index = (understanding.referenced_ordinal - 1) if understanding.referenced_ordinal else 0
+    if re.search(r"\bafter\s+that\b", understanding.normalized_text) and understanding.referenced_ordinal is None:
+        index = 1
+    index = min(max(index, 0), len(prior_tools) - 1)
+    selected = prior_tools[index]
+    selected_profile = _profile_tool(selected)
+    if selected_profile is None:
+        return None
+    display, details = selected_profile
+    if index == 0 and len(prior_tools) > 1:
+        next_display, next_details = _profile_tool(prior_tools[1]) or (prior_tools[1], {"purpose": "the next evidence step"})
+        return (
+            f"Start with {display} when you need {details['purpose'].lower()} If the host is already known, "
+            f"{next_display} is the more direct first step for {next_details['purpose'].lower()} "
+            f"Then use {prior_tools[2] if len(prior_tools) > 2 else 'the next relevant Mongrel capability'} to fill the next evidence gap."
+        )
+    return f"{display} is the referenced step: {details['purpose']} {details['evidence']}"
 
 
 def build_standalone_ask_prompt(question: str, history: History = ()) -> str:
@@ -128,6 +214,11 @@ def answer_standalone_product_question(question: str, history: History = ()) -> 
 
     normalized = _normalized(question)
     prior = _history_text(history)
+    understanding = understand_conversation(question, history)
+
+    capability_answer = _standalone_capability_answer(question, normalized)
+    if capability_answer is not None:
+        return capability_answer
 
     if re.search(r"\b(what|which|list|name)\b.*\btools?\b.*\b(have|available|mongrel)\b", normalized) or normalized in {
         "what tools do you have?",
@@ -137,6 +228,11 @@ def answer_standalone_product_question(question: str, history: History = ()) -> 
 
     if "assess a web target" in normalized or "assessment order" in normalized and "web" in normalized:
         return _web_assessment_flow()
+
+    if understanding.is_follow_up and (understanding.requests_detail or understanding.narrows_selection or re.search(r"\b(?:that|this|it)\b", normalized)):
+        focused = _focused_follow_up_answer(understanding)
+        if focused is not None:
+            return focused
 
     first_step_question = normalized.rstrip(" ?.!\n")
     if first_step_question in {

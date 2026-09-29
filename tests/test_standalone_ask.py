@@ -2,10 +2,13 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from app.bot.handlers.ask import ask_handler
 from app.bot.handlers.scan import scan_target_handler
 from app.services.chat_state import append_ai_conversation_exchange, clear_ai_waiting, get_ai_conversation_history
 from app.services.mongrel_self_knowledge import get_mongrel_tool_names
+from app.services.conversation_understanding import normalize_conversational_text, understand_conversation
 from app.services.standalone_ask import answer_standalone_product_question, build_standalone_ask_prompt
 
 
@@ -92,9 +95,43 @@ def test_standalone_ask_followup_first_step_question_uses_bounded_context() -> N
     history = (("user", "what should we do first?"), ("assistant", _answer("what should we do first?")))
     answer = _answer("elaborate. what tool first?", history).lower()
 
-    assert "mongrel" in answer.lower()
+    assert answer.startswith("start with bbot")
     assert "nmap" in answer and "httpx" in answer
     assert "openvas" not in answer and "qualys" not in answer and "rapid7" not in answer
+
+
+@pytest.mark.parametrize(
+    ("question", "marker"),
+    (
+        ("which one first?", "Start with BBOT"),
+        ("why that one?", "Start with BBOT"),
+        ("what does that do?", "Start with BBOT"),
+        ("what about the second one?", "Nmap is the referenced step"),
+        ("and after that?", "Nmap is the referenced step"),
+    ),
+)
+def test_standalone_followups_answer_the_narrow_reference(question: str, marker: str) -> None:
+    history = (("user", "what should we do first?"), ("assistant", _answer("what should we do first?")))
+
+    answer = _answer(question, history)
+
+    assert marker in answer
+    assert answer != history[-1][1]
+
+
+def test_standalone_normalization_handles_casual_noise_without_rewriting_technical_tokens() -> None:
+    assert normalize_conversational_text("what the fuck should we do nxt?") == "what should we do next?"
+    understanding = understand_conversation("can Mongrel run openVPS?", ())
+    assert understanding.original_text == "can Mongrel run openVPS?"
+    assert "openvps" in understanding.normalized_text
+
+
+def test_standalone_unknown_technical_capability_is_not_silently_substituted() -> None:
+    answer = _answer("can Mongrel run openVPS?")
+
+    assert "openVPS" in answer
+    assert "OpenVZ" not in answer
+    assert "do not recognize" in answer
 
 
 def test_standalone_generic_prompt_is_bounded_and_has_no_assessment_context() -> None:
@@ -207,9 +244,13 @@ def test_standalone_ask_external_tool_question_reaches_general_ai_without_claimi
     )
     message = SimpleNamespace(text="How does OpenVAS work?", reply_text=AsyncMock())
 
-    with patch("app.services.standalone_ask.answer_standalone_product_question", return_value=None), patch(
-        "app.bot.handlers.scan.ask_ai", return_value="General OpenVAS explanation"
-    ) as ask_ai:
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    with (
+        patch("app.bot.handlers.scan.ask_ai", return_value="General OpenVAS explanation") as ask_ai,
+        patch("app.bot.handlers.scan.asyncio.to_thread", side_effect=run_inline),
+    ):
         asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id), effective_chat=SimpleNamespace(id=user_id)), context))
 
     ask_ai.assert_called_once()
@@ -232,7 +273,13 @@ def test_standalone_ask_typing_failure_does_not_block_persistence_or_delivery() 
     )
     message = SimpleNamespace(text="How does SSRF work?", reply_text=AsyncMock())
 
-    with patch("app.bot.handlers.scan.ask_ai", return_value="Stored general answer"):
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    with (
+        patch("app.bot.handlers.scan.ask_ai", return_value="Stored general answer"),
+        patch("app.bot.handlers.scan.asyncio.to_thread", side_effect=run_inline),
+    ):
         asyncio.run(scan_target_handler(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=user_id)), context))
 
     assert message.reply_text.call_args_list[-1].args[0] == "Stored general answer"
