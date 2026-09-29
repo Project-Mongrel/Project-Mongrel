@@ -104,8 +104,8 @@ def test_standalone_ask_followup_first_step_question_uses_bounded_context() -> N
     ("question", "marker"),
     (
         ("which one first?", "Start with BBOT"),
-        ("why that one?", "Start with BBOT"),
-        ("what does that do?", "Start with BBOT"),
+        ("why that one?", "BBOT is the referenced step"),
+        ("what does that do?", "BBOT is the referenced step"),
         ("what about the second one?", "Nmap is the referenced step"),
         ("and after that?", "Nmap is the referenced step"),
     ),
@@ -117,6 +117,23 @@ def test_standalone_followups_answer_the_narrow_reference(question: str, marker:
 
     assert marker in answer
     assert answer != history[-1][1]
+
+
+def test_standalone_multi_turn_followups_advance_the_selected_tool() -> None:
+    history = [("user", "what should we do first"), ("assistant", _answer("what should we do first"))]
+
+    first = _answer("elobarate. what tool first?", history)
+    history.extend([("user", "elobarate. what tool first?"), ("assistant", first)])
+    why = _answer("why that one?", history)
+    assert why.startswith("BBOT is the referenced step")
+
+    history.extend([("user", "why that one?"), ("assistant", why)])
+    second = _answer("what about the secind one?", history)
+    assert second.startswith("Nmap is the referenced step")
+
+    history.extend([("user", "what about the secind one?"), ("assistant", second)])
+    after = _answer("and after that one?", history)
+    assert after.startswith("httpx is the referenced step")
 
 
 def test_standalone_normalization_handles_casual_noise_without_rewriting_technical_tokens() -> None:

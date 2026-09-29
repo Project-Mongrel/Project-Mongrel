@@ -11,6 +11,8 @@ _CASUAL_ALIASES = (
     (re.compile(r"\b(?:vulnerabilty|vunerability|vuln)\b"), "vulnerability"),
     (re.compile(r"\bexploitible\b"), "exploitable"),
     (re.compile(r"\bonw\b"), "one"),
+    (re.compile(r"\b(?:elobarate|elaborat)\b"), "elaborate"),
+    (re.compile(r"\bsecind\b"), "second"),
     (re.compile(r"\bwouldnt\b"), "wouldn't"),
     (re.compile(r"\bdont\b"), "don't"),
     (re.compile(r"\bwat\b"), "what"),
@@ -35,6 +37,8 @@ class ConversationUnderstanding:
     narrows_selection: bool
     referenced_ordinal: int | None
     previous_assistant_text: str
+    previous_assistant_texts: tuple[str, ...]
+    previous_user_text: str
 
 
 def normalize_conversational_text(text: str) -> str:
@@ -52,10 +56,17 @@ def understand_conversation(text: str, history: History = ()) -> ConversationUnd
     original = str(text or "").strip()
     normalized = normalize_conversational_text(original)
     prior_assistant = ""
+    prior_assistants = []
+    prior_user = ""
     for role, content in reversed(history):
         if str(role).lower() == "assistant":
-            prior_assistant = str(content or "")
-            break
+            assistant_text = str(content or "")
+            if not prior_assistant:
+                prior_assistant = assistant_text
+            if len(prior_assistants) < 4:
+                prior_assistants.append(assistant_text)
+        elif str(role).lower() == "user" and not prior_user:
+            prior_user = str(content or "")
     intent_text = re.sub(r"[?!.,;:]+", " ", normalized)
     intent_text = " ".join(intent_text.split())
     requests_detail = bool(re.search(r"\b(?:elaborate|expand|go deeper|explain|why|what do you mean)\b", intent_text))
@@ -63,7 +74,7 @@ def understand_conversation(text: str, history: History = ()) -> ConversationUnd
         re.search(r"\b(?:which|what)\s+(?:one|tool)\b|\b(?:first|second|third|after that|why that one)\b|\bwhat about\b", intent_text)
     )
     referenced_ordinal = None
-    ordinal_match = re.search(r"\b(first|second|third|one|two|three)\b", intent_text)
+    ordinal_match = re.search(r"\b(first|second|third|two|three)\b", intent_text)
     if ordinal_match:
         referenced_ordinal = {"first": 1, "one": 1, "second": 2, "two": 2, "third": 3, "three": 3}[ordinal_match.group(1)]
     is_follow_up = bool(prior_assistant) and (
@@ -80,4 +91,6 @@ def understand_conversation(text: str, history: History = ()) -> ConversationUnd
         narrows_selection=narrows_selection,
         referenced_ordinal=referenced_ordinal,
         previous_assistant_text=prior_assistant,
+        previous_assistant_texts=tuple(prior_assistants),
+        previous_user_text=prior_user,
     )

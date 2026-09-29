@@ -98,19 +98,41 @@ def _standalone_capability_answer(question: str, normalized: str) -> str | None:
 
 
 def _focused_follow_up_answer(understanding: ConversationUnderstanding) -> str | None:
-    prior_tools = _tool_names_in_text(understanding.previous_assistant_text)
+    prior_tools = []
+    for assistant_text in understanding.previous_assistant_texts or (understanding.previous_assistant_text,):
+        candidate_tools = _tool_names_in_text(assistant_text)
+        if len(candidate_tools) > 1:
+            prior_tools = candidate_tools
+            break
+    if not prior_tools:
+        prior_tools = _tool_names_in_text(understanding.previous_assistant_text)
     if not prior_tools:
         return None
-    index = (understanding.referenced_ordinal - 1) if understanding.referenced_ordinal else 0
-    if re.search(r"\bafter\s+that\b", understanding.normalized_text) and understanding.referenced_ordinal is None:
-        index = 1
+    previous_user_normalized = _normalized(understanding.previous_user_text)
+    previous_selection = re.search(r"\b(first|second|third|two|three)\b", previous_user_normalized)
+    previous_index = (
+        {"first": 0, "second": 1, "third": 2, "two": 1, "three": 2}[previous_selection.group(1)]
+        if previous_selection
+        else 0
+    )
+    if understanding.referenced_ordinal is not None:
+        index = understanding.referenced_ordinal - 1
+    elif re.search(r"\bafter\s+that\b", understanding.normalized_text):
+        index = previous_index + 1
+    else:
+        index = previous_index
     index = min(max(index, 0), len(prior_tools) - 1)
     selected = prior_tools[index]
     selected_profile = _profile_tool(selected)
     if selected_profile is None:
         return None
     display, details = selected_profile
-    if index == 0 and len(prior_tools) > 1:
+    initial_selection = bool(
+        re.search(r"\b(?:what|which)\s+(?:tool|one)\b", understanding.normalized_text)
+        and re.search(r"\bfirst\b", understanding.normalized_text)
+        and "tool" not in previous_user_normalized
+    )
+    if index == 0 and len(prior_tools) > 1 and initial_selection:
         next_display, next_details = _profile_tool(prior_tools[1]) or (prior_tools[1], {"purpose": "the next evidence step"})
         return (
             f"Start with {display} when you need {details['purpose'].lower()} If the host is already known, "
