@@ -10,13 +10,48 @@ Mongrel is deliberately uncertainty-honest. A completed scan is not proof that a
 
 The competition bot is **[@Project_Mongrel_Bot](https://t.me/Project_Mongrel_Bot)**.
 
-1. Open the official Telegram mobile app, desktop app, or [Telegram Web](https://web.telegram.org/).
+1. If you do not already have Telegram, install the official [mobile app](https://telegram.org/apps) or [desktop app](https://desktop.telegram.org/), or use [Telegram Web](https://web.telegram.org/) in your browser.
 2. Sign in or create a Telegram account.
 3. Search for the exact username `@Project_Mongrel_Bot`.
 4. Open the bot and press **Start**, or send `/start`.
 5. Use only a target you own or are explicitly authorized to test.
 
+Telegram Desktop is particularly convenient for reviewing longer scan results and reports.
+
 Competition-bot access requires no local installation. The [Self-hosting](#self-hosting) instructions are separate and are only for operators deploying their own Mongrel instance.
+
+## More Than a Tool Wrapper
+
+Mongrel began as a Telegram security-tool orchestrator and evolved into an evidence-driven assessment platform. It coordinates 12 security tools through dedicated runners and parsers, normalizes their output, and persists assessment state and lifecycle in SQLite. Telegram provides the operational UX, while specialist AI, Assessment-scoped Ask Mongrel, and Standalone/Generic Ask Mongrel interpret different kinds of context without pretending that a conversation is evidence.
+
+The platform also includes a cross-tool assessment map, provenance linking, encrypted Evidence Vault storage for sensitive Gitleaks evidence, review and approval workflows, deterministic and reporting guardrails, and explicit uncertainty. Conclusions stay tied to persisted evidence rather than to tool names, model confidence, or a completed process.
+
+The locked competition toolset is exactly:
+
+**Nmap, BBOT, Nuclei, httpx, Playwright, Katana, ffuf, testssl.sh, Gitleaks, Prowler, Metasploit, and TShark.**
+
+## How to Use Project Mongrel
+
+1. Find and open **@Project_Mongrel_Bot** in Telegram.
+2. Press **Start** or send `/start`.
+3. Use the home screen to choose between a new assessment, a standalone question, previous assessments, and other supported workflows.
+4. Choose **New Assessment** to enter Assessment Mode, name the assessment, and provide an authorized target.
+5. Run tools from the assessment dashboard. Review each result, its stored evidence, and its limitations before choosing the next action.
+6. Use **Ask Mongrel about this assessment** for questions grounded in that assessment's authorized persisted evidence.
+7. Use the home-screen **Ask Mongrel** for general cybersecurity questions and Mongrel capability guidance. It does not inherit assessment evidence or run tools from chat text.
+8. Open **Previous Assessments** to return to active, partial, interrupted, or completed workspaces.
+9. Use the assessment **Dashboard**, **AI Report**, and **Markdown Report** to review lifecycle state, evidence, interpretation, recommendations, and limitations.
+10. Use Telegram navigation buttons to return to the dashboard, history, reports, or Ask Mongrel. Telegram Desktop can be especially convenient for reviewing longer scan results and reports.
+
+## Which mode should I use?
+
+| Goal | Use | What it does |
+|---|---|---|
+| Collect evidence for one authorized target over time | **Assessment Mode** | Creates a persistent workspace with target, tool state, normalized evidence, provenance, history, and reports. |
+| Ask what a stored assessment established | **Assessment Ask Mongrel** | Answers from that assessment's authorized persisted evidence and explains what remains uncertain. |
+| Ask a general cybersecurity or Mongrel capability question | **Standalone Ask Mongrel** | Provides bounded general guidance without assessment findings and without executing tools. |
+| Return to earlier work | **Previous Assessments / History** | Reopens stored assessments and their scan history without automatically rerunning tools. |
+| Review results and generate deliverables | **Dashboard / Report** | Shows assessment state and evidence-backed AI or deterministic Markdown reporting with limitations. |
 
 ## A 60-second first assessment
 
@@ -88,6 +123,8 @@ Standard and Deep require their configured wordlists; Mongrel does not silently 
 - **Guided Validation** walks through target, service, an allowlisted compatible validation, review, and explicit approval.
 - **Advanced Manual Mode** accepts the bounded structured request format and retains the same authorization and policy controls.
 
+Both modes are evidence-driven and require the applicable review, approval, authorization, and policy checks. Module execution, process completion, or a target response is not by itself successful exploitation.
+
 Launching a module, completing a workflow, or receiving a target response does not prove exploitation. Session establishment and validation outcome remain separate evidence.
 
 ### TShark modes
@@ -97,6 +134,8 @@ Launching a module, completing a workflow, or receiving a target response does n
 - **Standalone Live Capture** requires explicit approval and a configured allowlisted interface.
 
 Packets, endpoints, DNS, HTTP fields, or TLS metadata are observations—not automatic proof of a completed transaction, TLS handshake, exploit, or compromise. TShark cannot bypass Metasploit approval or make an old failed validation eligible.
+
+Capture and PCAP results retain scope, interface, filter, and time limitations. Correlation can support attribution to a validation window, but it is not proof of exploitation or compromise.
 
 ## Evidence model
 
@@ -119,17 +158,24 @@ Ask Mongrel and assessment reports include uncertainty and limitations because n
 Use a short evidence story instead of trying to demonstrate every tool live:
 
 1. Create or open an authorized assessment.
-2. Run **Nmap** to establish visible network exposure.
-3. Use **httpx** and/or **Nuclei** where the discovered web surface supports them.
-4. Ask Mongrel what was established, what remains uncertain, and what to do next.
-5. Reopen the workspace through **Previous Assessments**.
-6. Generate an AI or Markdown report and show that its claims remain bounded by stored evidence.
+2. Run **BBOT** to collect bounded reconnaissance and asset observations.
+3. Run **Nmap** to establish observed host, port, and service exposure.
+4. Ask **Assessment-scoped Ask Mongrel** what BBOT and Nmap established together, what remains unknown, and what should be considered next.
+5. Generate the **AI Report** and/or **Markdown Report** to demonstrate evidence-backed reporting and uncertainty.
+6. Optionally reopen the workspace through **Previous Assessments** to demonstrate persistence and history.
 
 This path demonstrates collection, interpretation, persistence, uncertainty, and reporting without implying that all 12 tools are appropriate for one target.
 
 ## Self-hosting
 
 Self-hosting is independent from access to `@Project_Mongrel_Bot`.
+
+Clone the transferred repository from the new organization:
+
+```bash
+git clone https://github.com/Project-Mongrel/Project-Mongrel.git
+cd Project-Mongrel
+```
 
 ### Prerequisites
 
@@ -242,6 +288,8 @@ python scripts/security_audit.py --full
 - SQLite-backed assessment data and evidence files require normal backup, filesystem-permission, and disk-capacity operations.
 - Live capture and active validation require explicit authorization and carefully scoped host configuration.
 
+The same boundaries apply across the dashboard, AI Report, Markdown Report, and Ask Mongrel: scan completion does not mean a target is secure; absence of a finding is not proof of absence; passive or reconnaissance observations are not automatically vulnerabilities; observed traffic is not proof of compromise; and missing coverage remains unknown.
+
 ## Repository map
 
 ```text
@@ -258,4 +306,4 @@ scripts/          # Security audit and maintenance utilities
 tests/            # Automated regression suite
 ```
 
-Repository: <https://github.com/FuzzyDuckLabs/Project-Mongrel>
+Repository: <https://github.com/Project-Mongrel/Project-Mongrel>

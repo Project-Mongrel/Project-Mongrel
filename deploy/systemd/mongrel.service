@@ -1,6 +1,6 @@
 [Unit]
 Description=Project Mongrel Telegram Bot
-Documentation=https://github.com/FuzzyDuckLabs/Project-Mongrel
+Documentation=https://github.com/Project-Mongrel/Project-Mongrel
 Wants=network-online.target
 After=network-online.target ollama.service
 StartLimitIntervalSec=120
