@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from app.parsers.tshark_parser import normalize_tshark_result
-from app.services.metasploit_approval import get_metasploit_proposal
+from app.services.metasploit_approval import MetasploitApprovalError, get_metasploit_proposal, require_approved_metasploit_action
 from app.services.tshark_approval import TSharkApprovalError, mark_tshark_capture_status, require_approved_tshark_capture
 from app.tools.metasploit_runner import run_metasploit_validation
 from app.tools.tshark_live_runner import build_tshark_live_capture_command, check_tshark_live_readiness
@@ -48,6 +48,15 @@ def run_tshark_capture_during_validation(
     if metasploit_proposal.fingerprint != str(metasploit_request.get("fingerprint") or ""):
         mark_tshark_capture_status(capture_proposal.id, "failed")
         return _result(False, "Metasploit validation details changed.", "validation_mutated", provenance=provenance)
+    try:
+        require_approved_metasploit_action(
+            metasploit_proposal_id,
+            user_id=user_id,
+            request=metasploit_request,
+        )
+    except MetasploitApprovalError as exc:
+        mark_tshark_capture_status(capture_proposal.id, "failed")
+        return _result(False, str(exc), "approval_required", provenance=provenance)
 
     readiness = check_tshark_live_readiness()
     if readiness.get("ready") is not True:

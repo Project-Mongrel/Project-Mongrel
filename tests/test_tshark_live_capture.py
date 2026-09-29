@@ -15,7 +15,7 @@ from app.services.tshark_approval import (
     propose_tshark_capture,
     require_approved_tshark_capture,
 )
-from app.services.metasploit_approval import approve_metasploit_proposal, clear_metasploit_proposals, propose_metasploit_action
+from app.services.metasploit_approval import approve_metasploit_proposal, clear_metasploit_proposals, mark_metasploit_proposal_status, propose_metasploit_action
 from app.services.metasploit_policy import build_metasploit_action_request
 from app.services.tshark_policy import build_tshark_capture_request
 from app.services.tshark_validation_capture import run_tshark_capture_during_validation
@@ -361,3 +361,132 @@ def test_tshark_capture_during_validation_stops_capture_on_validation_exception(
     assert result["error_type"] == "execution_failed"
     assert stopped == ["terminated"]
     assert not list(tmp_path.glob("mongrel-tshark-validation-*.pcapng"))
+
+
+@pytest.mark.parametrize("status", ["failed", "rejected"])
+def test_tshark_capture_during_validation_rejects_terminal_metasploit_proposal_before_capture(status: str, tmp_path) -> None:
+    capture_request = _request()
+    capture_proposal_id = _approved(capture_request)
+    metasploit_request = build_metasploit_action_request(
+        module="auxiliary/scanner/http/http_version",
+        action_type="auxiliary_validation",
+        target="example.com",
+        port=80,
+    )
+    metasploit_proposal = approve_metasploit_proposal(propose_metasploit_action(100, metasploit_request).id, user_id=100)
+    mark_metasploit_proposal_status(metasploit_proposal.id, status)
+
+    with (
+        patch("app.services.tshark_validation_capture.check_tshark_live_readiness") as readiness_mock,
+        patch("app.services.tshark_validation_capture.subprocess.Popen") as popen_mock,
+    ):
+        result = run_tshark_capture_during_validation(
+            user_id=100,
+            capture_proposal_id=capture_proposal_id,
+            capture_request=capture_request,
+            metasploit_proposal_id=metasploit_proposal.id,
+            metasploit_request=metasploit_request,
+            work_dir=tmp_path,
+        )
+
+    assert result["success"] is False
+    assert result["error_type"] == "approval_required"
+    readiness_mock.assert_not_called()
+    popen_mock.assert_not_called()
+
+
+def test_tshark_capture_during_validation_rejects_unapproved_metasploit_proposal_before_capture(tmp_path) -> None:
+    capture_request = _request()
+    capture_proposal_id = _approved(capture_request)
+    metasploit_request = build_metasploit_action_request(
+        module="auxiliary/scanner/http/http_version",
+        action_type="auxiliary_validation",
+        target="example.com",
+        port=80,
+    )
+    metasploit_proposal_id = propose_metasploit_action(100, metasploit_request).id
+
+    with (
+        patch("app.services.tshark_validation_capture.check_tshark_live_readiness") as readiness_mock,
+        patch("app.services.tshark_validation_capture.subprocess.Popen") as popen_mock,
+    ):
+        result = run_tshark_capture_during_validation(
+            user_id=100,
+            capture_proposal_id=capture_proposal_id,
+            capture_request=capture_request,
+            metasploit_proposal_id=metasploit_proposal_id,
+            metasploit_request=metasploit_request,
+            work_dir=tmp_path,
+        )
+
+    assert result["success"] is False
+    assert result["error_type"] == "approval_required"
+    readiness_mock.assert_not_called()
+    popen_mock.assert_not_called()
+
+
+def test_tshark_capture_during_validation_rejects_expired_metasploit_proposal_before_capture(tmp_path) -> None:
+    capture_request = _request()
+    capture_proposal_id = _approved(capture_request)
+    metasploit_request = build_metasploit_action_request(
+        module="auxiliary/scanner/http/http_version",
+        action_type="auxiliary_validation",
+        target="example.com",
+        port=80,
+    )
+    metasploit_proposal = approve_metasploit_proposal(propose_metasploit_action(100, metasploit_request).id, user_id=100)
+    from app.services import metasploit_approval
+
+    metasploit_approval._proposals[metasploit_proposal.id] = replace(
+        metasploit_proposal,
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    with (
+        patch("app.services.tshark_validation_capture.check_tshark_live_readiness") as readiness_mock,
+        patch("app.services.tshark_validation_capture.subprocess.Popen") as popen_mock,
+    ):
+        result = run_tshark_capture_during_validation(
+            user_id=100,
+            capture_proposal_id=capture_proposal_id,
+            capture_request=capture_request,
+            metasploit_proposal_id=metasploit_proposal.id,
+            metasploit_request=metasploit_request,
+            work_dir=tmp_path,
+        )
+
+    assert result["success"] is False
+    assert result["error_type"] == "approval_required"
+    readiness_mock.assert_not_called()
+    popen_mock.assert_not_called()
+
+
+def test_tshark_capture_during_validation_rejects_mismatched_metasploit_proposal_before_capture(tmp_path) -> None:
+    capture_request = _request()
+    capture_proposal_id = _approved(capture_request)
+    metasploit_request = build_metasploit_action_request(
+        module="auxiliary/scanner/http/http_version",
+        action_type="auxiliary_validation",
+        target="example.com",
+        port=80,
+    )
+    metasploit_proposal = approve_metasploit_proposal(propose_metasploit_action(100, metasploit_request).id, user_id=100)
+    mutated_request = {**metasploit_request, "port": 8080, "fingerprint": "mutated-request"}
+
+    with (
+        patch("app.services.tshark_validation_capture.check_tshark_live_readiness") as readiness_mock,
+        patch("app.services.tshark_validation_capture.subprocess.Popen") as popen_mock,
+    ):
+        result = run_tshark_capture_during_validation(
+            user_id=100,
+            capture_proposal_id=capture_proposal_id,
+            capture_request=capture_request,
+            metasploit_proposal_id=metasploit_proposal.id,
+            metasploit_request=mutated_request,
+            work_dir=tmp_path,
+        )
+
+    assert result["success"] is False
+    assert result["error_type"] == "validation_mutated"
+    readiness_mock.assert_not_called()
+    popen_mock.assert_not_called()
