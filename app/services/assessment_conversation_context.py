@@ -936,11 +936,23 @@ def _preserve_requested_bbot_ip_observations(sanitized_finding: dict, finding: d
     if not isinstance(existing, list):
         return
     existing_values = {
-        str(item.get("value") or "").strip()
+        (
+            str(item.get("observation_type") or item.get("type") or "").lower(),
+            str(item.get("value") or "").strip(),
+        )
         for item in existing
         if isinstance(item, dict)
     }
-    additions = [_sanitize(item) for item in matching if str(item.get("value") or "").strip() not in existing_values]
+    additions = []
+    for item in matching:
+        pair = (
+            str(item.get("observation_type") or item.get("type") or "").lower(),
+            str(item.get("value") or "").strip(),
+        )
+        if pair in existing_values:
+            continue
+        existing_values.add(pair)
+        additions.append(_sanitize(item))
     if not additions:
         return
     bounded = list(existing)

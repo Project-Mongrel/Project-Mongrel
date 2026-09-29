@@ -3085,11 +3085,13 @@ def test_bbot_exact_ip_questions_retain_real_bounded_observation_shape() -> None
     assessment = create_assessment("BBOT bounded observations", user_id=user_id)
     add_assessment_target(assessment["id"], "btjoinery.ie")
     observations = [
-        {"observation_type": "subdomain", "value": f"host-{index}.btjoinery.ie"}
-        for index in range(11)
+        {"observation_type": "raw_event", "value": f"event-{index}"}
+        for index in range(36)
     ]
-    observations.append({"observation_type": "ip_address", "value": "198.185.159.144"})
-    observations.append({"observation_type": "dns_record", "value": "btjoinery.ie A 198.185.159.144"})
+    observations[2] = {"observation_type": "dns_record", "value": "198.185.159.144"}
+    observations[27] = {"observation_type": "ip_address", "value": "198.185.159.144"}
+    observations[31] = {"observation_type": "ip_address", "value": "198.185.159.0"}
+    observations[32] = {"observation_type": "ip_address", "value": "198.185.159.0"}
     finding = add_finding(
         user_id=user_id,
         finding={
@@ -3098,7 +3100,7 @@ def test_bbot_exact_ip_questions_retain_real_bounded_observation_shape() -> None
             "status": "completed",
             "finding_count": len(observations),
             "observations": observations,
-            "observation_counts": {"subdomain": 11, "ip_address": 1, "dns_record": 1},
+            "observation_counts": {"raw_event": 32, "ip_address": 3, "dns_record": 1},
             "metadata": {"observation_count": len(observations)},
         },
     )
@@ -3125,9 +3127,57 @@ def test_bbot_exact_ip_questions_retain_real_bounded_observation_shape() -> None
 
     assert present["answer"].startswith("Yes.")
     assert "198.185.159.144" in present["answer"]
-    assert absent["answer"].startswith("No.")
+    assert absent["answer"].startswith("Yes.")
     assert "198.185.159.0" in absent["answer"]
-    assert "198.185.159.144" not in absent["answer"]
+
+    bounded_context = build_assessment_conversation_context(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=conversation["id"],
+        question=second_question,
+    )
+    bounded_observations = bounded_context["assessment_context"]["findings"][0]["observations"]
+    assert sum(
+        item.get("observation_type") == "ip_address" and item.get("value") == "198.185.159.0"
+        for item in bounded_observations
+    ) == 1
+
+    missing = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=conversation["id"],
+        question="Did BBOT observe 198.185.159.1?",
+    )
+    assert missing["answer"].startswith("No.")
+    assert "198.185.159.1" in missing["answer"]
+    assert "bounded to this BBOT result" in missing["answer"]
+
+
+def test_bbot_dns_record_does_not_answer_exact_ip_query() -> None:
+    user_id = 1127
+    assessment = create_assessment("BBOT DNS-only indicator", user_id=user_id)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "bbot",
+            "target": "btjoinery.ie",
+            "status": "completed",
+            "observations": [{"observation_type": "dns_record", "value": "198.185.159.144"}],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="bbot", status="completed", finding_id=finding["id"])
+
+    result = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="Did BBOT observe 198.185.159.144?",
+    )
+
+    assert result["answer"].startswith("No.")
+    assert "198.185.159.144" in result["answer"]
+    assert "bounded to this BBOT result" in result["answer"]
 
 
 def test_nuclei_summary_uses_persisted_aggregate_counts_after_context_caps_list() -> None:
