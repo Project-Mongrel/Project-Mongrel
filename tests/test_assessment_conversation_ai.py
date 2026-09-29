@@ -3045,6 +3045,41 @@ def test_live_shaped_eight_tool_summary_is_deterministic_and_cross_tool_grounded
     assert "confirmed vulnerability" not in answer.lower()
 
 
+def test_bbot_exact_ip_question_does_not_substitute_nearby_observation() -> None:
+    user_id = 1125
+    assessment = create_assessment("BBOT exact indicator", user_id=user_id)
+    add_assessment_target(assessment["id"], "btjoinery.ie")
+    finding = add_finding(
+        user_id=user_id,
+        finding={
+            "source": "bbot",
+            "target": "btjoinery.ie",
+            "status": "completed",
+            "observations": [{"observation_type": "ip_address", "value": "198.185.159.144"}],
+        },
+    )
+    record_assessment_scan(assessment["id"], tool="bbot", status="completed", finding_id=finding["id"])
+
+    absent = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="Did BBOT observe 198.185.159.0?",
+    )
+    present = answer_assessment_conversation_question(
+        user_id=user_id,
+        assessment_id=assessment["id"],
+        conversation_id=None,
+        question="Did BBOT observe 198.185.159.144?",
+    )
+
+    assert absent["answer"].startswith("No.")
+    assert "198.185.159.0" in absent["answer"]
+    assert "198.185.159.144" not in absent["answer"]
+    assert present["answer"].startswith("Yes.")
+    assert "198.185.159.144" in present["answer"]
+
+
 def test_nuclei_summary_uses_persisted_aggregate_counts_after_context_caps_list() -> None:
     user_id = 1128
     assessment = create_assessment("Nuclei aggregate budget", user_id=user_id)

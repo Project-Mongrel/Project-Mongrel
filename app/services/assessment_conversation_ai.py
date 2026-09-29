@@ -1,6 +1,7 @@
 import json
 import re
 from copy import deepcopy
+from ipaddress import ip_address
 from pathlib import Path
 from time import perf_counter
 from urllib.parse import urlparse
@@ -147,6 +148,7 @@ def answer_assessment_conversation_question(
         or _build_cross_tool_port_443_answer(context)
         or _build_httpx_waf_semantic_answer(context)
         or _build_direct_nmap_evidence_fallback(context)
+        or _build_direct_bbot_indicator_answer(context)
         or _build_direct_httpx_evidence_answer(context)
         or _build_direct_testssl_evidence_answer(context)
         or _build_direct_metasploit_evidence_answer(context)
@@ -1305,6 +1307,51 @@ def _build_direct_nmap_evidence_fallback(context: dict) -> str | None:
         observations.append(prefix + (" and reported " + ", ".join(ports) if ports else " with no stored open-port observations") + ".")
     observations.append("That is what Nmap established; it did not establish vulnerability or TLS quality.")
     return " ".join(observations)
+
+
+def _build_direct_bbot_indicator_answer(context: dict) -> str | None:
+    """Answer exact BBOT IP questions from normalized observations only."""
+    if _selected_tools(context) != {"bbot"}:
+        return None
+    question = str(context.get("current_question") or "")
+    requested = _extract_ip_literals(question)
+    if not requested or not re.search(r"\b(?:bbot|observe|observed|find|found|see|saw)\b", question, flags=re.IGNORECASE):
+        return None
+    observed = {
+        str(item.get("value") or "").strip()
+        for finding in _tool_findings(context, "bbot")
+        for key in ("observations", "bbot_observations")
+        for item in (finding.get(key) or [])
+        if isinstance(item, dict)
+        and str(item.get("observation_type") or item.get("type") or "").lower() == "ip_address"
+        and _is_valid_ip(item.get("value"))
+    }
+    present = [indicator for indicator in requested if indicator in observed]
+    absent = [indicator for indicator in requested if indicator not in observed]
+    if absent:
+        requested_text = ", ".join(absent)
+        return (
+            f"No. BBOT did not store {requested_text} in the available normalized evidence. "
+            "That is bounded to this BBOT result and does not prove the address was absent globally; no nearby IP was substituted."
+        )
+    return "Yes. BBOT stored the exact IP address value(s) " + ", ".join(present) + " in normalized evidence."
+
+
+def _extract_ip_literals(value: object) -> set[str]:
+    candidates = re.findall(
+        r"(?<![A-Za-z0-9])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9])|"
+        r"(?<![A-Za-z0-9])(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:]+(?![A-Za-z0-9])",
+        str(value or ""),
+    )
+    return {candidate for candidate in candidates if _is_valid_ip(candidate)}
+
+
+def _is_valid_ip(value: object) -> bool:
+    try:
+        ip_address(str(value or "").strip())
+    except ValueError:
+        return False
+    return True
 
 
 def _selected_tools(context: dict) -> set[str]:

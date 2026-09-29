@@ -1,4 +1,5 @@
 import re
+from ipaddress import ip_address
 
 from app.services.ai_client import ask_ai
 from app.services.bbot_summary import build_bbot_recon_summary, build_bbot_recon_summary_from_observations
@@ -307,6 +308,8 @@ def _sanitize_recon_summary(recon_summary: str) -> str:
 def _sanitize_response_lines(lines: list[str], observations: list[dict] | None = None) -> list[str]:
     if _looks_truncated_response(lines):
         return _deterministic_bbot_assessment_lines(observations or [])
+    if _contains_unsupported_ip_literal(lines, observations or []):
+        return _deterministic_bbot_assessment_lines(observations or [])
     if _contains_unsupported_recon_claim(lines):
         return _deterministic_bbot_assessment_lines(observations or [])
     sanitized_lines = []
@@ -317,6 +320,34 @@ def _sanitize_response_lines(lines: list[str], observations: list[dict] | None =
             continue
         sanitized_lines.append(line)
     return sanitized_lines if sanitized_lines else list(FALLBACK_LINES)
+
+
+def _contains_unsupported_ip_literal(lines: list[str], observations: list[dict]) -> bool:
+    supported = {
+        str(observation.get("value") or "").strip()
+        for observation in observations
+        if str(observation.get("observation_type") or "").lower() == "ip_address"
+        and _valid_ip(observation.get("value"))
+    }
+    rendered = "\n".join(str(line or "") for line in lines)
+    return any(ip not in supported for ip in _extract_ip_literals(rendered))
+
+
+def _extract_ip_literals(value: object) -> set[str]:
+    candidates = re.findall(
+        r"(?<![A-Za-z0-9])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9])|"
+        r"(?<![A-Za-z0-9])(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:]+(?![A-Za-z0-9])",
+        str(value or ""),
+    )
+    return {candidate for candidate in candidates if _valid_ip(candidate)}
+
+
+def _valid_ip(value: object) -> bool:
+    try:
+        ip_address(str(value or "").strip())
+    except ValueError:
+        return False
+    return True
 
 
 def _deterministic_bbot_assessment_lines(observations: list[dict]) -> list[str]:

@@ -315,6 +315,26 @@ def test_ai_response_distinguishes_observations_from_recommendations() -> None:
     assert "- Run Nuclei against discovered domains or URLs where authorized." in text
 
 
+def test_ai_response_cannot_introduce_unsupported_ip_observation() -> None:
+    investigation = create_investigation(user_id=11010, target="example.com")
+    add_observation(
+        user_id=11010,
+        investigation_id=investigation["id"],
+        source="bbot",
+        observation_type="ip_address",
+        value="198.185.159.144",
+        target="example.com",
+    )
+    response = "Observed Facts\n- IP addresses: 198.185.159.0"
+
+    with patch("app.services.bbot_ai_assessment.ask_ai", return_value=response):
+        lines = generate_bbot_ai_assessment(11010, investigation_id=investigation["id"], target="example.com")
+
+    rendered = "\n".join(lines)
+    assert "198.185.159.0" not in rendered
+    assert "198.185.159.144" in rendered
+
+
 def test_prompt_includes_discovered_subdomains_and_urls() -> None:
     prompt = build_bbot_ai_assessment_prompt(
         observations=[
